@@ -75,7 +75,7 @@ class ColStore:
     --------
     >>> ds = ColStore.from_dataframe(df, "data.cstore")
     >>> ds['price']                      # ColumnView -> to_array()
-    >>> ds[100:200, ['price', 'qty']]    # TableView -> to_dict / to_record / to_frame
+    >>> ds[100:200, ['price', 'qty']]    # TableView -> to_dict / to_record / to_dataframe
     """
 
     def __init__(

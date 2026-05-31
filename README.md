@@ -38,7 +38,7 @@ ds[[1, 5, 9], ['price', 'qty']]      # TableView (fancy rows + cols)
 ds['price'].to_array()                          # 1D ndarray
 ds[indices, ['price', 'qty']].to_dict()         # dict of 1D arrays
 ds[indices, ['price', 'qty']].to_record()       # structured ndarray
-ds[indices, ['price', 'qty']].to_frame()        # pandas DataFrame
+ds[indices, ['price', 'qty']].to_dataframe()    # pandas DataFrame
 ```
 
 ## Writing from other sources
