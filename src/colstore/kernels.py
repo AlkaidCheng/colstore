@@ -10,6 +10,8 @@ import warnings
 
 import numpy as np
 
+from . import config
+
 try:
     from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
@@ -93,7 +95,7 @@ def gather(
     if backend == "cpp":
         if _CPP_AVAILABLE and kernel_compatible:
             output = np.empty(indices.shape[0], dtype=dtype)
-            _cpp_module.gather(source, indices, output)
+            _cpp_module.gather(source, indices, output, config.get_gather_thread_cap())
             return output
         if not _CPP_AVAILABLE:
             warnings.warn(
