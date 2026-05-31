@@ -8,7 +8,6 @@ import pytest
 from colstore import cpp_available
 from colstore.kernels import gather, max_threads
 
-
 pytestmark = pytest.mark.skipif(
     not cpp_available(),
     reason="C++ gather extension not built; install with `pip install .`",
@@ -18,9 +17,16 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize(
     "numpy_dtype",
     [
-        np.float32, np.float64,
-        np.int8, np.int16, np.int32, np.int64,
-        np.uint8, np.uint16, np.uint32, np.uint64,
+        np.float32,
+        np.float64,
+        np.int8,
+        np.int16,
+        np.int32,
+        np.int64,
+        np.uint8,
+        np.uint16,
+        np.uint32,
+        np.uint64,
     ],
 )
 def test_cpp_gather_matches_numpy_fancy_index_for_every_dtype(numpy_dtype):
@@ -29,9 +35,7 @@ def test_cpp_gather_matches_numpy_fancy_index_for_every_dtype(numpy_dtype):
         source = rng.standard_normal(10_000).astype(numpy_dtype)
     elif np.issubdtype(numpy_dtype, np.signedinteger):
         max_value = np.iinfo(numpy_dtype).max // 2
-        source = rng.integers(
-            -max_value, max_value, size=10_000, dtype=numpy_dtype
-        )
+        source = rng.integers(-max_value, max_value, size=10_000, dtype=numpy_dtype)
     else:
         max_value = np.iinfo(numpy_dtype).max // 2
         source = rng.integers(0, max_value, size=10_000, dtype=numpy_dtype)
@@ -60,6 +64,7 @@ def test_cpp_gather_zero_length_input_returns_empty():
 
 def test_cpp_gather_rejects_non_int64_indices():
     from colstore import _gather as cpp_module
+
     source = np.zeros(10, dtype=np.float32)
     indices_wrong = np.array([0, 1, 2], dtype=np.int32)
     output = np.empty(3, dtype=np.float32)
@@ -69,6 +74,7 @@ def test_cpp_gather_rejects_non_int64_indices():
 
 def test_cpp_gather_rejects_dtype_mismatch():
     from colstore import _gather as cpp_module
+
     source = np.zeros(10, dtype=np.float32)
     indices = np.array([0, 1, 2], dtype=np.int64)
     output_wrong_dtype = np.empty(3, dtype=np.float64)

@@ -41,9 +41,7 @@ def test_set_max_workers_rejects_negative():
 
 def test_default_madvise_is_a_known_option_or_none():
     advice = get_default_madvise()
-    assert advice in (
-        "normal", "sequential", "random", "willneed", "dontneed", None
-    )
+    assert advice in ("normal", "sequential", "random", "willneed", "dontneed", None)
 
 
 def test_set_default_madvise_roundtrips():

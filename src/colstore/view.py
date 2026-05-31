@@ -33,7 +33,7 @@ class _BaseView:
     subclasses.
     """
 
-    __slots__ = ("_store", "_row_part")
+    __slots__ = ("_row_part", "_store")
 
     def __init__(self, store: ColStore, row_part: Any) -> None:
         self._store = store
@@ -105,9 +105,7 @@ class ColumnView(_BaseView):
             Owning 1D array of the selected rows in the column's stored
             dtype. Safe to use after the source store is closed.
         """
-        return self._store._gather_one(
-            self._column_name, self._resolve_row_indexer()
-        )
+        return self._store._gather_one(self._column_name, self._resolve_row_indexer())
 
 
 class TableView(_BaseView):
@@ -160,9 +158,7 @@ class TableView(_BaseView):
             Owning arrays in selection order; each column's stored dtype is
             preserved.
         """
-        return self._store._gather_many(
-            self._column_names, self._resolve_row_indexer()
-        )
+        return self._store._gather_many(self._column_names, self._resolve_row_indexer())
 
     def to_record(self) -> np.ndarray:
         """Materialize as a structured (record) ndarray with one field per column.
@@ -174,9 +170,7 @@ class TableView(_BaseView):
         """
         column_data = self.to_dict()
         n_records = next(iter(column_data.values())).shape[0]
-        record_dtype = np.dtype(
-            [(name, column_data[name].dtype) for name in self._column_names]
-        )
+        record_dtype = np.dtype([(name, column_data[name].dtype) for name in self._column_names])
         record_array = np.empty(n_records, dtype=record_dtype)
         for name in self._column_names:
             record_array[name] = column_data[name]

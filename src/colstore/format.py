@@ -18,9 +18,9 @@ inside the manifest, not by changing the magic.
 """
 
 import json
+import os
 import struct
-from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import numpy as np
 
@@ -31,7 +31,10 @@ _MANIFEST_LEN_SIZE = struct.calcsize(_MANIFEST_LEN_FMT)
 _ALIGNMENT = 64
 _FORMAT_VERSION = 1
 
-ColumnLayout = dict[str, tuple[int, np.dtype]]
+# Path-like accepted by every public function in this module.
+PathLike = str | os.PathLike[str]
+
+ColumnLayout = dict[str, tuple[int, np.dtype[Any]]]
 
 
 class FormatError(Exception):
@@ -45,7 +48,7 @@ def align_up(value: int, alignment: int = _ALIGNMENT) -> int:
 
 def write_header(
     file: IO[bytes],
-    columns_meta: list[dict],
+    columns_meta: list[dict[str, Any]],
     n_rows: int,
 ) -> int:
     """Write magic + manifest + padding; return the data start offset."""
@@ -65,23 +68,19 @@ def write_header(
     return data_offset
 
 
-def read_header(path: str | Path) -> tuple[dict, int]:
+def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
     """Read magic and manifest; return ``(manifest_dict, data_start_offset)``."""
     with open(path, "rb") as input_file:
         magic = input_file.read(len(_MAGIC))
         if magic != _MAGIC:
-            raise FormatError(
-                f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}"
-            )
-        manifest_size = struct.unpack(
-            _MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE)
-        )[0]
+            raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
+        manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
         manifest = json.loads(input_file.read(manifest_size))
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + manifest_size
     return manifest, align_up(header_size)
 
 
-def build_column_layout(manifest: dict, data_offset: int) -> ColumnLayout:
+def build_column_layout(manifest: dict[str, Any], data_offset: int) -> ColumnLayout:
     """Compute per-column ``(byte_offset, dtype)`` from manifest and start offset."""
     layout: ColumnLayout = {}
     n_rows = manifest["n_rows"]
@@ -94,8 +93,8 @@ def build_column_layout(manifest: dict, data_offset: int) -> ColumnLayout:
 
 
 def write_dataset(
-    columns: dict[str, np.ndarray],
-    path: str | Path,
+    columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
+    path: PathLike,
     *,
     batch_size: int,
     show_progress: bool,
@@ -113,25 +112,23 @@ def write_dataset(
             raise ValueError(f"Column {name!r} must be 1D; got {array.ndim}D.")
         if array.dtype.kind == "O":
             raise TypeError(
-                f"Column {name!r} has object dtype; "
-                f"only fixed-size dtypes are supported."
+                f"Column {name!r} has object dtype; " f"only fixed-size dtypes are supported."
             )
         if array.shape[0] != n_rows:
-            raise ValueError(
-                f"Column {name!r} has {array.shape[0]} rows; expected {n_rows}."
-            )
+            raise ValueError(f"Column {name!r} has {array.shape[0]} rows; expected {n_rows}.")
 
-    columns_meta = [
-        {"name": name, "dtype": columns[name].dtype.str} for name in column_names
-    ]
+    columns_meta = [{"name": name, "dtype": columns[name].dtype.str} for name in column_names]
     total_batches = (-(-n_rows // batch_size)) * len(column_names)
 
-    with open(path, "wb") as output_file, tqdm(
-        total=total_batches,
-        desc="Writing colstore",
-        unit="batch",
-        disable=not show_progress,
-    ) as progress:
+    with (
+        open(path, "wb") as output_file,
+        tqdm(
+            total=total_batches,
+            desc="Writing colstore",
+            unit="batch",
+            disable=not show_progress,
+        ) as progress,
+    ):
         write_header(output_file, columns_meta, n_rows)
         for name in column_names:
             array = columns[name]

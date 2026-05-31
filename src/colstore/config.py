@@ -19,16 +19,17 @@ except ImportError:
 MadviseOption = Literal["normal", "sequential", "random", "willneed", "dontneed"]
 GatherBackend = Literal["cpp", "numpy", "numba"]
 
-_config: dict[str, object] = {
-    "max_workers": _DEFAULT_MAX_WORKERS,
-    "default_madvise": "sequential",
-    "default_backend": "cpp",
-}
+# Typed module-level state. Held as separate variables rather than a single
+# `dict[str, object]` so mypy can preserve the precise types through the
+# get_* / set_* accessors without casts.
+_max_workers: int = _DEFAULT_MAX_WORKERS
+_default_madvise: MadviseOption | None = "sequential"
+_default_backend: GatherBackend = "cpp"
 
 
 def get_max_workers() -> int:
     """Return the package-wide default thread count for multi-column reads."""
-    return int(_config["max_workers"])
+    return _max_workers
 
 
 def set_max_workers(n: int) -> None:
@@ -37,30 +38,31 @@ def set_max_workers(n: int) -> None:
     Recommend setting to the number of *physical* CPU cores; hyperthreaded
     logical cores rarely help memory-bound workloads.
     """
+    global _max_workers
     if n < 1:
         raise ValueError(f"max_workers must be >= 1, got {n}.")
-    _config["max_workers"] = int(n)
+    _max_workers = int(n)
 
 
 def get_default_madvise() -> MadviseOption | None:
     """Return the default ``madvise`` hint applied to new ``ColStore`` opens."""
-    return _config["default_madvise"]  # type: ignore[return-value]
+    return _default_madvise
 
 
 def set_default_madvise(advice: MadviseOption | None) -> None:
     """Set the package-wide default ``madvise`` hint for new ``ColStore`` opens."""
-    _config["default_madvise"] = advice
+    global _default_madvise
+    _default_madvise = advice
 
 
 def get_default_backend() -> GatherBackend:
     """Return the default gather backend for new ``ColStore`` opens."""
-    return _config["default_backend"]  # type: ignore[return-value]
+    return _default_backend
 
 
 def set_default_backend(backend: GatherBackend) -> None:
     """Set the default gather backend (``"cpp"``, ``"numpy"``, or ``"numba"``)."""
+    global _default_backend
     if backend not in ("cpp", "numpy", "numba"):
-        raise ValueError(
-            f"backend must be 'cpp', 'numpy', or 'numba'; got {backend!r}."
-        )
-    _config["default_backend"] = backend
+        raise ValueError(f"backend must be 'cpp', 'numpy', or 'numba'; got {backend!r}.")
+    _default_backend = backend

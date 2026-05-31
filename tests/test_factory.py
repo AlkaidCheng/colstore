@@ -12,9 +12,7 @@ def test_from_dataframe_returns_opened_store(tmp_path):
     frame = pd.DataFrame(
         {"x": np.arange(100, dtype=np.float32), "y": np.arange(100, dtype=np.int64)}
     )
-    store = ColStore.from_dataframe(
-        frame, tmp_path / "out.cstore", show_progress=False
-    )
+    store = ColStore.from_dataframe(frame, tmp_path / "out.cstore", show_progress=False)
     try:
         assert store.n_rows == 100
         assert store.columns == ["x", "y"]
@@ -32,9 +30,7 @@ def test_from_dataframe_preserves_dtypes(tmp_path):
             "u8": np.array([255, 0], dtype=np.uint8),
         }
     )
-    with ColStore.from_dataframe(
-        frame, tmp_path / "dtypes.cstore", show_progress=False
-    ) as store:
+    with ColStore.from_dataframe(frame, tmp_path / "dtypes.cstore", show_progress=False) as store:
         assert store.dtypes["f32"] == np.float32
         assert store.dtypes["i16"] == np.int16
         assert store.dtypes["u8"] == np.uint8
@@ -45,9 +41,7 @@ def test_from_dict_round_trips(tmp_path):
         "x": np.arange(50, dtype=np.float64),
         "y": np.arange(50, dtype=np.int32) * 3,
     }
-    with ColStore.from_dict(
-        columns, tmp_path / "out.cstore", show_progress=False
-    ) as store:
+    with ColStore.from_dict(columns, tmp_path / "out.cstore", show_progress=False) as store:
         roundtripped = store[:].to_dict()
         for column_name in columns:
             assert np.array_equal(roundtripped[column_name], columns[column_name])
@@ -59,9 +53,7 @@ def test_from_records_round_trips(tmp_path):
     records["price"] = np.arange(20, dtype=np.float32) * 0.5
     records["count"] = np.arange(20, dtype=np.int64) * 7
 
-    with ColStore.from_records(
-        records, tmp_path / "rec.cstore", show_progress=False
-    ) as store:
+    with ColStore.from_records(records, tmp_path / "rec.cstore", show_progress=False) as store:
         out = store[:].to_record()
         assert out.dtype.names == ("price", "count")
         assert np.array_equal(out["price"], records["price"])

@@ -11,16 +11,20 @@ with bounded process memory.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import ctypes.util
 import mmap
 import os
 import warnings
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, overload
 
 import numpy as np
+from numpy.typing import NDArray
 
 from . import config, format, kernels
 from .view import ColumnView, TableView
@@ -76,20 +80,18 @@ class ColStore:
 
     def __init__(
         self,
-        path: str | os.PathLike,
+        path: str | os.PathLike[str],
         *,
-        madvise: str | None = _USE_DEFAULT_MADVISE,  # type: ignore[assignment]
+        madvise: str | None = _USE_DEFAULT_MADVISE,
         mlock: bool = False,
         backend: str | None = None,
         max_workers: int | None = None,
     ) -> None:
         self._path = Path(path)
         self._manifest, data_offset = format.read_header(self._path)
-        self._layout: format.ColumnLayout = format.build_column_layout(
-            self._manifest, data_offset
-        )
+        self._layout: format.ColumnLayout = format.build_column_layout(self._manifest, data_offset)
         self._closed = False
-        self._memmaps: dict[str, np.memmap] = {
+        self._memmaps: dict[str, np.memmap[Any, np.dtype[Any]]] = {
             name: np.memmap(
                 self._path,
                 dtype=column_dtype,
@@ -100,7 +102,7 @@ class ColStore:
             for name, (column_offset, column_dtype) in self._layout.items()
         }
 
-        if madvise is _USE_DEFAULT_MADVISE:
+        if madvise == _USE_DEFAULT_MADVISE:
             madvise = config.get_default_madvise()
         if madvise is not None:
             self._apply_madvise(madvise)
@@ -116,46 +118,41 @@ class ColStore:
     def from_dataframe(
         cls,
         frame: pd.DataFrame,
-        path: str | os.PathLike,
+        path: str | os.PathLike[str],
         *,
         batch_size: int = 100_000,
         show_progress: bool = True,
         **open_kwargs: Any,
     ) -> ColStore:
         """Write a pandas DataFrame to disk and open the result."""
-        columns: dict[str, np.ndarray] = {}
+        columns: dict[str, NDArray[Any]] = {}
         for column_name in frame.columns:
             columns[str(column_name)] = frame[column_name].to_numpy()
-        format.write_dataset(
-            columns, path, batch_size=batch_size, show_progress=show_progress
-        )
+        format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
         return cls(path, **open_kwargs)
 
     @classmethod
     def from_dict(
         cls,
-        columns: dict[str, np.ndarray],
-        path: str | os.PathLike,
+        columns: dict[str, NDArray[Any]],
+        path: str | os.PathLike[str],
         *,
         batch_size: int = 100_000,
         show_progress: bool = True,
         **open_kwargs: Any,
     ) -> ColStore:
         """Write a dict of 1D NumPy column arrays to disk and open the result."""
-        normalized: dict[str, np.ndarray] = {
-            str(name): np.ascontiguousarray(array)
-            for name, array in columns.items()
+        normalized: dict[str, NDArray[Any]] = {
+            str(name): np.ascontiguousarray(array) for name, array in columns.items()
         }
-        format.write_dataset(
-            normalized, path, batch_size=batch_size, show_progress=show_progress
-        )
+        format.write_dataset(normalized, path, batch_size=batch_size, show_progress=show_progress)
         return cls(path, **open_kwargs)
 
     @classmethod
     def from_records(
         cls,
-        records: np.ndarray,
-        path: str | os.PathLike,
+        records: NDArray[Any],
+        path: str | os.PathLike[str],
         *,
         batch_size: int = 100_000,
         show_progress: bool = True,
@@ -164,13 +161,10 @@ class ColStore:
         """Write a structured (record) NumPy array to disk and open the result."""
         if records.dtype.names is None:
             raise TypeError("Expected a structured ndarray with named fields.")
-        columns: dict[str, np.ndarray] = {
-            name: np.ascontiguousarray(records[name])
-            for name in records.dtype.names
+        columns: dict[str, NDArray[Any]] = {
+            name: np.ascontiguousarray(records[name]) for name in records.dtype.names
         }
-        format.write_dataset(
-            columns, path, batch_size=batch_size, show_progress=show_progress
-        )
+        format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
         return cls(path, **open_kwargs)
 
     # ---- Read-only properties ------------------------------------------
@@ -220,7 +214,7 @@ class ColStore:
     def __contains__(self, column_name: object) -> bool:
         return isinstance(column_name, str) and column_name in self._layout
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[str]:
         return iter(self.columns)
 
     @overload
@@ -228,13 +222,9 @@ class ColStore:
     @overload
     def __getitem__(self, key: tuple[Any, str]) -> ColumnView: ...
     @overload
-    def __getitem__(
-        self, key: int | slice | list | np.ndarray
-    ) -> TableView: ...
+    def __getitem__(self, key: int | slice | list[Any] | NDArray[Any]) -> TableView: ...
     @overload
-    def __getitem__(
-        self, key: tuple[Any, list[str] | tuple[str, ...]]
-    ) -> TableView: ...
+    def __getitem__(self, key: tuple[Any, list[str] | tuple[str, ...]]) -> TableView: ...
 
     def __getitem__(self, key: Any) -> ColumnView | TableView:
         row_part, column_names, is_single_column = self._parse_key(key)
@@ -264,7 +254,12 @@ class ColStore:
     def __enter__(self) -> ColStore:
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         self.close()
 
     # ---- Indexing helpers ----------------------------------------------
@@ -274,8 +269,7 @@ class ColStore:
         if isinstance(key, tuple):
             if len(key) != 2:
                 raise IndexError(
-                    f"Expected at most 2 elements in indexing tuple; "
-                    f"got {len(key)}."
+                    f"Expected at most 2 elements in indexing tuple; " f"got {len(key)}."
                 )
             row_part, column_part = key
         elif self._looks_like_column_spec(key):
@@ -300,10 +294,7 @@ class ColStore:
 
         unknown = [name for name in column_names if name not in self._layout]
         if unknown:
-            raise KeyError(
-                f"Unknown column(s): {unknown}. "
-                f"Available columns: {self.columns}"
-            )
+            raise KeyError(f"Unknown column(s): {unknown}. " f"Available columns: {self.columns}")
         return row_part, column_names, is_single_column
 
     @staticmethod
@@ -320,20 +311,17 @@ class ColStore:
     def _apply_madvise(self, advice: str) -> None:
         if advice not in _MADVISE_FLAGS:
             raise ValueError(
-                f"Invalid madvise value {advice!r}; "
-                f"expected one of {sorted(_MADVISE_FLAGS)}."
+                f"Invalid madvise value {advice!r}; " f"expected one of {sorted(_MADVISE_FLAGS)}."
             )
         flag = _MADVISE_FLAGS[advice]
         for memmap_view in self._memmaps.values():
-            try:
+            with contextlib.suppress(AttributeError, OSError):
                 memmap_view._mmap.madvise(flag)  # type: ignore[attr-defined]
-            except (AttributeError, OSError):
-                pass
 
     def _apply_mlock(self) -> None:
         libc_name = ctypes.util.find_library("c")
         if libc_name is None:
-            warnings.warn("mlock requested but libc could not be located.")
+            warnings.warn("mlock requested but libc could not be located.", stacklevel=2)
             return
         libc = ctypes.CDLL(libc_name, use_errno=True)
         for memmap_view in self._memmaps.values():
@@ -343,40 +331,39 @@ class ColStore:
                 errno = ctypes.get_errno()
                 warnings.warn(
                     f"mlock failed (errno={errno}); pages may be paged out "
-                    f"under memory pressure."
+                    f"under memory pressure.",
+                    stacklevel=2,
                 )
                 return
 
     # ---- Gather (called by views) --------------------------------------
 
-    def _gather_one(self, column_name: str, row_indexer) -> np.ndarray:
+    def _gather_one(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
         """Read one column with the given row selector; return owning ndarray."""
         if self._closed:
             raise ValueError("ColStore is closed.")
         source = self._memmaps[column_name]
         column_dtype = self._layout[column_name][1]
+        # ``np.array(..., copy=True)`` is typed to return ``NDArray[Any]``;
+        # the older ``np.asarray(x).copy()`` chain returns ``Any`` under
+        # current numpy stubs, hence the explicit constructor calls.
         if row_indexer is None:
-            return np.asarray(source).copy()
+            return np.array(source, copy=True)
         if isinstance(row_indexer, int):
-            return np.atleast_1d(source[row_indexer]).copy()
+            return np.atleast_1d(np.array(source[row_indexer], copy=True))
         if isinstance(row_indexer, slice):
-            return np.asarray(source[row_indexer]).copy()
+            return np.array(source[row_indexer], copy=True)
         # Integer ndarray (fancy index): dispatch to chosen backend.
         return kernels.gather(source, row_indexer, column_dtype, backend=self._backend)
 
-    def _gather_many(
-        self, column_names: list[str], row_indexer
-    ) -> dict[str, np.ndarray]:
+    def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         """Read multiple columns in parallel; return ordered dict of owning arrays."""
         workers = self.max_workers
         if workers <= 1 or len(column_names) <= 1:
-            return {
-                name: self._gather_one(name, row_indexer) for name in column_names
-            }
+            return {name: self._gather_one(name, row_indexer) for name in column_names}
         n_workers = min(workers, len(column_names))
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {
-                name: executor.submit(self._gather_one, name, row_indexer)
-                for name in column_names
+                name: executor.submit(self._gather_one, name, row_indexer) for name in column_names
             }
             return {name: futures[name].result() for name in column_names}

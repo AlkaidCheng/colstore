@@ -52,9 +52,7 @@ def test_close_is_idempotent(small_store):
 
 def test_context_manager_closes_on_exit(tmp_path, small_frame):
     path = tmp_path / "ctx.cstore"
-    with ColStore.from_dataframe(
-        small_frame, path, show_progress=False
-    ) as store:
+    with ColStore.from_dataframe(small_frame, path, show_progress=False) as store:
         _ = store["price"].to_array()
     with pytest.raises(ValueError, match="closed"):
         store["price"].to_array()
@@ -62,17 +60,13 @@ def test_context_manager_closes_on_exit(tmp_path, small_frame):
 
 def test_max_workers_property_uses_override_when_set(tmp_path, small_frame):
     path = tmp_path / "overr.cstore"
-    with ColStore.from_dataframe(
-        small_frame, path, show_progress=False, max_workers=3
-    ) as store:
+    with ColStore.from_dataframe(small_frame, path, show_progress=False, max_workers=3) as store:
         assert store.max_workers == 3
 
 
 def test_backend_property_reflects_constructor_choice(tmp_path, small_frame):
     path = tmp_path / "back.cstore"
-    with ColStore.from_dataframe(
-        small_frame, path, show_progress=False, backend="numpy"
-    ) as store:
+    with ColStore.from_dataframe(small_frame, path, show_progress=False, backend="numpy") as store:
         assert store.backend == "numpy"
 
 

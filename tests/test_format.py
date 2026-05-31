@@ -44,13 +44,13 @@ def test_column_layout_offsets_are_contiguous(tmp_path):
     path = tmp_path / "case.cstore"
     columns = {
         "a": np.arange(10, dtype=np.float32),  # 40 bytes
-        "b": np.arange(10, dtype=np.int64),    # 80 bytes
+        "b": np.arange(10, dtype=np.int64),  # 80 bytes
     }
     write_dataset(columns, path, batch_size=10, show_progress=False)
     manifest, data_offset = read_header(path)
     layout = build_column_layout(manifest, data_offset)
     a_offset, a_dtype = layout["a"]
-    b_offset, b_dtype = layout["b"]
+    b_offset, _b_dtype = layout["b"]
     assert a_offset == data_offset
     assert b_offset == a_offset + 10 * a_dtype.itemsize
 
@@ -87,8 +87,7 @@ def test_write_rejects_inconsistent_row_counts(tmp_path):
 
 def test_write_rejects_empty(tmp_path):
     with pytest.raises(ValueError, match="empty"):
-        write_dataset({}, tmp_path / "empty.cstore",
-                      batch_size=10, show_progress=False)
+        write_dataset({}, tmp_path / "empty.cstore", batch_size=10, show_progress=False)
 
 
 def test_dtype_is_preserved_byte_for_byte(tmp_path):

@@ -20,7 +20,8 @@ Package-wide defaults (thread count, ``madvise`` hint, gather backend) live
 in :mod:`colstore.config` and can be changed at runtime.
 """
 
-from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 try:
     __version__ = _pkg_version("colstore")
@@ -41,19 +42,19 @@ from .store import ColStore
 from .view import ColumnView, TableView
 
 __all__ = [
+    "FILE_EXTENSION",
     "ColStore",
     "ColumnView",
-    "TableView",
     "FormatError",
-    "FILE_EXTENSION",
-    "get_max_workers",
-    "set_max_workers",
-    "get_default_madvise",
-    "set_default_madvise",
-    "get_default_backend",
-    "set_default_backend",
-    "cpp_available",
-    "numba_available",
-    "max_threads",
+    "TableView",
     "__version__",
+    "cpp_available",
+    "get_default_backend",
+    "get_default_madvise",
+    "get_max_workers",
+    "max_threads",
+    "numba_available",
+    "set_default_backend",
+    "set_default_madvise",
+    "set_max_workers",
 ]

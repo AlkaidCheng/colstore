@@ -57,9 +57,7 @@ def test_int_array_with_multi_columns(medium_store, medium_frame):
 def test_int_list_with_multi_columns(medium_store, medium_frame):
     indices = [1, 5, 99, 0, 49999]
     result = medium_store[indices, ["a", "c"]].to_dict()
-    assert np.allclose(
-        result["a"], medium_frame["a"].iloc[indices].to_numpy()
-    )
+    assert np.allclose(result["a"], medium_frame["a"].iloc[indices].to_numpy())
 
 
 def test_boolean_mask_with_single_column(medium_store, medium_frame):

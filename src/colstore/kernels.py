@@ -11,7 +11,7 @@ import warnings
 import numpy as np
 
 try:
-    from . import _gather as _cpp_module
+    from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
     _CPP_AVAILABLE = True
 except ImportError as exc:
@@ -23,10 +23,11 @@ try:
 
     _NUMBA_AVAILABLE = True
 
-    @njit(parallel=True, cache=True, boundscheck=False, fastmath=True)
-    def _numba_gather_kernel(source, indices, output):
+    @njit(parallel=True, cache=True, boundscheck=False, fastmath=True)  # type: ignore[untyped-decorator]
+    def _numba_gather_kernel(source: np.ndarray, indices: np.ndarray, output: np.ndarray) -> None:
         for i in prange(indices.shape[0]):
             output[i] = source[indices[i]]
+
 except ImportError:
     _NUMBA_AVAILABLE = False
 
@@ -44,7 +45,8 @@ def numba_available() -> bool:
 def max_threads() -> int:
     """Return the gather kernel's max thread count (1 without OpenMP)."""
     if _CPP_AVAILABLE:
-        return _cpp_module.max_threads()
+        # The compiled module has no stubs; cast its return through int().
+        return int(_cpp_module.max_threads())
     return 1
 
 
@@ -94,8 +96,7 @@ def gather(
             _numba_gather_kernel(source, indices, output)
             return output
         warnings.warn(
-            "Requested 'numba' backend but Numba is not installed; "
-            "falling back to NumPy.",
+            "Requested 'numba' backend but Numba is not installed; " "falling back to NumPy.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -103,7 +104,6 @@ def gather(
 
     if backend != "numpy":
         raise ValueError(
-            f"Unknown gather backend {backend!r}; "
-            f"expected 'cpp', 'numpy', or 'numba'."
+            f"Unknown gather backend {backend!r}; " f"expected 'cpp', 'numpy', or 'numba'."
         )
     return np.asarray(source[indices], dtype=dtype)
