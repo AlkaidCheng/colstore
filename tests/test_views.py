@@ -42,10 +42,10 @@ def test_column_view_to_array_preserves_dtype(small_store, small_frame):
 
 
 def test_column_view_does_not_have_to_dict():
-    """ColumnView does not implement to_dict / to_record / to_dataframe."""
+    """ColumnView does not implement to_dict / to_record / to_frame."""
     assert not hasattr(ColumnView, "to_dict")
     assert not hasattr(ColumnView, "to_record")
-    assert not hasattr(ColumnView, "to_dataframe")
+    assert not hasattr(ColumnView, "to_frame")
 
 
 def test_table_view_does_not_have_to_array():
@@ -69,8 +69,8 @@ def test_table_view_to_record_preserves_each_dtype(small_store, small_frame):
     assert record_array.shape == (10,)
 
 
-def test_table_view_to_dataframe_returns_dataframe(small_store, small_frame):
-    out_frame = small_store[100:110, ["price", "qty"]].to_dataframe()
+def test_table_view_to_frame_returns_dataframe(small_store, small_frame):
+    out_frame = small_store[100:110, ["price", "qty"]].to_frame()
     assert isinstance(out_frame, pd.DataFrame)
     assert list(out_frame.columns) == ["price", "qty"]
     assert len(out_frame) == 10

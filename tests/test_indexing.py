@@ -3,7 +3,32 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
+
+from colstore import ColStore
+from colstore.kernels import cpp_available, numba_available
+
+# Index validation runs against every available gather backend so the
+# C++/Numba kernels are held to the same bounds/negative-index contract as
+# NumPy.
+_BACKENDS = ["numpy"]
+if cpp_available():
+    _BACKENDS.append("cpp")
+if numba_available():
+    _BACKENDS.append("numba")
+
+
+@pytest.fixture
+def validation_store(tmp_path, request):
+    frame = pd.DataFrame(
+        {"a": np.arange(100, dtype=np.float64), "c": np.arange(100, dtype=np.int64)}
+    )
+    opened = ColStore.from_dataframe(
+        frame, tmp_path / "idx.cstore", show_progress=False, backend=request.param
+    )
+    yield opened
+    opened.close()
 
 
 def test_single_int_row_indexing(medium_store, medium_frame):
@@ -109,3 +134,49 @@ def test_oversized_tuple_raises_indexerror(small_store):
 def test_invalid_column_selector_type_raises_indexerror(small_store):
     with pytest.raises(IndexError, match="string"):
         small_store[100:200, 42]
+
+
+# ---- Index validation across backends --------------------------------------
+# Bounds-check every integer selector and fold negatives before the value
+# reaches a gather backend, so all backends agree with NumPy semantics.
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_out_of_bounds_fancy_index_raises(validation_store):
+    with pytest.raises(IndexError, match="out of bounds"):
+        validation_store[np.array([100]), "a"].to_array()
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_negative_fancy_index_folds(validation_store):
+    assert validation_store[np.array([-1, -2]), "c"].to_array().tolist() == [99, 98]
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_out_of_bounds_scalar_raises(validation_store):
+    with pytest.raises(IndexError, match="out of bounds"):
+        validation_store[100, "a"].to_array()
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_negative_scalar_folds(validation_store):
+    assert validation_store[-1, "a"].to_array().tolist() == [99.0]
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_float_index_array_raises(validation_store):
+    with pytest.raises(IndexError, match="integer or boolean"):
+        validation_store[np.array([1.7, 2.9]), "a"].to_array()
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_zero_dim_array_is_scalar_shape(validation_store):
+    result = validation_store[np.array(5), "a"].to_array()
+    assert result.shape == (1,)
+    assert result.tolist() == [5.0]
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_bad_mask_length_raises(validation_store):
+    with pytest.raises(IndexError, match="mask length"):
+        validation_store[np.zeros(50, dtype=bool), "a"].to_array()
