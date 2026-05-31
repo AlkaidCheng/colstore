@@ -29,6 +29,7 @@ inside the manifest, not by changing the magic.
 import json
 import os
 import struct
+import zlib
 import sys
 from typing import IO, Any
 
@@ -40,6 +41,7 @@ _MANIFEST_LEN_FMT = "<Q"
 _MANIFEST_LEN_SIZE = struct.calcsize(_MANIFEST_LEN_FMT)
 _ALIGNMENT = 64
 _FORMAT_VERSION = 1
+_SUPPORTED_VERSIONS = frozenset({1})
 
 # Path-like accepted by every public function in this module.
 PathLike = str | os.PathLike[str]
@@ -56,6 +58,15 @@ def align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+def _manifest_checksum(columns_meta: list[dict[str, Any]], n_rows: int) -> int:
+    """Compute a CRC32 over the structural manifest fields."""
+    payload = json.dumps(
+        {"n_rows": n_rows, "columns": columns_meta},
+        sort_keys=True,
+    ).encode("utf-8")
+    return zlib.crc32(payload) & 0xFFFFFFFF
+
+
 def write_header(
     file: IO[bytes],
     columns_meta: list[dict[str, Any]],
@@ -66,6 +77,7 @@ def write_header(
         "format_version": _FORMAT_VERSION,
         "n_rows": n_rows,
         "columns": columns_meta,
+        "manifest_crc32": _manifest_checksum(columns_meta, n_rows),
     }
     manifest_bytes = json.dumps(manifest).encode("utf-8")
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + len(manifest_bytes)
@@ -79,15 +91,51 @@ def write_header(
 
 
 def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
-    """Read magic and manifest; return ``(manifest_dict, data_start_offset)``."""
+    """Read and validate magic + manifest; return ``(manifest_dict, data_start_offset)``.
+
+    Raises
+    ------
+    FormatError
+        If the magic is wrong, the ``format_version`` is unsupported, the
+        manifest checksum does not match, or the file is shorter than the
+        column data the manifest describes.
+    """
     with open(path, "rb") as input_file:
         magic = input_file.read(len(_MAGIC))
         if magic != _MAGIC:
             raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
         manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
         manifest = json.loads(input_file.read(manifest_size))
+
+    version = manifest.get("format_version")
+    if version not in _SUPPORTED_VERSIONS:
+        raise FormatError(
+            f"Unsupported format_version {version!r}; this build supports "
+            f"{sorted(_SUPPORTED_VERSIONS)}."
+        )
+
+    expected_crc = manifest.get("manifest_crc32")
+    if expected_crc is not None:
+        actual_crc = _manifest_checksum(manifest["columns"], manifest["n_rows"])
+        if actual_crc != expected_crc:
+            raise FormatError(
+                f"Manifest checksum mismatch (stored {expected_crc}, computed "
+                f"{actual_crc}); the header is corrupt."
+            )
+
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + manifest_size
-    return manifest, align_up(header_size)
+    data_offset = align_up(header_size)
+
+    expected_data_bytes = sum(
+        manifest["n_rows"] * np.dtype(column["dtype"]).itemsize for column in manifest["columns"]
+    )
+    actual_data_bytes = os.path.getsize(path) - data_offset
+    if actual_data_bytes < expected_data_bytes:
+        raise FormatError(
+            f"File is truncated: expected at least {expected_data_bytes} bytes of "
+            f"column data after offset {data_offset}, found {actual_data_bytes}."
+        )
+    return manifest, data_offset
 
 
 def build_column_layout(manifest: dict[str, Any], data_offset: int) -> ColumnLayout:
