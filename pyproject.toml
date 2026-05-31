@@ -1,0 +1,110 @@
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "cython>=3.0",
+    "numpy>=1.25",
+    "setuptools_scm>=8",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "colstore"
+dynamic = ["version"]
+description = "Memory-mapped columnar binary format for fast random-access I/O on structured arrays."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Alkaid Cheng", email = "alkaid.ccheng@gmail.com" }]
+license = { text = "MIT" }
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "numpy>=1.25",
+    "pandas>=1.5",
+    "tqdm>=4.60",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+numba = ["numba>=0.59"]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.4",
+    "black>=24.0",
+    "mypy>=1.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/AlkaidCheng/colstore"
+Issues = "https://github.com/AlkaidCheng/colstore/issues"
+
+# --- scikit-build-core (build backend) ---------------------------------------
+# Drives CMake for the Cython binding + C++ kernel and pulls the project
+# version dynamically from setuptools_scm so git tags are the single source
+# of truth.
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.18"
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/colstore"]
+sdist.include = [
+    "CMakeLists.txt",
+    "pyproject.toml",
+    "README.md",
+    "src/**",
+    "include/**",
+    "tests/**",
+]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.setuptools_scm"
+
+# --- Dynamic versioning ------------------------------------------------------
+# An empty [tool.setuptools_scm] table activates SCM-driven versioning. Tag
+# `vX.Y.Z` on the release commit and that becomes the wheel version; commits
+# past the tag get a `+gHASH.dDATE` local-version suffix that PyPI rejects, so
+# only tagged commits are publishable.
+
+[tool.setuptools_scm]
+
+# --- Test / lint / format / typecheck ----------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+ignore_missing_imports = true
+# The compiled C++ extension has no stubs; skip it from strict checking.
+[[tool.mypy.overrides]]
+module = "colstore._gather"
+ignore_errors = true

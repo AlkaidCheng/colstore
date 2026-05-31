@@ -1,0 +1,171 @@
+name: Release
+
+# Triggered when a GitHub Release is published. We use `published`
+# rather than `created` so drafting a release in the GitHub UI doesn't
+# fire the publish step prematurely — the release has to actually go
+# live.
+#
+# Also exposes a manual `workflow_dispatch` button so maintainers can
+# build (but not publish) on demand for verification.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false  # never cancel an in-progress publish
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Sanity-gate: re-run the test suite on the release commit.
+  #
+  # CI on `main` already covers this for the normal flow, but a release
+  # can technically be tagged on any commit, so we re-verify before
+  # touching PyPI. We only run a single Python version here (latest
+  # stable) — the full matrix lives in ci.yml.
+  # ---------------------------------------------------------------------
+  test:
+    name: Sanity-test the release commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # tags needed for setuptools_scm
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: pytest -v
+
+  # ---------------------------------------------------------------------
+  # 2a. Build the sdist on Linux.
+  #
+  # The sdist is platform-independent; one job is enough. It contains
+  # the Cython .pyx, C++ sources, and the CMake build description, so
+  # users on unsupported platforms can still build from source.
+  # ---------------------------------------------------------------------
+  build_sdist:
+    name: Build sdist
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools_scm
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: List built artifacts
+        run: ls -l dist/
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+
+  # ---------------------------------------------------------------------
+  # 2b. Build per-platform wheels with cibuildwheel.
+  #
+  # colstore has a C++/Cython extension, so we can't ship a single
+  # py3-none-any wheel like a pure-Python package would. cibuildwheel
+  # runs the build inside manylinux containers for Linux and natively
+  # on macOS, producing wheels that pip can install on the same
+  # ABI/arch without a compiler on the user's machine.
+  # ---------------------------------------------------------------------
+  build_wheels:
+    name: Build wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # setuptools_scm
+
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v2.21
+        env:
+          # We support 3.10+; skip older interpreters, PyPy, 32-bit
+          # Linux, and musllinux (we don't test it).
+          CIBW_SKIP: "cp36-* cp37-* cp38-* cp39-* pp* *-manylinux_i686 *-musllinux*"
+          # The kernel's OpenMP path requires libomp on macOS;
+          # manylinux images already include it.
+          CIBW_BEFORE_ALL_MACOS: brew install libomp
+          # Quick smoke test on the built wheel before declaring it good.
+          CIBW_TEST_REQUIRES: pytest pandas
+          CIBW_TEST_COMMAND: pytest -q {project}/tests/test_format.py {project}/tests/test_factory.py
+
+      - name: List built artifacts
+        run: ls -l wheelhouse/
+
+      - name: Upload wheels artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
+
+  # ---------------------------------------------------------------------
+  # 3. Publish to PyPI via Trusted Publishing (OIDC).
+  #
+  # This job ONLY runs on a real `release: published` event — the
+  # manual workflow_dispatch path stops at `build` so maintainers can
+  # download and inspect the artifacts without touching PyPI.
+  # ---------------------------------------------------------------------
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [build_sdist, build_wheels]
+    if: github.event_name == 'release'
+
+    environment:
+      name: pypi
+      url: https://pypi.org/p/colstore
+
+    permissions:
+      id-token: write  # required for OIDC token used by Trusted Publishing
+
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          # All three uploaded artifacts (sdist + 2 wheel sets) get
+          # flattened into dist/ for the upload step.
+          merge-multiple: true
+
+      - name: List artifacts before upload
+        run: ls -l dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No user/password — Trusted Publishing handles auth via OIDC.

@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+wheelhouse/
+_skbuild/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Cython
+#   The .pyx is committed; the generated .cpp is a build artifact. Ignore
+#   that but keep our hand-written C++ kernel under src/cpp/.
+*.cpp
+!src/cpp/*.cpp
+cython_debug/
+
+# setuptools_scm — auto-generated at build time from git tags; never check in.
+src/colstore/_version.py
+
+# Installer / publisher
+pip-log.txt
+pip-delete-this-directory.txt
+.pypirc
+
+# Tests & coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+coverage.xml
+*.cover
+cover/
+.hypothesis/
+htmlcov/
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Linting
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints
+profile_default/
+
+# Virtual environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
