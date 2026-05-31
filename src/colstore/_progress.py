@@ -1,4 +1,6 @@
-"""A small, dependency-light progress-bar abstraction. ..."""
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import IO, Protocol, runtime_checkable
 
 @runtime_checkable
 class ProgressBar(Protocol):
