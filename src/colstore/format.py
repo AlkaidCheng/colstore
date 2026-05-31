@@ -43,6 +43,11 @@ _ALIGNMENT = 64
 _FORMAT_VERSION = 1
 _SUPPORTED_VERSIONS = frozenset({1})
 
+# Default per-column metadata. Recorded on write so future readers/writers can
+# branch on these keys without a format break; v1 only ever writes the defaults.
+_DEFAULT_ENCODING = "raw"  # reserved for future "zstd", "dict", etc.
+_DEFAULT_NULLABLE = False  # reserved for future null-bitmap support
+
 # Path-like accepted by every public function in this module.
 PathLike = str | os.PathLike[str]
 
@@ -207,7 +212,13 @@ def write_dataset(
 
     little_endian_columns = {name: _to_little_endian(columns[name]) for name in column_names}
     columns_meta = [
-        {"name": name, "dtype": little_endian_columns[name].dtype.str} for name in column_names
+        {
+            "name": name,
+            "dtype": little_endian_columns[name].dtype.str,
+            "encoding": _DEFAULT_ENCODING,
+            "nullable": _DEFAULT_NULLABLE,
+        }
+        for name in column_names
     ]
     total_batches = (-(-n_rows // batch_size)) * len(column_names)
 
