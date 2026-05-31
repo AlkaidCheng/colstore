@@ -1,6 +1,8 @@
+import warnings
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import IO, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
 
 @runtime_checkable
 class ProgressBar(Protocol):
@@ -10,19 +12,40 @@ class ProgressBar(Protocol):
 
 
 class NullProgressBar:
-    def update(self, n: int = 1) -> None: ...
-    def set_description(self, desc=None, refresh=True) -> None: ...
-    def set_postfix(self, *args, **kwargs) -> None: ...
+    def update(self, n: int = 1) -> None:
+        return None
+
+    def set_description(self, desc: str | None = None, refresh: bool = True) -> None:
+        return None
+
+    def set_postfix(self, *args: Any, **kwargs: Any) -> None:
+        return None
 
 
 @contextmanager
-def progress_bar(total=None, *, desc=None, unit="it", enabled=True) -> Iterator[ProgressBar]:
+def progress_bar(
+    total: int | None = None,
+    *,
+    desc: str | None = None,
+    unit: str = "it",
+    enabled: bool = True,
+) -> Iterator[ProgressBar]:
     if not enabled:
-        yield NullProgressBar(); return
+        yield NullProgressBar()
+        return
+
     try:
         from tqdm.auto import tqdm
     except ImportError:
-        warnings.warn("... install colstore[progress] ...", RuntimeWarning, stacklevel=3)
-        yield NullProgressBar(); return
+        warnings.warn(
+            "Progress reporting was requested but 'tqdm' is not installed; "
+            "continuing without a progress bar. Install the 'progress' extra "
+            "(pip install colstore[progress]) to enable it.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        yield NullProgressBar()
+        return
+
     with tqdm(total=total, desc=desc, unit=unit) as bar:
         yield bar
