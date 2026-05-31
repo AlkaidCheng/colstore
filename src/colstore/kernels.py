@@ -50,6 +50,14 @@ def max_threads() -> int:
     return 1
 
 
+def _is_native_order(array: np.ndarray) -> bool:
+    """Return whether `array` is in the host's native byte order."""
+    byteorder = array.dtype.byteorder
+    if byteorder in ("=", "|"):
+        return True
+    return (byteorder == "<") == bool(np.little_endian)
+
+
 def gather(
     source: np.ndarray,
     indices: np.ndarray,
@@ -66,40 +74,50 @@ def gather(
     indices : numpy.ndarray
         Integer index array, ``int64``.
     dtype : numpy.dtype
-        Output dtype; must match ``source.dtype``.
+        Output dtype; native byte order.
     backend : str, optional
         ``"cpp"`` (default), ``"numpy"``, or ``"numba"``. Falls back to NumPy
-        with a warning if the requested backend isn't available.
+        with a warning if the requested backend isn't available, and silently
+        for dtype kinds or byte orders the compiled kernels can't handle.
 
     Returns
     -------
     numpy.ndarray
         Owning 1D array of length ``len(indices)``.
     """
+    # The compiled/JIT kernels do raw element copies and assume native byte
+    # order and a fixed set of numeric kinds. Anything else uses NumPy, which
+    # handles byte-swapping and exotic dtypes correctly.
+    kernel_compatible = dtype.kind in ("f", "i", "u", "b") and _is_native_order(source)
+
     if backend == "cpp":
-        if _CPP_AVAILABLE:
+        if _CPP_AVAILABLE and kernel_compatible:
             output = np.empty(indices.shape[0], dtype=dtype)
             _cpp_module.gather(source, indices, output)
             return output
-        warnings.warn(
-            "Requested 'cpp' backend but the compiled extension is not "
-            "available; falling back to NumPy. Rebuild the package to "
-            "enable the C++ kernel.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if not _CPP_AVAILABLE:
+            warnings.warn(
+                "Requested 'cpp' backend but the compiled extension is not "
+                "available; falling back to NumPy. Rebuild the package to "
+                "enable the C++ kernel.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        # dtypes outside the kernel's supported kinds (e.g. datetime64, fixed-
+        # width strings) or non-native byte order fall through to NumPy.
         backend = "numpy"
 
     if backend == "numba":
-        if _NUMBA_AVAILABLE:
+        if _NUMBA_AVAILABLE and kernel_compatible:
             output = np.empty(indices.shape[0], dtype=dtype)
             _numba_gather_kernel(source, indices, output)
             return output
-        warnings.warn(
-            "Requested 'numba' backend but Numba is not installed; " "falling back to NumPy.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if not _NUMBA_AVAILABLE:
+            warnings.warn(
+                "Requested 'numba' backend but Numba is not installed; falling back to NumPy.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         backend = "numpy"
 
     if backend != "numpy":

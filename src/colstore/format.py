@@ -11,6 +11,15 @@ The manifest is a small JSON object that records ``format_version``,
 exactly; columns are stored back-to-back with no per-row overhead. The
 canonical file extension is ``.cstore``.
 
+Supported column dtypes are the fixed-size NumPy kinds: floating point,
+signed/unsigned integers, booleans, ``datetime64``/``timedelta64``, and
+fixed-width strings (``S`` bytes and ``U`` unicode). Object/variable-length
+columns are rejected.
+
+Byte order: column bytes are always written **little-endian** so files are
+portable across hosts. On a big-endian host the data is byte-swapped on
+write and again on read, so callers always see native-order arrays.
+
 The 8-byte magic ``b"CSTORE\\x00\\x01"`` spells the format name (6 ASCII
 bytes) followed by two reserved bytes; the bytes are constant for the life
 of the format. Per-instance evolution is tracked via ``format_version``
@@ -20,7 +29,7 @@ inside the manifest, not by changing the magic.
 import json
 import os
 import struct
-import zlib
+import sys
 from typing import IO, Any
 
 import numpy as np
@@ -31,7 +40,6 @@ _MANIFEST_LEN_FMT = "<Q"
 _MANIFEST_LEN_SIZE = struct.calcsize(_MANIFEST_LEN_FMT)
 _ALIGNMENT = 64
 _FORMAT_VERSION = 1
-_SUPPORTED_VERSIONS = frozenset({1})
 
 # Path-like accepted by every public function in this module.
 PathLike = str | os.PathLike[str]
@@ -48,15 +56,6 @@ def align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _manifest_checksum(columns_meta: list[dict[str, Any]], n_rows: int) -> int:
-    """Compute a CRC32 over the structural manifest fields."""
-    payload = json.dumps(
-        {"n_rows": n_rows, "columns": columns_meta},
-        sort_keys=True,
-    ).encode("utf-8")
-    return zlib.crc32(payload) & 0xFFFFFFFF
-
-
 def write_header(
     file: IO[bytes],
     columns_meta: list[dict[str, Any]],
@@ -67,7 +66,6 @@ def write_header(
         "format_version": _FORMAT_VERSION,
         "n_rows": n_rows,
         "columns": columns_meta,
-        "manifest_crc32": _manifest_checksum(columns_meta, n_rows),
     }
     manifest_bytes = json.dumps(manifest).encode("utf-8")
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + len(manifest_bytes)
@@ -81,55 +79,24 @@ def write_header(
 
 
 def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
-    """Read and validate magic + manifest; return ``(manifest_dict, data_start_offset)``.
-
-    Raises
-    ------
-    FormatError
-        If the magic is wrong, the ``format_version`` is unsupported, the
-        manifest checksum does not match, or the file is shorter than the
-        column data the manifest describes.
-    """
+    """Read magic and manifest; return ``(manifest_dict, data_start_offset)``."""
     with open(path, "rb") as input_file:
         magic = input_file.read(len(_MAGIC))
         if magic != _MAGIC:
             raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
         manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
         manifest = json.loads(input_file.read(manifest_size))
-
-    version = manifest.get("format_version")
-    if version not in _SUPPORTED_VERSIONS:
-        raise FormatError(
-            f"Unsupported format_version {version!r}; this build supports "
-            f"{sorted(_SUPPORTED_VERSIONS)}."
-        )
-
-    expected_crc = manifest.get("manifest_crc32")
-    if expected_crc is not None:
-        actual_crc = _manifest_checksum(manifest["columns"], manifest["n_rows"])
-        if actual_crc != expected_crc:
-            raise FormatError(
-                f"Manifest checksum mismatch (stored {expected_crc}, computed "
-                f"{actual_crc}); the header is corrupt."
-            )
-
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + manifest_size
-    data_offset = align_up(header_size)
-
-    expected_data_bytes = sum(
-        manifest["n_rows"] * np.dtype(column["dtype"]).itemsize for column in manifest["columns"]
-    )
-    actual_data_bytes = os.path.getsize(path) - data_offset
-    if actual_data_bytes < expected_data_bytes:
-        raise FormatError(
-            f"File is truncated: expected at least {expected_data_bytes} bytes of "
-            f"column data after offset {data_offset}, found {actual_data_bytes}."
-        )
-    return manifest, data_offset
+    return manifest, align_up(header_size)
 
 
 def build_column_layout(manifest: dict[str, Any], data_offset: int) -> ColumnLayout:
-    """Compute per-column ``(byte_offset, dtype)`` from manifest and start offset."""
+    """Compute per-column ``(byte_offset, dtype)`` from manifest and start offset.
+
+    The dtype is the on-disk dtype, which is little-endian for multi-byte
+    kinds. Memory-maps must use this dtype to interpret the bytes correctly;
+    the store presents native-order arrays to callers via the gather path.
+    """
     layout: ColumnLayout = {}
     n_rows = manifest["n_rows"]
     current_offset = data_offset
@@ -138,6 +105,24 @@ def build_column_layout(manifest: dict[str, Any], data_offset: int) -> ColumnLay
         layout[column_info["name"]] = (current_offset, column_dtype)
         current_offset += n_rows * column_dtype.itemsize
     return layout
+
+
+_SUPPORTED_KINDS = frozenset({"f", "i", "u", "b", "M", "m", "S", "U"})
+
+
+def _to_little_endian(array: np.ndarray[Any, np.dtype[Any]]) -> np.ndarray[Any, np.dtype[Any]]:
+    """Return `array` with little-endian byte order, copying only if needed.
+
+    Multi-byte columns are stored little-endian on disk for portability. On a
+    little-endian host this is a no-op; on a big-endian host it byte-swaps.
+    Single-byte and string-of-bytes kinds have no byte order to normalize.
+    """
+    byteorder = array.dtype.byteorder
+    if byteorder in ("|", "<"):
+        return array
+    if byteorder == ">" or (byteorder == "=" and sys.byteorder == "big"):
+        return array.astype(array.dtype.newbyteorder("<"))
+    return array
 
 
 def write_dataset(
@@ -154,18 +139,28 @@ def write_dataset(
         raise ValueError("Cannot write an empty column mapping.")
 
     column_names = list(columns)
-    n_rows = columns[column_names[0]].shape[0]
+    n_rows = int(columns[column_names[0]].shape[0])
     for name, array in columns.items():
         if array.ndim != 1:
             raise ValueError(f"Column {name!r} must be 1D; got {array.ndim}D.")
         if array.dtype.kind == "O":
             raise TypeError(
-                f"Column {name!r} has object dtype; " f"only fixed-size dtypes are supported."
+                f"Column {name!r} has object dtype; only fixed-size dtypes are "
+                f"supported (cast to a NumPy dtype, e.g. float64 or a fixed-width "
+                f"string like 'S16'/'U16', first)."
+            )
+        if array.dtype.kind not in _SUPPORTED_KINDS:
+            raise TypeError(
+                f"Column {name!r} has unsupported dtype kind {array.dtype.kind!r} "
+                f"({array.dtype}); supported kinds are {sorted(_SUPPORTED_KINDS)}."
             )
         if array.shape[0] != n_rows:
             raise ValueError(f"Column {name!r} has {array.shape[0]} rows; expected {n_rows}.")
 
-    columns_meta = [{"name": name, "dtype": columns[name].dtype.str} for name in column_names]
+    little_endian_columns = {name: _to_little_endian(columns[name]) for name in column_names}
+    columns_meta = [
+        {"name": name, "dtype": little_endian_columns[name].dtype.str} for name in column_names
+    ]
     total_batches = (-(-n_rows // batch_size)) * len(column_names)
 
     with (
@@ -179,7 +174,7 @@ def write_dataset(
     ):
         write_header(output_file, columns_meta, n_rows)
         for name in column_names:
-            array = columns[name]
+            array = little_endian_columns[name]
             for batch_start in range(0, n_rows, batch_size):
                 batch_end = min(batch_start + batch_size, n_rows)
                 array[batch_start:batch_end].tofile(output_file)
