@@ -30,8 +30,8 @@ import json
 import os
 import struct
 import sys
-from typing import IO, Any
 import zlib
+from typing import IO, Any
 
 import numpy as np
 
