@@ -186,8 +186,8 @@ class ColStore:
 
     @property
     def dtypes(self) -> dict[str, np.dtype]:
-        """Map of column name to NumPy dtype."""
-        return {name: dtype for name, (_, dtype) in self._layout.items()}
+        """Map of column name to NumPy dtype, in the host's native byte order."""
+        return {name: dtype.newbyteorder("=") for name, (_, dtype) in self._layout.items()}
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -339,22 +339,28 @@ class ColStore:
     # ---- Gather (called by views) --------------------------------------
 
     def _gather_one(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
-        """Read one column with the given row selector; return owning ndarray."""
+        """Read one column with the given row selector; return owning ndarray.
+
+        Output arrays are always native byte order, even though the on-disk
+        column is stored little-endian. On a little-endian host this is a
+        no-op; on a big-endian host NumPy converts during the copy/gather.
+        """
         if self._closed:
             raise ValueError("ColStore is closed.")
         source = self._memmaps[column_name]
-        column_dtype = self._layout[column_name][1]
+        disk_dtype = self._layout[column_name][1]
+        native_dtype = disk_dtype.newbyteorder("=")
         # ``np.array(..., copy=True)`` is typed to return ``NDArray[Any]``;
         # the older ``np.asarray(x).copy()`` chain returns ``Any`` under
         # current numpy stubs, hence the explicit constructor calls.
         if row_indexer is None:
-            return np.array(source, copy=True)
+            return np.array(source, dtype=native_dtype, copy=True)
         if isinstance(row_indexer, int):
-            return np.atleast_1d(np.array(source[row_indexer], copy=True))
+            return np.atleast_1d(np.array(source[row_indexer], dtype=native_dtype, copy=True))
         if isinstance(row_indexer, slice):
-            return np.array(source[row_indexer], copy=True)
+            return np.array(source[row_indexer], dtype=native_dtype, copy=True)
         # Integer ndarray (fancy index): dispatch to chosen backend.
-        return kernels.gather(source, row_indexer, column_dtype, backend=self._backend)
+        return kernels.gather(source, row_indexer, native_dtype, backend=self._backend)
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         """Read multiple columns in parallel; return ordered dict of owning arrays."""
