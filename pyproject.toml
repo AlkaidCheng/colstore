@@ -33,14 +33,18 @@ classifiers = [
 ]
 dependencies = [
     "numpy>=1.25",
-    "pandas>=1.5",
-    "tqdm>=4.60",
     "psutil>=5.9",
 ]
 
 [project.optional-dependencies]
+pandas = ["pandas>=1.5"]
+progress = ["tqdm>=4.60"]
 numba = ["numba>=0.59"]
+all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59"]
 dev = [
+    "pandas>=1.5",
+    "tqdm>=4.60",
+    "numba>=0.59",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.4",
