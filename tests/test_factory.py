@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from colstore import ColStore
 
@@ -82,3 +83,22 @@ def test_factory_writes_correct_extension_by_convention(tmp_path):
         pass
     assert target.exists()
     assert target.suffix == ".cstore"
+
+
+def test_factory_accepts_none_batch_size(tmp_path):
+    store = ColStore.from_dict(
+        {"x": np.arange(10, dtype=np.int32)},
+        tmp_path / "f.cstore",
+        batch_size=None,
+        show_progress=False,
+    )
+    try:
+        assert store.n_rows == 10
+    finally:
+        store.close()
+
+
+def test_from_dataframe_rejects_object_backed_extension_dtype(tmp_path):
+    frame = pd.DataFrame({"s": pd.array(["x", "y"], dtype="string")})
+    with pytest.raises(TypeError, match="object array"):
+        ColStore.from_dataframe(frame, tmp_path / "s.cstore", show_progress=False)
