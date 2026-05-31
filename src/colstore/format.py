@@ -35,6 +35,8 @@ from typing import IO, Any
 
 import numpy as np
 
+from ._progress import progress_bar
+
 FILE_EXTENSION = ".cstore"
 _MAGIC = b"CSTORE\x00\x01"
 _MANIFEST_LEN_FMT = "<Q"
@@ -201,7 +203,6 @@ def write_dataset(
     show_progress : bool
         Whether to display a tqdm progress bar.
     """
-    from tqdm.auto import tqdm
 
     if not columns:
         raise ValueError("Cannot write an empty column mapping.")
@@ -247,11 +248,8 @@ def write_dataset(
 
     with (
         open(path, "wb") as output_file,
-        tqdm(
-            total=total_units,
-            desc="Writing colstore",
-            unit=unit,
-            disable=not show_progress,
+        progress_bar(
+            total_units, desc="Writing colstore", unit=unit, enabled=show_progress
         ) as progress,
     ):
         write_header(output_file, columns_meta, n_rows)
