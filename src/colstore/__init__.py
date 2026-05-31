@@ -14,7 +14,7 @@ The package centers on:
   materializes with :meth:`ColumnView.to_array`.
 * :class:`TableView` — lazy multi-column view; materializes with
   :meth:`TableView.to_dict`, :meth:`TableView.to_record`, or
-  :meth:`TableView.to_frame`.
+  :meth:`TableView.to_dataframe`.
 
 Package-wide defaults (thread count, ``madvise`` hint, gather backend) live
 in :mod:`colstore.config` and can be changed at runtime.

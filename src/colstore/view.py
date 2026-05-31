@@ -5,7 +5,7 @@ Two concrete classes implement the public surface:
 * :class:`ColumnView` — produced by ``ds['col']`` or ``ds[rows, 'col']``.
   Supports only :meth:`to_array`.
 * :class:`TableView` — produced by every other indexing pattern.
-  Supports :meth:`to_dict`, :meth:`to_record`, and :meth:`to_frame`.
+  Supports :meth:`to_dict`, :meth:`to_record`, and :meth:`to_dataframe`.
 
 Both share a tiny base class for the row-indexer normalization logic; that
 base is internal and not part of the public API.
@@ -112,7 +112,7 @@ class ColumnView(_BaseView):
 
     Materializes to a 1D ``numpy.ndarray`` via :meth:`to_array`. No other
     materialization method is available; calling :meth:`to_dict`,
-    :meth:`to_record`, or :meth:`to_frame` here would not make sense and
+    :meth:`to_record`, or :meth:`to_dataframe` here would not make sense and
     those methods are intentionally absent from this class.
     """
 
@@ -159,7 +159,7 @@ class TableView(_BaseView):
     """Lazy view of multiple columns produced by any non-string indexing.
 
     Materializes through one of :meth:`to_dict`, :meth:`to_record`, or
-    :meth:`to_frame`. There is intentionally no ``to_array`` method —
+    :meth:`to_dataframe`. There is intentionally no ``to_array`` method —
     multiple columns generally have different dtypes and cannot be packed
     into a single homogeneous ndarray.
     """
@@ -223,7 +223,7 @@ class TableView(_BaseView):
             record_array[name] = column_data[name]
         return record_array
 
-    def to_frame(self) -> pd.DataFrame:
+    def to_dataframe(self) -> pd.DataFrame:
         """Materialize as a pandas DataFrame.
 
         Returns
