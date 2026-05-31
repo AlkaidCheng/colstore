@@ -27,26 +27,30 @@ cnp.import_array()
 
 cdef extern from "colstore/gather.hpp" nogil:
     void colstore_gather_f32(const float*, const int64_t*, float*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_f64(const double*, const int64_t*, double*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_i8(const int8_t*, const int64_t*, int8_t*,
-                            ptrdiff_t)
+                            ptrdiff_t, int)
     void colstore_gather_i16(const int16_t*, const int64_t*, int16_t*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_i32(const int32_t*, const int64_t*, int32_t*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_i64(const int64_t*, const int64_t*, int64_t*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_u8(const uint8_t*, const int64_t*, uint8_t*,
-                            ptrdiff_t)
+                            ptrdiff_t, int)
     void colstore_gather_u16(const uint16_t*, const int64_t*, uint16_t*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_u32(const uint32_t*, const int64_t*, uint32_t*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     void colstore_gather_u64(const uint64_t*, const int64_t*, uint64_t*,
-                             ptrdiff_t)
+                             ptrdiff_t, int)
     int colstore_max_threads()
+
+
+cdef extern from "colstore/gather.hpp" namespace "colstore" nogil:
+    ptrdiff_t resolve_thread_count(ptrdiff_t n_indices, int cap)
 
 
 def max_threads() -> int:
@@ -54,7 +58,16 @@ def max_threads() -> int:
     return colstore_max_threads()
 
 
-def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output):
+def thread_count_for(Py_ssize_t n_indices, int cap) -> int:
+    """Return the thread count the kernel would use for ``n_indices``/``cap``.
+
+    Exposed for tests and diagnostics; mirrors the C++ ``resolve_thread_count``.
+    """
+    return resolve_thread_count(n_indices, cap)
+
+
+def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
+           int thread_cap=0):
     """Compute ``output[i] = source[indices[i]]`` via the parallel C++ kernel.
 
     Parameters
@@ -66,6 +79,10 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output):
     output : numpy.ndarray
         1D array with the same dtype as ``source`` and length matching
         ``indices``. Filled in-place.
+    thread_cap : int, optional
+        Maximum OpenMP threads to use. ``0`` (default) or any non-positive
+        value means the OpenMP maximum; the kernel still drops to a single
+        thread for small inputs and scales up to this cap for large ones.
 
     Raises
     ------
@@ -107,54 +124,54 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output):
         if itemsize == 4:
             with nogil:
                 colstore_gather_f32(<const float*>source_ptr, indices_ptr,
-                                    <float*>output_ptr, n_indices)
+                                    <float*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 8:
             with nogil:
                 colstore_gather_f64(<const double*>source_ptr, indices_ptr,
-                                    <double*>output_ptr, n_indices)
+                                    <double*>output_ptr, n_indices, thread_cap)
             dispatched = True
     elif kind_code == 'i':
         if itemsize == 1:
             with nogil:
                 colstore_gather_i8(<const int8_t*>source_ptr, indices_ptr,
-                                   <int8_t*>output_ptr, n_indices)
+                                   <int8_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 2:
             with nogil:
                 colstore_gather_i16(<const int16_t*>source_ptr, indices_ptr,
-                                    <int16_t*>output_ptr, n_indices)
+                                    <int16_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 4:
             with nogil:
                 colstore_gather_i32(<const int32_t*>source_ptr, indices_ptr,
-                                    <int32_t*>output_ptr, n_indices)
+                                    <int32_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 8:
             with nogil:
                 colstore_gather_i64(<const int64_t*>source_ptr, indices_ptr,
-                                    <int64_t*>output_ptr, n_indices)
+                                    <int64_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
     elif kind_code == 'u' or kind_code == 'b':
         if itemsize == 1:
             with nogil:
                 colstore_gather_u8(<const uint8_t*>source_ptr, indices_ptr,
-                                   <uint8_t*>output_ptr, n_indices)
+                                   <uint8_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 2:
             with nogil:
                 colstore_gather_u16(<const uint16_t*>source_ptr, indices_ptr,
-                                    <uint16_t*>output_ptr, n_indices)
+                                    <uint16_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 4:
             with nogil:
                 colstore_gather_u32(<const uint32_t*>source_ptr, indices_ptr,
-                                    <uint32_t*>output_ptr, n_indices)
+                                    <uint32_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
         elif itemsize == 8:
             with nogil:
                 colstore_gather_u64(<const uint64_t*>source_ptr, indices_ptr,
-                                    <uint64_t*>output_ptr, n_indices)
+                                    <uint64_t*>output_ptr, n_indices, thread_cap)
             dispatched = True
 
     if not dispatched:
