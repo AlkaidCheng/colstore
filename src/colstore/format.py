@@ -182,10 +182,25 @@ def write_dataset(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
     path: PathLike,
     *,
-    batch_size: int,
+    batch_size: int | None,
     show_progress: bool,
 ) -> None:
-    """Serialize a dict of 1D NumPy columns to disk in colstore format."""
+    """Serialize a dict of 1D NumPy columns to disk in colstore format.
+
+    Parameters
+    ----------
+    columns : dict[str, numpy.ndarray]
+        Mapping of column name to a 1D fixed-size array. All columns must share
+        the same length.
+    path : str or os.PathLike
+        Destination path.
+    batch_size : int or None
+        Number of rows written per ``tofile`` call, used only to drive the
+        progress bar. ``None`` or any value ``<= 0`` writes each column in a
+        single call (no batching). Has no effect on the bytes written.
+    show_progress : bool
+        Whether to display a tqdm progress bar.
+    """
     from tqdm.auto import tqdm
 
     if not columns:
@@ -220,21 +235,33 @@ def write_dataset(
         }
         for name in column_names
     ]
-    total_batches = (-(-n_rows // batch_size)) * len(column_names)
+
+    # ``None`` or any non-positive value means "write each column in one call".
+    effective_batch = batch_size if (batch_size is not None and batch_size > 0) else 0
+    if effective_batch > 0:
+        total_units = (-(-n_rows // effective_batch)) * len(column_names)
+        unit = "batch"
+    else:
+        total_units = len(column_names)
+        unit = "col"
 
     with (
         open(path, "wb") as output_file,
         tqdm(
-            total=total_batches,
+            total=total_units,
             desc="Writing colstore",
-            unit="batch",
+            unit=unit,
             disable=not show_progress,
         ) as progress,
     ):
         write_header(output_file, columns_meta, n_rows)
         for name in column_names:
             array = little_endian_columns[name]
-            for batch_start in range(0, n_rows, batch_size):
-                batch_end = min(batch_start + batch_size, n_rows)
+            if effective_batch <= 0:
+                array.tofile(output_file)
+                progress.update(1)
+                continue
+            for batch_start in range(0, n_rows, effective_batch):
+                batch_end = min(batch_start + effective_batch, n_rows)
                 array[batch_start:batch_end].tofile(output_file)
                 progress.update(1)

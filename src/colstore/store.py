@@ -120,7 +120,7 @@ class ColStore:
         frame: pd.DataFrame,
         path: str | os.PathLike[str],
         *,
-        batch_size: int = 100_000,
+        batch_size: int | None = 100_000,
         show_progress: bool = True,
         **open_kwargs: Any,
     ) -> ColStore:
@@ -137,7 +137,7 @@ class ColStore:
         columns: dict[str, NDArray[Any]],
         path: str | os.PathLike[str],
         *,
-        batch_size: int = 100_000,
+        batch_size: int | None = 100_000,
         show_progress: bool = True,
         **open_kwargs: Any,
     ) -> ColStore:
