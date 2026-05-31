@@ -127,7 +127,15 @@ class ColStore:
         """Write a pandas DataFrame to disk and open the result."""
         columns: dict[str, NDArray[Any]] = {}
         for column_name in frame.columns:
-            columns[str(column_name)] = frame[column_name].to_numpy()
+            series = frame[column_name]
+            array = series.to_numpy()
+            if array.dtype.kind == "O":
+                raise TypeError(
+                    f"Column {column_name!r} (pandas dtype {series.dtype}) converts to "
+                    f"an object array and cannot be stored. Cast it to a fixed-size NumPy "
+                    f"dtype (e.g. float64, int64, or a fixed-width string like 'S16') first."
+                )
+            columns[str(column_name)] = array
         format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
         return cls(path, **open_kwargs)
 
