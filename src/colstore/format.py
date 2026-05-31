@@ -29,9 +29,9 @@ inside the manifest, not by changing the magic.
 import json
 import os
 import struct
-import zlib
 import sys
 from typing import IO, Any
+import zlib
 
 import numpy as np
 
