@@ -40,18 +40,65 @@ class _BaseView:
         self._row_part = row_part
 
     def _resolve_row_indexer(self) -> _RowIndexer:
-        """Normalize the user's row selector into None / int / slice / int-array."""
+        """Normalize the user's row selector into None / int / slice / int-array.
+
+        All integer selectors are validated against ``n_rows`` here, and
+        negative positions are folded to their non-negative equivalents. This
+        makes every gather backend (NumPy, C++, Numba) agree on bounds and
+        wraparound semantics, instead of leaving the unchecked kernels to read
+        out of bounds on a memmap.
+        """
         row = self._row_part
         if row is None:
             return None
         if isinstance(row, (int, np.integer)):
-            return int(row)
+            return self._normalize_scalar(int(row))
         if isinstance(row, slice):
             return row
         row_array = np.asarray(row)
+        if row_array.ndim == 0:
+            # A 0-d array (e.g. ``np.array(5)``) behaves like a scalar int, not
+            # a length-1 fancy index; route it to the scalar path so the result
+            # shape matches ``ds[5]``.
+            if row_array.dtype == bool:
+                raise IndexError("0-d boolean index is not supported.")
+            if row_array.dtype.kind not in ("i", "u"):
+                raise IndexError(
+                    f"Row index must be integer or boolean; got dtype {row_array.dtype}."
+                )
+            return self._normalize_scalar(int(row_array))
         if row_array.dtype == bool:
+            if row_array.shape[0] != self._store.n_rows:
+                raise IndexError(
+                    f"Boolean mask length {row_array.shape[0]} does not match "
+                    f"n_rows {self._store.n_rows}."
+                )
             return np.flatnonzero(row_array)
-        return row_array.astype(np.int64, copy=False)
+        if row_array.dtype.kind not in ("i", "u"):
+            raise IndexError(
+                f"Row index array must be integer or boolean; got dtype {row_array.dtype}."
+            )
+        return self._validate_fancy_index(row_array.astype(np.int64, copy=False))
+
+    def _normalize_scalar(self, position: int) -> int:
+        """Fold a negative scalar row index and bounds-check it."""
+        n_rows = self._store.n_rows
+        if position < 0:
+            position += n_rows
+        if not 0 <= position < n_rows:
+            raise IndexError(f"Row index {position} out of bounds for n_rows {n_rows}.")
+        return position
+
+    def _validate_fancy_index(self, indices: np.ndarray) -> np.ndarray:
+        """Fold negative indices and bounds-check the whole array in one pass."""
+        n_rows = self._store.n_rows
+        if indices.size == 0:
+            return indices
+        if (indices < 0).any():
+            indices = np.where(indices < 0, indices + n_rows, indices)
+        if indices.min() < 0 or indices.max() >= n_rows:
+            raise IndexError(f"Row index out of bounds for n_rows {n_rows}.")
+        return indices
 
     @staticmethod
     def _summarize_row_part(row_part: Any) -> str:
