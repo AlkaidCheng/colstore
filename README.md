@@ -90,27 +90,6 @@ Fixed-size only: `float32`, `float64`, `int8/16/32/64`, `uint8/16/32/64`,
 `bool`. Object dtype (strings, Python objects) is rejected at write time —
 the design point is zero-copy random access, which requires a fixed stride.
 
-## Layout
-
-```
-colstore/
-├── pyproject.toml              # scikit-build-core build
-├── CMakeLists.txt              # Cython + C++ build
-├── include/colstore/
-│   └── gather.hpp              # public C++ header
-├── src/
-│   ├── cpp/gather.cpp          # OpenMP + prefetch kernel
-│   ├── cython/_gather.pyx      # dtype-dispatched binding
-│   └── colstore/               # Python package
-│       ├── __init__.py
-│       ├── config.py
-│       ├── format.py
-│       ├── kernels.py
-│       ├── view.py             # ColumnView + TableView
-│       └── store.py
-└── tests/                      # pytest suite
-```
-
 ## License
 
-MIT.
+MIT License - see [LICENSE](LICENSE) file for details.
