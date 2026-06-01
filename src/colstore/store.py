@@ -346,12 +346,19 @@ class ColStore:
 
     # ---- Gather (called by views) --------------------------------------
 
-    def _gather_one(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
+    def _gather_one(
+        self, column_name: str, row_indexer: Any, thread_cap: int | None = None
+    ) -> NDArray[Any]:
         """Read one column with the given row selector; return owning ndarray.
 
         Output arrays are always native byte order, even though the on-disk
         column is stored little-endian. On a little-endian host this is a
         no-op; on a big-endian host NumPy converts during the copy/gather.
+
+        ``thread_cap`` overrides the per-call OpenMP thread cap for the fancy-
+        index path; ``None`` uses the package default. :meth:`_gather_many`
+        passes a divided budget here so concurrent column reads do not
+        oversubscribe.
         """
         if self._closed:
             raise ValueError("ColStore is closed.")
@@ -368,16 +375,29 @@ class ColStore:
         if isinstance(row_indexer, slice):
             return np.array(source[row_indexer], dtype=native_dtype, copy=True)
         # Integer ndarray (fancy index): dispatch to chosen backend.
-        return kernels.gather(source, row_indexer, native_dtype, backend=self._backend)
+        return kernels.gather(
+            source, row_indexer, native_dtype, backend=self._backend, thread_cap=thread_cap
+        )
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
-        """Read multiple columns in parallel; return ordered dict of owning arrays."""
+        """Read multiple columns in parallel; return ordered dict of owning arrays.
+
+        Columns are read concurrently on a thread pool, and each column's C++
+        gather may itself use OpenMP threads. To keep the product of the two
+        from oversubscribing the cores, the per-column OpenMP cap is divided by
+        the number of columns running concurrently. With many columns this
+        drives each kernel to a single thread, so parallelism comes from the
+        column pool (the regime where that is most efficient); with few columns
+        each kernel still gets a meaningful share of the cap.
+        """
         workers = self.max_workers
         if workers <= 1 or len(column_names) <= 1:
             return {name: self._gather_one(name, row_indexer) for name in column_names}
         n_workers = min(workers, len(column_names))
+        per_column_cap = max(1, config.get_gather_thread_cap() // n_workers)
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {
-                name: executor.submit(self._gather_one, name, row_indexer) for name in column_names
+                name: executor.submit(self._gather_one, name, row_indexer, per_column_cap)
+                for name in column_names
             }
             return {name: futures[name].result() for name in column_names}
