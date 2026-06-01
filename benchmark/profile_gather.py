@@ -145,8 +145,40 @@ def make_store(path: str, n_rows: int, n_cols: int, dtype) -> None:
     ColStore.from_dict(columns, path, show_progress=False).close()
 
 
-def drop_caches() -> bool:
-    """Attempt to flush OS page cache. Requires root; returns True on success."""
+def evict_file_cache(path: str) -> bool:
+    """Evict a single file's pages from the OS page cache without root.
+
+    Uses ``posix_fadvise(POSIX_FADV_DONTNEED)``, which drops the cached pages
+    for just this file (after an ``fsync`` to flush any dirty pages). Unlike
+    ``/proc/sys/vm/drop_caches`` this needs no privileges and does not disturb
+    the rest of the system cache, so it is the right tool for cold-cache
+    measurement of a specific store. Returns ``True`` on success.
+    """
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or dontneed is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            fadvise(fd, 0, 0, dontneed)  # offset=0, len=0 -> whole file
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def drop_caches(path: str | None = None) -> bool:
+    """Flush the page cache. Prefer per-file eviction; fall back to global.
+
+    If ``path`` is given, evict just that file via ``posix_fadvise`` (no root
+    required). Otherwise, or if that is unavailable, attempt the global
+    ``/proc/sys/vm/drop_caches`` (requires root). Returns ``True`` on success.
+    """
+    if path is not None and evict_file_cache(path):
+        return True
     try:
         subprocess.run(["sync"], check=True)
         with open("/proc/sys/vm/drop_caches", "w") as f:
@@ -224,7 +256,7 @@ def benchmark_thread_sweep(
     ds = ColStore(store_path, backend="cpp")
     ds[unsorted_indices, "f0"].to_array()  # warm
 
-    print(f"\n{'=' * 70}\nthread-cap sweep (cpp, 1M unsorted indices, 1 col)")
+    print(f"\n{'=' * 70}\nthread-cap sweep " f"(cpp, {n_indices:,} unsorted indices, 1 col)")
     original = config.get_gather_thread_cap()
     try:
         for cap in thread_caps:
@@ -252,7 +284,8 @@ def main() -> None:
     parser.add_argument(
         "--cold",
         action="store_true",
-        help="Also run cold-cache variants (requires root for drop_caches).",
+        help="Evict the store from the page cache before measuring (per-file "
+        "posix_fadvise, no root needed).",
     )
     parser.add_argument(
         "--thread-sweep",
@@ -298,10 +331,13 @@ def main() -> None:
         calibrate(verbose=True)
 
     if args.cold:
-        if not drop_caches():
-            print("WARNING: drop_caches failed (need root). Cold runs not meaningful.")
+        if not drop_caches(args.path):
+            print(
+                "WARNING: cache eviction failed. Cold runs not meaningful "
+                "(need posix_fadvise support or root for drop_caches)."
+            )
         else:
-            print("Page cache dropped.")
+            print(f"Page cache evicted for {args.path}.")
 
     if args.thread_sweep is not None:
         caps = args.thread_sweep or [1, 2, 4, 8, 16]
