@@ -84,6 +84,26 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         value means the OpenMP maximum; the kernel still drops to a single
         thread for small inputs and scales up to this cap for large ones.
 
+    Notes
+    -----
+    Despite the historical name, this function requires a caller-allocated
+    ``output`` buffer; allocation is the dispatcher's job (see
+    :func:`colstore.kernels.gather`). Kept for compatibility with callers
+    that import ``_gather.gather`` directly; new code should call
+    :func:`gather_into`, which is the same function under the explicit name.
+    """
+    gather_into(source, indices, output, thread_cap)
+
+
+def gather_into(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
+                int thread_cap=0):
+    """No-allocation gather: fill ``output`` in place from ``source[indices]``.
+
+    Identical semantics to :func:`gather` but the explicit name makes the
+    no-allocation contract clear. Used by the Python-level dispatcher to
+    avoid an extra ``np.empty`` when it has a pre-allocated buffer (e.g. for
+    multi-column reads where all outputs are sized up front).
+
     Raises
     ------
     TypeError
