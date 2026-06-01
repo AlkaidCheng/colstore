@@ -49,7 +49,7 @@ class Sample:
     majflt: int
     read_bytes: int
     read_chars: int
-    nvcsw: int   # voluntary context switches (usually = blocking syscalls)
+    nvcsw: int  # voluntary context switches (usually = blocking syscalls)
     nivcsw: int  # involuntary (preempted)
     n_elements: int
     output_bytes: int
@@ -64,20 +64,28 @@ class Sample:
         print(f"  wall          : {self.wall_s * 1000:8.2f} ms")
         print(f"  user cpu      : {self.user_s * 1000:8.2f} ms")
         print(f"  sys  cpu      : {self.sys_s * 1000:8.2f} ms")
-        print(f"  utilization   : {utilization * 100:8.1f}%   "
-              f"(cpu_time / wall; values < 100% mean stalled, > 100% mean multi-core)")
+        print(
+            f"  utilization   : {utilization * 100:8.1f}%   "
+            f"(cpu_time / wall; values < 100% mean stalled, > 100% mean multi-core)"
+        )
         print(f"  throughput    : {gbps:8.2f} GB/s output")
         print(f"  per-element   : {ns_per_elt:8.1f} ns/elt")
-        print(f"  minor faults  : {self.minflt:8d}  "
-              f"(first-touch of pages already in page cache)")
-        print(f"  major faults  : {self.majflt:8d}  "
-              f"(first-touch requiring disk read; HUGE if non-zero)")
-        print(f"  vol ctx sw    : {self.nvcsw:8d}  "
-              f"(blocking syscalls; high means io_wait or lock waits)")
-        print(f"  invol ctx sw  : {self.nivcsw:8d}  "
-              f"(preemption; high under contention)")
-        print(f"  disk read     : {self.read_bytes / 1e6:8.2f} MB"
-              f" (logical), {self.read_chars / 1e6:.2f} MB incl. cache")
+        print(
+            f"  minor faults  : {self.minflt:8d}  " f"(first-touch of pages already in page cache)"
+        )
+        print(
+            f"  major faults  : {self.majflt:8d}  "
+            f"(first-touch requiring disk read; HUGE if non-zero)"
+        )
+        print(
+            f"  vol ctx sw    : {self.nvcsw:8d}  "
+            f"(blocking syscalls; high means io_wait or lock waits)"
+        )
+        print(f"  invol ctx sw  : {self.nivcsw:8d}  " f"(preemption; high under contention)")
+        print(
+            f"  disk read     : {self.read_bytes / 1e6:8.2f} MB"
+            f" (logical), {self.read_chars / 1e6:.2f} MB incl. cache"
+        )
         for key, value in self.extra.items():
             print(f"  {key:14}: {value}")
 
@@ -133,14 +141,44 @@ def make_store(path: str, n_rows: int, n_cols: int, dtype) -> None:
         return
     print(f"Creating store M={n_rows:,} x N_COLS={n_cols} ({dtype}) at {path}")
     rng = np.random.default_rng(0)
-    columns = {
-        f"f{i}": rng.standard_normal(n_rows).astype(dtype) for i in range(n_cols)
-    }
+    columns = {f"f{i}": rng.standard_normal(n_rows).astype(dtype) for i in range(n_cols)}
     ColStore.from_dict(columns, path, show_progress=False).close()
 
 
-def drop_caches() -> bool:
-    """Attempt to flush OS page cache. Requires root; returns True on success."""
+def evict_file_cache(path: str) -> bool:
+    """Evict a single file's pages from the OS page cache without root.
+
+    Uses ``posix_fadvise(POSIX_FADV_DONTNEED)``, which drops the cached pages
+    for just this file (after an ``fsync`` to flush any dirty pages). Unlike
+    ``/proc/sys/vm/drop_caches`` this needs no privileges and does not disturb
+    the rest of the system cache, so it is the right tool for cold-cache
+    measurement of a specific store. Returns ``True`` on success.
+    """
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or dontneed is None:
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+            fadvise(fd, 0, 0, dontneed)  # offset=0, len=0 -> whole file
+        finally:
+            os.close(fd)
+        return True
+    except OSError:
+        return False
+
+
+def drop_caches(path: str | None = None) -> bool:
+    """Flush the page cache. Prefer per-file eviction; fall back to global.
+
+    If ``path`` is given, evict just that file via ``posix_fadvise`` (no root
+    required). Otherwise, or if that is unavailable, attempt the global
+    ``/proc/sys/vm/drop_caches`` (requires root). Returns ``True`` on success.
+    """
+    if path is not None and evict_file_cache(path):
+        return True
     try:
         subprocess.run(["sync"], check=True)
         with open("/proc/sys/vm/drop_caches", "w") as f:
@@ -198,44 +236,115 @@ def benchmark_workload(
         ds.close()
 
 
+def benchmark_thread_sweep(
+    store_path: str,
+    n_rows: int,
+    n_indices: int,
+    bytes_per_elt: int,
+    thread_caps: list[int],
+) -> None:
+    """Sweep the gather thread cap on the unsorted single-column workload.
+
+    This is the workload most sensitive to thread count (scattered, memory-
+    latency-bound), so it shows the bandwidth-saturation knee most clearly.
+    Use it to confirm the configured cap sits just past the knee on this box.
+    """
+    from colstore import config
+
+    rng = np.random.default_rng(0)
+    unsorted_indices = rng.permutation(n_rows)[:n_indices].astype(np.int64)
+    ds = ColStore(store_path, backend="cpp")
+    ds[unsorted_indices, "f0"].to_array()  # warm
+
+    print(f"\n{'=' * 70}\nthread-cap sweep " f"(cpp, {n_indices:,} unsorted indices, 1 col)")
+    original = config.get_gather_thread_cap()
+    try:
+        for cap in thread_caps:
+            config.set_gather_thread_cap(cap)
+            # best-of-3 to damp scheduling noise
+            best = float("inf")
+            for _ in range(3):
+                with measure(f"[cpp] thread_cap={cap}", n_indices, n_indices * bytes_per_elt) as s:
+                    ds[unsorted_indices, "f0"].to_array()
+                best = min(best, s.wall_s)
+            gbps = n_indices * bytes_per_elt / max(best, 1e-12) / 1e9
+            print(f"  cap={cap:>3}: best {best * 1000:7.2f} ms  ({gbps:5.2f} GB/s)")
+    finally:
+        config.set_gather_thread_cap(original)
+        ds.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--path", default="/tmp/profile_gather.cstore")
     parser.add_argument("--rows", type=int, default=10_000_000)
     parser.add_argument("--cols", type=int, default=20)
     parser.add_argument("--indices", type=int, default=1_000_000)
+    parser.add_argument("--backends", nargs="+", default=["cpp", "numpy"], choices=["cpp", "numpy"])
     parser.add_argument(
-        "--backends", nargs="+", default=["cpp", "numpy"], choices=["cpp", "numpy"]
+        "--cold",
+        action="store_true",
+        help="Evict the store from the page cache before measuring (per-file "
+        "posix_fadvise, no root needed).",
     )
     parser.add_argument(
-        "--cold", action="store_true",
-        help="Also run cold-cache variants (requires root for drop_caches).",
+        "--thread-sweep",
+        nargs="*",
+        type=int,
+        default=None,
+        metavar="CAP",
+        help="Sweep these gather thread caps on the unsorted workload (e.g. "
+        "--thread-sweep 1 2 4 8 16). With no values, uses 1 2 4 8 16.",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Run one-time autotune calibration and cache the chosen cap.",
     )
     args = parser.parse_args()
 
     print(f"Python {sys.version.split()[0]}, NumPy {np.__version__}")
     print(f"C++ extension: {cpp_available()}, OpenMP threads: {max_threads()}")
-    print(f"CPU count: physical={psutil.cpu_count(logical=False)}, "
-          f"logical={psutil.cpu_count(logical=True)}")
+    print(
+        f"CPU count: physical={psutil.cpu_count(logical=False)}, "
+        f"logical={psutil.cpu_count(logical=True)}"
+    )
+    from colstore import config
+
+    print(f"gather_thread_cap: {config.get_gather_thread_cap()}")
     cpu_freq = psutil.cpu_freq()
     if cpu_freq is not None:
-        print(f"CPU freq: {cpu_freq.current:.0f} MHz "
-              f"(min={cpu_freq.min:.0f}, max={cpu_freq.max:.0f})")
+        print(
+            f"CPU freq: {cpu_freq.current:.0f} MHz "
+            f"(min={cpu_freq.min:.0f}, max={cpu_freq.max:.0f})"
+        )
 
     bytes_per_elt = 4  # float32
     make_store(args.path, args.rows, args.cols, np.float32)
     file_size_gb = os.path.getsize(args.path) / 1e9
     print(f"\nStore file: {file_size_gb:.2f} GB")
 
-    if args.cold:
-        if not drop_caches():
-            print("WARNING: drop_caches failed (need root). Cold runs not meaningful.")
-        else:
-            print("Page cache dropped.")
+    if args.calibrate:
+        from colstore import calibrate
 
-    benchmark_workload(
-        args.path, args.rows, args.cols, args.indices, bytes_per_elt, args.backends
-    )
+        print("\nRunning calibration...")
+        calibrate(verbose=True)
+
+    if args.cold:
+        if not drop_caches(args.path):
+            print(
+                "WARNING: cache eviction failed. Cold runs not meaningful "
+                "(need posix_fadvise support or root for drop_caches)."
+            )
+        else:
+            print(f"Page cache evicted for {args.path}.")
+
+    if args.thread_sweep is not None:
+        caps = args.thread_sweep or [1, 2, 4, 8, 16]
+        caps = [c for c in caps if c <= max_threads()] or [1]
+        benchmark_thread_sweep(args.path, args.rows, args.indices, bytes_per_elt, caps)
+
+    benchmark_workload(args.path, args.rows, args.cols, args.indices, bytes_per_elt, args.backends)
 
 
 if __name__ == "__main__":
