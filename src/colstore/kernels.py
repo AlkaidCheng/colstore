@@ -102,8 +102,14 @@ def gather(
 
     if backend == "cpp":
         if _CPP_AVAILABLE and kernel_compatible:
+            # The C++ kernel beats numpy.take per-thread by 2-4x even at one
+            # thread (numpy re-validates every index on top of work we already
+            # did at the Python layer), and pulls further ahead in parallel.
+            # So when the kernel is compatible we always use it; the kernel's
+            # own resolve_thread_count picks the right number of threads
+            # (1 below the parallel threshold, scaling up from there).
             output = np.empty(indices.shape[0], dtype=dtype)
-            _cpp_module.gather(source, indices, output, effective_cap)
+            _cpp_module.gather_into(source, indices, output, effective_cap)
             return output
         if not _CPP_AVAILABLE:
             warnings.warn(
