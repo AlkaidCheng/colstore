@@ -135,3 +135,86 @@ def test_calibrate_picks_and_caches_a_cap(tmp_path, monkeypatch):
         assert autotune.load_cached_cap() == chosen
     finally:
         config.set_gather_thread_cap(original)
+
+
+# ---- Dispatch: always use cpp kernel when compatible ---------------------
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
+def test_gather_into_matches_gather():
+    """``gather_into`` and ``gather`` produce identical output in-place."""
+    from colstore import _gather  # type: ignore[attr-defined]
+
+    source = np.arange(1_000_000, dtype=np.float64)
+    indices = np.array([999_999, 0, 500_000, 1, 999_998], dtype=np.int64)
+    out_old = np.empty(5, dtype=np.float64)
+    out_new = np.empty(5, dtype=np.float64)
+    _gather.gather(source, indices, out_old, 4)
+    _gather.gather_into(source, indices, out_new, 4)
+    assert np.array_equal(out_old, out_new)
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
+def test_dispatcher_always_uses_cpp_kernel_when_compatible(monkeypatch):
+    """The cpp kernel is invoked for every kernel-compatible gather, including
+    small ones; the kernel itself picks serial vs parallel internally.
+
+    Benchmarks on multi-core hardware showed the cpp kernel beats ``np.take``
+    by 1.5-2x at one thread because numpy re-validates indices that we
+    already validated upstream and uses a slower internal copy path. So the
+    cpp kernel is the right answer at every size.
+    """
+    from colstore import (
+        _gather,  # type: ignore[attr-defined]
+        kernels,
+    )
+
+    cpp_calls: list[int] = []
+    real_gather_into = _gather.gather_into
+
+    def spy(source, indices, output, thread_cap):
+        cpp_calls.append(len(indices))
+        return real_gather_into(source, indices, output, thread_cap)
+
+    monkeypatch.setattr(_gather, "gather_into", spy)
+
+    source = np.arange(2_000_000, dtype=np.float32)
+    # Tiny, mid, and large gathers should all reach the cpp kernel.
+    for n in (100, 10_000, 1_500_000):
+        indices = np.arange(n, dtype=np.int64)
+        out = kernels.gather(source, indices, source.dtype, backend="cpp", thread_cap=8)
+        assert np.array_equal(out, source[indices])
+
+    assert cpp_calls == [100, 10_000, 1_500_000]
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
+def test_dispatcher_falls_back_to_numpy_for_incompatible_dtypes():
+    """Non-native byte order and unsupported kinds still bypass the cpp kernel.
+
+    This is the *correctness* fallback (the kernel does raw element copies and
+    cannot handle byte-swapping or e.g. datetime64), separate from any
+    performance-based decision.
+    """
+    from colstore import kernels
+
+    # Big-endian source -> numpy fallback.
+    be_source = np.arange(100, dtype=">f4")
+    out = kernels.gather(
+        be_source, np.array([5, 0, 99], dtype=np.int64), np.dtype("<f4"), backend="cpp"
+    )
+    assert out.tolist() == [5.0, 0.0, 99.0]
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
+def test_cpp_kernel_output_matches_numpy():
+    """Sanity: cpp kernel output matches plain ``source[indices]`` byte-for-byte."""
+    from colstore import kernels
+
+    rng = np.random.default_rng(7)
+    source = rng.standard_normal(500_000).astype(np.float64)
+    indices = rng.permutation(500_000)[:50_000].astype(np.int64)
+
+    via_cpp = kernels.gather(source, indices, source.dtype, backend="cpp")
+    expected = source[indices]
+    assert np.array_equal(via_cpp, expected)
