@@ -66,6 +66,7 @@ def gather(
     dtype: np.dtype,
     *,
     backend: str = "cpp",
+    thread_cap: int | None = None,
 ) -> np.ndarray:
     """Return ``source[indices]`` as an owning ndarray using the chosen backend.
 
@@ -81,6 +82,12 @@ def gather(
         ``"cpp"`` (default), ``"numpy"``, or ``"numba"``. Falls back to NumPy
         with a warning if the requested backend isn't available, and silently
         for dtype kinds or byte orders the compiled kernels can't handle.
+    thread_cap : int or None, optional
+        Per-call OpenMP thread cap for the C++ kernel. ``None`` (default) uses
+        the package-wide :func:`colstore.config.get_gather_thread_cap`. Callers
+        that run several gathers concurrently (e.g. multi-column reads) pass a
+        reduced cap so the product of outer threads and inner OpenMP threads
+        does not oversubscribe the cores.
 
     Returns
     -------
@@ -91,11 +98,12 @@ def gather(
     # order and a fixed set of numeric kinds. Anything else uses NumPy, which
     # handles byte-swapping and exotic dtypes correctly.
     kernel_compatible = dtype.kind in ("f", "i", "u", "b") and _is_native_order(source)
+    effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
 
     if backend == "cpp":
         if _CPP_AVAILABLE and kernel_compatible:
             output = np.empty(indices.shape[0], dtype=dtype)
-            _cpp_module.gather(source, indices, output, config.get_gather_thread_cap())
+            _cpp_module.gather(source, indices, output, effective_cap)
             return output
         if not _CPP_AVAILABLE:
             warnings.warn(
