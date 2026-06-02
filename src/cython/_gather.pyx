@@ -8,15 +8,19 @@ every fixed-width numeric dtype, plus fixed-width bytes/unicode strings,
 datetime64, and timedelta64 -- anything whose itemsize is one of those four
 sizes "just works."
 
-Two Python entry points:
+Three Python entry points:
 
 * :func:`gather` -- element-indexed (hot path). Caller passes int64 element
   indices; the kernel computes byte addresses internally. No Python-side
-  allocation per call; matches the cost of the original per-dtype kernel.
+  allocation per call.
+
+* :func:`gather_into` -- alias for :func:`gather` retained for callers that
+  reach the binding directly (the colstore.kernels dispatcher uses this
+  name to make the no-allocation contract explicit at the call site).
 
 * :func:`gather_bytes` -- byte-offset. Caller passes int64 byte offsets
-  directly. Used by the multi-record reader where byte addresses cross
-  record boundaries and can't be computed as a simple multiply.
+  directly. Used by the multi-record reader (PR 2) where byte addresses
+  cross record boundaries.
 """
 
 import numpy as np
@@ -76,17 +80,17 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         1D ``int64`` array of element positions into ``source``.
     output : numpy.ndarray
         1D array with the same dtype as ``source`` and length matching
-        ``indices``. Filled in-place.
+        ``indices``. Filled in-place; allocation is the caller's job.
     thread_cap : int, optional
-        Maximum OpenMP threads to use. ``0`` (default) or any non-positive
-        value means the OpenMP maximum; the kernel still drops to a single
-        thread for small inputs and scales up to this cap for large ones.
+        Maximum OpenMP threads. ``0`` (default) means the OpenMP maximum;
+        the kernel still drops to a single thread for small inputs and
+        scales up to this cap for large ones.
 
     Raises
     ------
     TypeError
-        If dtypes mismatch, ``indices`` is not int64, or the element size is
-        not supported.
+        If dtypes mismatch, ``indices`` is not int64, or the element size
+        is not supported.
     ValueError
         If shapes are incompatible.
     """
@@ -137,6 +141,17 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         )
 
 
+def gather_into(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
+                int thread_cap=0):
+    """Alias for :func:`gather`.
+
+    The name is used by :mod:`colstore.kernels` to make the no-allocation
+    contract explicit at the call site -- the kernel never allocates the
+    output buffer; the caller does. Functionally identical to :func:`gather`.
+    """
+    gather(source, indices, output, thread_cap)
+
+
 def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
                  cnp.ndarray output, int thread_cap=0):
     """Byte-offset gather: copy ``itemsize`` bytes from ``source + byte_offsets[i]``.
@@ -150,8 +165,7 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
         1D ``int64`` array. Each element is a byte offset into ``source``;
         the kernel reads ``output.dtype.itemsize`` bytes starting there.
         The caller guarantees each offset points at an itemsize-aligned
-        address (automatic when offsets are computed as ``element_index *
-        itemsize``, optionally with fixed per-record headers added).
+        address.
     output : numpy.ndarray
         1D array determining both the element size and the output dtype.
     thread_cap : int, optional
@@ -159,17 +173,17 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
 
     Notes
     -----
-    This entry point exists for the multi-record reader (PR 2): byte offsets
-    there encode record-header skips and per-record column offsets and so
-    cannot be reduced to a simple ``index * itemsize``. For the contiguous
-    hot path, :func:`gather` is faster because it skips the byte-offset
-    array materialization.
+    Used by the multi-record reader (PR 2): byte offsets there encode
+    record-header skips and per-record column offsets and cannot be reduced
+    to a simple ``index * itemsize``. For the contiguous hot path,
+    :func:`gather` is faster because it skips the byte-offset array
+    materialization.
 
     Raises
     ------
     TypeError
-        If ``byte_offsets`` is not int64, or the output element size is not
-        supported.
+        If ``byte_offsets`` is not int64, or the output element size is
+        not supported.
     ValueError
         If shapes are incompatible.
     """
