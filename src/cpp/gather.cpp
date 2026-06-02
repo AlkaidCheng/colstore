@@ -1,21 +1,36 @@
-// Implementation of the templated gather kernel and its extern "C" wrappers.
+// Implementation of the size-dispatched gather kernel and its extern "C"
+// wrappers.
 //
-// Performance levers used here:
+// Two entry points share the same size-templated kernel:
 //
-//  * OpenMP parallel for. The loop body is fully independent across i, so
-//    a static schedule keeps overhead minimal and maps cleanly to the OS
-//    thread pool.
-//  * Software prefetching. ``__builtin_prefetch`` issues a memory hint a
-//    few iterations ahead, which hides part of the L3/DRAM miss latency
-//    when ``indices`` are scattered. The prefetch is non-faulting on
-//    out-of-range addresses but we still guard with a bounds check to
-//    keep TSan happy.
-//  * ``__restrict__`` pointer qualifiers. They let the compiler assume
-//    source/indices/output do not alias, enabling vectorization of the
-//    store stream even though the load stream is scattered.
+//  * gather_indexed: element-indexed (caller passes int64 element offsets).
+//    The kernel computes byte addresses as ``base + indices[i] * sizeof(T)``
+//    per element. This is the hot path used for every contiguous gather --
+//    contiguous means the address math is uniform, and pushing it out to the
+//    Python level would only force an 8-byte-per-element materialization that
+//    we'd consume once and discard.
 //
-// The kernel is templated by element type, with explicit instantiations
-// below for every NumPy fixed-size dtype we expose through the binding.
+//  * gather_bytes: byte-offset (caller passes pre-computed int64 byte
+//    addresses). Used for the multi-record case where addresses are
+//    non-uniform (record-header skips, per-record column offsets) and the
+//    Python-side searchsorted work amortizes the materialization.
+//
+// Both are templated on the element *type* (uint8_t/16/32/64_t) so the
+// compiler can vectorize the typed loads/stores. The byte-pointer surface at
+// the extern "C" boundary keeps Cython binding code simple but the inner loop
+// is typed for performance.
+//
+// Performance levers:
+//
+//  * OpenMP parallel for. Loop body is independent across i; static schedule
+//    keeps overhead minimal.
+//  * Software prefetching. ``__builtin_prefetch`` issues a memory hint a few
+//    iterations ahead, hiding L3/DRAM miss latency for scattered loads.
+//  * ``__restrict__`` pointer qualifiers. Compiler can assume base, indices,
+//    and output do not alias, enabling vectorization of the store stream.
+//  * Typed dereferences inside the templated loop. ``*(T*)(base + ...)`` is
+//    treated by the compiler as a natural-alignment load and emits the same
+//    instructions as ``source[i]`` would in the old per-dtype kernel.
 
 #include "colstore/gather.hpp"
 
@@ -27,18 +42,13 @@
 
 namespace colstore {
 
-// Resolve how many OpenMP threads to use for a gather of ``n_indices``
-// elements, given a caller-supplied cap.
-//
-// The kernel is memory-bandwidth-bound, so two rules apply:
-//   1. Below PARALLEL_THRESHOLD the OpenMP fork/join + barrier cost dwarfs the
-//      actual work, so run serially (return 1).
+// Resolve OpenMP thread count for ``n_indices`` indices under a caller cap.
+// The kernel is memory-bandwidth-bound, so two rules:
+//   1. Below PARALLEL_THRESHOLD the fork/join cost dwarfs the work -> serial.
 //   2. Above it, scale roughly one thread per ELEMENTS_PER_THREAD elements,
 //      clamped to ``cap``. Bandwidth saturates at a small thread count well
-//      below the core count, so the cap (typically <= 8) is the real limit;
-//      the work-proportional term just avoids spinning up the full cap for
-//      mid-sized gathers.
-//
+//      below core count, so the cap (typically <= 8) is the real limit; the
+//      work-proportional term just avoids the full cap for mid-sized gathers.
 // ``cap`` <= 0 means "use the OpenMP maximum" (no colstore-imposed limit).
 std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
 #ifdef _OPENMP
@@ -60,13 +70,22 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
 #endif
 }
 
+// Element-indexed gather: ``output[i] = base_as_T[indices[i]]``.
+//
+// The caller passes byte pointers but the kernel reinterprets them as T*
+// for the load/store -- this gives the compiler typed-alignment information
+// and produces the same vectorized loop as a direct ``T* output[i] =
+// T* source[i]`` body. T is one of the unsigned integer types (uint8_t/16_t/
+// 32_t/64_t); the bytes copied are agnostic to the user-facing dtype kind.
 template <typename T>
-void gather_typed(const T* __restrict__ source,
-                  const std::int64_t* __restrict__ indices,
-                  T* __restrict__ output,
-                  std::ptrdiff_t n_indices,
-                  int thread_cap,
-                  std::ptrdiff_t prefetch_distance) {
+void gather_indexed_typed(const std::uint8_t* __restrict__ base,
+                          const std::int64_t* __restrict__ indices,
+                          std::uint8_t* __restrict__ output,
+                          std::ptrdiff_t n_indices,
+                          int thread_cap,
+                          std::ptrdiff_t prefetch_distance) {
+  const T* src = reinterpret_cast<const T*>(base);
+  T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
@@ -76,95 +95,143 @@ void gather_typed(const T* __restrict__ source,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (i + prefetch_distance < n_indices) {
-      // Hint: read-only, low temporal locality (we won't revisit).
-      __builtin_prefetch(&source[indices[i + prefetch_distance]], 0, 0);
+      __builtin_prefetch(&src[indices[i + prefetch_distance]], 0, 0);
     }
-    output[i] = source[indices[i]];
+    dst[i] = src[indices[i]];
   }
 }
 
-// Explicit instantiations for every dtype we expose. Keeping these in the
-// .cpp avoids re-instantiating the template in every translation unit that
-// includes the header.
-template void gather_typed<float>(const float*, const std::int64_t*, float*,
-                                  std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<double>(const double*, const std::int64_t*, double*,
-                                   std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::int8_t>(const std::int8_t*, const std::int64_t*,
-                                        std::int8_t*, std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::int16_t>(const std::int16_t*,
-                                         const std::int64_t*, std::int16_t*,
-                                         std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::int32_t>(const std::int32_t*,
-                                         const std::int64_t*, std::int32_t*,
-                                         std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::int64_t>(const std::int64_t*,
-                                         const std::int64_t*, std::int64_t*,
-                                         std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::uint8_t>(const std::uint8_t*,
-                                         const std::int64_t*, std::uint8_t*,
-                                         std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::uint16_t>(const std::uint16_t*,
-                                          const std::int64_t*, std::uint16_t*,
-                                          std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::uint32_t>(const std::uint32_t*,
-                                          const std::int64_t*, std::uint32_t*,
-                                          std::ptrdiff_t, int, std::ptrdiff_t);
-template void gather_typed<std::uint64_t>(const std::uint64_t*,
-                                          const std::int64_t*, std::uint64_t*,
-                                          std::ptrdiff_t, int, std::ptrdiff_t);
+// Byte-offset gather: ``output[i] = *(T*)(base + byte_offsets[i])``.
+//
+// For the multi-record reader: addresses are non-uniform and pre-computed at
+// the Python level (record-header skips, per-record column offsets). The
+// kernel reinterprets the loaded bytes as T to give the compiler the same
+// typed-alignment information; caller guarantees offsets are T-aligned.
+template <typename T>
+void gather_bytes_typed(const std::uint8_t* __restrict__ base,
+                        const std::int64_t* __restrict__ byte_offsets,
+                        std::uint8_t* __restrict__ output,
+                        std::ptrdiff_t n_indices,
+                        int thread_cap,
+                        std::ptrdiff_t prefetch_distance) {
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (i + prefetch_distance < n_indices) {
+      __builtin_prefetch(base + byte_offsets[i + prefetch_distance], 0, 0);
+    }
+    dst[i] = *reinterpret_cast<const T*>(base + byte_offsets[i]);
+  }
+}
+
+// Explicit instantiations -- four sizes for each entry point.
+template void gather_indexed_typed<std::uint8_t>(const std::uint8_t*,
+                                                 const std::int64_t*,
+                                                 std::uint8_t*,
+                                                 std::ptrdiff_t, int,
+                                                 std::ptrdiff_t);
+template void gather_indexed_typed<std::uint16_t>(const std::uint8_t*,
+                                                  const std::int64_t*,
+                                                  std::uint8_t*,
+                                                  std::ptrdiff_t, int,
+                                                  std::ptrdiff_t);
+template void gather_indexed_typed<std::uint32_t>(const std::uint8_t*,
+                                                  const std::int64_t*,
+                                                  std::uint8_t*,
+                                                  std::ptrdiff_t, int,
+                                                  std::ptrdiff_t);
+template void gather_indexed_typed<std::uint64_t>(const std::uint8_t*,
+                                                  const std::int64_t*,
+                                                  std::uint8_t*,
+                                                  std::ptrdiff_t, int,
+                                                  std::ptrdiff_t);
+template void gather_bytes_typed<std::uint8_t>(const std::uint8_t*,
+                                               const std::int64_t*,
+                                               std::uint8_t*,
+                                               std::ptrdiff_t, int,
+                                               std::ptrdiff_t);
+template void gather_bytes_typed<std::uint16_t>(const std::uint8_t*,
+                                                const std::int64_t*,
+                                                std::uint8_t*,
+                                                std::ptrdiff_t, int,
+                                                std::ptrdiff_t);
+template void gather_bytes_typed<std::uint32_t>(const std::uint8_t*,
+                                                const std::int64_t*,
+                                                std::uint8_t*,
+                                                std::ptrdiff_t, int,
+                                                std::ptrdiff_t);
+template void gather_bytes_typed<std::uint64_t>(const std::uint8_t*,
+                                                const std::int64_t*,
+                                                std::uint8_t*,
+                                                std::ptrdiff_t, int,
+                                                std::ptrdiff_t);
 
 }  // namespace colstore
 
 extern "C" {
 
-void colstore_gather_f32(const float* source, const std::int64_t* indices,
-                         float* output, std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<float>(source, indices, output, n, thread_cap);
+void colstore_gather_indexed_1(const std::uint8_t* base,
+                               const std::int64_t* indices,
+                               std::uint8_t* output,
+                               std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_indexed_typed<std::uint8_t>(base, indices, output, n,
+                                               thread_cap);
 }
-void colstore_gather_f64(const double* source, const std::int64_t* indices,
-                         double* output, std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<double>(source, indices, output, n, thread_cap);
+void colstore_gather_indexed_2(const std::uint8_t* base,
+                               const std::int64_t* indices,
+                               std::uint8_t* output,
+                               std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_indexed_typed<std::uint16_t>(base, indices, output, n,
+                                                thread_cap);
 }
-void colstore_gather_i8(const std::int8_t* source,
-                        const std::int64_t* indices, std::int8_t* output,
-                        std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::int8_t>(source, indices, output, n, thread_cap);
+void colstore_gather_indexed_4(const std::uint8_t* base,
+                               const std::int64_t* indices,
+                               std::uint8_t* output,
+                               std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_indexed_typed<std::uint32_t>(base, indices, output, n,
+                                                thread_cap);
 }
-void colstore_gather_i16(const std::int16_t* source,
-                         const std::int64_t* indices, std::int16_t* output,
-                         std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::int16_t>(source, indices, output, n, thread_cap);
+void colstore_gather_indexed_8(const std::uint8_t* base,
+                               const std::int64_t* indices,
+                               std::uint8_t* output,
+                               std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_indexed_typed<std::uint64_t>(base, indices, output, n,
+                                                thread_cap);
 }
-void colstore_gather_i32(const std::int32_t* source,
-                         const std::int64_t* indices, std::int32_t* output,
-                         std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::int32_t>(source, indices, output, n, thread_cap);
+
+void colstore_gather_bytes_1(const std::uint8_t* base,
+                             const std::int64_t* byte_offsets,
+                             std::uint8_t* output,
+                             std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_bytes_typed<std::uint8_t>(base, byte_offsets, output, n,
+                                             thread_cap);
 }
-void colstore_gather_i64(const std::int64_t* source,
-                         const std::int64_t* indices, std::int64_t* output,
-                         std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::int64_t>(source, indices, output, n, thread_cap);
+void colstore_gather_bytes_2(const std::uint8_t* base,
+                             const std::int64_t* byte_offsets,
+                             std::uint8_t* output,
+                             std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_bytes_typed<std::uint16_t>(base, byte_offsets, output, n,
+                                              thread_cap);
 }
-void colstore_gather_u8(const std::uint8_t* source,
-                        const std::int64_t* indices, std::uint8_t* output,
-                        std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::uint8_t>(source, indices, output, n, thread_cap);
+void colstore_gather_bytes_4(const std::uint8_t* base,
+                             const std::int64_t* byte_offsets,
+                             std::uint8_t* output,
+                             std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_bytes_typed<std::uint32_t>(base, byte_offsets, output, n,
+                                              thread_cap);
 }
-void colstore_gather_u16(const std::uint16_t* source,
-                         const std::int64_t* indices, std::uint16_t* output,
-                         std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::uint16_t>(source, indices, output, n, thread_cap);
-}
-void colstore_gather_u32(const std::uint32_t* source,
-                         const std::int64_t* indices, std::uint32_t* output,
-                         std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::uint32_t>(source, indices, output, n, thread_cap);
-}
-void colstore_gather_u64(const std::uint64_t* source,
-                         const std::int64_t* indices, std::uint64_t* output,
-                         std::ptrdiff_t n, int thread_cap) {
-  colstore::gather_typed<std::uint64_t>(source, indices, output, n, thread_cap);
+void colstore_gather_bytes_8(const std::uint8_t* base,
+                             const std::int64_t* byte_offsets,
+                             std::uint8_t* output,
+                             std::ptrdiff_t n, int thread_cap) {
+  colstore::gather_bytes_typed<std::uint64_t>(base, byte_offsets, output, n,
+                                              thread_cap);
 }
 
 int colstore_max_threads() {

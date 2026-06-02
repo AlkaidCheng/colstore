@@ -137,11 +137,92 @@ def test_calibrate_picks_and_caches_a_cap(tmp_path, monkeypatch):
         config.set_gather_thread_cap(original)
 
 
-# ---- Dispatch: always use cpp kernel when compatible ---------------------
+@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
+def test_gather_honors_explicit_thread_cap(tmp_path):
+    # An explicit thread_cap override is accepted and produces correct output,
+    # independent of the global config cap.
+    from colstore import kernels
+
+    source = np.arange(2_000_000, dtype=np.float64)
+    indices = np.array([1_999_999, 0, 1_000_000, 5], dtype=np.int64)
+    for cap in (1, 2, 8):
+        out = kernels.gather(source, indices, source.dtype, backend="cpp", thread_cap=cap)
+        assert out.tolist() == [1_999_999.0, 0.0, 1_000_000.0, 5.0]
+
+
+def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
+    # Multi-column concurrent reads must divide the per-call cap across columns
+    # so outer threads x inner OpenMP threads does not oversubscribe. We assert
+    # on the divided value the dispatcher computes, and on correct output.
+    captured: dict[str, int | None] = {}
+
+    import colstore.store as store_mod
+
+    real_gather_one = store_mod.ColStore._gather_one
+
+    def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
+        captured[column_name] = thread_cap
+        return real_gather_one(self, column_name, row_indexer, thread_cap)
+
+    monkeypatch.setattr(store_mod.ColStore, "_gather_one", spy)
+
+    columns = {f"c{i}": np.arange(100, dtype=np.float64) + i for i in range(4)}
+    store = colstore.ColStore.from_dict(
+        columns, tmp_path / "many.cstore", show_progress=False, backend="cpp"
+    )
+    original_cap = config.get_gather_thread_cap()
+    original_workers = config.get_max_workers()
+    try:
+        config.set_gather_thread_cap(8)
+        config.set_max_workers(4)
+        indices = np.array([99, 0, 50], dtype=np.int64)
+        result = store[indices, list(columns)].to_dict()
+        # 8 cap / 4 concurrent columns -> 2 threads each.
+        assert set(captured.values()) == {2}
+        # Output still correct.
+        for i, name in enumerate(columns):
+            assert result[name].tolist() == [99 + i, 0 + i, 50 + i]
+    finally:
+        config.set_gather_thread_cap(original_cap)
+        config.set_max_workers(original_workers)
+        store.close()
+
+
+def test_gather_many_cap_never_below_one(tmp_path, monkeypatch):
+    # With more concurrent columns than the cap, each kernel floors at 1 thread.
+    captured: dict[str, int | None] = {}
+    import colstore.store as store_mod
+
+    real = store_mod.ColStore._gather_one
+
+    def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
+        captured[column_name] = thread_cap
+        return real(self, column_name, row_indexer, thread_cap)
+
+    monkeypatch.setattr(store_mod.ColStore, "_gather_one", spy)
+    columns = {f"c{i}": np.arange(50, dtype=np.float32) for i in range(6)}
+    store = colstore.ColStore.from_dict(
+        columns, tmp_path / "floor.cstore", show_progress=False, backend="cpp"
+    )
+    original_cap = config.get_gather_thread_cap()
+    original_workers = config.get_max_workers()
+    try:
+        config.set_gather_thread_cap(2)
+        config.set_max_workers(6)
+        store[np.array([1, 2, 3]), list(columns)].to_dict()
+        # 2 cap / 6 columns -> floored at 1.
+        assert set(captured.values()) == {1}
+    finally:
+        config.set_gather_thread_cap(original_cap)
+        config.set_max_workers(original_workers)
+        store.close()
+
+
+# ---- Dispatch: numpy delegation for serial, cpp kernel for parallel --------
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
-def test_gather_into_matches_gather():
+def test_gather_into_matches_gather(tmp_path):
     """``gather_into`` and ``gather`` produce identical output in-place."""
     from colstore import _gather  # type: ignore[attr-defined]
 
@@ -159,10 +240,12 @@ def test_dispatcher_always_uses_cpp_kernel_when_compatible(monkeypatch):
     """The cpp kernel is invoked for every kernel-compatible gather, including
     small ones; the kernel itself picks serial vs parallel internally.
 
-    Benchmarks on multi-core hardware showed the cpp kernel beats ``np.take``
-    by 1.5-2x at one thread because numpy re-validates indices that we
-    already validated upstream and uses a slower internal copy path. So the
-    cpp kernel is the right answer at every size.
+    Earlier versions of the dispatcher delegated small gathers to ``np.take``
+    on the assumption that NumPy's tight C loop beat Cython/OpenMP entry cost.
+    Benchmarks on real multi-core hardware overturned that: the cpp kernel
+    beats ``np.take`` by 2-4x even at one thread, because numpy re-validates
+    indices that we already validated upstream and uses a slower internal
+    copy path. So the cpp kernel is now the right answer at every size.
     """
     from colstore import (
         _gather,  # type: ignore[attr-defined]
@@ -189,7 +272,7 @@ def test_dispatcher_always_uses_cpp_kernel_when_compatible(monkeypatch):
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
-def test_dispatcher_falls_back_to_numpy_for_incompatible_dtypes():
+def test_dispatcher_falls_back_to_numpy_for_incompatible_dtypes(tmp_path):
     """Non-native byte order and unsupported kinds still bypass the cpp kernel.
 
     This is the *correctness* fallback (the kernel does raw element copies and
@@ -207,7 +290,7 @@ def test_dispatcher_falls_back_to_numpy_for_incompatible_dtypes():
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
-def test_cpp_kernel_output_matches_numpy():
+def test_cpp_kernel_output_matches_numpy(tmp_path):
     """Sanity: cpp kernel output matches plain ``source[indices]`` byte-for-byte."""
     from colstore import kernels
 

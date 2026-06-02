@@ -1,51 +1,53 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False
 # distutils: language = c++
-"""Cython binding for the C++ gather kernel.
+"""Cython binding for the size-dispatched C++ gather kernel.
 
-Exposes a single Python-callable ``gather`` that dispatches by NumPy dtype
-to the appropriate ``extern "C"`` wrapper in ``include/colstore/gather.hpp``.
-Index arrays must be ``int64``; source and output must share the same
-fixed-size dtype.
+The underlying C++ kernel is templated on element size (1/2/4/8 bytes), not
+on NumPy dtype kind. A single set of four templates per entry point covers
+every fixed-width numeric dtype, plus fixed-width bytes/unicode strings,
+datetime64, and timedelta64 -- anything whose itemsize is one of those four
+sizes "just works."
+
+Three Python entry points:
+
+* :func:`gather` -- element-indexed (hot path). Caller passes int64 element
+  indices; the kernel computes byte addresses internally. No Python-side
+  allocation per call.
+
+* :func:`gather_into` -- alias for :func:`gather` retained for callers that
+  reach the binding directly (the colstore.kernels dispatcher uses this
+  name to make the no-allocation contract explicit at the call site).
+
+* :func:`gather_bytes` -- byte-offset. Caller passes int64 byte offsets
+  directly. Used by the multi-record reader (PR 2) where byte addresses
+  cross record boundaries.
 """
 
 import numpy as np
 
 cimport numpy as cnp
-from libc.stdint cimport (
-    int8_t,
-    int16_t,
-    int32_t,
-    int64_t,
-    uint8_t,
-    uint16_t,
-    uint32_t,
-    uint64_t,
-)
+from libc.stdint cimport int64_t, uint8_t
 
 cnp.import_array()
 
 
 cdef extern from "colstore/gather.hpp" nogil:
-    void colstore_gather_f32(const float*, const int64_t*, float*,
-                             ptrdiff_t, int)
-    void colstore_gather_f64(const double*, const int64_t*, double*,
-                             ptrdiff_t, int)
-    void colstore_gather_i8(const int8_t*, const int64_t*, int8_t*,
-                            ptrdiff_t, int)
-    void colstore_gather_i16(const int16_t*, const int64_t*, int16_t*,
-                             ptrdiff_t, int)
-    void colstore_gather_i32(const int32_t*, const int64_t*, int32_t*,
-                             ptrdiff_t, int)
-    void colstore_gather_i64(const int64_t*, const int64_t*, int64_t*,
-                             ptrdiff_t, int)
-    void colstore_gather_u8(const uint8_t*, const int64_t*, uint8_t*,
-                            ptrdiff_t, int)
-    void colstore_gather_u16(const uint16_t*, const int64_t*, uint16_t*,
-                             ptrdiff_t, int)
-    void colstore_gather_u32(const uint32_t*, const int64_t*, uint32_t*,
-                             ptrdiff_t, int)
-    void colstore_gather_u64(const uint64_t*, const int64_t*, uint64_t*,
-                             ptrdiff_t, int)
+    void colstore_gather_indexed_1(const uint8_t*, const int64_t*, uint8_t*,
+                                   ptrdiff_t, int)
+    void colstore_gather_indexed_2(const uint8_t*, const int64_t*, uint8_t*,
+                                   ptrdiff_t, int)
+    void colstore_gather_indexed_4(const uint8_t*, const int64_t*, uint8_t*,
+                                   ptrdiff_t, int)
+    void colstore_gather_indexed_8(const uint8_t*, const int64_t*, uint8_t*,
+                                   ptrdiff_t, int)
+    void colstore_gather_bytes_1(const uint8_t*, const int64_t*, uint8_t*,
+                                 ptrdiff_t, int)
+    void colstore_gather_bytes_2(const uint8_t*, const int64_t*, uint8_t*,
+                                 ptrdiff_t, int)
+    void colstore_gather_bytes_4(const uint8_t*, const int64_t*, uint8_t*,
+                                 ptrdiff_t, int)
+    void colstore_gather_bytes_8(const uint8_t*, const int64_t*, uint8_t*,
+                                 ptrdiff_t, int)
     int colstore_max_threads()
 
 
@@ -68,55 +70,34 @@ def thread_count_for(Py_ssize_t n_indices, int cap) -> int:
 
 def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
            int thread_cap=0):
-    """Compute ``output[i] = source[indices[i]]`` via the parallel C++ kernel.
+    """Element-indexed gather: ``output[i] = source[indices[i]]``.
 
     Parameters
     ----------
     source : numpy.ndarray
-        1D array of any supported fixed-size dtype.
+        1D array with a fixed-size dtype (itemsize 1/2/4/8 bytes).
     indices : numpy.ndarray
-        1D ``int64`` array of positions into ``source``.
+        1D ``int64`` array of element positions into ``source``.
     output : numpy.ndarray
         1D array with the same dtype as ``source`` and length matching
-        ``indices``. Filled in-place.
+        ``indices``. Filled in-place; allocation is the caller's job.
     thread_cap : int, optional
-        Maximum OpenMP threads to use. ``0`` (default) or any non-positive
-        value means the OpenMP maximum; the kernel still drops to a single
-        thread for small inputs and scales up to this cap for large ones.
-
-    Notes
-    -----
-    Despite the historical name, this function requires a caller-allocated
-    ``output`` buffer; allocation is the dispatcher's job (see
-    :func:`colstore.kernels.gather`). Kept for compatibility with callers
-    that import ``_gather.gather`` directly; new code should call
-    :func:`gather_into`, which is the same function under the explicit name.
-    """
-    gather_into(source, indices, output, thread_cap)
-
-
-def gather_into(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
-                int thread_cap=0):
-    """No-allocation gather: fill ``output`` in place from ``source[indices]``.
-
-    Identical semantics to :func:`gather` but the explicit name makes the
-    no-allocation contract clear. Used by the Python-level dispatcher to
-    avoid an extra ``np.empty`` when it has a pre-allocated buffer (e.g. for
-    multi-column reads where all outputs are sized up front).
+        Maximum OpenMP threads. ``0`` (default) means the OpenMP maximum;
+        the kernel still drops to a single thread for small inputs and
+        scales up to this cap for large ones.
 
     Raises
     ------
     TypeError
-        If dtypes mismatch or the source dtype is unsupported.
+        If dtypes mismatch, ``indices`` is not int64, or the element size
+        is not supported.
     ValueError
         If shapes are incompatible.
     """
     if source.ndim != 1 or indices.ndim != 1 or output.ndim != 1:
         raise ValueError("All inputs to gather must be 1D arrays.")
     if indices.dtype != np.int64:
-        raise TypeError(
-            f"indices must be int64; got {indices.dtype}."
-        )
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
     if source.dtype != output.dtype:
         raise TypeError(
             f"source dtype {source.dtype} does not match output dtype "
@@ -132,70 +113,117 @@ def gather_into(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     if n_indices == 0:
         return
 
-    cdef str kind_code = source.dtype.kind
     cdef int itemsize = source.dtype.itemsize
-    cdef void* source_ptr = cnp.PyArray_DATA(source)
-    cdef int64_t* indices_ptr = <int64_t*>cnp.PyArray_DATA(indices)
-    cdef void* output_ptr = cnp.PyArray_DATA(output)
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
 
-    # 'f' floating, 'i' signed int, 'u'/'b' unsigned/bool
-    cdef bint dispatched = False
-    if kind_code == 'f':
-        if itemsize == 4:
-            with nogil:
-                colstore_gather_f32(<const float*>source_ptr, indices_ptr,
-                                    <float*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 8:
-            with nogil:
-                colstore_gather_f64(<const double*>source_ptr, indices_ptr,
-                                    <double*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-    elif kind_code == 'i':
-        if itemsize == 1:
-            with nogil:
-                colstore_gather_i8(<const int8_t*>source_ptr, indices_ptr,
-                                   <int8_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 2:
-            with nogil:
-                colstore_gather_i16(<const int16_t*>source_ptr, indices_ptr,
-                                    <int16_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 4:
-            with nogil:
-                colstore_gather_i32(<const int32_t*>source_ptr, indices_ptr,
-                                    <int32_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 8:
-            with nogil:
-                colstore_gather_i64(<const int64_t*>source_ptr, indices_ptr,
-                                    <int64_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-    elif kind_code == 'u' or kind_code == 'b':
-        if itemsize == 1:
-            with nogil:
-                colstore_gather_u8(<const uint8_t*>source_ptr, indices_ptr,
-                                   <uint8_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 2:
-            with nogil:
-                colstore_gather_u16(<const uint16_t*>source_ptr, indices_ptr,
-                                    <uint16_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 4:
-            with nogil:
-                colstore_gather_u32(<const uint32_t*>source_ptr, indices_ptr,
-                                    <uint32_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-        elif itemsize == 8:
-            with nogil:
-                colstore_gather_u64(<const uint64_t*>source_ptr, indices_ptr,
-                                    <uint64_t*>output_ptr, n_indices, thread_cap)
-            dispatched = True
-
-    if not dispatched:
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_indexed_1(base, indices_ptr, output_ptr,
+                                      n_indices, thread_cap)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_indexed_2(base, indices_ptr, output_ptr,
+                                      n_indices, thread_cap)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_indexed_4(base, indices_ptr, output_ptr,
+                                      n_indices, thread_cap)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_indexed_8(base, indices_ptr, output_ptr,
+                                      n_indices, thread_cap)
+    else:
         raise TypeError(
-            f"Unsupported source dtype: {source.dtype}. The C++ kernel "
-            f"handles float32/64, int8/16/32/64, uint8/16/32/64, and bool."
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+
+def gather_into(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
+                int thread_cap=0):
+    """Alias for :func:`gather`.
+
+    The name is used by :mod:`colstore.kernels` to make the no-allocation
+    contract explicit at the call site -- the kernel never allocates the
+    output buffer; the caller does. Functionally identical to :func:`gather`.
+    """
+    gather(source, indices, output, thread_cap)
+
+
+def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
+                 cnp.ndarray output, int thread_cap=0):
+    """Byte-offset gather: copy ``itemsize`` bytes from ``source + byte_offsets[i]``.
+
+    Parameters
+    ----------
+    source : numpy.ndarray
+        Source buffer treated as raw bytes (the dtype is ignored; only the
+        base pointer matters).
+    byte_offsets : numpy.ndarray
+        1D ``int64`` array. Each element is a byte offset into ``source``;
+        the kernel reads ``output.dtype.itemsize`` bytes starting there.
+        The caller guarantees each offset points at an itemsize-aligned
+        address.
+    output : numpy.ndarray
+        1D array determining both the element size and the output dtype.
+    thread_cap : int, optional
+        Maximum OpenMP threads. ``0`` means the OpenMP maximum.
+
+    Notes
+    -----
+    Used by the multi-record reader (PR 2): byte offsets there encode
+    record-header skips and per-record column offsets and cannot be reduced
+    to a simple ``index * itemsize``. For the contiguous hot path,
+    :func:`gather` is faster because it skips the byte-offset array
+    materialization.
+
+    Raises
+    ------
+    TypeError
+        If ``byte_offsets`` is not int64, or the output element size is
+        not supported.
+    ValueError
+        If shapes are incompatible.
+    """
+    if byte_offsets.ndim != 1 or output.ndim != 1:
+        raise ValueError("byte_offsets and output must be 1D arrays.")
+    if byte_offsets.dtype != np.int64:
+        raise TypeError(f"byte_offsets must be int64; got {byte_offsets.dtype}.")
+
+    cdef ptrdiff_t n_indices = byte_offsets.shape[0]
+    if output.shape[0] != n_indices:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match byte_offsets "
+            f"length {n_indices}."
+        )
+    if n_indices == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* offsets_ptr = <const int64_t*>cnp.PyArray_DATA(byte_offsets)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_bytes_1(base, offsets_ptr, output_ptr,
+                                    n_indices, thread_cap)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_bytes_2(base, offsets_ptr, output_ptr,
+                                    n_indices, thread_cap)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_bytes_4(base, offsets_ptr, output_ptr,
+                                    n_indices, thread_cap)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_bytes_8(base, offsets_ptr, output_ptr,
+                                    n_indices, thread_cap)
+    else:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
         )
