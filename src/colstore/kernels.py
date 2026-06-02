@@ -79,9 +79,13 @@ def gather(
     dtype : numpy.dtype
         Output dtype; native byte order.
     backend : str, optional
-        ``"cpp"`` (default), ``"numpy"``, or ``"numba"``. Falls back to NumPy
-        with a warning if the requested backend isn't available, and silently
-        for dtype kinds or byte orders the compiled kernels can't handle.
+        ``"cpp"`` (default), ``"numpy"``, or ``"numba"``. The C++ kernel is
+        used whenever the input dtype is kernel-compatible (numeric kinds in
+        native byte order); the kernel itself decides serial vs parallel
+        execution based on input size and the configured thread cap. Falls
+        back to NumPy with a warning if the requested backend isn't available,
+        and silently for dtype kinds or byte orders the compiled kernels
+        can't handle.
     thread_cap : int or None, optional
         Per-call OpenMP thread cap for the C++ kernel. ``None`` (default) uses
         the package-wide :func:`colstore.config.get_gather_thread_cap`. Callers
