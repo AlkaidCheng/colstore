@@ -10,13 +10,9 @@ implementation. The work splits into two halves:
   contiguous run in the output. This is bandwidth-bound and dominates the
   runtime. We use :func:`os.sendfile` on Linux (kernel-space copy, no
   Python-side surfacing) and :func:`shutil.copyfileobj` on other platforms.
-
-  An earlier draft tried to use ``os.sendfile`` on any POSIX platform.
-  That was wrong: on macOS, ``os.sendfile`` requires the destination fd
-  to be a *socket* and raises ``ENOTSOCK`` for our file-to-file use case.
-  Linux's ``sendfile`` accepts a regular-file destination since kernel
-  2.6.33 (which is everywhere modern). The platform gate is
-  ``sys.platform == "linux"``, not ``os.name == "posix"``.
+  macOS has ``os.sendfile`` but it requires a socket destination and so is
+  unusable for file-to-file copies; Windows has no ``os.sendfile``. The
+  platform gate is therefore ``sys.platform == "linux"``.
 
 Memory footprint is bounded by the kernel's sendfile buffer on Linux and
 by ``shutil.COPY_BUFSIZE`` (64 KB) elsewhere, independent of file size.

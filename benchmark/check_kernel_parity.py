@@ -1,12 +1,11 @@
 """Side-by-side perf check: element-indexed vs byte-offset kernel entry points.
 
-The size-based kernel refactor (PR 1) keeps the element-indexed entry point
-(:func:`colstore._gather.gather`) as the hot path for contiguous gathers,
-and adds a byte-offset entry point (:func:`gather_bytes`) for the multi-
-record reader that PR 2 introduces. The two entry points share size-
-templated inner loops; the only difference is whether the byte address per
-element is computed inside the kernel (``base + indices[i] * itemsize``)
-or passed in as a pre-computed array.
+The C++ kernel exposes two entry points. The element-indexed
+(:func:`colstore._gather.gather`) is the hot path for contiguous gathers;
+the byte-offset (:func:`gather_bytes`) serves the multi-record reader. The
+two share size-templated inner loops; the only difference is whether the
+byte address per element is computed inside the kernel
+(``base + indices[i] * itemsize``) or passed in as a pre-computed array.
 
 This script measures both at ``thread_cap=1`` (serial), against ``np.take``
 as a reference. It confirms:

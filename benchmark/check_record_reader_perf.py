@@ -1,9 +1,9 @@
 """Compare read perf across single-record and multi-record files.
 
-A colstore file is a sequence of records. After a single ``from_dict`` /
-``from_dataframe`` / ``from_records`` call the file has exactly one record;
-after many small writes via :class:`ColStoreWriter` (PR 3) it has many. The
-reader takes different code paths for these two cases:
+A colstore file is a sequence of records. After a one-shot
+:func:`colstore.store` call the file has exactly one record; after many
+small writes via :class:`ColStoreWriter` it has many. The reader takes
+different code paths for these two cases:
 
 1. Single record: per-column memmaps + the element-indexed ``gather``
    kernel. Contiguous, prefetcher-friendly.
@@ -17,8 +17,8 @@ This script confirms two claims:
 
 * Single-record reads are as fast as a pure contiguous gather would be.
 * Multi-record reads pay a bounded penalty that scales sub-linearly with
-  record count. Past a threshold the user should call ``compact()``
-  (PR 4) to collapse back to a single record.
+  record count. Past a threshold the user should call
+  :func:`colstore.compact` to collapse back to a single record.
 
 To compare, this benchmark builds several files containing the *same*
 logical data:

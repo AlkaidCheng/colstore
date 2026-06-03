@@ -1,11 +1,10 @@
 """Hand-built file fixtures for testing the multi-record reader.
 
-PR 2 lands the reader without a writer that can produce multi-record files
-(the writer comes in PR 3). To exercise the reader we build files
-byte-by-byte from Python here, then read them through :class:`ColStoreReader`.
-This module is the single source of truth for "what a valid multi-record
-file looks like" -- if the writer in PR 3 disagrees with this fixture, one
-of them is wrong.
+To validate the reader independently of the writer, this module builds
+files byte-by-byte from Python and feeds them through
+:class:`ColStoreReader`. It is the single source of truth for "what a
+valid multi-record file looks like" -- if the writer and this fixture
+ever disagree, one of them is wrong, and this one is the spec.
 """
 
 from __future__ import annotations

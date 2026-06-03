@@ -306,7 +306,7 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
     The header CRC32 covers the first 28 bytes (everything but the CRC slot);
     a corrupt header is detected on read even if only the in-place fields
     were tampered with. Used by :func:`write_dataset` for the single-record
-    write path and by :class:`ColStoreWriter` (PR 3) for the multi-record case.
+    write path and by :class:`ColStoreWriter` for the multi-record case.
     """
     header_prefix = struct.pack(
         "<4sqqq",

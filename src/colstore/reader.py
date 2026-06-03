@@ -413,7 +413,7 @@ class ColStoreReader:
           can land anywhere across records, and it dominates the cost.
           Argsort + sorted-path + reindex is *slower* than this (measured)
           because argsort on K int64 costs more than searchsorted does. The
-          escape valve is :meth:`compact` (PR 4) -- collapse to a single
+          escape valve is :func:`colstore.compact` -- collapse to a single
           record and the fast path kicks in.
 
         For an integer scalar selector, the result is a length-1 ndarray

@@ -6,9 +6,10 @@ fast path (per-column memmaps, contiguous gather); reads of multi-record
 files take a slower path that bins indices to records via
 ``np.searchsorted`` and gathers via byte offsets.
 
-PR 2 lands the multi-record reader without a writer that can produce
-multi-record files (the writer comes in PR 3). These tests build files by
-hand via :mod:`_format_fixture` and exercise both paths.
+Both paths are validated here against hand-built fixtures from
+:mod:`_format_fixture` so the test isn't dependent on the writer being
+correct -- if the writer and these fixtures ever disagree, the fixture is
+the source of truth for what a valid file looks like.
 
 Coverage matrix:
 
