@@ -80,17 +80,18 @@ def write_record_file(
     # ---- Build the file header. ----
     manifest = {
         "format_version": 1,
-        "n_records": n_records,
-        "committed_rows": total_rows,
         "columns": columns_meta,
-        "manifest_crc32": fmt._manifest_checksum(columns_meta, n_records, total_rows),
+        "manifest_crc32": fmt._manifest_checksum(columns_meta),
     }
     manifest_bytes = json.dumps(manifest).encode("utf-8")
-    header_size = len(fmt._MAGIC) + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
+    header_size = (
+        len(fmt._MAGIC) + fmt._COUNTERS_SIZE + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
+    )
     data_offset = fmt.align_up(header_size)
 
     with open(path, "wb") as out:
         out.write(fmt._MAGIC)
+        out.write(fmt._pack_counters(n_records, total_rows))
         out.write(struct.pack(fmt._MANIFEST_LEN_FMT, len(manifest_bytes)))
         out.write(manifest_bytes)
         out.write(b"\x00" * (data_offset - header_size))

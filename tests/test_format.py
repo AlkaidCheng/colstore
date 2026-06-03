@@ -241,15 +241,33 @@ def test_corrupt_manifest_checksum_raises(tmp_path):
         {"alpha": np.arange(3, dtype=np.float64)}, path, batch_size=None, show_progress=False
     )
     raw = bytearray(path.read_bytes())
-    manifest_size = struct.unpack("<Q", raw[8:16])[0]
-    manifest = json.loads(raw[16 : 16 + manifest_size])
-    # Equal-length edit: change content without resizing the header.
+    # Layout: magic (8) + counters (32) + manifest_len (8) + manifest (...).
+    manifest_len_offset = len(fmt._MAGIC) + fmt._COUNTERS_SIZE
+    manifest_offset = manifest_len_offset + fmt._MANIFEST_LEN_SIZE
+    manifest_size = struct.unpack("<Q", raw[manifest_len_offset:manifest_offset])[0]
+    manifest = json.loads(raw[manifest_offset : manifest_offset + manifest_size])
+    # Equal-length edit: change content without resizing the manifest.
     manifest["columns"][0]["name"] = "ALPHA"
     edited = json.dumps(manifest).encode("utf-8")
     assert len(edited) == manifest_size
-    raw[16 : 16 + manifest_size] = edited
+    raw[manifest_offset : manifest_offset + manifest_size] = edited
     path.write_bytes(bytes(raw))
     with pytest.raises(FormatError, match="checksum"):
+        ColStore(path)
+
+
+def test_corrupt_counters_block_raises(tmp_path):
+    """The counters block (n_records + committed_rows + CRC) sits at fixed
+    offset 8. A bit-flip there must surface as a clean FormatError before
+    the manifest is even parsed.
+    """
+    path = tmp_path / "ct.cstore"
+    write_dataset({"x": np.arange(3, dtype=np.float64)}, path, batch_size=None, show_progress=False)
+    raw = bytearray(path.read_bytes())
+    # Flip a bit inside the n_records field. The counters CRC will mismatch.
+    raw[len(fmt._MAGIC)] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    with pytest.raises(FormatError, match=r"[Cc]ounters"):
         ColStore(path)
 
 
@@ -257,17 +275,26 @@ def test_unsupported_version_raises(tmp_path):
     path = tmp_path / "v.cstore"
     write_dataset({"x": np.arange(4, dtype=np.float64)}, path, batch_size=None, show_progress=False)
     manifest, data_offset = read_header(path)
-    manifest["format_version"] = 999
-    manifest["manifest_crc32"] = fmt._manifest_checksum(
-        manifest["columns"], manifest["n_records"], manifest["committed_rows"]
+    n_records = manifest["n_records"]
+    committed_rows = manifest["committed_rows"]
+    # Rebuild the JSON manifest with format_version corrupted to an unsupported
+    # value; the counters block stays valid (we just want to trip the version
+    # check, not the CRC check).
+    bad_manifest = {
+        "format_version": 999,
+        "columns": manifest["columns"],
+        "manifest_crc32": fmt._manifest_checksum(manifest["columns"]),
+    }
+    manifest_bytes = json.dumps(bad_manifest).encode("utf-8")
+    header_size = (
+        len(fmt._MAGIC) + fmt._COUNTERS_SIZE + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
     )
-    manifest_bytes = json.dumps(manifest).encode("utf-8")
-    header_size = len(fmt._MAGIC) + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
     new_offset = align_up(header_size)
     # Everything past data_offset (record header + body) is preserved verbatim.
     body_bytes = path.read_bytes()[data_offset:]
     with open(path, "wb") as handle:
         handle.write(fmt._MAGIC)
+        handle.write(fmt._pack_counters(n_records, committed_rows))
         handle.write(struct.pack(fmt._MANIFEST_LEN_FMT, len(manifest_bytes)))
         handle.write(manifest_bytes)
         handle.write(b"\x00" * (new_offset - header_size))
