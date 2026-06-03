@@ -1,4 +1,4 @@
-"""Tests for ColStore basics: properties, lifecycle, container protocol."""
+"""Tests for ColStoreReader basics: properties, lifecycle, container protocol."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import ColStore
+from colstore import ColStoreReader
 
 
 def test_shape_matches_dataframe(small_store, small_frame):
@@ -36,7 +36,7 @@ def test_dtypes_match_source(small_store):
 
 def test_repr_includes_path_and_shape(small_store):
     repr_text = repr(small_store)
-    assert "ColStore" in repr_text
+    assert "ColStoreReader" in repr_text
     assert "shape" in repr_text
 
 
@@ -75,9 +75,9 @@ def test_store_reopen_recovers_same_data(tmp_path, small_frame):
     """Closing and reopening the same file returns identical data."""
     path = tmp_path / "reopen.cstore"
     colstore.store(small_frame, path, show_progress=False).close()
-    with ColStore(path) as store:
+    with ColStoreReader(path) as store:
         assert store.shape == (len(small_frame), len(small_frame.columns))
         first = store["price"].to_array()
-    with ColStore(path) as store_reopened:
+    with ColStoreReader(path) as store_reopened:
         second = store_reopened["price"].to_array()
     assert np.array_equal(first, second)

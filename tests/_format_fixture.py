@@ -2,7 +2,7 @@
 
 PR 2 lands the reader without a writer that can produce multi-record files
 (the writer comes in PR 3). To exercise the reader we build files
-byte-by-byte from Python here, then read them through :class:`ColStore`.
+byte-by-byte from Python here, then read them through :class:`ColStoreReader`.
 This module is the single source of truth for "what a valid multi-record
 file looks like" -- if the writer in PR 3 disagrees with this fixture, one
 of them is wrong.
@@ -128,7 +128,7 @@ def write_record_file(
 def expected_column_values(records: list[dict[str, np.ndarray]], name: str) -> np.ndarray:
     """Logical concatenation of column ``name`` across all records.
 
-    This is the ground truth: a ColStore read with ``ds[:, name]`` or
+    This is the ground truth: a ColStoreReader read with ``ds[:, name]`` or
     ``ds[indices, name]`` must agree with indexing into this array.
     """
     return np.concatenate([rec[name] for rec in records])

@@ -1,7 +1,7 @@
 """Tests for the module-level API: open, create, recreate, update, store.
 
-These wrappers around ColStore/ColWriter are the recommended public surface.
-The class-level constructors (`ColStore(path)`, `ColWriter(path, mode)`) keep
+These wrappers around ColStoreReader/ColStoreWriter are the recommended public surface.
+The class-level constructors (`ColStoreReader(path)`, `ColStoreWriter(path, mode)`) keep
 working too, but module-level functions are the documented entry points.
 """
 
@@ -12,17 +12,17 @@ import pandas as pd
 import pytest
 
 import colstore
-from colstore import ColStore, ColWriter
+from colstore import ColStoreReader, ColStoreWriter
 
 # ---- open ------------------------------------------------------------------
 
 
 def test_open_returns_colstore(tmp_path):
-    """``colstore.open`` returns a ColStore equivalent to direct construction."""
+    """``colstore.open`` returns a ColStoreReader equivalent to direct construction."""
     path = tmp_path / "x.cstore"
     colstore.store({"a": np.arange(10, dtype=np.float32)}, path, show_progress=False).close()
     with colstore.open(path) as ds:
-        assert isinstance(ds, ColStore)
+        assert isinstance(ds, ColStoreReader)
         assert ds.n_rows == 10
         assert np.array_equal(ds[:, "a"].to_array(), np.arange(10, dtype=np.float32))
 
@@ -37,10 +37,10 @@ def test_open_missing_file_raises(tmp_path):
 
 
 def test_create_returns_writer(tmp_path):
-    """``colstore.create`` returns a ColWriter for a new file."""
+    """``colstore.create`` returns a ColStoreWriter for a new file."""
     path = tmp_path / "c.cstore"
     with colstore.create(path) as w:
-        assert isinstance(w, ColWriter)
+        assert isinstance(w, ColStoreWriter)
         assert w.mode == "create"
         w.write({"a": np.arange(5, dtype=np.int32)})
     with colstore.open(path) as ds:

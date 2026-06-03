@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import FILE_EXTENSION, ColStore, FormatError
+from colstore import FILE_EXTENSION, ColStoreReader, FormatError
 from colstore import format as fmt
 from colstore.format import (
     align_up,
@@ -198,7 +198,7 @@ def test_big_endian_input_stored_little_endian(tmp_path):
     write_dataset({"v": np.arange(5, dtype=">i4")}, path, batch_size=None, show_progress=False)
     manifest, _ = read_header(path)
     assert manifest["columns"][0]["dtype"] == "<i4"
-    store = ColStore(path, backend="numpy")
+    store = ColStoreReader(path, backend="numpy")
     assert store["v"].to_array().tolist() == [0, 1, 2, 3, 4]
     assert store.dtypes["v"].byteorder in ("=", "<", "|")
     store.close()
@@ -233,7 +233,7 @@ def test_truncated_file_raises(tmp_path):
     )
     path.write_bytes(path.read_bytes()[:-8])
     with pytest.raises(FormatError, match="truncated"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_corrupt_manifest_checksum_raises(tmp_path):
@@ -254,7 +254,7 @@ def test_corrupt_manifest_checksum_raises(tmp_path):
     raw[manifest_offset : manifest_offset + manifest_size] = edited
     path.write_bytes(bytes(raw))
     with pytest.raises(FormatError, match="checksum"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_corrupt_counters_block_raises(tmp_path):
@@ -269,7 +269,7 @@ def test_corrupt_counters_block_raises(tmp_path):
     raw[len(fmt._MAGIC)] ^= 0xFF
     path.write_bytes(bytes(raw))
     with pytest.raises(FormatError, match=r"[Cc]ounters"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_unsupported_version_raises(tmp_path):
@@ -301,7 +301,7 @@ def test_unsupported_version_raises(tmp_path):
         handle.write(b"\x00" * (new_offset - header_size))
         handle.write(body_bytes)
     with pytest.raises(FormatError, match="format_version"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 # ---- Batching is a no-op on output bytes -----------------------------------

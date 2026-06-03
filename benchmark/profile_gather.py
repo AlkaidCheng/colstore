@@ -1,4 +1,4 @@
-"""Comprehensive performance profile of ColStore gather operations.
+"""Comprehensive performance profile of ColStoreReader gather operations.
 
 Captures three layers of measurement for every operation:
 
@@ -35,7 +35,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import psutil
 
-from colstore import ColStore, cpp_available, max_threads
+import colstore
+from colstore import ColStoreReader, cpp_available, max_threads
 
 
 @dataclass
@@ -142,7 +143,7 @@ def make_store(path: str, n_rows: int, n_cols: int, dtype) -> None:
     print(f"Creating store M={n_rows:,} x N_COLS={n_cols} ({dtype}) at {path}")
     rng = np.random.default_rng(0)
     columns = {f"f{i}": rng.standard_normal(n_rows).astype(dtype) for i in range(n_cols)}
-    ColStore.from_dict(columns, path, show_progress=False).close()
+    colstore.store(columns, path, show_progress=False).close()
 
 
 def evict_file_cache(path: str) -> bool:
@@ -202,7 +203,7 @@ def benchmark_workload(
 
     for backend in backends:
         print(f"\n{'=' * 70}\nbackend = {backend!r}")
-        ds = ColStore(store_path, backend=backend)
+        ds = ColStoreReader(store_path, backend=backend)
 
         # Warm-cache run: touch every page once so subsequent measurements
         # exclude major page-fault cost.
@@ -253,7 +254,7 @@ def benchmark_thread_sweep(
 
     rng = np.random.default_rng(0)
     unsorted_indices = rng.permutation(n_rows)[:n_indices].astype(np.int64)
-    ds = ColStore(store_path, backend="cpp")
+    ds = ColStoreReader(store_path, backend="cpp")
     ds[unsorted_indices, "f0"].to_array()  # warm
 
     print(f"\n{'=' * 70}\nthread-cap sweep " f"(cpp, {n_indices:,} unsorted indices, 1 col)")

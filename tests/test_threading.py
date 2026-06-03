@@ -158,13 +158,13 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
 
     import colstore.reader as store_mod
 
-    real_gather_one = store_mod.ColStore._gather_one
+    real_gather_one = store_mod.ColStoreReader._gather_one
 
     def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
         captured[column_name] = thread_cap
         return real_gather_one(self, column_name, row_indexer, thread_cap)
 
-    monkeypatch.setattr(store_mod.ColStore, "_gather_one", spy)
+    monkeypatch.setattr(store_mod.ColStoreReader, "_gather_one", spy)
 
     columns = {f"c{i}": np.arange(100, dtype=np.float64) + i for i in range(4)}
     store = colstore.store(columns, tmp_path / "many.cstore", show_progress=False, backend="cpp")
@@ -191,13 +191,13 @@ def test_gather_many_cap_never_below_one(tmp_path, monkeypatch):
     captured: dict[str, int | None] = {}
     import colstore.reader as store_mod
 
-    real = store_mod.ColStore._gather_one
+    real = store_mod.ColStoreReader._gather_one
 
     def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
         captured[column_name] = thread_cap
         return real(self, column_name, row_indexer, thread_cap)
 
-    monkeypatch.setattr(store_mod.ColStore, "_gather_one", spy)
+    monkeypatch.setattr(store_mod.ColStoreReader, "_gather_one", spy)
     columns = {f"c{i}": np.arange(50, dtype=np.float32) for i in range(6)}
     store = colstore.store(columns, tmp_path / "floor.cstore", show_progress=False, backend="cpp")
     original_cap = config.get_gather_thread_cap()

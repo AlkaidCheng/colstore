@@ -52,7 +52,7 @@ from typing import Any
 import numpy as np
 
 import colstore
-from colstore import ColStore, cpp_available, max_threads
+from colstore import ColStoreReader, cpp_available, max_threads
 from colstore.config import get_gather_thread_cap
 
 # ---------------------------------------------------------------------------
@@ -141,7 +141,7 @@ def _time_fn(fn: Any, repeats: int) -> tuple[float, float, float]:
 # indices); they should NOT include any first-touch cost in the timed region.
 
 
-def _make_store(path: str, dtype: np.dtype) -> ColStore:
+def _make_store(path: str, dtype: np.dtype) -> ColStoreReader:
     """Create (or reuse) the synthetic store. Matches profile_gather's validator."""
     requested = np.dtype(dtype)
     if os.path.exists(path):
@@ -164,8 +164,8 @@ def _make_store(path: str, dtype: np.dtype) -> ColStore:
         columns = {
             f"f{i}": rng.standard_normal(STORE_ROWS).astype(requested) for i in range(STORE_COLS)
         }
-        ColStore.from_dict(columns, path, show_progress=False).close()
-    return ColStore(path, backend="cpp")  # backend overridden per-workload below
+        colstore.store(columns, path, show_progress=False).close()
+    return ColStoreReader(path, backend="cpp")  # backend overridden per-workload below
 
 
 def _indices(n: int, pattern: str, max_row: int) -> np.ndarray:
@@ -185,7 +185,7 @@ def _build_workloads(
 
     # --- gather: fancy-index one column. The main hot path. ---
     for backend in backends:
-        store = ColStore(store_path, backend=backend)
+        store = ColStoreReader(store_path, backend=backend)
         for size_label, n in SIZES.items():
             for pattern in PATTERNS:
                 idx = _indices(n, pattern, STORE_ROWS)
@@ -199,7 +199,7 @@ def _build_workloads(
 
     # --- to_dict: multi-column gather, exercises _gather_many's budget split. ---
     for backend in backends:
-        store = ColStore(store_path, backend=backend)
+        store = ColStoreReader(store_path, backend=backend)
         all_cols = store.columns
         for size_label, n in SIZES.items():
             # One pattern (sorted) is enough for to_dict; varying both axes
@@ -213,7 +213,7 @@ def _build_workloads(
 
     # --- slice read: contiguous range, exercises memmap + copy path. ---
     for backend in backends:
-        store = ColStore(store_path, backend=backend)
+        store = ColStoreReader(store_path, backend=backend)
         for size_label, n in SIZES.items():
             sl = slice(0, n)
 

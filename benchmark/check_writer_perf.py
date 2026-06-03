@@ -1,4 +1,4 @@
-"""Compare streaming ColWriter vs one-shot ``colstore.store`` perf.
+"""Compare streaming ColStoreWriter vs one-shot ``colstore.store`` perf.
 
 Streaming a fixed total row count as many small records should be slower
 per-row than one big write (more record headers, more counter updates),

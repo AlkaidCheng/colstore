@@ -16,8 +16,8 @@ A file is a sequence of one or more records. Each record carries a 32-byte
 header followed by a column-major body (columns laid out back-to-back in
 schema declaration order, no inter-column padding) padded up to 8 bytes so
 the next record's header is naturally aligned. Files written in one shot
-(via :meth:`ColStore.from_dict` etc.) produce a single-record file;
-:class:`ColWriter` (PR 3) produces multi-record files.
+(via :func:`colstore.store`) produce a single-record file;
+:class:`ColStoreWriter` produces multi-record files.
 
 Each record header is::
 
@@ -261,7 +261,7 @@ def write_header(
       * 8-byte magic (constant).
       * 32-byte counters block at fixed offset 8 -- ``(n_records,
         committed_rows, crc32)``. The writer rewrites this in place on
-        :meth:`ColWriter.close` without touching the manifest.
+        :meth:`ColStoreWriter.close` without touching the manifest.
       * 8-byte manifest length prefix + JSON manifest (immutable schema).
       * Zero padding so the first record header lands at a 64-byte
         alignment boundary.
@@ -288,7 +288,7 @@ def write_header(
 def write_counters(file: IO[bytes], n_records: int, committed_rows: int) -> None:
     """Rewrite the 32-byte counters block at its fixed offset.
 
-    Used by :meth:`ColWriter.close` to commit the new record count and row
+    Used by :meth:`ColStoreWriter.close` to commit the new record count and row
     total atomically. The 32-byte block is small enough that a single
     ``write()`` is generally atomic on common filesystems; even if it
     isn't, the embedded CRC catches a torn write on the next open.
@@ -306,7 +306,7 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
     The header CRC32 covers the first 28 bytes (everything but the CRC slot);
     a corrupt header is detected on read even if only the in-place fields
     were tampered with. Used by :func:`write_dataset` for the single-record
-    write path and by :class:`ColWriter` (PR 3) for the multi-record case.
+    write path and by :class:`ColStoreWriter` (PR 3) for the multi-record case.
     """
     header_prefix = struct.pack(
         "<4sqqq",
@@ -509,7 +509,7 @@ def write_dataset(
 
     Writes a single-record file: file header + 32B record header + column-
     major body + 8B padding. For multi-record streaming writes, use
-    :class:`colstore.ColWriter`.
+    :class:`colstore.ColStoreWriter`.
 
     Parameters
     ----------

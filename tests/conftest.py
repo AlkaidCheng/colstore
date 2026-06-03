@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 import colstore
-from colstore import ColStore
+from colstore import ColStoreReader
 
 
 @pytest.fixture
@@ -27,8 +27,8 @@ def small_frame() -> pd.DataFrame:
 
 
 @pytest.fixture
-def small_store(tmp_path, small_frame) -> ColStore:
-    """A small opened ColStore built from `small_frame`."""
+def small_store(tmp_path, small_frame) -> ColStoreReader:
+    """A small opened ColStoreReader built from `small_frame`."""
     store_path = tmp_path / "small.cstore"
     store = colstore.store(small_frame, store_path, show_progress=False)
     yield store
@@ -51,7 +51,7 @@ def medium_frame() -> pd.DataFrame:
 
 
 @pytest.fixture
-def medium_store(tmp_path, medium_frame) -> ColStore:
+def medium_store(tmp_path, medium_frame) -> ColStoreReader:
     store_path = tmp_path / "medium.cstore"
     store = colstore.store(medium_frame, store_path, show_progress=False)
     yield store

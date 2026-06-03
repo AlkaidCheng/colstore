@@ -1,6 +1,6 @@
-"""The ColStore class: a memory-mapped, columnar, randomly-accessible store.
+"""The ColStoreReader class: a memory-mapped, columnar, randomly-accessible store.
 
-A ``ColStore`` opens a ``.cstore`` file and exposes its columns through a
+A ``ColStoreReader`` opens a ``.cstore`` file and exposes its columns through a
 NumPy/pandas-like indexing API that returns lazy view objects. Single-string
 column selection yields a :class:`ColumnView`; every other shape yields a
 :class:`TableView`. The package is positioned as an **I/O library for a
@@ -43,7 +43,7 @@ _MADVISE_FLAGS: dict[str, int] = {
 _USE_DEFAULT_MADVISE = "__default__"
 
 
-class ColStore:
+class ColStoreReader:
     """Memory-mapped columnar store with lazy, NumPy-style indexing.
 
     Opening a store reads its header, creates one ``np.memmap`` per column,
@@ -73,7 +73,7 @@ class ColStore:
 
     Examples
     --------
-    >>> ds = ColStore.from_dataframe(df, "data.cstore")
+    >>> ds = colstore.store(df, "data.cstore")
     >>> ds['price']                      # ColumnView -> to_array()
     >>> ds[100:200, ['price', 'qty']]    # TableView -> to_dict / to_record / to_dataframe
     """
@@ -234,7 +234,7 @@ class ColStore:
         column_preview = self.columns[:5]
         suffix = "..." if len(self._column_dtypes) > len(column_preview) else ""
         return (
-            f"ColStore(path={self._path.name!r}, "
+            f"ColStoreReader(path={self._path.name!r}, "
             f"shape={self.shape}, columns={column_preview}{suffix})"
         )
 
@@ -253,7 +253,7 @@ class ColStore:
             del self._file_mmap
         self._closed = True
 
-    def __enter__(self) -> ColStore:
+    def __enter__(self) -> ColStoreReader:
         return self
 
     def __exit__(
@@ -365,7 +365,7 @@ class ColStore:
         oversubscribe.
         """
         if self._closed:
-            raise ValueError("ColStore is closed.")
+            raise ValueError("ColStoreReader is closed.")
         if self._is_multi_record:
             return self._gather_one_multi_record(column_name, row_indexer, thread_cap)
         # Single-record fast path: one per-column memmap; the read is a

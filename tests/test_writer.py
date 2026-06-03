@@ -1,4 +1,4 @@
-"""Tests for ColWriter: streaming, append, crash-safety, locking, lifecycle.
+"""Tests for ColStoreWriter: streaming, append, crash-safety, locking, lifecycle.
 
 The module-level API tests (``test_api.py``) cover the create/recreate/update
 entry points at the function level. These tests focus on the writer's own

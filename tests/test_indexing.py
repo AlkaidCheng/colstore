@@ -1,4 +1,4 @@
-"""Tests for ColStore indexing semantics across every documented pattern."""
+"""Tests for ColStoreReader indexing semantics across every documented pattern."""
 
 from __future__ import annotations
 

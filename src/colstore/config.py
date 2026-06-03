@@ -1,7 +1,7 @@
 """Global configuration for the colstore package.
 
 Settings can be inspected and changed at runtime. They are used as defaults
-when constructing :class:`~colstore.ColStore` instances; per-instance overrides
+when constructing :class:`~colstore.ColStoreReader` instances; per-instance overrides
 take precedence over these globals.
 """
 
@@ -91,18 +91,18 @@ def set_gather_thread_cap(n: int) -> None:
 
 
 def get_default_madvise() -> MadviseOption | None:
-    """Return the default ``madvise`` hint applied to new ``ColStore`` opens."""
+    """Return the default ``madvise`` hint applied to new ``ColStoreReader`` opens."""
     return _default_madvise
 
 
 def set_default_madvise(advice: MadviseOption | None) -> None:
-    """Set the package-wide default ``madvise`` hint for new ``ColStore`` opens."""
+    """Set the package-wide default ``madvise`` hint for new ``ColStoreReader`` opens."""
     global _default_madvise
     _default_madvise = advice
 
 
 def get_default_backend() -> GatherBackend:
-    """Return the default gather backend for new ``ColStore`` opens."""
+    """Return the default gather backend for new ``ColStoreReader`` opens."""
     return _default_backend
 
 

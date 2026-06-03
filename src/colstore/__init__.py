@@ -8,7 +8,7 @@ the materialized output even when the file on disk is much larger.
 
 The package centers on:
 
-* :class:`ColStore` — opens a ``.cstore`` file and exposes NumPy/pandas-style
+* :class:`ColStoreReader` — opens a ``.cstore`` file and exposes NumPy/pandas-style
   indexing returning lazy views.
 * :class:`ColumnView` — lazy single-column view produced by ``ds['col']``;
   materializes with :meth:`ColumnView.to_array`.
@@ -62,7 +62,6 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
 from .api import create, open, recreate, store, update
-from .reader import ColStore
 from .autotune import (
     apply_cached_cap_if_present,
     calibrate,
@@ -80,15 +79,16 @@ from .config import (
 )
 from .format import FILE_EXTENSION, FormatError
 from .kernels import cpp_available, max_threads, numba_available
+from .reader import ColStoreReader
 from .view import ColumnView, TableView
-from .writer import ColWriter
+from .writer import ColStoreWriter
 
 apply_cached_cap_if_present()
 
 __all__ = [
     "FILE_EXTENSION",
-    "ColStore",
-    "ColWriter",
+    "ColStoreReader",
+    "ColStoreWriter",
     "ColumnView",
     "FormatError",
     "TableView",

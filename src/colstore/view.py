@@ -1,4 +1,4 @@
-"""Lazy views returned by ``ColStore.__getitem__``.
+"""Lazy views returned by ``ColStoreReader.__getitem__``.
 
 Two concrete classes implement the public surface:
 
@@ -20,7 +20,7 @@ import numpy as np
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .reader import ColStore
+    from .reader import ColStoreReader
 
 _RowIndexer = int | slice | np.ndarray | None
 
@@ -29,13 +29,13 @@ class _BaseView:
     """Shared row-indexer plumbing for the two view types.
 
     Not part of the public API: users should construct views via
-    ``ColStore.__getitem__`` and consume them through the concrete
+    ``ColStoreReader.__getitem__`` and consume them through the concrete
     subclasses.
     """
 
     __slots__ = ("_row_part", "_store")
 
-    def __init__(self, store: ColStore, row_part: Any) -> None:
+    def __init__(self, store: ColStoreReader, row_part: Any) -> None:
         self._store = store
         self._row_part = row_part
 
@@ -120,7 +120,7 @@ class ColumnView(_BaseView):
 
     def __init__(
         self,
-        store: ColStore,
+        store: ColStoreReader,
         row_part: Any,
         column_name: str,
     ) -> None:
@@ -168,7 +168,7 @@ class TableView(_BaseView):
 
     def __init__(
         self,
-        store: ColStore,
+        store: ColStoreReader,
         row_part: Any,
         column_names: list[str],
     ) -> None:

@@ -1,6 +1,6 @@
 """Streaming writer for record-based colstore files.
 
-A :class:`ColWriter` appends one record per :meth:`write` call. The
+A :class:`ColStoreWriter` appends one record per :meth:`write` call. The
 counters block (``n_records`` and ``committed_rows``) is rewritten in
 place on :meth:`close`, atomically committing the session's writes;
 readers opening the file mid-write see only what was committed by the
@@ -58,7 +58,7 @@ import numpy as np
 from . import format as fmt
 
 
-class ColWriter:
+class ColStoreWriter:
     """Append-only writer for a colstore file. See module docstring.
 
     Use :func:`colstore.create`, :func:`colstore.recreate`, or
@@ -226,7 +226,7 @@ class ColWriter:
             On unsupported column dtypes.
         """
         if self._closed:
-            raise ValueError("ColWriter is closed.")
+            raise ValueError("ColStoreWriter is closed.")
         if not columns:
             return  # no-op; don't lock schema, don't write record header
 
@@ -285,7 +285,7 @@ class ColWriter:
                     self._path.unlink()
             self._closed = True
 
-    def __enter__(self) -> ColWriter:
+    def __enter__(self) -> ColStoreWriter:
         return self
 
     def __exit__(
@@ -301,7 +301,7 @@ class ColWriter:
         # this is the safety net for forgotten close() calls.
         if not self._closed:
             warnings.warn(
-                f"ColWriter for {self._path} was not closed explicitly; "
+                f"ColStoreWriter for {self._path} was not closed explicitly; "
                 f"committing from __del__. Prefer 'with' or an explicit "
                 f".close() call.",
                 ResourceWarning,
@@ -312,7 +312,7 @@ class ColWriter:
 
     def __repr__(self) -> str:
         return (
-            f"ColWriter(path={self._path.name!r}, mode={self._mode!r}, "
+            f"ColStoreWriter(path={self._path.name!r}, mode={self._mode!r}, "
             f"n_records={self._n_records}, committed_rows={self._committed_rows}"
             f"{', closed' if self._closed else ''})"
         )

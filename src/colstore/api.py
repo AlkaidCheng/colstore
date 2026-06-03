@@ -1,6 +1,6 @@
 """Module-level convenience functions: open, create, recreate, update, store.
 
-These thin wrappers around :class:`ColStore` and :class:`ColWriter` give the
+These thin wrappers around :class:`ColStoreReader` and :class:`ColStoreWriter` give the
 package a uroot-style entry-point surface where each function does one
 obvious thing.
 """
@@ -13,38 +13,38 @@ from typing import Any
 import numpy as np
 
 from . import format as fmt
-from .reader import ColStore
-from .writer import ColWriter
+from .reader import ColStoreReader
+from .writer import ColStoreWriter
 
 
-def open(path: str | os.PathLike[str], **kwargs: Any) -> ColStore:
+def open(path: str | os.PathLike[str], **kwargs: Any) -> ColStoreReader:
     """Open an existing ``.cstore`` file for read.
 
-    Equivalent to ``ColStore(path, **kwargs)``. The file must exist and be
+    Equivalent to ``ColStoreReader(path, **kwargs)``. The file must exist and be
     a valid colstore file; otherwise :class:`FileNotFoundError` or
     :class:`FormatError` propagates.
     """
-    return ColStore(path, **kwargs)
+    return ColStoreReader(path, **kwargs)
 
 
-def create(path: str | os.PathLike[str]) -> ColWriter:
+def create(path: str | os.PathLike[str]) -> ColStoreWriter:
     """Open a new file for streaming writes; fail if it already exists.
 
     Use this when you want to be sure you are not overwriting anything.
     """
-    return ColWriter(path, mode="create")
+    return ColStoreWriter(path, mode="create")
 
 
-def recreate(path: str | os.PathLike[str]) -> ColWriter:
+def recreate(path: str | os.PathLike[str]) -> ColStoreWriter:
     """Open a file for streaming writes, truncating any existing content.
 
     Use this when you intentionally want to overwrite. To fail on
     overwrite instead, use :func:`create`.
     """
-    return ColWriter(path, mode="recreate")
+    return ColStoreWriter(path, mode="recreate")
 
 
-def update(path: str | os.PathLike[str]) -> ColWriter:
+def update(path: str | os.PathLike[str]) -> ColStoreWriter:
     """Open an existing file for append.
 
     The schema is loaded from the existing manifest; every :meth:`write`
@@ -52,7 +52,7 @@ def update(path: str | os.PathLike[str]) -> ColWriter:
     any) are truncated on open. Raises :class:`FileNotFoundError` if the
     file does not exist.
     """
-    return ColWriter(path, mode="update")
+    return ColStoreWriter(path, mode="update")
 
 
 def store(
@@ -62,7 +62,7 @@ def store(
     mode: str = "create",
     show_progress: bool = True,
     **open_kwargs: Any,
-) -> ColStore:
+) -> ColStoreReader:
     """One-shot: write a single-record file and return an opened reader.
 
     Accepted ``data`` types:
@@ -77,7 +77,7 @@ def store(
     writes, use :func:`create` / :func:`recreate` / :func:`update`
     directly.
 
-    Returns the opened :class:`ColStore` for immediate use.
+    Returns the opened :class:`ColStoreReader` for immediate use.
     """
     if mode not in ("create", "recreate"):
         raise ValueError(f"Invalid mode {mode!r} for store(); expected 'create' or 'recreate'.")
@@ -85,13 +85,13 @@ def store(
     columns = _coerce_to_columns(data)
 
     # write_dataset is the single-record writer that includes a progress bar;
-    # ColWriter is for multi-record streams. For one-shot writes, write_dataset
+    # ColStoreWriter is for multi-record streams. For one-shot writes, write_dataset
     # is slightly cheaper (no counter rewrite at the end -- the counters are
     # right the first time) and surfaces a progress bar.
     if mode == "create" and os.path.exists(path):
         raise FileExistsError(f"{path} already exists; use mode='recreate' to overwrite.")
     fmt.write_dataset(columns, path, batch_size=100_000, show_progress=show_progress)
-    return ColStore(path, **open_kwargs)
+    return ColStoreReader(path, **open_kwargs)
 
 
 def _coerce_to_columns(
