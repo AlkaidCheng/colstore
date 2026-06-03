@@ -21,16 +21,13 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, overload
+from typing import Any, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import config, format, kernels
 from .view import ColumnView, TableView
-
-if TYPE_CHECKING:
-    pass
 
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
@@ -270,9 +267,7 @@ class ColStoreReader:
         """Split a ``__getitem__`` key into row part, column names, singular flag."""
         if isinstance(key, tuple):
             if len(key) != 2:
-                raise IndexError(
-                    f"Expected at most 2 elements in indexing tuple; " f"got {len(key)}."
-                )
+                raise IndexError(f"Expected at most 2 elements in indexing tuple; got {len(key)}.")
             row_part, column_part = key
         elif self._looks_like_column_spec(key):
             row_part, column_part = None, key
@@ -296,7 +291,7 @@ class ColStoreReader:
 
         unknown = [name for name in column_names if name not in self._column_dtypes]
         if unknown:
-            raise KeyError(f"Unknown column(s): {unknown}. " f"Available columns: {self.columns}")
+            raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
         return row_part, column_names, is_single_column
 
     @staticmethod
@@ -313,7 +308,7 @@ class ColStoreReader:
     def _apply_madvise(self, advice: str) -> None:
         if advice not in _MADVISE_FLAGS:
             raise ValueError(
-                f"Invalid madvise value {advice!r}; " f"expected one of {sorted(_MADVISE_FLAGS)}."
+                f"Invalid madvise value {advice!r}; expected one of {sorted(_MADVISE_FLAGS)}."
             )
         flag = _MADVISE_FLAGS[advice]
         if self._is_multi_record:

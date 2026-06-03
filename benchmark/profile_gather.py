@@ -71,9 +71,7 @@ class Sample:
         )
         print(f"  throughput    : {gbps:8.2f} GB/s output")
         print(f"  per-element   : {ns_per_elt:8.1f} ns/elt")
-        print(
-            f"  minor faults  : {self.minflt:8d}  " f"(first-touch of pages already in page cache)"
-        )
+        print(f"  minor faults  : {self.minflt:8d}  (first-touch of pages already in page cache)")
         print(
             f"  major faults  : {self.majflt:8d}  "
             f"(first-touch requiring disk read; HUGE if non-zero)"
@@ -82,7 +80,7 @@ class Sample:
             f"  vol ctx sw    : {self.nvcsw:8d}  "
             f"(blocking syscalls; high means io_wait or lock waits)"
         )
-        print(f"  invol ctx sw  : {self.nivcsw:8d}  " f"(preemption; high under contention)")
+        print(f"  invol ctx sw  : {self.nivcsw:8d}  (preemption; high under contention)")
         print(
             f"  disk read     : {self.read_bytes / 1e6:8.2f} MB"
             f" (logical), {self.read_chars / 1e6:.2f} MB incl. cache"
@@ -257,7 +255,7 @@ def benchmark_thread_sweep(
     ds = ColStoreReader(store_path, backend="cpp")
     ds[unsorted_indices, "f0"].to_array()  # warm
 
-    print(f"\n{'=' * 70}\nthread-cap sweep " f"(cpp, {n_indices:,} unsorted indices, 1 col)")
+    print(f"\n{'=' * 70}\nthread-cap sweep (cpp, {n_indices:,} unsorted indices, 1 col)")
     original = config.get_gather_thread_cap()
     try:
         for cap in thread_caps:

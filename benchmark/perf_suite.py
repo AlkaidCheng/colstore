@@ -398,9 +398,7 @@ def _compare(current: SuiteResult, baseline_path: str, noise_band: float) -> int
             f"{c.median_ms:>10.3f}  {delta_pct:>+8.1f}%  {flag}"
         )
     print()
-    print(
-        f"Summary: {regressions} cell(s) regressed beyond +{noise_band * 100:.0f}% " f"noise band."
-    )
+    print(f"Summary: {regressions} cell(s) regressed beyond +{noise_band * 100:.0f}% noise band.")
     return regressions
 
 

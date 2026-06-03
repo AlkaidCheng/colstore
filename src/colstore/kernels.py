@@ -142,6 +142,6 @@ def gather(
 
     if backend != "numpy":
         raise ValueError(
-            f"Unknown gather backend {backend!r}; " f"expected 'cpp', 'numpy', or 'numba'."
+            f"Unknown gather backend {backend!r}; expected 'cpp', 'numpy', or 'numba'."
         )
     return np.asarray(source[indices], dtype=dtype)
