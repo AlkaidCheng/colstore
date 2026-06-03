@@ -465,10 +465,19 @@ class ColStore:
           than the generic path on a slice spanning 10 records (0.07 ms vs
           3.4 ms).
 
-        * **Fancy index**: searchsorted to bin indices to records, then
-          ``gather_bytes`` kernel. The searchsorted is O(K log R) and
-          dominates the cost; for sorted inputs PR-internal follow-up
-          replaces it with a cheaper boundary-based partition.
+        * **Sorted fancy index**: boundary-based partition. ``np.searchsorted``
+          on the *record-row boundaries* against the indices array (O(R log K))
+          replaces searchsorted on the *indices* against the boundaries
+          (O(K log R)). For K=200K, R=100 this saves ~1.3 ms on the
+          ~4.5 ms sorted path. Same kernel work afterward.
+
+        * **Unsorted fancy index**: searchsorted + byte-offset gather. This
+          is the generic path; the searchsorted is unavoidable when indices
+          can land anywhere across records, and it dominates the cost.
+          Argsort + sorted-path + reindex is *slower* than this (measured)
+          because argsort on K int64 costs more than searchsorted does. The
+          escape valve is :meth:`compact` (PR 4) -- collapse to a single
+          record and the fast path kicks in.
 
         For an integer scalar selector, the result is a length-1 ndarray
         matching the contiguous path's ``atleast_1d`` semantics.
@@ -509,12 +518,23 @@ class ColStore:
         if n == 0:
             return np.empty(0, dtype=native_dtype)
 
-        # Vectorized bin to record. ``side="right"`` gives the index of the
-        # record that *contains* each row: indices into a R+1 cumsum, then
-        # subtract 1. Out-of-range indices are not possible here because the
-        # view layer validates against n_rows before reaching us.
-        record_id = np.searchsorted(self._record_starts_rows, indices, side="right") - 1
-        within_record = indices - self._record_starts_rows[record_id]
+        # ---- Fancy-index path. Choose how to bin indices to records.
+        record_starts_rows = self._record_starts_rows
+        # Sortedness check is O(K) but ~100x faster than a searchsorted at
+        # K=200K, so the early exit is essentially free in the unsorted case.
+        if n > 1 and bool(np.all(indices[1:] >= indices[:-1])):
+            # Sorted: count how many indices fall in each record by locating
+            # the record boundaries *within the indices array*. R searchsorts
+            # of size K -> O(R log K). Then a single np.repeat produces the
+            # record_id array.
+            crossings = np.searchsorted(indices, record_starts_rows, side="left")
+            counts = np.diff(crossings)  # length R, sums to n
+            record_id = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+        else:
+            # Unsorted (or n == 1). searchsorted on the boundaries is K log R.
+            record_id = np.searchsorted(record_starts_rows, indices, side="right") - 1
+
+        within_record = indices - record_starts_rows[record_id]
         # Byte address of each requested element:
         #   record body offset
         #   + column prefix within the record (= col_prefix * n_rows_in_record)
