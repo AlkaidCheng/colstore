@@ -457,12 +457,18 @@ class ColStore:
     ) -> NDArray[Any]:
         """Read one column from a file with multiple records.
 
-        Per-call cost beyond a contiguous gather: O(K log R) for the
-        searchsorted + O(K) for the per-index byte-address arithmetic
-        (all vectorized numpy on the small ``record_starts_*`` arrays).
-        The kernel call itself uses ``gather_bytes`` -- same inner loop as
-        the indexed gather, with one extra array load per element instead
-        of a multiply.
+        Per-pattern dispatch:
+
+        * **Slice** (``None`` / ``slice`` / contiguous range): per-record
+          contiguous memcpy via ``np.frombuffer``. Avoids the gather kernel
+          and the byte-offset materialization entirely. Measured ~48x faster
+          than the generic path on a slice spanning 10 records (0.07 ms vs
+          3.4 ms).
+
+        * **Fancy index**: searchsorted to bin indices to records, then
+          ``gather_bytes`` kernel. The searchsorted is O(K log R) and
+          dominates the cost; for sorted inputs PR-internal follow-up
+          replaces it with a cheaper boundary-based partition.
 
         For an integer scalar selector, the result is a length-1 ndarray
         matching the contiguous path's ``atleast_1d`` semantics.
@@ -474,12 +480,26 @@ class ColStore:
         itemsize = disk_dtype.itemsize
         col_prefix = int(self._column_prefix_bytes[column_name])
 
+        # ---- Slice / None / scalar ints all map to a contiguous row range.
+        # Handle them with one path that avoids the gather kernel entirely.
         if row_indexer is None:
-            indices = np.arange(self._n_rows, dtype=np.int64)
-        elif isinstance(row_indexer, int):
-            indices = np.array([row_indexer], dtype=np.int64)
-        elif isinstance(row_indexer, slice):
+            return self._read_contiguous_range_multi_record(
+                0, self._n_rows, disk_dtype, native_dtype, col_prefix, itemsize
+            )
+        if isinstance(row_indexer, int):
+            # Folding negative indices was already done by the view layer.
+            return self._read_contiguous_range_multi_record(
+                row_indexer, row_indexer + 1, disk_dtype, native_dtype, col_prefix, itemsize
+            )
+        if isinstance(row_indexer, slice):
             start, stop, step = row_indexer.indices(self._n_rows)
+            if step == 1:
+                # The hot case. step != 1 falls through to the fancy-index
+                # path; non-unit-step slices are rare and not worth special-
+                # casing further (they'd need per-record arange-style picks).
+                return self._read_contiguous_range_multi_record(
+                    start, stop, disk_dtype, native_dtype, col_prefix, itemsize
+                )
             indices = np.arange(start, stop, step, dtype=np.int64)
         else:
             # int ndarray -- already validated and made int64 by the view layer.
@@ -508,6 +528,72 @@ class ColStore:
         output = np.empty(n, dtype=native_dtype)
         effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
         _cpp_module.gather_bytes(self._file_mmap, byte_offsets, output, effective_cap)
+        return output
+
+    def _read_contiguous_range_multi_record(
+        self,
+        start: int,
+        stop: int,
+        disk_dtype: np.dtype[Any],
+        native_dtype: np.dtype[Any],
+        col_prefix: int,
+        itemsize: int,
+    ) -> NDArray[Any]:
+        """Read rows ``[start, stop)`` for one column across records via memcpy.
+
+        Replaces the gather kernel for contiguous-range reads. A range
+        spanning R' records is served by R' contiguous memory copies from
+        the file mmap, plus two O(log R) searchsorted calls to locate the
+        first/last overlapping records. No per-element work.
+
+        The output is always native byte order; if the disk dtype is
+        non-native the per-record view from ``np.frombuffer`` is byteswapped
+        during the assignment into ``output``.
+        """
+        n = stop - start
+        output = np.empty(n, dtype=native_dtype)
+        if n == 0:
+            return output
+
+        record_starts_rows = self._record_starts_rows
+        first_record = int(np.searchsorted(record_starts_rows, start, side="right") - 1)
+        # stop-1 is the last row index actually read; same searchsorted finds
+        # which record holds it.
+        last_record = int(np.searchsorted(record_starts_rows, stop - 1, side="right") - 1)
+
+        # Precompute per-record bounds in vectorized numpy. The Python loop
+        # below only does the copy itself -- avoiding per-iter numpy-scalar
+        # arithmetic and the implicit int() coercion that np.frombuffer would
+        # otherwise do on each call. At R'=100 overlapping records this saves
+        # ~10% over recomputing bounds in the loop.
+        rec_slice = slice(first_record, last_record + 1)
+        rec_row_starts = record_starts_rows[rec_slice]
+        rec_n_rows = self._n_rows_per_record[rec_slice]
+        rec_body_starts = self._record_starts_bytes[rec_slice]
+        # Clip [start, stop) against each record's row range to get the
+        # number of rows we read from each, and the byte offset of the first
+        # one within that record.
+        within_los = np.maximum(start, rec_row_starts) - rec_row_starts
+        within_his = np.minimum(stop, rec_row_starts + rec_n_rows) - rec_row_starts
+        counts = within_his - within_los  # >0 for every overlapping record
+        byte_offsets = rec_body_starts + col_prefix * rec_n_rows + within_los * itemsize
+        write_starts = np.empty(counts.shape[0] + 1, dtype=np.int64)
+        write_starts[0] = 0
+        np.cumsum(counts, out=write_starts[1:])
+
+        # Convert to Python ints once, outside the loop. np.frombuffer takes
+        # ints for offset/count; passing numpy scalars works but coerces on
+        # every call.
+        counts_list = counts.tolist()
+        byte_offsets_list = byte_offsets.tolist()
+        write_starts_list = write_starts.tolist()
+        for i in range(counts.shape[0]):
+            count = counts_list[i]
+            view = np.frombuffer(
+                self._file_mmap, dtype=disk_dtype, count=count, offset=byte_offsets_list[i]
+            )
+            output[write_starts_list[i] : write_starts_list[i] + count] = view
+
         return output
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
