@@ -2,15 +2,23 @@
 
 File layout::
 
-    [magic 8B][manifest_len 8B (u64 little-endian)][manifest_json]
+    [magic 8B]
+    [counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
+    [manifest_len 8B (u64 little-endian)]
+    [manifest_json: format_version + columns + manifest_crc32]
     [zero-padding to 64-byte alignment]
     [record_0 header 32B][record_0 body, padded to 8B]
     [record_1 header 32B][record_1 body, padded to 8B]
     ...
 
-The manifest is a small JSON object recording ``format_version``,
-``n_records``, ``committed_rows``, and per-column ``{name, dtype}``. Column
-dtypes are preserved exactly. The canonical file extension is ``.cstore``.
+The 8-byte magic is followed by a 32-byte counters block at fixed offset 8
+holding the mutable ``n_records`` and ``committed_rows`` (with its own
+CRC32). The JSON manifest holds the immutable schema (``format_version``
+and per-column ``{name, dtype, encoding, nullable}``). Splitting mutable
+counters from the immutable manifest is what lets the writer commit a
+session atomically -- it can rewrite the 32-byte counters block in place
+without shifting any record byte offsets. The canonical file extension is
+``.cstore``.
 
 A file is a sequence of one or more records. Each record carries a 32-byte
 header followed by a column-major body (columns laid out back-to-back in

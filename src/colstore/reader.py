@@ -4,9 +4,9 @@ A ``ColStoreReader`` opens a ``.cstore`` file and exposes its columns through a
 NumPy/pandas-like indexing API that returns lazy view objects. Single-string
 column selection yields a :class:`ColumnView`; every other shape yields a
 :class:`TableView`. The package is positioned as an **I/O library for a
-custom binary format**: write a structured array or DataFrame once with one
-of the ``from_*`` factories, then load arbitrary row/column subsets from disk
-with bounded process memory.
+custom binary format**: write a tabular dataset once via
+:func:`colstore.store` (one-shot) or :class:`ColStoreWriter` (streaming), then
+load arbitrary row/column subsets from disk with bounded process memory.
 """
 
 from __future__ import annotations
@@ -55,8 +55,8 @@ class ColStoreReader:
     Parameters
     ----------
     path : str or pathlib.Path
-        Path to a ``.cstore`` file produced by one of the ``from_*`` factory
-        methods.
+        Path to a ``.cstore`` file produced by :func:`colstore.store` or
+        :class:`ColStoreWriter`.
     madvise : str or None, optional
         Kernel access-pattern hint applied to every column memmap. One of
         ``"normal"``, ``"sequential"``, ``"random"``, ``"willneed"``,
