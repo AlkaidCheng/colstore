@@ -4,12 +4,28 @@ File layout::
 
     [magic 8B][manifest_len 8B (u64 little-endian)][manifest_json]
     [zero-padding to 64-byte alignment]
-    [column_0 raw bytes][column_1 raw bytes]...[column_n raw bytes]
+    [record_0 header 32B][record_0 body, padded to 8B]
+    [record_1 header 32B][record_1 body, padded to 8B]
+    ...
 
-The manifest is a small JSON object that records ``format_version``,
-``n_rows``, and per-column ``{name, dtype}``. Column dtypes are preserved
-exactly; columns are stored back-to-back with no per-row overhead. The
-canonical file extension is ``.cstore``.
+The manifest is a small JSON object recording ``format_version``,
+``n_records``, ``committed_rows``, and per-column ``{name, dtype}``. Column
+dtypes are preserved exactly. The canonical file extension is ``.cstore``.
+
+A file is a sequence of one or more records. Each record carries a 32-byte
+header followed by a column-major body (columns laid out back-to-back in
+schema declaration order, no inter-column padding) padded up to 8 bytes so
+the next record's header is naturally aligned. Files written in one shot
+(via :meth:`ColStore.from_dict` etc.) produce a single-record file;
+:class:`ColWriter` (PR 3) produces multi-record files.
+
+Each record header is::
+
+    4B  magic b"REC\\x01"
+    8B  record_index (i64, sequential from 0)
+    8B  n_rows       (i64)
+    8B  reserved
+    4B  header CRC32 (over the first 28 bytes)
 
 Supported column dtypes are the fixed-size NumPy kinds: floating point,
 signed/unsigned integers, booleans, ``datetime64``/``timedelta64``, and
@@ -45,8 +61,22 @@ _ALIGNMENT = 64
 _FORMAT_VERSION = 1
 _SUPPORTED_VERSIONS = frozenset({1})
 
+# Record header layout. A record is "[32B header][record body]" where the
+# body is column-major (columns concatenated in schema order) and padded to a
+# multiple of _RECORD_BODY_ALIGNMENT bytes. The alignment is 8 so that every
+# column's first element is naturally aligned for the kernel's typed loads
+# regardless of itemsize mix in the schema.
+_RECORD_HEADER_SIZE = 32
+_RECORD_HEADER_FMT = (
+    "<4sqqqI"  # magic(4) + record_index(i64) + n_rows(i64) + reserved(i64) + crc(u32)
+)
+_RECORD_HEADER_PACK_SIZE = struct.calcsize(_RECORD_HEADER_FMT)  # 32
+_RECORD_MAGIC = b"REC\x01"
+_RECORD_BODY_ALIGNMENT = 8
+
 # Default per-column metadata. Recorded on write so future readers/writers can
-# branch on these keys without a format break; v1 only ever writes the defaults.
+# branch on these keys without a format break; today only the defaults are
+# written.
 _DEFAULT_ENCODING = "raw"  # reserved for future "zstd", "dict", etc.
 _DEFAULT_NULLABLE = False  # reserved for future null-bitmap support
 
@@ -65,26 +95,144 @@ def align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _manifest_checksum(columns_meta: list[dict[str, Any]], n_rows: int) -> int:
+def _manifest_checksum(
+    columns_meta: list[dict[str, Any]],
+    n_records: int,
+    committed_rows: int,
+) -> int:
     """Compute a CRC32 over the structural manifest fields."""
     payload = json.dumps(
-        {"n_rows": n_rows, "columns": columns_meta},
+        {
+            "columns": columns_meta,
+            "n_records": n_records,
+            "committed_rows": committed_rows,
+        },
         sort_keys=True,
     ).encode("utf-8")
     return zlib.crc32(payload) & 0xFFFFFFFF
 
 
+def record_body_size(n_rows: int, itemsizes: list[int]) -> int:
+    """Return the on-disk size of a record body given its row count and schema.
+
+    The body is column-major (each column contiguous) with no inter-column
+    padding; the whole body is padded up to ``_RECORD_BODY_ALIGNMENT`` (8B)
+    so the next record's header -- and therefore its body -- is naturally
+    aligned for the largest itemsize the kernel handles.
+    """
+    raw_bytes = n_rows * sum(itemsizes)
+    return align_up(raw_bytes, _RECORD_BODY_ALIGNMENT)
+
+
+def read_record_index(
+    path: PathLike,
+    data_offset: int,
+    n_records: int,
+    itemsizes: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Walk record headers to build the per-record index used by the reader.
+
+    Returns three small int64 arrays:
+
+    * ``record_starts_rows`` shape ``(R+1,)`` -- cumulative row counts. The
+      reader's hot path uses this with ``np.searchsorted`` to bin indices to
+      records.
+    * ``record_starts_bytes`` shape ``(R,)`` -- file byte offset of each
+      record's body (post-32B header). The base address for any byte-offset
+      computation against that record.
+    * ``n_rows_per_record`` shape ``(R,)`` -- needed at read time to compute
+      per-column offsets within a record without materializing a 2D table:
+      ``column_prefix_bytes[j] * n_rows_per_record[record_id]``.
+
+    Total storage: 24 bytes per record. Cost to build: ``R`` * 32B reads,
+    typically microseconds even for thousands of records.
+
+    Raises
+    ------
+    FormatError
+        On wrong record magic, mismatched record index, or CRC mismatch in
+        any record header. All three indicate file corruption.
+    """
+    record_starts_rows = np.empty(n_records + 1, dtype=np.int64)
+    record_starts_bytes = np.empty(n_records, dtype=np.int64)
+    n_rows_per_record = np.empty(n_records, dtype=np.int64)
+    record_starts_rows[0] = 0
+
+    cumulative_rows = 0
+    next_record_offset = data_offset
+    with open(path, "rb") as input_file:
+        for record_index in range(n_records):
+            input_file.seek(next_record_offset)
+            header_bytes = input_file.read(_RECORD_HEADER_PACK_SIZE)
+            if len(header_bytes) != _RECORD_HEADER_PACK_SIZE:
+                raise FormatError(
+                    f"Truncated record header at offset {next_record_offset}: "
+                    f"expected {_RECORD_HEADER_PACK_SIZE} bytes, got {len(header_bytes)}."
+                )
+            magic, stored_index, n_rows, _reserved, stored_crc = struct.unpack(
+                _RECORD_HEADER_FMT, header_bytes
+            )
+            if magic != _RECORD_MAGIC:
+                raise FormatError(
+                    f"Bad record magic at offset {next_record_offset}: expected "
+                    f"{_RECORD_MAGIC!r}, got {magic!r}."
+                )
+            if stored_index != record_index:
+                raise FormatError(
+                    f"Record index mismatch at offset {next_record_offset}: "
+                    f"manifest expects record {record_index}, header says {stored_index}."
+                )
+            # CRC covers the first 28 bytes (everything but the CRC itself).
+            actual_crc = zlib.crc32(header_bytes[:28]) & 0xFFFFFFFF
+            if actual_crc != stored_crc:
+                raise FormatError(
+                    f"Record {record_index} header CRC mismatch "
+                    f"(stored {stored_crc}, computed {actual_crc})."
+                )
+
+            body_offset = next_record_offset + _RECORD_HEADER_SIZE
+            record_starts_bytes[record_index] = body_offset
+            n_rows_per_record[record_index] = n_rows
+            cumulative_rows += n_rows
+            record_starts_rows[record_index + 1] = cumulative_rows
+            next_record_offset = body_offset + record_body_size(n_rows, itemsizes)
+
+        # After the walk, ``next_record_offset`` is where record N+1's header
+        # would start, equivalently the end of the last record's padded body.
+        # The file must extend at least this far; if it doesn't, the last
+        # record's body is truncated. Inter-record truncation would already
+        # have been caught above (header read or magic check on the next
+        # record), but a truncation in the final record's body is only
+        # visible here.
+        file_size = os.fstat(input_file.fileno()).st_size
+        if file_size < next_record_offset:
+            raise FormatError(
+                f"File is truncated: last record body ends at offset "
+                f"{next_record_offset} but file is only {file_size} bytes."
+            )
+
+    return record_starts_rows, record_starts_bytes, n_rows_per_record
+
+
 def write_header(
     file: IO[bytes],
     columns_meta: list[dict[str, Any]],
-    n_rows: int,
+    n_records: int,
+    committed_rows: int,
 ) -> int:
-    """Write magic + manifest + padding; return the data start offset."""
+    """Write magic + manifest + padding; return the data start offset.
+
+    The manifest carries the format version, the number of records that
+    follow, and the total number of rows across all records. The actual
+    record headers + bodies are written by the caller, immediately
+    following the returned offset.
+    """
     manifest = {
         "format_version": _FORMAT_VERSION,
-        "n_rows": n_rows,
+        "n_records": n_records,
+        "committed_rows": committed_rows,
         "columns": columns_meta,
-        "manifest_crc32": _manifest_checksum(columns_meta, n_rows),
+        "manifest_crc32": _manifest_checksum(columns_meta, n_records, committed_rows),
     }
     manifest_bytes = json.dumps(manifest).encode("utf-8")
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + len(manifest_bytes)
@@ -97,15 +245,39 @@ def write_header(
     return data_offset
 
 
+def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None:
+    """Write a 32-byte record header to ``file`` at its current position.
+
+    The header CRC32 covers the first 28 bytes (everything but the CRC slot);
+    a corrupt header is detected on read even if only the in-place fields
+    were tampered with. Used by :func:`write_dataset` for the single-record
+    write path and by :class:`ColWriter` (PR 3) for the multi-record case.
+    """
+    header_prefix = struct.pack(
+        "<4sqqq",
+        _RECORD_MAGIC,
+        record_index,
+        n_rows,
+        0,  # reserved
+    )
+    crc = zlib.crc32(header_prefix) & 0xFFFFFFFF
+    file.write(header_prefix)
+    file.write(struct.pack("<I", crc))
+
+
 def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
-    """Read and validate magic + manifest; return ``(manifest_dict, data_start_offset)``.
+    """Read and validate the file header; return ``(manifest_dict, data_start_offset)``.
+
+    Validates the file header only -- magic, ``format_version``, and the
+    manifest CRC. Per-record headers (and any truncation past the file
+    header) are validated by :func:`read_record_index`, which the caller
+    runs immediately after this to build the per-record index.
 
     Raises
     ------
     FormatError
-        If the magic is wrong, the ``format_version`` is unsupported, the
-        manifest checksum does not match, or the file is shorter than the
-        column data the manifest describes.
+        On wrong magic, unsupported ``format_version``, or manifest checksum
+        mismatch.
     """
     with open(path, "rb") as input_file:
         magic = input_file.read(len(_MAGIC))
@@ -123,7 +295,9 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
 
     expected_crc = manifest.get("manifest_crc32")
     if expected_crc is not None:
-        actual_crc = _manifest_checksum(manifest["columns"], manifest["n_rows"])
+        actual_crc = _manifest_checksum(
+            manifest["columns"], manifest["n_records"], manifest["committed_rows"]
+        )
         if actual_crc != expected_crc:
             raise FormatError(
                 f"Manifest checksum mismatch (stored {expected_crc}, computed "
@@ -132,29 +306,33 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
 
     header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + manifest_size
     data_offset = align_up(header_size)
-
-    expected_data_bytes = sum(
-        manifest["n_rows"] * np.dtype(column["dtype"]).itemsize for column in manifest["columns"]
-    )
-    actual_data_bytes = os.path.getsize(path) - data_offset
-    if actual_data_bytes < expected_data_bytes:
-        raise FormatError(
-            f"File is truncated: expected at least {expected_data_bytes} bytes of "
-            f"column data after offset {data_offset}, found {actual_data_bytes}."
-        )
     return manifest, data_offset
 
 
-def build_column_layout(manifest: dict[str, Any], data_offset: int) -> ColumnLayout:
-    """Compute per-column ``(byte_offset, dtype)`` from manifest and start offset.
+def build_column_layout(manifest: dict[str, Any], body_offset: int, n_rows: int) -> ColumnLayout:
+    """Compute per-column ``(byte_offset, dtype)`` within a single record.
 
-    The dtype is the on-disk dtype, which is little-endian for multi-byte
-    kinds. Memory-maps must use this dtype to interpret the bytes correctly;
-    the store presents native-order arrays to callers via the gather path.
+    ``body_offset`` is the file offset of the record body's first byte --
+    i.e. past the 32-byte record header. The reader's caller obtains this
+    from :func:`read_record_index` so that the layout sits on top of an
+    already-validated record.
+
+    For a record with ``n_rows`` rows, each column's data is laid out
+    back-to-back in schema declaration order with no inter-column padding.
+    The reader uses the returned layout to build one ``np.memmap`` per
+    column.
+
+    Valid only for the single-record fast path. Multi-record files have no
+    meaningful per-column layout (each column's bytes are scattered across
+    records); the reader computes byte addresses on the fly instead.
+
+    The dtype returned is the on-disk dtype, which is little-endian for
+    multi-byte kinds. Memory-maps must use this dtype to interpret the
+    bytes correctly; the store presents native-order arrays to callers via
+    the gather path.
     """
     layout: ColumnLayout = {}
-    n_rows = manifest["n_rows"]
-    current_offset = data_offset
+    current_offset = body_offset
     for column_info in manifest["columns"]:
         column_dtype = np.dtype(column_info["dtype"])
         layout[column_info["name"]] = (current_offset, column_dtype)
@@ -252,14 +430,27 @@ def write_dataset(
             total_units, desc="Writing colstore", unit=unit, enabled=show_progress
         ) as progress,
     ):
-        write_header(output_file, columns_meta, n_rows)
+        write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
+        # Single record at index 0 wrapping the entire dataset. Reads of this
+        # file take the fast path (per-column memmaps, contiguous gather).
+        write_record_header(output_file, record_index=0, n_rows=n_rows)
+        body_bytes = 0
         for name in column_names:
             array = little_endian_columns[name]
             if effective_batch <= 0:
                 array.tofile(output_file)
+                body_bytes += array.nbytes
                 progress.update(1)
                 continue
             for batch_start in range(0, n_rows, effective_batch):
                 batch_end = min(batch_start + effective_batch, n_rows)
-                array[batch_start:batch_end].tofile(output_file)
+                chunk = array[batch_start:batch_end]
+                chunk.tofile(output_file)
+                body_bytes += chunk.nbytes
                 progress.update(1)
+        # Pad the record body up to _RECORD_BODY_ALIGNMENT so any future
+        # record (if this file were later opened for append) would start at
+        # a naturally-aligned offset.
+        pad = align_up(body_bytes, _RECORD_BODY_ALIGNMENT) - body_bytes
+        if pad:
+            output_file.write(b"\x00" * pad)
