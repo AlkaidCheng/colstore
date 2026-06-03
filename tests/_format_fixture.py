@@ -2,7 +2,7 @@
 
 PR 2 lands the reader without a writer that can produce multi-record files
 (the writer comes in PR 3). To exercise the reader we build files
-byte-by-byte from Python here, then read them through :class:`ColStore`.
+byte-by-byte from Python here, then read them through :class:`ColStoreReader`.
 This module is the single source of truth for "what a valid multi-record
 file looks like" -- if the writer in PR 3 disagrees with this fixture, one
 of them is wrong.
@@ -80,17 +80,18 @@ def write_record_file(
     # ---- Build the file header. ----
     manifest = {
         "format_version": 1,
-        "n_records": n_records,
-        "committed_rows": total_rows,
         "columns": columns_meta,
-        "manifest_crc32": fmt._manifest_checksum(columns_meta, n_records, total_rows),
+        "manifest_crc32": fmt._manifest_checksum(columns_meta),
     }
     manifest_bytes = json.dumps(manifest).encode("utf-8")
-    header_size = len(fmt._MAGIC) + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
+    header_size = (
+        len(fmt._MAGIC) + fmt._COUNTERS_SIZE + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
+    )
     data_offset = fmt.align_up(header_size)
 
     with open(path, "wb") as out:
         out.write(fmt._MAGIC)
+        out.write(fmt._pack_counters(n_records, total_rows))
         out.write(struct.pack(fmt._MANIFEST_LEN_FMT, len(manifest_bytes)))
         out.write(manifest_bytes)
         out.write(b"\x00" * (data_offset - header_size))
@@ -127,7 +128,7 @@ def write_record_file(
 def expected_column_values(records: list[dict[str, np.ndarray]], name: str) -> np.ndarray:
     """Logical concatenation of column ``name`` across all records.
 
-    This is the ground truth: a ColStore read with ``ds[:, name]`` or
+    This is the ground truth: a ColStoreReader read with ``ds[:, name]`` or
     ``ds[indices, name]`` must agree with indexing into this array.
     """
     return np.concatenate([rec[name] for rec in records])

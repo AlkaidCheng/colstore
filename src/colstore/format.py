@@ -16,8 +16,8 @@ A file is a sequence of one or more records. Each record carries a 32-byte
 header followed by a column-major body (columns laid out back-to-back in
 schema declaration order, no inter-column padding) padded up to 8 bytes so
 the next record's header is naturally aligned. Files written in one shot
-(via :meth:`ColStore.from_dict` etc.) produce a single-record file;
-:class:`ColWriter` (PR 3) produces multi-record files.
+(via :func:`colstore.store`) produce a single-record file;
+:class:`ColStoreWriter` produces multi-record files.
 
 Each record header is::
 
@@ -51,7 +51,7 @@ from typing import IO, Any
 
 import numpy as np
 
-from ._progress import progress_bar
+from .progress import progress_bar
 
 FILE_EXTENSION = ".cstore"
 _MAGIC = b"CSTORE\x00\x01"
@@ -60,6 +60,22 @@ _MANIFEST_LEN_SIZE = struct.calcsize(_MANIFEST_LEN_FMT)
 _ALIGNMENT = 64
 _FORMAT_VERSION = 1
 _SUPPORTED_VERSIONS = frozenset({1})
+
+# Counters block. Lives at a fixed offset (right after the magic bytes) so the
+# writer can rewrite it in place on close() without shifting any record byte
+# offsets. The block is 32 bytes:
+#
+#     8B  n_records       (i64 LE)
+#     8B  committed_rows  (i64 LE)
+#     4B  counters_crc32  (over the first 16 bytes)
+#     12B reserved        (zero)
+#
+# Separating mutable counters from the immutable JSON manifest is what enables
+# crash-safe streaming writes: each successful close() atomically commits the
+# new counter values; the immutable manifest never moves.
+_COUNTERS_OFFSET = len(_MAGIC)  # 8
+_COUNTERS_FMT = "<qqI12s"
+_COUNTERS_SIZE = struct.calcsize(_COUNTERS_FMT)  # 32
 
 # Record header layout. A record is "[32B header][record body]" where the
 # body is column-major (columns concatenated in schema order) and padded to a
@@ -95,21 +111,39 @@ def align_up(value: int, alignment: int = _ALIGNMENT) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def _manifest_checksum(
-    columns_meta: list[dict[str, Any]],
-    n_records: int,
-    committed_rows: int,
-) -> int:
-    """Compute a CRC32 over the structural manifest fields."""
-    payload = json.dumps(
-        {
-            "columns": columns_meta,
-            "n_records": n_records,
-            "committed_rows": committed_rows,
-        },
-        sort_keys=True,
-    ).encode("utf-8")
+def _manifest_checksum(columns_meta: list[dict[str, Any]]) -> int:
+    """Compute a CRC32 over the immutable manifest fields.
+
+    The manifest carries only schema (format_version, columns). Mutable
+    counters (n_records, committed_rows) live in a separate fixed-position
+    block so the writer can update them on close() without changing the
+    manifest's bytes.
+    """
+    payload = json.dumps({"columns": columns_meta}, sort_keys=True).encode("utf-8")
     return zlib.crc32(payload) & 0xFFFFFFFF
+
+
+def _pack_counters(n_records: int, committed_rows: int) -> bytes:
+    """Pack the 32-byte counters block including its CRC32."""
+    body = struct.pack("<qq", n_records, committed_rows)
+    crc = zlib.crc32(body) & 0xFFFFFFFF
+    return struct.pack(_COUNTERS_FMT, n_records, committed_rows, crc, b"\x00" * 12)
+
+
+def _unpack_counters(raw: bytes) -> tuple[int, int]:
+    """Parse and validate the 32-byte counters block; return (n_records, committed_rows)."""
+    if len(raw) != _COUNTERS_SIZE:
+        raise FormatError(
+            f"Counters block truncated: expected {_COUNTERS_SIZE} bytes, got {len(raw)}."
+        )
+    n_records, committed_rows, stored_crc, _reserved = struct.unpack(_COUNTERS_FMT, raw)
+    actual_crc = zlib.crc32(struct.pack("<qq", n_records, committed_rows)) & 0xFFFFFFFF
+    if actual_crc != stored_crc:
+        raise FormatError(
+            f"Counters block CRC mismatch (stored {stored_crc}, computed {actual_crc}); "
+            f"the file header is corrupt."
+        )
+    return n_records, committed_rows
 
 
 def record_body_size(n_rows: int, itemsizes: list[int]) -> int:
@@ -220,29 +254,50 @@ def write_header(
     n_records: int,
     committed_rows: int,
 ) -> int:
-    """Write magic + manifest + padding; return the data start offset.
+    """Write magic + counters + manifest + padding; return the data start offset.
 
-    The manifest carries the format version, the number of records that
-    follow, and the total number of rows across all records. The actual
-    record headers + bodies are written by the caller, immediately
-    following the returned offset.
+    The on-disk header has four parts:
+
+      * 8-byte magic (constant).
+      * 32-byte counters block at fixed offset 8 -- ``(n_records,
+        committed_rows, crc32)``. The writer rewrites this in place on
+        :meth:`ColStoreWriter.close` without touching the manifest.
+      * 8-byte manifest length prefix + JSON manifest (immutable schema).
+      * Zero padding so the first record header lands at a 64-byte
+        alignment boundary.
+
+    Callers seeking only to update counters use :func:`write_counters`.
     """
     manifest = {
         "format_version": _FORMAT_VERSION,
-        "n_records": n_records,
-        "committed_rows": committed_rows,
         "columns": columns_meta,
-        "manifest_crc32": _manifest_checksum(columns_meta, n_records, committed_rows),
+        "manifest_crc32": _manifest_checksum(columns_meta),
     }
     manifest_bytes = json.dumps(manifest).encode("utf-8")
-    header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + len(manifest_bytes)
+    header_size = len(_MAGIC) + _COUNTERS_SIZE + _MANIFEST_LEN_SIZE + len(manifest_bytes)
     data_offset = align_up(header_size)
 
     file.write(_MAGIC)
+    file.write(_pack_counters(n_records, committed_rows))
     file.write(struct.pack(_MANIFEST_LEN_FMT, len(manifest_bytes)))
     file.write(manifest_bytes)
     file.write(b"\x00" * (data_offset - header_size))
     return data_offset
+
+
+def write_counters(file: IO[bytes], n_records: int, committed_rows: int) -> None:
+    """Rewrite the 32-byte counters block at its fixed offset.
+
+    Used by :meth:`ColStoreWriter.close` to commit the new record count and row
+    total atomically. The 32-byte block is small enough that a single
+    ``write()`` is generally atomic on common filesystems; even if it
+    isn't, the embedded CRC catches a torn write on the next open.
+
+    The caller must position the file at the right offset itself (the
+    helper just packs and writes the 32 bytes), or use ``file.seek`` to
+    move there before calling.
+    """
+    file.write(_pack_counters(n_records, committed_rows))
 
 
 def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None:
@@ -251,7 +306,7 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
     The header CRC32 covers the first 28 bytes (everything but the CRC slot);
     a corrupt header is detected on read even if only the in-place fields
     were tampered with. Used by :func:`write_dataset` for the single-record
-    write path and by :class:`ColWriter` (PR 3) for the multi-record case.
+    write path and by :class:`ColStoreWriter` (PR 3) for the multi-record case.
     """
     header_prefix = struct.pack(
         "<4sqqq",
@@ -266,23 +321,30 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
 
 
 def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
-    """Read and validate the file header; return ``(manifest_dict, data_start_offset)``.
+    """Read and validate the file header; return ``(header_dict, data_start_offset)``.
 
-    Validates the file header only -- magic, ``format_version``, and the
-    manifest CRC. Per-record headers (and any truncation past the file
+    The header_dict contains both the immutable manifest fields
+    (``format_version``, ``columns``, ``manifest_crc32``) and the mutable
+    counters (``n_records``, ``committed_rows``) read from the fixed
+    32-byte counters block. Callers don't need to know they live in
+    separate on-disk regions.
+
+    Validates the file header only -- magic, counters CRC, format version,
+    and manifest CRC. Per-record headers (and any truncation past the file
     header) are validated by :func:`read_record_index`, which the caller
     runs immediately after this to build the per-record index.
 
     Raises
     ------
     FormatError
-        On wrong magic, unsupported ``format_version``, or manifest checksum
-        mismatch.
+        On wrong magic, counters CRC mismatch, unsupported
+        ``format_version``, or manifest CRC mismatch.
     """
     with open(path, "rb") as input_file:
         magic = input_file.read(len(_MAGIC))
         if magic != _MAGIC:
             raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
+        n_records, committed_rows = _unpack_counters(input_file.read(_COUNTERS_SIZE))
         manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
         manifest = json.loads(input_file.read(manifest_size))
 
@@ -295,16 +357,18 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
 
     expected_crc = manifest.get("manifest_crc32")
     if expected_crc is not None:
-        actual_crc = _manifest_checksum(
-            manifest["columns"], manifest["n_records"], manifest["committed_rows"]
-        )
+        actual_crc = _manifest_checksum(manifest["columns"])
         if actual_crc != expected_crc:
             raise FormatError(
                 f"Manifest checksum mismatch (stored {expected_crc}, computed "
                 f"{actual_crc}); the header is corrupt."
             )
 
-    header_size = len(_MAGIC) + _MANIFEST_LEN_SIZE + manifest_size
+    # Merge counters into the returned dict so callers see one unified view.
+    manifest["n_records"] = n_records
+    manifest["committed_rows"] = committed_rows
+
+    header_size = len(_MAGIC) + _COUNTERS_SIZE + _MANIFEST_LEN_SIZE + manifest_size
     data_offset = align_up(header_size)
     return manifest, data_offset
 
@@ -358,30 +422,28 @@ def _to_little_endian(array: np.ndarray[Any, np.dtype[Any]]) -> np.ndarray[Any, 
     return array
 
 
-def write_dataset(
+def normalize_columns(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
-    path: PathLike,
     *,
-    batch_size: int | None,
-    show_progress: bool,
-) -> None:
-    """Serialize a dict of 1D NumPy columns to disk in colstore format.
+    expected_schema: list[dict[str, Any]] | None = None,
+) -> tuple[list[str], int, dict[str, np.ndarray[Any, np.dtype[Any]]], list[dict[str, Any]]]:
+    """Validate a column dict and return the pieces needed to write a record.
 
-    Parameters
-    ----------
-    columns : dict[str, numpy.ndarray]
-        Mapping of column name to a 1D fixed-size array. All columns must share
-        the same length.
-    path : str or os.PathLike
-        Destination path.
-    batch_size : int or None
-        Number of rows written per ``tofile`` call, used only to drive the
-        progress bar. ``None`` or any value ``<= 0`` writes each column in a
-        single call (no batching). Has no effect on the bytes written.
-    show_progress : bool
-        Whether to display a tqdm progress bar.
+    Returns ``(column_names, n_rows, little_endian_columns, columns_meta)``.
+
+    If ``expected_schema`` is given (non-None), the columns must match it
+    exactly: same names in the same order, same dtypes. This is what the
+    streaming writer uses for second-and-later ``write()`` calls. If
+    ``expected_schema`` is None, the schema is inferred from the columns
+    (the first-write case).
+
+    Raises
+    ------
+    ValueError
+        On an empty dict, ragged columns, or schema/dtype mismatch.
+    TypeError
+        On unsupported dtype kinds (object, void, etc.).
     """
-
     if not columns:
         raise ValueError("Cannot write an empty column mapping.")
 
@@ -414,6 +476,56 @@ def write_dataset(
         }
         for name in column_names
     ]
+
+    if expected_schema is not None:
+        if len(expected_schema) != len(columns_meta):
+            raise ValueError(
+                f"Schema mismatch: file has {len(expected_schema)} columns, "
+                f"got {len(columns_meta)}."
+            )
+        for expected, actual in zip(expected_schema, columns_meta, strict=True):
+            if expected["name"] != actual["name"]:
+                raise ValueError(
+                    f"Column name mismatch: file expects {expected['name']!r}, "
+                    f"got {actual['name']!r}."
+                )
+            if expected["dtype"] != actual["dtype"]:
+                raise ValueError(
+                    f"Column {expected['name']!r}: file dtype {expected['dtype']!r} "
+                    f"does not match write dtype {actual['dtype']!r}."
+                )
+
+    return column_names, n_rows, little_endian_columns, columns_meta
+
+
+def write_dataset(
+    columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
+    path: PathLike,
+    *,
+    batch_size: int | None,
+    show_progress: bool,
+) -> None:
+    """Serialize a dict of 1D NumPy columns to disk in colstore format.
+
+    Writes a single-record file: file header + 32B record header + column-
+    major body + 8B padding. For multi-record streaming writes, use
+    :class:`colstore.ColStoreWriter`.
+
+    Parameters
+    ----------
+    columns : dict[str, numpy.ndarray]
+        Mapping of column name to a 1D fixed-size array. All columns must share
+        the same length.
+    path : str or os.PathLike
+        Destination path.
+    batch_size : int or None
+        Number of rows written per ``tofile`` call, used only to drive the
+        progress bar. ``None`` or any value ``<= 0`` writes each column in a
+        single call (no batching). Has no effect on the bytes written.
+    show_progress : bool
+        Whether to display a tqdm progress bar.
+    """
+    column_names, n_rows, little_endian_columns, columns_meta = normalize_columns(columns)
 
     # ``None`` or any non-positive value means "write each column in one call".
     effective_batch = batch_size if (batch_size is not None and batch_size > 0) else 0

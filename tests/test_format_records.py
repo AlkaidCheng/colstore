@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 from _format_fixture import expected_column_values, write_record_file
 
-from colstore import ColStore
+from colstore import ColStoreReader
 from colstore import format as fmt
 from colstore.format import FormatError
 
@@ -82,7 +82,7 @@ def test_introspection_matches_logical_data(tmp_path, n_records):
     records = _make_records(n_records)
     write_record_file(path, _schema(), records)
     expected_total = sum(len(r["i32"]) for r in records)
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         assert ds.n_rows == expected_total
         assert ds.columns == ["i32", "f64", "i8"]
         assert ds.shape == (expected_total, 3)
@@ -96,7 +96,7 @@ def test_dispatches_fast_path_for_single_record(tmp_path, n_records, expected_mu
     """R==1 takes the single-record fast path; R>1 takes the multi-record path."""
     path = tmp_path / "dispatch.cstore"
     write_record_file(path, _schema(), _make_records(n_records))
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         assert ds._is_multi_record is expected_multi
 
 
@@ -109,7 +109,7 @@ def test_full_table_read_concatenates_records(tmp_path, n_records):
     path = tmp_path / "full.cstore"
     records = _make_records(n_records)
     write_record_file(path, _schema(), records)
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         for name, _ in _schema():
             expected = expected_column_values(records, name)
             got = ds[:, name].to_array()
@@ -123,7 +123,7 @@ def test_slice_within_and_across_records(tmp_path, n_records):
     records = _make_records(n_records)
     write_record_file(path, _schema(), records)
     total = sum(len(r["i32"]) for r in records)
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         truth = expected_column_values(records, "i32")
         # Slice strictly inside the first record.
         assert np.array_equal(ds[0:3, "i32"].to_array(), truth[0:3])
@@ -143,7 +143,7 @@ def test_scalar_integer_index(tmp_path, n_records):
     write_record_file(path, _schema(), records)
     truth = expected_column_values(records, "f64")
     total = truth.shape[0]
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         assert np.array_equal(ds[0, "f64"].to_array(), truth[0:1])
         # In the middle (likely crosses a record boundary if R > 1).
         mid = total // 2
@@ -174,7 +174,7 @@ def test_fancy_index_returns_correct_values(tmp_path, n_records, pattern):
         indices = np.arange(min(5, first_record_len))
     indices = indices.astype(np.int64)
 
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[indices, "i32"].to_array()
         assert np.array_equal(got, truth[indices])
 
@@ -187,7 +187,7 @@ def test_boolean_mask(tmp_path, n_records):
     write_record_file(path, _schema(), records)
     truth = expected_column_values(records, "i32")
     mask = (truth % 3) == 0
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         assert np.array_equal(ds[mask, "i32"].to_array(), truth[mask])
 
 
@@ -200,7 +200,7 @@ def test_negative_indices_fold(tmp_path, n_records):
     truth = expected_column_values(records, "i32")
     total = truth.shape[0]
     indices = np.array([-1, -2, 0, -total])
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         assert np.array_equal(ds[indices, "i32"].to_array(), truth[indices])
 
 
@@ -215,7 +215,7 @@ def test_multi_column_to_dict(tmp_path, n_records):
     write_record_file(path, _schema(), records)
     truth = {name: expected_column_values(records, name) for name, _ in _schema()}
     indices = np.array([0, 3, len(truth["i32"]) - 1])
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[indices, ["i32", "f64", "i8"]].to_dict()
         for name in got:
             assert np.array_equal(got[name], truth[name][indices]), f"col {name}"
@@ -238,7 +238,7 @@ def test_record_body_padding_to_8_bytes(tmp_path):
     ]
     path = tmp_path / "pad.cstore"
     write_record_file(path, schema, records)
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         assert ds.n_rows == 8
         # Both records read back intact, demonstrating the second record
         # header was found at the right offset despite the first body padding.
@@ -267,7 +267,7 @@ def test_corrupt_record_magic_raises(tmp_path):
     _, data_offset = fmt.read_header(path)
     _corrupt_record_field(path, data_offset, 0, b"BAD\x00")
     with pytest.raises(FormatError, match="record magic"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_mismatched_record_index_raises(tmp_path):
@@ -286,7 +286,7 @@ def test_mismatched_record_index_raises(tmp_path):
     # CRC will also mismatch; either error message is acceptable -- both are
     # FormatError, both correctly identify a broken header.
     with pytest.raises(FormatError):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_corrupt_record_crc_raises(tmp_path):
@@ -297,7 +297,7 @@ def test_corrupt_record_crc_raises(tmp_path):
     # CRC is at offset 28 of the header (last 4 bytes).
     _corrupt_record_field(path, data_offset, 28, b"\xff\xff\xff\xff")
     with pytest.raises(FormatError, match="CRC"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_truncated_file_raises(tmp_path):
@@ -309,13 +309,13 @@ def test_truncated_file_raises(tmp_path):
     # n_records=3 but we leave only enough bytes for ~one record body.
     path.write_bytes(data[: len(data) // 2])
     with pytest.raises(FormatError):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 # ---- Per-pattern fast paths --------------------------------------------------
 #
 # Three optimizations on top of the multi-record reader (see
-# ColStore._gather_one_multi_record): a contiguous-range path for slices,
+# ColStoreReader._gather_one_multi_record): a contiguous-range path for slices,
 # a boundary-based partition for sorted fancy indices, and a fall-through
 # searchsorted path for unsorted indices. These tests cover correctness at
 # the boundaries where the optimizations diverge from the generic path --
@@ -335,7 +335,7 @@ def test_slice_boundary_starting_exactly_on_record_boundary(tmp_path):
     truth = expected_column_values(records, "i32")
     # First row of record 1 = total rows in record 0.
     record1_start = len(records[0]["i32"])
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[record1_start:, "i32"].to_array()
         assert np.array_equal(got, truth[record1_start:])
 
@@ -353,7 +353,7 @@ def test_slice_boundary_ending_exactly_on_record_boundary(tmp_path):
     truth = expected_column_values(records, "i32")
     # End-of-record-1 boundary.
     boundary = len(records[0]["i32"]) + len(records[1]["i32"])
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[:boundary, "i32"].to_array()
         assert np.array_equal(got, truth[:boundary])
 
@@ -367,7 +367,7 @@ def test_slice_fully_inside_one_record(tmp_path):
     # Pick a slice inside record 2 (rows [r0+r1, r0+r1+r2)).
     r0, r1, r2 = (len(records[i]["i32"]) for i in range(3))
     a, b = r0 + r1 + 1, r0 + r1 + r2 - 1
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[a:b, "i32"].to_array()
         assert np.array_equal(got, truth[a:b])
 
@@ -383,7 +383,7 @@ def test_slice_with_non_unit_step_still_correct(tmp_path):
     records = _make_records(4)
     write_record_file(path, _schema(), records)
     truth = expected_column_values(records, "i32")
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[1:20:3, "i32"].to_array()
         assert np.array_equal(got, truth[1:20:3])
         got = ds[::5, "i32"].to_array()
@@ -408,7 +408,7 @@ def test_sorted_fancy_index_matches_unsorted_fancy_index(tmp_path):
     sorted_idx = np.sort(rng.choice(truth.shape[0], size=20, replace=False)).astype(np.int64)
     permutation = rng.permutation(sorted_idx.shape[0])
     unsorted_idx = sorted_idx[permutation]
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         sorted_out = ds[sorted_idx, "i32"].to_array()
         unsorted_out = ds[unsorted_idx, "i32"].to_array()
         # The two reads produce the same values in different orders.
@@ -433,7 +433,7 @@ def test_sorted_with_duplicates_uses_correct_path(tmp_path):
     boundary = len(records[0]["i32"])  # first row of record 1
     idx = np.array([0, 0, 1, boundary - 1, boundary, boundary, boundary + 1], dtype=np.int64)
     assert np.all(idx[1:] >= idx[:-1])  # confirm sortedness predicate
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         got = ds[idx, "i32"].to_array()
         assert np.array_equal(got, truth[idx])
 
@@ -466,7 +466,7 @@ def test_slice_across_zero_row_record(tmp_path):
     ]
     write_record_file(path, _schema(), records)
     truth = expected_column_values(records, "i32")
-    with ColStore(path) as ds:
+    with ColStoreReader(path) as ds:
         # Slice spans the zero-row record.
         got = ds[3:7, "i32"].to_array()
         assert np.array_equal(got, truth[3:7])

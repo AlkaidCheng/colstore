@@ -15,7 +15,8 @@ import warnings
 import numpy as np
 import pytest
 
-from colstore import FILE_EXTENSION, ColStore, FormatError
+import colstore
+from colstore import FILE_EXTENSION, ColStoreReader, FormatError
 from colstore import format as fmt
 from colstore.format import (
     align_up,
@@ -162,7 +163,7 @@ def test_write_rejects_unsupported_dtype_kind(tmp_path):
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_fixed_width_bytes_roundtrip(tmp_path, backend):
     columns = {"name": np.array([b"alice", b"bob", b"carol"], dtype="S8")}
-    store = ColStore.from_dict(columns, tmp_path / "s.cstore", show_progress=False, backend=backend)
+    store = colstore.store(columns, tmp_path / "s.cstore", show_progress=False, backend=backend)
     result = store[np.array([2, 0]), "name"].to_array()
     assert result.tolist() == [b"carol", b"alice"]
     store.close()
@@ -171,7 +172,7 @@ def test_fixed_width_bytes_roundtrip(tmp_path, backend):
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_fixed_width_unicode_roundtrip(tmp_path, backend):
     columns = {"label": np.array(["alpha", "beta", "gamma"], dtype="U10")}
-    store = ColStore.from_dict(columns, tmp_path / "u.cstore", show_progress=False, backend=backend)
+    store = colstore.store(columns, tmp_path / "u.cstore", show_progress=False, backend=backend)
     assert store[1:3, "label"].to_array().tolist() == ["beta", "gamma"]
     # Fancy index exercises the kernel-fallback path for unicode.
     assert store[np.array([2, 0]), "label"].to_array().tolist() == ["gamma", "alpha"]
@@ -184,7 +185,7 @@ def test_datetime64_roundtrip(tmp_path, backend):
     # cpp/numba backends must not warn here; they silently fall back to NumPy.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        store = ColStore.from_dict(
+        store = colstore.store(
             {"t": values}, tmp_path / "dt.cstore", show_progress=False, backend=backend
         )
         result = store[np.array([1, 0]), "t"].to_array()
@@ -197,7 +198,7 @@ def test_big_endian_input_stored_little_endian(tmp_path):
     write_dataset({"v": np.arange(5, dtype=">i4")}, path, batch_size=None, show_progress=False)
     manifest, _ = read_header(path)
     assert manifest["columns"][0]["dtype"] == "<i4"
-    store = ColStore(path, backend="numpy")
+    store = ColStoreReader(path, backend="numpy")
     assert store["v"].to_array().tolist() == [0, 1, 2, 3, 4]
     assert store.dtypes["v"].byteorder in ("=", "<", "|")
     store.close()
@@ -232,7 +233,7 @@ def test_truncated_file_raises(tmp_path):
     )
     path.write_bytes(path.read_bytes()[:-8])
     with pytest.raises(FormatError, match="truncated"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 def test_corrupt_manifest_checksum_raises(tmp_path):
@@ -241,39 +242,66 @@ def test_corrupt_manifest_checksum_raises(tmp_path):
         {"alpha": np.arange(3, dtype=np.float64)}, path, batch_size=None, show_progress=False
     )
     raw = bytearray(path.read_bytes())
-    manifest_size = struct.unpack("<Q", raw[8:16])[0]
-    manifest = json.loads(raw[16 : 16 + manifest_size])
-    # Equal-length edit: change content without resizing the header.
+    # Layout: magic (8) + counters (32) + manifest_len (8) + manifest (...).
+    manifest_len_offset = len(fmt._MAGIC) + fmt._COUNTERS_SIZE
+    manifest_offset = manifest_len_offset + fmt._MANIFEST_LEN_SIZE
+    manifest_size = struct.unpack("<Q", raw[manifest_len_offset:manifest_offset])[0]
+    manifest = json.loads(raw[manifest_offset : manifest_offset + manifest_size])
+    # Equal-length edit: change content without resizing the manifest.
     manifest["columns"][0]["name"] = "ALPHA"
     edited = json.dumps(manifest).encode("utf-8")
     assert len(edited) == manifest_size
-    raw[16 : 16 + manifest_size] = edited
+    raw[manifest_offset : manifest_offset + manifest_size] = edited
     path.write_bytes(bytes(raw))
     with pytest.raises(FormatError, match="checksum"):
-        ColStore(path)
+        ColStoreReader(path)
+
+
+def test_corrupt_counters_block_raises(tmp_path):
+    """The counters block (n_records + committed_rows + CRC) sits at fixed
+    offset 8. A bit-flip there must surface as a clean FormatError before
+    the manifest is even parsed.
+    """
+    path = tmp_path / "ct.cstore"
+    write_dataset({"x": np.arange(3, dtype=np.float64)}, path, batch_size=None, show_progress=False)
+    raw = bytearray(path.read_bytes())
+    # Flip a bit inside the n_records field. The counters CRC will mismatch.
+    raw[len(fmt._MAGIC)] ^= 0xFF
+    path.write_bytes(bytes(raw))
+    with pytest.raises(FormatError, match=r"[Cc]ounters"):
+        ColStoreReader(path)
 
 
 def test_unsupported_version_raises(tmp_path):
     path = tmp_path / "v.cstore"
     write_dataset({"x": np.arange(4, dtype=np.float64)}, path, batch_size=None, show_progress=False)
     manifest, data_offset = read_header(path)
-    manifest["format_version"] = 999
-    manifest["manifest_crc32"] = fmt._manifest_checksum(
-        manifest["columns"], manifest["n_records"], manifest["committed_rows"]
+    n_records = manifest["n_records"]
+    committed_rows = manifest["committed_rows"]
+    # Rebuild the JSON manifest with format_version corrupted to an unsupported
+    # value; the counters block stays valid (we just want to trip the version
+    # check, not the CRC check).
+    bad_manifest = {
+        "format_version": 999,
+        "columns": manifest["columns"],
+        "manifest_crc32": fmt._manifest_checksum(manifest["columns"]),
+    }
+    manifest_bytes = json.dumps(bad_manifest).encode("utf-8")
+    header_size = (
+        len(fmt._MAGIC) + fmt._COUNTERS_SIZE + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
     )
-    manifest_bytes = json.dumps(manifest).encode("utf-8")
-    header_size = len(fmt._MAGIC) + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
     new_offset = align_up(header_size)
     # Everything past data_offset (record header + body) is preserved verbatim.
     body_bytes = path.read_bytes()[data_offset:]
     with open(path, "wb") as handle:
         handle.write(fmt._MAGIC)
+        handle.write(fmt._pack_counters(n_records, committed_rows))
         handle.write(struct.pack(fmt._MANIFEST_LEN_FMT, len(manifest_bytes)))
         handle.write(manifest_bytes)
         handle.write(b"\x00" * (new_offset - header_size))
         handle.write(body_bytes)
     with pytest.raises(FormatError, match="format_version"):
-        ColStore(path)
+        ColStoreReader(path)
 
 
 # ---- Batching is a no-op on output bytes -----------------------------------

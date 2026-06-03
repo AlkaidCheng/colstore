@@ -70,7 +70,7 @@ def test_thread_count_resolution_rules():
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
 def test_gather_correct_under_various_caps(tmp_path):
-    store = colstore.ColStore.from_dict(
+    store = colstore.store(
         {"a": np.arange(5000, dtype=np.float64)},
         tmp_path / "caps.cstore",
         show_progress=False,
@@ -156,20 +156,18 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
     # on the divided value the dispatcher computes, and on correct output.
     captured: dict[str, int | None] = {}
 
-    import colstore.store as store_mod
+    import colstore.reader as store_mod
 
-    real_gather_one = store_mod.ColStore._gather_one
+    real_gather_one = store_mod.ColStoreReader._gather_one
 
     def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
         captured[column_name] = thread_cap
         return real_gather_one(self, column_name, row_indexer, thread_cap)
 
-    monkeypatch.setattr(store_mod.ColStore, "_gather_one", spy)
+    monkeypatch.setattr(store_mod.ColStoreReader, "_gather_one", spy)
 
     columns = {f"c{i}": np.arange(100, dtype=np.float64) + i for i in range(4)}
-    store = colstore.ColStore.from_dict(
-        columns, tmp_path / "many.cstore", show_progress=False, backend="cpp"
-    )
+    store = colstore.store(columns, tmp_path / "many.cstore", show_progress=False, backend="cpp")
     original_cap = config.get_gather_thread_cap()
     original_workers = config.get_max_workers()
     try:
@@ -191,19 +189,17 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
 def test_gather_many_cap_never_below_one(tmp_path, monkeypatch):
     # With more concurrent columns than the cap, each kernel floors at 1 thread.
     captured: dict[str, int | None] = {}
-    import colstore.store as store_mod
+    import colstore.reader as store_mod
 
-    real = store_mod.ColStore._gather_one
+    real = store_mod.ColStoreReader._gather_one
 
     def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
         captured[column_name] = thread_cap
         return real(self, column_name, row_indexer, thread_cap)
 
-    monkeypatch.setattr(store_mod.ColStore, "_gather_one", spy)
+    monkeypatch.setattr(store_mod.ColStoreReader, "_gather_one", spy)
     columns = {f"c{i}": np.arange(50, dtype=np.float32) for i in range(6)}
-    store = colstore.ColStore.from_dict(
-        columns, tmp_path / "floor.cstore", show_progress=False, backend="cpp"
-    )
+    store = colstore.store(columns, tmp_path / "floor.cstore", show_progress=False, backend="cpp")
     original_cap = config.get_gather_thread_cap()
     original_workers = config.get_max_workers()
     try:

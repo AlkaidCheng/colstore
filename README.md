@@ -2,12 +2,12 @@
 
 A memory-mapped columnar binary format for fast, memory-efficient I/O on
 structured arrays. `colstore` lets you write a tabular dataset to a single
-`.cstore` file once and then load arbitrary row/column subsets without
-materializing the rest. Internally, columns are stored back-to-back as raw
-NumPy bytes, reads use `np.memmap`, and fancy-index gathers run through a
-parallel C++ kernel (OpenMP + software prefetching) bound via Cython. Process
-memory stays bounded by the size of the output you ask for; the source file
-is never fully read into RAM.
+`.cstore` file (in one shot or streamed across many records) and then load
+arbitrary row/column subsets without materializing the rest. Internally,
+columns are stored back-to-back as raw NumPy bytes, reads use `np.memmap`,
+and fancy-index gathers run through a parallel C++ kernel (OpenMP + software
+prefetching) bound via Cython. Process memory stays bounded by the size of
+the output you ask for; the source file is never fully read into RAM.
 
 ## Install
 
@@ -22,10 +22,13 @@ build still succeeds but the kernel runs single-threaded.
 ## Quick start
 
 ```python
-from colstore import ColStore
+import colstore
 
-# Write and open in one call. `.cstore` is the canonical extension.
-ds = ColStore.from_dataframe(df, "data.cstore")
+# One-shot write + open. `.cstore` is the canonical extension.
+ds = colstore.store(df, "data.cstore")
+
+# Or open an existing file for read.
+ds = colstore.open("data.cstore")
 
 # Indexing returns lazy views; no data is read yet.
 ds['price']                          # ColumnView
@@ -41,24 +44,52 @@ ds[indices, ['price', 'qty']].to_record()       # structured ndarray
 ds[indices, ['price', 'qty']].to_dataframe()    # pandas DataFrame
 ```
 
-## Writing from other sources
+## Writing
+
+`colstore.store(data, path)` is the one-shot path; it dispatches on the
+input type:
 
 ```python
-from colstore import ColStore
+import colstore
 import numpy as np
 
 # From a dict of 1D arrays.
-ColStore.from_dict(
+colstore.store(
     {"x": np.arange(100, dtype=np.float32), "y": np.arange(100, dtype=np.int64)},
     "data.cstore",
 )
 
 # From a structured (record) array.
 records = np.empty(100, dtype=[("price", np.float32), ("qty", np.int32)])
-ColStore.from_records(records, "data.cstore")
+colstore.store(records, "data.cstore", mode="recreate")
+
+# From a pandas DataFrame.
+colstore.store(df, "data.cstore", mode="recreate")
 ```
 
-Each factory returns an opened `ColStore` ready to read from.
+`mode="create"` (default) refuses to overwrite; `mode="recreate"` truncates
+an existing file.
+
+For multi-record streaming writes (data arriving in batches, or appending
+to an existing file), use `colstore.create` / `colstore.recreate` /
+`colstore.update`:
+
+```python
+# Append-only stream into a new file.
+with colstore.create("data.cstore") as f:
+    for batch in source:
+        f.write({"x": batch.x, "y": batch.y})
+
+# Resume appending to an existing file. Schema is loaded from the manifest
+# and every write must match it. Bytes from a crashed prior writer are
+# truncated on open.
+with colstore.update("data.cstore") as f:
+    f.write({"x": more_x, "y": more_y})
+```
+
+The writer commits records atomically on `close()` by rewriting a 32-byte
+counters block. A reader opening the file mid-write sees only what the
+last successful close committed.
 
 ## Configuration
 
@@ -74,15 +105,22 @@ set_default_backend("cpp")        # gather kernel: cpp | numpy | numba
 
 ```
 [magic 8B = b"CSTORE\x00\x01"]
+[counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
 [manifest_len 8B (u64 little-endian)]
-[manifest_json]
+[manifest_json: format_version + columns + manifest_crc32]
 [zero-padding to 64-byte alignment]
-[column_0 raw bytes][column_1 raw bytes]...[column_n raw bytes]
+[record_0 header 32B][record_0 body, padded to 8B]
+[record_1 header 32B][record_1 body, padded to 8B]
+...
 ```
 
-The manifest is a small JSON object recording `format_version`, `n_rows`,
-and per-column `{name, dtype}`. Column dtypes are preserved byte-for-byte;
-columns are stored back-to-back with no per-row overhead.
+The JSON manifest is immutable and carries only the schema; the mutable
+record/row counters live in their own fixed-position 32-byte block (with
+its own CRC) right after the magic. Each record body holds the columns
+back-to-back as raw bytes. A one-shot write produces a single-record file
+that reads via a per-column memmap fast path; a streamed write produces a
+multi-record file with per-pattern dispatch (contiguous range, sorted
+fancy, unsorted fancy).
 
 ## Supported dtypes
 

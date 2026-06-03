@@ -2,7 +2,7 @@
 
 A colstore file is a sequence of records. After a single ``from_dict`` /
 ``from_dataframe`` / ``from_records`` call the file has exactly one record;
-after many small writes via :class:`ColWriter` (PR 3) it has many. The
+after many small writes via :class:`ColStoreWriter` (PR 3) it has many. The
 reader takes different code paths for these two cases:
 
 1. Single record: per-column memmaps + the element-indexed ``gather``
@@ -44,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from _format_fixture import write_record_file
 
-from colstore import ColStore
+from colstore import ColStoreReader
 
 
 def _make_file(path: Path, n_rows: int, n_records: int, dtype: np.dtype) -> None:
@@ -127,14 +127,14 @@ def main() -> None:
         print("-" * len(header))
 
         # Baseline: R=1 (post-compaction). All other counts compared against it.
-        ds_baseline = ColStore(paths[1])
+        ds_baseline = ColStoreReader(paths[1])
         assert ds_baseline._is_multi_record is False, "R=1 should take the fast path"
         t_baseline = _best(lambda d=ds_baseline, s=selector: d[s, "x"].to_array(), args.repeats)
         ds_baseline.close()
         print(f"{'R=1':<10} {t_baseline * 1000:>10.3f}  {'1.00x':>8}")
 
         for n_rec in args.record_counts:
-            ds = ColStore(paths[n_rec])
+            ds = ColStoreReader(paths[n_rec])
             assert ds._is_multi_record is True
             t = _best(lambda d=ds, s=selector: d[s, "x"].to_array(), args.repeats)
             ds.close()

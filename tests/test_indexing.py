@@ -1,4 +1,4 @@
-"""Tests for ColStore indexing semantics across every documented pattern."""
+"""Tests for ColStoreReader indexing semantics across every documented pattern."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from colstore import ColStore
+import colstore
 from colstore.kernels import cpp_available, numba_available
 
 # Index validation runs against every available gather backend so the
@@ -24,7 +24,7 @@ def validation_store(tmp_path, request):
     frame = pd.DataFrame(
         {"a": np.arange(100, dtype=np.float64), "c": np.arange(100, dtype=np.int64)}
     )
-    opened = ColStore.from_dataframe(
+    opened = colstore.store(
         frame, tmp_path / "idx.cstore", show_progress=False, backend=request.param
     )
     yield opened

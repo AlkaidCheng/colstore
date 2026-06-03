@@ -1,6 +1,6 @@
-"""The ColStore class: a memory-mapped, columnar, randomly-accessible store.
+"""The ColStoreReader class: a memory-mapped, columnar, randomly-accessible store.
 
-A ``ColStore`` opens a ``.cstore`` file and exposes its columns through a
+A ``ColStoreReader`` opens a ``.cstore`` file and exposes its columns through a
 NumPy/pandas-like indexing API that returns lazy view objects. Single-string
 column selection yields a :class:`ColumnView`; every other shape yields a
 :class:`TableView`. The package is positioned as an **I/O library for a
@@ -30,7 +30,7 @@ from . import config, format, kernels
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
-    import pandas as pd
+    pass
 
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
@@ -43,7 +43,7 @@ _MADVISE_FLAGS: dict[str, int] = {
 _USE_DEFAULT_MADVISE = "__default__"
 
 
-class ColStore:
+class ColStoreReader:
     """Memory-mapped columnar store with lazy, NumPy-style indexing.
 
     Opening a store reads its header, creates one ``np.memmap`` per column,
@@ -73,7 +73,7 @@ class ColStore:
 
     Examples
     --------
-    >>> ds = ColStore.from_dataframe(df, "data.cstore")
+    >>> ds = colstore.store(df, "data.cstore")
     >>> ds['price']                      # ColumnView -> to_array()
     >>> ds[100:200, ['price', 'qty']]    # TableView -> to_dict / to_record / to_dataframe
     """
@@ -165,69 +165,6 @@ class ColStore:
         self._backend = backend or config.get_default_backend()
         self._max_workers_override = max_workers
 
-    # ---- Factory methods -----------------------------------------------
-
-    @classmethod
-    def from_dataframe(
-        cls,
-        frame: pd.DataFrame,
-        path: str | os.PathLike[str],
-        *,
-        batch_size: int | None = 100_000,
-        show_progress: bool = True,
-        **open_kwargs: Any,
-    ) -> ColStore:
-        """Write a pandas DataFrame to disk and open the result."""
-        columns: dict[str, NDArray[Any]] = {}
-        for column_name in frame.columns:
-            series = frame[column_name]
-            array = series.to_numpy()
-            if array.dtype.kind == "O":
-                raise TypeError(
-                    f"Column {column_name!r} (pandas dtype {series.dtype}) converts to "
-                    f"an object array and cannot be stored. Cast it to a fixed-size NumPy "
-                    f"dtype (e.g. float64, int64, or a fixed-width string like 'S16') first."
-                )
-            columns[str(column_name)] = array
-        format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
-        return cls(path, **open_kwargs)
-
-    @classmethod
-    def from_dict(
-        cls,
-        columns: dict[str, NDArray[Any]],
-        path: str | os.PathLike[str],
-        *,
-        batch_size: int | None = 100_000,
-        show_progress: bool = True,
-        **open_kwargs: Any,
-    ) -> ColStore:
-        """Write a dict of 1D NumPy column arrays to disk and open the result."""
-        normalized: dict[str, NDArray[Any]] = {
-            str(name): np.ascontiguousarray(array) for name, array in columns.items()
-        }
-        format.write_dataset(normalized, path, batch_size=batch_size, show_progress=show_progress)
-        return cls(path, **open_kwargs)
-
-    @classmethod
-    def from_records(
-        cls,
-        records: NDArray[Any],
-        path: str | os.PathLike[str],
-        *,
-        batch_size: int = 100_000,
-        show_progress: bool = True,
-        **open_kwargs: Any,
-    ) -> ColStore:
-        """Write a structured (record) NumPy array to disk and open the result."""
-        if records.dtype.names is None:
-            raise TypeError("Expected a structured ndarray with named fields.")
-        columns: dict[str, NDArray[Any]] = {
-            name: np.ascontiguousarray(records[name]) for name in records.dtype.names
-        }
-        format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
-        return cls(path, **open_kwargs)
-
     # ---- Read-only properties ------------------------------------------
 
     @property
@@ -297,7 +234,7 @@ class ColStore:
         column_preview = self.columns[:5]
         suffix = "..." if len(self._column_dtypes) > len(column_preview) else ""
         return (
-            f"ColStore(path={self._path.name!r}, "
+            f"ColStoreReader(path={self._path.name!r}, "
             f"shape={self.shape}, columns={column_preview}{suffix})"
         )
 
@@ -316,7 +253,7 @@ class ColStore:
             del self._file_mmap
         self._closed = True
 
-    def __enter__(self) -> ColStore:
+    def __enter__(self) -> ColStoreReader:
         return self
 
     def __exit__(
@@ -428,7 +365,7 @@ class ColStore:
         oversubscribe.
         """
         if self._closed:
-            raise ValueError("ColStore is closed.")
+            raise ValueError("ColStoreReader is closed.")
         if self._is_multi_record:
             return self._gather_one_multi_record(column_name, row_indexer, thread_cap)
         # Single-record fast path: one per-column memmap; the read is a
