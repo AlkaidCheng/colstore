@@ -20,7 +20,7 @@ import numpy as np
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .store import ColStore
+    from ._store import ColStore
 
 _RowIndexer = int | slice | np.ndarray | None
 

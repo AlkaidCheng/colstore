@@ -78,7 +78,7 @@ from .config import (
 )
 from .format import FILE_EXTENSION, FormatError
 from .kernels import cpp_available, max_threads, numba_available
-from .store import ColStore
+from ._store import ColStore
 from .view import ColumnView, TableView
 
 apply_cached_cap_if_present()
