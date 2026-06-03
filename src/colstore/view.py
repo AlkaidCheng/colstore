@@ -3,9 +3,9 @@
 Two concrete classes implement the public surface:
 
 * :class:`ColumnView` — produced by ``ds['col']`` or ``ds[rows, 'col']``.
-  Supports only :meth:`to_array`.
+  Supports only :meth:`array`.
 * :class:`TableView` — produced by every other indexing pattern.
-  Supports :meth:`to_dict`, :meth:`to_record`, and :meth:`to_dataframe`.
+  Supports :meth:`dict`, :meth:`recarray`, and :meth:`frame`.
 
 Both share a tiny base class for the row-indexer normalization logic; that
 base is internal and not part of the public API.
@@ -110,9 +110,9 @@ class _BaseView:
 class ColumnView(_BaseView):
     """Lazy view of a single column produced by indexing with a string name.
 
-    Materializes to a 1D ``numpy.ndarray`` via :meth:`to_array`. No other
-    materialization method is available; calling :meth:`to_dict`,
-    :meth:`to_record`, or :meth:`to_dataframe` here would not make sense and
+    Materializes to a 1D ``numpy.ndarray`` via :meth:`array`. No other
+    materialization method is available; calling :meth:`dict`,
+    :meth:`recarray`, or :meth:`frame` here would not make sense and
     those methods are intentionally absent from this class.
     """
 
@@ -143,7 +143,7 @@ class ColumnView(_BaseView):
         """NumPy dtype of the selected column."""
         return self._store.dtypes[self._column_name]
 
-    def to_array(self) -> np.ndarray:
+    def array(self) -> np.ndarray:
         """Materialize as a 1D owning ndarray.
 
         Returns
@@ -158,8 +158,8 @@ class ColumnView(_BaseView):
 class TableView(_BaseView):
     """Lazy view of multiple columns produced by any non-string indexing.
 
-    Materializes through one of :meth:`to_dict`, :meth:`to_record`, or
-    :meth:`to_dataframe`. There is intentionally no ``to_array`` method —
+    Materializes through one of :meth:`dict`, :meth:`recarray`, or
+    :meth:`frame`. There is intentionally no ``array`` method —
     multiple columns generally have different dtypes and cannot be packed
     into a single homogeneous ndarray.
     """
@@ -196,7 +196,7 @@ class TableView(_BaseView):
         """Per-column NumPy dtypes."""
         return {name: self._store.dtypes[name] for name in self._column_names}
 
-    def to_dict(self) -> dict[str, np.ndarray]:
+    def dict(self) -> dict[str, np.ndarray]:
         """Materialize as a dict mapping column name to 1D ndarray.
 
         Returns
@@ -207,7 +207,7 @@ class TableView(_BaseView):
         """
         return self._store._gather_many(self._column_names, self._resolve_row_indexer())
 
-    def to_record(self) -> np.ndarray:
+    def recarray(self) -> np.ndarray:
         """Materialize as a structured (record) ndarray with one field per column.
 
         Returns
@@ -215,7 +215,7 @@ class TableView(_BaseView):
         numpy.ndarray
             Structured 1D array. ``result[name]`` returns the column.
         """
-        column_data = self.to_dict()
+        column_data = self.dict()
         n_records = next(iter(column_data.values())).shape[0]
         record_dtype = np.dtype([(name, column_data[name].dtype) for name in self._column_names])
         record_array = np.empty(n_records, dtype=record_dtype)
@@ -223,7 +223,7 @@ class TableView(_BaseView):
             record_array[name] = column_data[name]
         return record_array
 
-    def to_dataframe(self) -> pd.DataFrame:
+    def frame(self) -> pd.DataFrame:
         """Materialize as a pandas DataFrame.
 
         Returns
@@ -233,4 +233,4 @@ class TableView(_BaseView):
         """
         import pandas as pd
 
-        return pd.DataFrame(self.to_dict())
+        return pd.DataFrame(self.dict())

@@ -2,19 +2,20 @@
 
 ``colstore`` provides a compact on-disk container for tabular, fixed-size
 numeric data. A ``.cstore`` file stores each column as a contiguous block of
-raw bytes preceded by a small JSON manifest. Reads use ``numpy.memmap`` plus
-a parallel C++ gather kernel, so process memory stays bounded by the size of
-the materialized output even when the file on disk is much larger.
+raw bytes; reads use ``numpy.memmap`` plus a parallel C++ gather kernel, so
+process memory stays bounded by the size of the materialized output even
+when the file on disk is much larger.
 
-The package centers on:
+The public surface centers on:
 
-* :class:`ColStoreReader` — opens a ``.cstore`` file and exposes NumPy/pandas-style
-  indexing returning lazy views.
-* :class:`ColumnView` — lazy single-column view produced by ``ds['col']``;
-  materializes with :meth:`ColumnView.to_array`.
-* :class:`TableView` — lazy multi-column view; materializes with
-  :meth:`TableView.to_dict`, :meth:`TableView.to_record`, or
-  :meth:`TableView.to_dataframe`.
+* :func:`open` / :func:`store` / :func:`create` / :func:`recreate` /
+  :func:`update` -- module-level entry points for reading and writing.
+* :func:`compact` -- collapse a multi-record file into a single-record file.
+* :func:`info` / :func:`schema` -- introspect a file without reading bodies.
+* :class:`ColStoreReader` -- the underlying reader class; indexes return
+  lazy views (:class:`ColumnView` for a single column,
+  :class:`TableView` for multi-column).
+* :class:`ColStoreWriter` -- the underlying streaming writer class.
 
 Package-wide defaults (thread count, ``madvise`` hint, gather backend) live
 in :mod:`colstore.config` and can be changed at runtime.

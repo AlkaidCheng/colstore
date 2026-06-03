@@ -117,11 +117,10 @@ def test_numpy_backend_always_works():
 def test_kernel_handles_fixed_width_non_numeric_dtypes(dtype):
     """The size-dispatched kernel handles any dtype whose itemsize is 1/2/4/8.
 
-    Prior to PR 1 the kernel was templated by NumPy dtype kind ('f'/'i'/'u'/'b'),
-    so fixed-width strings, datetime64, and timedelta64 fell through to NumPy
-    even though their underlying layout is a fixed-size POD copy. The byte-
-    offset kernel doesn't care about kind -- only itemsize -- so these now
-    work natively at the kernel level.
+    The kernel dispatches by itemsize rather than NumPy dtype kind, so
+    fixed-width strings, datetime64, and timedelta64 are handled natively
+    -- their on-disk layout is a fixed-size POD copy, which is all the
+    kernel needs to know.
     """
     from colstore import _gather  # type: ignore[attr-defined]
 
@@ -158,7 +157,7 @@ def test_kernel_rejects_unsupported_itemsize():
 def test_gather_bytes_entry_point_equivalent_to_gather():
     """``gather_bytes`` with offsets = indices * itemsize matches ``gather``.
 
-    Locks in the relationship the multi-record reader (PR 2) relies on: when
+    Locks in the relationship the multi-record reader relies on: when
     no record-header arithmetic is needed, byte-offset gather degenerates
     cleanly to element-indexed gather.
     """

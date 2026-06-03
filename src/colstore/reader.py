@@ -4,9 +4,9 @@ A ``ColStoreReader`` opens a ``.cstore`` file and exposes its columns through a
 NumPy/pandas-like indexing API that returns lazy view objects. Single-string
 column selection yields a :class:`ColumnView`; every other shape yields a
 :class:`TableView`. The package is positioned as an **I/O library for a
-custom binary format**: write a structured array or DataFrame once with one
-of the ``from_*`` factories, then load arbitrary row/column subsets from disk
-with bounded process memory.
+custom binary format**: write a tabular dataset once via
+:func:`colstore.store` (one-shot) or :class:`ColStoreWriter` (streaming), then
+load arbitrary row/column subsets from disk with bounded process memory.
 """
 
 from __future__ import annotations
@@ -21,16 +21,13 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, overload
+from typing import Any, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import config, format, kernels
 from .view import ColumnView, TableView
-
-if TYPE_CHECKING:
-    pass
 
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
@@ -50,13 +47,14 @@ class ColStoreReader:
     and applies any requested kernel hints. Reads are performed through
     ``__getitem__``, which returns a lazy view: either a :class:`ColumnView`
     (single-column) or a :class:`TableView` (multi-column). The view
-    materializes when one of its ``to_*`` methods is called.
+    materializes when one of its ``array`` / ``dict`` / ``recarray`` /
+    ``frame`` methods is called.
 
     Parameters
     ----------
     path : str or pathlib.Path
-        Path to a ``.cstore`` file produced by one of the ``from_*`` factory
-        methods.
+        Path to a ``.cstore`` file produced by :func:`colstore.store` or
+        :class:`ColStoreWriter`.
     madvise : str or None, optional
         Kernel access-pattern hint applied to every column memmap. One of
         ``"normal"``, ``"sequential"``, ``"random"``, ``"willneed"``,
@@ -74,8 +72,8 @@ class ColStoreReader:
     Examples
     --------
     >>> ds = colstore.store(df, "data.cstore")
-    >>> ds['price']                      # ColumnView -> to_array()
-    >>> ds[100:200, ['price', 'qty']]    # TableView -> to_dict / to_record / to_dataframe
+    >>> ds['price']                      # ColumnView -> array()
+    >>> ds[100:200, ['price', 'qty']]    # TableView -> dict / recarray / frame
     """
 
     def __init__(
@@ -270,9 +268,7 @@ class ColStoreReader:
         """Split a ``__getitem__`` key into row part, column names, singular flag."""
         if isinstance(key, tuple):
             if len(key) != 2:
-                raise IndexError(
-                    f"Expected at most 2 elements in indexing tuple; " f"got {len(key)}."
-                )
+                raise IndexError(f"Expected at most 2 elements in indexing tuple; got {len(key)}.")
             row_part, column_part = key
         elif self._looks_like_column_spec(key):
             row_part, column_part = None, key
@@ -296,7 +292,7 @@ class ColStoreReader:
 
         unknown = [name for name in column_names if name not in self._column_dtypes]
         if unknown:
-            raise KeyError(f"Unknown column(s): {unknown}. " f"Available columns: {self.columns}")
+            raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
         return row_part, column_names, is_single_column
 
     @staticmethod
@@ -313,7 +309,7 @@ class ColStoreReader:
     def _apply_madvise(self, advice: str) -> None:
         if advice not in _MADVISE_FLAGS:
             raise ValueError(
-                f"Invalid madvise value {advice!r}; " f"expected one of {sorted(_MADVISE_FLAGS)}."
+                f"Invalid madvise value {advice!r}; expected one of {sorted(_MADVISE_FLAGS)}."
             )
         flag = _MADVISE_FLAGS[advice]
         if self._is_multi_record:
@@ -413,7 +409,7 @@ class ColStoreReader:
           can land anywhere across records, and it dominates the cost.
           Argsort + sorted-path + reindex is *slower* than this (measured)
           because argsort on K int64 costs more than searchsorted does. The
-          escape valve is :meth:`compact` (PR 4) -- collapse to a single
+          escape valve is :func:`colstore.compact` -- collapse to a single
           record and the fast path kicks in.
 
         For an integer scalar selector, the result is a length-1 ndarray

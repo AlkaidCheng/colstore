@@ -82,7 +82,7 @@ def test_gather_correct_under_various_caps(tmp_path):
     try:
         for cap in (1, 2, 8):
             config.set_gather_thread_cap(cap)
-            result = store[indices, "a"].to_array()
+            result = store[indices, "a"].array()
             assert np.array_equal(result, expected)
     finally:
         config.set_gather_thread_cap(original)
@@ -174,7 +174,7 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
         config.set_gather_thread_cap(8)
         config.set_max_workers(4)
         indices = np.array([99, 0, 50], dtype=np.int64)
-        result = store[indices, list(columns)].to_dict()
+        result = store[indices, list(columns)].dict()
         # 8 cap / 4 concurrent columns -> 2 threads each.
         assert set(captured.values()) == {2}
         # Output still correct.
@@ -205,7 +205,7 @@ def test_gather_many_cap_never_below_one(tmp_path, monkeypatch):
     try:
         config.set_gather_thread_cap(2)
         config.set_max_workers(6)
-        store[np.array([1, 2, 3]), list(columns)].to_dict()
+        store[np.array([1, 2, 3]), list(columns)].dict()
         # 2 cap / 6 columns -> floored at 1.
         assert set(captured.values()) == {1}
     finally:

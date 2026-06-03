@@ -27,7 +27,7 @@ def test_writer_writes_single_record_round_trip(tmp_path):
     with colstore.open(path) as ds:
         assert ds.n_rows == 10
         assert ds._is_multi_record is False  # single record fast path
-        assert np.array_equal(ds[:, "a"].to_array(), np.arange(10, dtype=np.float32))
+        assert np.array_equal(ds[:, "a"].array(), np.arange(10, dtype=np.float32))
 
 
 def test_writer_writes_multi_record(tmp_path):
@@ -43,7 +43,7 @@ def test_writer_writes_multi_record(tmp_path):
         assert ds.n_rows == 9
         assert ds._is_multi_record is True
         assert np.array_equal(
-            ds[:, "a"].to_array(), np.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.int32)
+            ds[:, "a"].array(), np.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.int32)
         )
 
 
@@ -117,7 +117,7 @@ def test_writer_zero_row_record_is_legal(tmp_path):
         assert w.committed_rows == 3
     with colstore.open(path) as ds:
         assert ds.n_rows == 3
-        assert np.array_equal(ds[:, "a"].to_array(), np.array([1, 2, 3]))
+        assert np.array_equal(ds[:, "a"].array(), np.array([1, 2, 3]))
 
 
 def test_writer_close_without_writing_removes_file(tmp_path):
@@ -222,7 +222,7 @@ def test_update_appends_to_existing_records(tmp_path):
                 np.array([100, 200, 300], dtype=np.int32),
             ]
         )
-        assert np.array_equal(ds[:, "a"].to_array(), expected)
+        assert np.array_equal(ds[:, "a"].array(), expected)
 
 
 def test_update_truncates_orphan_bytes(tmp_path):
@@ -253,7 +253,7 @@ def test_update_truncates_orphan_bytes(tmp_path):
         expected = np.concatenate(
             [np.arange(5, dtype=np.int32), np.array([100, 101, 102], dtype=np.int32)]
         )
-        assert np.array_equal(ds[:, "a"].to_array(), expected)
+        assert np.array_equal(ds[:, "a"].array(), expected)
 
 
 def test_update_writer_records_count_starts_from_existing(tmp_path):
@@ -283,7 +283,7 @@ def test_uncommitted_writes_are_invisible_to_readers(tmp_path):
     # Open a reader concurrently. It should see only the committed record.
     with colstore.open(path) as ds:
         assert ds.n_rows == 3
-        assert np.array_equal(ds[:, "a"].to_array(), np.arange(3, dtype=np.int32))
+        assert np.array_equal(ds[:, "a"].array(), np.arange(3, dtype=np.int32))
     w2.close()
     # After close, the new record is visible.
     with colstore.open(path) as ds:
@@ -323,7 +323,7 @@ def test_simulated_crash_loses_only_uncommitted(tmp_path):
         w3.write({"a": np.array([1000], dtype=np.int32)})
     with colstore.open(path) as ds:
         assert ds.n_rows == 4
-        assert np.array_equal(ds[:, "a"].to_array(), np.array([0, 1, 2, 1000], dtype=np.int32))
+        assert np.array_equal(ds[:, "a"].array(), np.array([0, 1, 2, 1000], dtype=np.int32))
 
 
 # ---- Advisory locking ------------------------------------------------------
@@ -393,5 +393,5 @@ def test_writer_multicol_round_trip(tmp_path):
         assert ds.n_rows == 7 + 8 + 9 + 10 + 11
         assert ds._is_multi_record is True
         # Spot-check first record's contents via slice.
-        first = ds[:7, "x"].to_array()
+        first = ds[:7, "x"].array()
         assert np.array_equal(first, np.arange(7, dtype=np.int32))

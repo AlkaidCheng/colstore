@@ -166,9 +166,12 @@ def compact(
     into one contiguous block per column, after which all reads take
     the single-record fast path.
 
-    The byte splice is done via :func:`os.sendfile` where available, so
-    memory footprint is bounded by the kernel's I/O buffer (tens of KB)
-    regardless of file size. Files much larger than RAM compact fine.
+    The byte splice goes through ``os.sendfile`` on Linux (kernel-space
+    copy with no Python-side surfacing) and ``shutil.copyfileobj`` on
+    macOS / Windows; on both paths the memory footprint is independent
+    of file size -- bounded by the kernel's sendfile buffer on Linux,
+    by ``shutil.COPY_BUFSIZE`` (64 KB) elsewhere. Files much larger
+    than RAM compact fine.
 
     Parameters
     ----------

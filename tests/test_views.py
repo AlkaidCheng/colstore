@@ -35,33 +35,33 @@ def test_row_with_multi_column_returns_table_view(small_store):
     assert isinstance(view, TableView)
 
 
-def test_column_view_to_array_preserves_dtype(small_store, small_frame):
-    result = small_store["price"].to_array()
+def test_column_view_array_preserves_dtype(small_store, small_frame):
+    result = small_store["price"].array()
     assert result.dtype == np.float32
     assert np.allclose(result, small_frame["price"].to_numpy())
 
 
-def test_column_view_does_not_have_to_dict():
-    """ColumnView does not implement to_dict / to_record / to_dataframe."""
-    assert not hasattr(ColumnView, "to_dict")
-    assert not hasattr(ColumnView, "to_record")
-    assert not hasattr(ColumnView, "to_dataframe")
+def test_column_view_does_not_have_dict():
+    """ColumnView does not implement dict / recarray / frame."""
+    assert not hasattr(ColumnView, "dict")
+    assert not hasattr(ColumnView, "recarray")
+    assert not hasattr(ColumnView, "frame")
 
 
-def test_table_view_does_not_have_to_array():
-    """TableView does not implement to_array."""
-    assert not hasattr(TableView, "to_array")
+def test_table_view_does_not_have_array():
+    """TableView does not implement array."""
+    assert not hasattr(TableView, "array")
 
 
-def test_table_view_to_dict_matches_source(small_store, small_frame):
-    result = small_store[100:200, ["price", "qty"]].to_dict()
+def test_table_view_dict_matches_source(small_store, small_frame):
+    result = small_store[100:200, ["price", "qty"]].dict()
     assert set(result) == {"price", "qty"}
     assert np.allclose(result["price"], small_frame["price"].iloc[100:200].to_numpy())
     assert np.array_equal(result["qty"], small_frame["qty"].iloc[100:200].to_numpy())
 
 
-def test_table_view_to_record_preserves_each_dtype(small_store, small_frame):
-    record_array = small_store[100:110, ["price", "qty", "flag"]].to_record()
+def test_table_view_recarray_preserves_each_dtype(small_store, small_frame):
+    record_array = small_store[100:110, ["price", "qty", "flag"]].recarray()
     assert record_array.dtype.names == ("price", "qty", "flag")
     assert record_array["price"].dtype == np.float32
     assert record_array["qty"].dtype == np.int32
@@ -69,8 +69,8 @@ def test_table_view_to_record_preserves_each_dtype(small_store, small_frame):
     assert record_array.shape == (10,)
 
 
-def test_table_view_to_dataframe_returns_dataframe(small_store, small_frame):
-    out_frame = small_store[100:110, ["price", "qty"]].to_dataframe()
+def test_table_view_frame_returns_dataframe(small_store, small_frame):
+    out_frame = small_store[100:110, ["price", "qty"]].frame()
     assert isinstance(out_frame, pd.DataFrame)
     assert list(out_frame.columns) == ["price", "qty"]
     assert len(out_frame) == 10
@@ -108,5 +108,5 @@ def test_lazy_view_does_not_read_until_materialized(small_store):
         _ = small_store[100:200, ["price", "qty"]]
     # If reads happened on construction, this loop would be much slower
     # than a single read; assertion below sanity-checks values.
-    materialized = small_store[100:200, ["price", "qty"]].to_dict()
+    materialized = small_store[100:200, ["price", "qty"]].dict()
     assert materialized["price"].shape == (100,)

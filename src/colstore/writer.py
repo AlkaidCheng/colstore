@@ -164,7 +164,6 @@ class ColStoreWriter:
         typically atomic at the syscall level; the embedded CRC catches a
         torn write on next open if it isn't.
         """
-        self._file.seek(fmt._COUNTERS_OFFSET)
         fmt.write_counters(self._file, self._n_records, self._committed_rows)
         self._file.flush()
         os.fsync(self._file.fileno())

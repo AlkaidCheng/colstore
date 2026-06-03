@@ -193,23 +193,23 @@ def _build_workloads(
                 # Capture store + idx by default-arg trick so each closure
                 # binds the correct values.
                 def thunk(s=store, i=idx):
-                    return s[i, "f0"].to_array()
+                    return s[i, "f0"].array()
 
                 out.append(("gather", backend, size_label, n, pattern, thunk))
 
-    # --- to_dict: multi-column gather, exercises _gather_many's budget split. ---
+    # --- dict: multi-column gather, exercises _gather_many's budget split. ---
     for backend in backends:
         store = ColStoreReader(store_path, backend=backend)
         all_cols = store.columns
         for size_label, n in SIZES.items():
-            # One pattern (sorted) is enough for to_dict; varying both axes
+            # One pattern (sorted) is enough for dict; varying both axes
             # quadruples runtime for marginal regression-detection value.
             idx = _indices(n, "sorted", STORE_ROWS)
 
             def thunk(s=store, i=idx, cols=all_cols):
-                return s[i, cols].to_dict()
+                return s[i, cols].dict()
 
-            out.append(("to_dict", backend, size_label, n, "sorted", thunk))
+            out.append(("dict", backend, size_label, n, "sorted", thunk))
 
     # --- slice read: contiguous range, exercises memmap + copy path. ---
     for backend in backends:
@@ -218,7 +218,7 @@ def _build_workloads(
             sl = slice(0, n)
 
             def thunk(s=store, _sl=sl):
-                return s[_sl, "f0"].to_array()
+                return s[_sl, "f0"].array()
 
             out.append(("slice", backend, size_label, n, None, thunk))
 
@@ -398,9 +398,7 @@ def _compare(current: SuiteResult, baseline_path: str, noise_band: float) -> int
             f"{c.median_ms:>10.3f}  {delta_pct:>+8.1f}%  {flag}"
         )
     print()
-    print(
-        f"Summary: {regressions} cell(s) regressed beyond +{noise_band * 100:.0f}% " f"noise band."
-    )
+    print(f"Summary: {regressions} cell(s) regressed beyond +{noise_band * 100:.0f}% noise band.")
     return regressions
 
 

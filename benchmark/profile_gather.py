@@ -71,9 +71,7 @@ class Sample:
         )
         print(f"  throughput    : {gbps:8.2f} GB/s output")
         print(f"  per-element   : {ns_per_elt:8.1f} ns/elt")
-        print(
-            f"  minor faults  : {self.minflt:8d}  " f"(first-touch of pages already in page cache)"
-        )
+        print(f"  minor faults  : {self.minflt:8d}  (first-touch of pages already in page cache)")
         print(
             f"  major faults  : {self.majflt:8d}  "
             f"(first-touch requiring disk read; HUGE if non-zero)"
@@ -82,7 +80,7 @@ class Sample:
             f"  vol ctx sw    : {self.nvcsw:8d}  "
             f"(blocking syscalls; high means io_wait or lock waits)"
         )
-        print(f"  invol ctx sw  : {self.nivcsw:8d}  " f"(preemption; high under contention)")
+        print(f"  invol ctx sw  : {self.nivcsw:8d}  (preemption; high under contention)")
         print(
             f"  disk read     : {self.read_bytes / 1e6:8.2f} MB"
             f" (logical), {self.read_chars / 1e6:.2f} MB incl. cache"
@@ -207,31 +205,31 @@ def benchmark_workload(
 
         # Warm-cache run: touch every page once so subsequent measurements
         # exclude major page-fault cost.
-        ds[sorted_indices].to_dict()
+        ds[sorted_indices].dict()
 
         with measure(
-            f"[{backend}] 1M sorted indices, all {n_cols_total} cols -> to_dict",
+            f"[{backend}] 1M sorted indices, all {n_cols_total} cols -> dict",
             n_indices * n_cols_total,
             n_indices * n_cols_total * bytes_per_elt,
         ) as s:
-            ds[sorted_indices].to_dict()
+            ds[sorted_indices].dict()
         s.print()
 
         with measure(
-            f"[{backend}] 1M sorted indices, 1 col -> to_array",
+            f"[{backend}] 1M sorted indices, 1 col -> array",
             n_indices,
             n_indices * bytes_per_elt,
         ) as s:
-            ds[sorted_indices, "f0"].to_array()
+            ds[sorted_indices, "f0"].array()
         s.print()
 
-        ds[unsorted_indices, "f0"].to_array()  # warm
+        ds[unsorted_indices, "f0"].array()  # warm
         with measure(
-            f"[{backend}] 1M UNSORTED indices, 1 col -> to_array",
+            f"[{backend}] 1M UNSORTED indices, 1 col -> array",
             n_indices,
             n_indices * bytes_per_elt,
         ) as s:
-            ds[unsorted_indices, "f0"].to_array()
+            ds[unsorted_indices, "f0"].array()
         s.print()
 
         ds.close()
@@ -255,9 +253,9 @@ def benchmark_thread_sweep(
     rng = np.random.default_rng(0)
     unsorted_indices = rng.permutation(n_rows)[:n_indices].astype(np.int64)
     ds = ColStoreReader(store_path, backend="cpp")
-    ds[unsorted_indices, "f0"].to_array()  # warm
+    ds[unsorted_indices, "f0"].array()  # warm
 
-    print(f"\n{'=' * 70}\nthread-cap sweep " f"(cpp, {n_indices:,} unsorted indices, 1 col)")
+    print(f"\n{'=' * 70}\nthread-cap sweep (cpp, {n_indices:,} unsorted indices, 1 col)")
     original = config.get_gather_thread_cap()
     try:
         for cap in thread_caps:
@@ -266,7 +264,7 @@ def benchmark_thread_sweep(
             best = float("inf")
             for _ in range(3):
                 with measure(f"[cpp] thread_cap={cap}", n_indices, n_indices * bytes_per_elt) as s:
-                    ds[unsorted_indices, "f0"].to_array()
+                    ds[unsorted_indices, "f0"].array()
                 best = min(best, s.wall_s)
             gbps = n_indices * bytes_per_elt / max(best, 1e-12) / 1e9
             print(f"  cap={cap:>3}: best {best * 1000:7.2f} ms  ({gbps:5.2f} GB/s)")

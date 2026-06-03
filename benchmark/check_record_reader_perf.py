@@ -1,9 +1,9 @@
 """Compare read perf across single-record and multi-record files.
 
-A colstore file is a sequence of records. After a single ``from_dict`` /
-``from_dataframe`` / ``from_records`` call the file has exactly one record;
-after many small writes via :class:`ColStoreWriter` (PR 3) it has many. The
-reader takes different code paths for these two cases:
+A colstore file is a sequence of records. After a one-shot
+:func:`colstore.store` call the file has exactly one record; after many
+small writes via :class:`ColStoreWriter` it has many. The reader takes
+different code paths for these two cases:
 
 1. Single record: per-column memmaps + the element-indexed ``gather``
    kernel. Contiguous, prefetcher-friendly.
@@ -17,8 +17,8 @@ This script confirms two claims:
 
 * Single-record reads are as fast as a pure contiguous gather would be.
 * Multi-record reads pay a bounded penalty that scales sub-linearly with
-  record count. Past a threshold the user should call ``compact()``
-  (PR 4) to collapse back to a single record.
+  record count. Past a threshold the user should call
+  :func:`colstore.compact` to collapse back to a single record.
 
 To compare, this benchmark builds several files containing the *same*
 logical data:
@@ -129,14 +129,14 @@ def main() -> None:
         # Baseline: R=1 (post-compaction). All other counts compared against it.
         ds_baseline = ColStoreReader(paths[1])
         assert ds_baseline._is_multi_record is False, "R=1 should take the fast path"
-        t_baseline = _best(lambda d=ds_baseline, s=selector: d[s, "x"].to_array(), args.repeats)
+        t_baseline = _best(lambda d=ds_baseline, s=selector: d[s, "x"].array(), args.repeats)
         ds_baseline.close()
         print(f"{'R=1':<10} {t_baseline * 1000:>10.3f}  {'1.00x':>8}")
 
         for n_rec in args.record_counts:
             ds = ColStoreReader(paths[n_rec])
             assert ds._is_multi_record is True
-            t = _best(lambda d=ds, s=selector: d[s, "x"].to_array(), args.repeats)
+            t = _best(lambda d=ds, s=selector: d[s, "x"].array(), args.repeats)
             ds.close()
             label = f"R={n_rec}"
             print(f"{label:<10} {t * 1000:>10.3f}  {t / t_baseline:>7.2f}x")

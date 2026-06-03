@@ -37,11 +37,11 @@ ds[100:200, 'price']                 # ColumnView
 ds[100:200, ['price', 'qty']]        # TableView
 ds[[1, 5, 9], ['price', 'qty']]      # TableView (fancy rows + cols)
 
-# Materialize through one of the to_* methods.
-ds['price'].to_array()                          # 1D ndarray
-ds[indices, ['price', 'qty']].to_dict()         # dict of 1D arrays
-ds[indices, ['price', 'qty']].to_record()       # structured ndarray
-ds[indices, ['price', 'qty']].to_dataframe()    # pandas DataFrame
+# Materialize through one of the materialization methods.
+ds['price'].array()                          # 1D ndarray
+ds[indices, ['price', 'qty']].dict()         # dict of 1D arrays
+ds[indices, ['price', 'qty']].recarray()     # structured ndarray
+ds[indices, ['price', 'qty']].frame()        # pandas DataFrame
 ```
 
 ## Writing
@@ -106,9 +106,10 @@ colstore.compact("data.cstore", out="new.cstore")  # leave source untouched
 
 In-place compaction writes to a sibling temp file and atomically renames
 into place; the source is untouched on failure. The byte copy uses
-`os.sendfile` where available, so memory footprint is bounded by the
-kernel's I/O buffer (tens of KB) regardless of file size — files much
-larger than RAM compact fine.
+`os.sendfile` on Linux (kernel-space copy, no Python-side surfacing)
+and `shutil.copyfileobj` on macOS/Windows; on both paths memory
+footprint is bounded by the kernel/I/O buffer (tens of KB) regardless
+of file size — files much larger than RAM compact fine.
 
 ## Introspection
 
@@ -158,9 +159,12 @@ fancy, unsorted fancy).
 
 ## Supported dtypes
 
-Fixed-size only: `float32`, `float64`, `int8/16/32/64`, `uint8/16/32/64`,
-`bool`. Object dtype (strings, Python objects) is rejected at write time —
-the design point is zero-copy random access, which requires a fixed stride.
+All fixed-size NumPy dtypes are supported: `float32`/`float64`,
+`int8/16/32/64`, `uint8/16/32/64`, `bool`, `datetime64`, `timedelta64`,
+and fixed-width strings (`S` bytes and `U` unicode, with the width baked
+into the dtype, e.g. `S16` or `U8`). Object dtype (variable-length
+strings, Python objects) is rejected at write time — the design point is
+zero-copy random access, which requires a fixed stride per row.
 
 ## License
 
