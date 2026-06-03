@@ -43,7 +43,7 @@ def test_repr_includes_path_and_shape(small_store):
 def test_close_releases_memmaps(small_store):
     small_store.close()
     with pytest.raises(ValueError, match="closed"):
-        small_store["price"].to_array()
+        small_store["price"].array()
 
 
 def test_close_is_idempotent(small_store):
@@ -54,9 +54,9 @@ def test_close_is_idempotent(small_store):
 def test_context_manager_closes_on_exit(tmp_path, small_frame):
     path = tmp_path / "ctx.cstore"
     with colstore.store(small_frame, path, show_progress=False) as store:
-        _ = store["price"].to_array()
+        _ = store["price"].array()
     with pytest.raises(ValueError, match="closed"):
-        store["price"].to_array()
+        store["price"].array()
 
 
 def test_max_workers_property_uses_override_when_set(tmp_path, small_frame):
@@ -77,7 +77,7 @@ def test_store_reopen_recovers_same_data(tmp_path, small_frame):
     colstore.store(small_frame, path, show_progress=False).close()
     with ColStoreReader(path) as store:
         assert store.shape == (len(small_frame), len(small_frame.columns))
-        first = store["price"].to_array()
+        first = store["price"].array()
     with ColStoreReader(path) as store_reopened:
-        second = store_reopened["price"].to_array()
+        second = store_reopened["price"].array()
     assert np.array_equal(first, second)

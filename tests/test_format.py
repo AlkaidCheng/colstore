@@ -164,7 +164,7 @@ def test_write_rejects_unsupported_dtype_kind(tmp_path):
 def test_fixed_width_bytes_roundtrip(tmp_path, backend):
     columns = {"name": np.array([b"alice", b"bob", b"carol"], dtype="S8")}
     store = colstore.store(columns, tmp_path / "s.cstore", show_progress=False, backend=backend)
-    result = store[np.array([2, 0]), "name"].to_array()
+    result = store[np.array([2, 0]), "name"].array()
     assert result.tolist() == [b"carol", b"alice"]
     store.close()
 
@@ -173,9 +173,9 @@ def test_fixed_width_bytes_roundtrip(tmp_path, backend):
 def test_fixed_width_unicode_roundtrip(tmp_path, backend):
     columns = {"label": np.array(["alpha", "beta", "gamma"], dtype="U10")}
     store = colstore.store(columns, tmp_path / "u.cstore", show_progress=False, backend=backend)
-    assert store[1:3, "label"].to_array().tolist() == ["beta", "gamma"]
+    assert store[1:3, "label"].array().tolist() == ["beta", "gamma"]
     # Fancy index exercises the kernel-fallback path for unicode.
-    assert store[np.array([2, 0]), "label"].to_array().tolist() == ["gamma", "alpha"]
+    assert store[np.array([2, 0]), "label"].array().tolist() == ["gamma", "alpha"]
     store.close()
 
 
@@ -188,7 +188,7 @@ def test_datetime64_roundtrip(tmp_path, backend):
         store = colstore.store(
             {"t": values}, tmp_path / "dt.cstore", show_progress=False, backend=backend
         )
-        result = store[np.array([1, 0]), "t"].to_array()
+        result = store[np.array([1, 0]), "t"].array()
     assert np.array_equal(result, values[[1, 0]])
     store.close()
 
@@ -199,7 +199,7 @@ def test_big_endian_input_stored_little_endian(tmp_path):
     manifest, _ = read_header(path)
     assert manifest["columns"][0]["dtype"] == "<i4"
     store = ColStoreReader(path, backend="numpy")
-    assert store["v"].to_array().tolist() == [0, 1, 2, 3, 4]
+    assert store["v"].array().tolist() == [0, 1, 2, 3, 4]
     assert store.dtypes["v"].byteorder in ("=", "<", "|")
     store.close()
 

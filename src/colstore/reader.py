@@ -47,7 +47,8 @@ class ColStoreReader:
     and applies any requested kernel hints. Reads are performed through
     ``__getitem__``, which returns a lazy view: either a :class:`ColumnView`
     (single-column) or a :class:`TableView` (multi-column). The view
-    materializes when one of its ``to_*`` methods is called.
+    materializes when one of its ``array`` / ``dict`` / ``recarray`` /
+    ``frame`` methods is called.
 
     Parameters
     ----------
@@ -71,8 +72,8 @@ class ColStoreReader:
     Examples
     --------
     >>> ds = colstore.store(df, "data.cstore")
-    >>> ds['price']                      # ColumnView -> to_array()
-    >>> ds[100:200, ['price', 'qty']]    # TableView -> to_dict / to_record / to_dataframe
+    >>> ds['price']                      # ColumnView -> array()
+    >>> ds[100:200, ['price', 'qty']]    # TableView -> dict / recarray / frame
     """
 
     def __init__(

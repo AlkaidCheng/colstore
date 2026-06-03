@@ -24,7 +24,7 @@ def test_open_returns_colstore(tmp_path):
     with colstore.open(path) as ds:
         assert isinstance(ds, ColStoreReader)
         assert ds.n_rows == 10
-        assert np.array_equal(ds[:, "a"].to_array(), np.arange(10, dtype=np.float32))
+        assert np.array_equal(ds[:, "a"].array(), np.arange(10, dtype=np.float32))
 
 
 def test_open_missing_file_raises(tmp_path):
@@ -90,7 +90,7 @@ def test_update_appends_records(tmp_path):
     with colstore.open(path) as ds:
         assert ds.n_rows == 9
         assert np.array_equal(
-            ds[:, "a"].to_array(), np.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.int32)
+            ds[:, "a"].array(), np.array([1, 2, 3, 4, 5, 6, 7, 8, 9], dtype=np.int32)
         )
 
 
@@ -122,7 +122,7 @@ def test_store_accepts_structured_ndarray(tmp_path):
     ds = colstore.store(records, tmp_path / "s.cstore", show_progress=False)
     try:
         assert ds.columns == ["x", "y"]
-        assert np.array_equal(ds[:, "x"].to_array(), np.array([1.0, 2.0, 3.0]))
+        assert np.array_equal(ds[:, "x"].array(), np.array([1.0, 2.0, 3.0]))
     finally:
         ds.close()
 

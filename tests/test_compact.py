@@ -30,8 +30,8 @@ def test_compact_collapses_multi_record_to_single(tmp_path):
 
     # Snapshot full content before compaction.
     with colstore.open(path) as ds:
-        a_before = ds[:, "a"].to_array().copy()
-        b_before = ds[:, "b"].to_array().copy()
+        a_before = ds[:, "a"].array().copy()
+        b_before = ds[:, "b"].array().copy()
 
     colstore.compact(path, show_progress=False)
 
@@ -44,8 +44,8 @@ def test_compact_collapses_multi_record_to_single(tmp_path):
     assert after.file_size == before.file_size - 4 * 32
 
     with colstore.open(path) as ds:
-        assert np.array_equal(ds[:, "a"].to_array(), a_before)
-        assert np.array_equal(ds[:, "b"].to_array(), b_before)
+        assert np.array_equal(ds[:, "a"].array(), a_before)
+        assert np.array_equal(ds[:, "b"].array(), b_before)
 
 
 def test_compact_preserves_fancy_index_reads(tmp_path):
@@ -61,14 +61,14 @@ def test_compact_preserves_fancy_index_reads(tmp_path):
         n_rows = ds.n_rows
         sorted_idx = np.sort(rng.choice(n_rows, size=200, replace=False)).astype(np.int64)
         unsorted_idx = rng.permutation(n_rows)[:200].astype(np.int64)
-        a_sorted_before = ds[sorted_idx, "x"].to_array().copy()
-        a_unsorted_before = ds[unsorted_idx, "x"].to_array().copy()
+        a_sorted_before = ds[sorted_idx, "x"].array().copy()
+        a_unsorted_before = ds[unsorted_idx, "x"].array().copy()
 
     colstore.compact(path, show_progress=False)
 
     with colstore.open(path) as ds:
-        assert np.array_equal(ds[sorted_idx, "x"].to_array(), a_sorted_before)
-        assert np.array_equal(ds[unsorted_idx, "x"].to_array(), a_unsorted_before)
+        assert np.array_equal(ds[sorted_idx, "x"].array(), a_sorted_before)
+        assert np.array_equal(ds[unsorted_idx, "x"].array(), a_unsorted_before)
 
 
 def test_compact_multi_column_with_mixed_dtypes(tmp_path):
@@ -91,14 +91,14 @@ def test_compact_multi_column_with_mixed_dtypes(tmp_path):
             )
 
     with colstore.open(path) as ds:
-        snapshots = {col: ds[:, col].to_array().copy() for col in ds.columns}
+        snapshots = {col: ds[:, col].array().copy() for col in ds.columns}
 
     colstore.compact(path, show_progress=False)
 
     with colstore.open(path) as ds:
         assert colstore.info(path).n_records == 1
         for col, expected in snapshots.items():
-            assert np.array_equal(ds[:, col].to_array(), expected), f"{col} differs"
+            assert np.array_equal(ds[:, col].array(), expected), f"{col} differs"
 
 
 # ---- No-op short-circuits --------------------------------------------------
@@ -203,7 +203,7 @@ def test_compact_zero_row_records_in_stream(tmp_path):
         f.write({"a": np.empty(0, dtype=np.int32)})
 
     with colstore.open(path) as ds:
-        expected = ds[:, "a"].to_array().copy()
+        expected = ds[:, "a"].array().copy()
     assert len(expected) == 8
 
     colstore.compact(path, show_progress=False)
@@ -211,7 +211,7 @@ def test_compact_zero_row_records_in_stream(tmp_path):
     assert colstore.info(path).n_records == 1
     assert colstore.info(path).n_rows == 8
     with colstore.open(path) as ds:
-        assert np.array_equal(ds[:, "a"].to_array(), expected)
+        assert np.array_equal(ds[:, "a"].array(), expected)
 
 
 def test_compact_preserves_byte_order_on_disk(tmp_path):
@@ -229,12 +229,12 @@ def test_compact_preserves_byte_order_on_disk(tmp_path):
         f.write({"x": np.arange(100, 107, dtype=np.float64)})
 
     with colstore.open(path) as ds:
-        expected = ds[:, "x"].to_array().copy()
+        expected = ds[:, "x"].array().copy()
 
     colstore.compact(path, show_progress=False)
 
     with colstore.open(path) as ds:
-        assert np.array_equal(ds[:, "x"].to_array(), expected)
+        assert np.array_equal(ds[:, "x"].array(), expected)
 
 
 # ---- Atomicity / failure handling ------------------------------------------
@@ -335,15 +335,15 @@ def test_compact_memory_bounded_on_large_file(tmp_path):
 
     with colstore.open(path) as ds:
         total_before = ds.n_rows
-        first_few = ds[:100, "x"].to_array().copy()
-        last_few = ds[-100:, "x"].to_array().copy()
+        first_few = ds[:100, "x"].array().copy()
+        last_few = ds[-100:, "x"].array().copy()
 
     colstore.compact(path, show_progress=False)
 
     with colstore.open(path) as ds:
         assert ds.n_rows == total_before
-        assert np.array_equal(ds[:100, "x"].to_array(), first_few)
-        assert np.array_equal(ds[-100:, "x"].to_array(), last_few)
+        assert np.array_equal(ds[:100, "x"].array(), first_few)
+        assert np.array_equal(ds[-100:, "x"].array(), last_few)
         assert colstore.info(path).n_records == 1
 
 
@@ -375,12 +375,12 @@ def test_compact_works_on_non_linux_fallback_path(tmp_path, monkeypatch):
             )
 
     with colstore.open(path) as ds:
-        x_before = ds[:, "x"].to_array().copy()
-        y_before = ds[:, "y"].to_array().copy()
+        x_before = ds[:, "x"].array().copy()
+        y_before = ds[:, "y"].array().copy()
 
     colstore.compact(path, show_progress=False)
 
     assert colstore.info(path).n_records == 1
     with colstore.open(path) as ds:
-        assert np.array_equal(ds[:, "x"].to_array(), x_before)
-        assert np.array_equal(ds[:, "y"].to_array(), y_before)
+        assert np.array_equal(ds[:, "x"].array(), x_before)
+        assert np.array_equal(ds[:, "y"].array(), y_before)

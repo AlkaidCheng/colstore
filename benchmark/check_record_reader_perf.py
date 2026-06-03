@@ -129,14 +129,14 @@ def main() -> None:
         # Baseline: R=1 (post-compaction). All other counts compared against it.
         ds_baseline = ColStoreReader(paths[1])
         assert ds_baseline._is_multi_record is False, "R=1 should take the fast path"
-        t_baseline = _best(lambda d=ds_baseline, s=selector: d[s, "x"].to_array(), args.repeats)
+        t_baseline = _best(lambda d=ds_baseline, s=selector: d[s, "x"].array(), args.repeats)
         ds_baseline.close()
         print(f"{'R=1':<10} {t_baseline * 1000:>10.3f}  {'1.00x':>8}")
 
         for n_rec in args.record_counts:
             ds = ColStoreReader(paths[n_rec])
             assert ds._is_multi_record is True
-            t = _best(lambda d=ds, s=selector: d[s, "x"].to_array(), args.repeats)
+            t = _best(lambda d=ds, s=selector: d[s, "x"].array(), args.repeats)
             ds.close()
             label = f"R={n_rec}"
             print(f"{label:<10} {t * 1000:>10.3f}  {t / t_baseline:>7.2f}x")

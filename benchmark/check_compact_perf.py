@@ -77,7 +77,7 @@ def main() -> None:
 
         # Read perf BEFORE compaction.
         with colstore.open(path) as ds:
-            t_before = _best(lambda d=ds: d[unsorted_idx, "x"].to_array(), args.repeats)
+            t_before = _best(lambda d=ds: d[unsorted_idx, "x"].array(), args.repeats)
         print(f"  unsorted-fancy read BEFORE: {t_before * 1000:7.2f} ms")
 
         # Compact (out-of-place so we can re-time the "before" case from the
@@ -93,7 +93,7 @@ def main() -> None:
 
         # Read perf AFTER compaction.
         with colstore.open(compacted) as ds:
-            t_after = _best(lambda d=ds: d[unsorted_idx, "x"].to_array(), args.repeats)
+            t_after = _best(lambda d=ds: d[unsorted_idx, "x"].array(), args.repeats)
         speedup = t_before / t_after if t_after > 0 else float("inf")
         print(f"  unsorted-fancy read AFTER:  {t_after * 1000:7.2f} ms  ({speedup:.1f}x speedup)")
 

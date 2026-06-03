@@ -113,7 +113,7 @@ def test_full_table_read_concatenates_records(tmp_path, n_records):
     with ColStoreReader(path) as ds:
         for name, _ in _schema():
             expected = expected_column_values(records, name)
-            got = ds[:, name].to_array()
+            got = ds[:, name].array()
             assert np.array_equal(got, expected), f"column {name} differs"
 
 
@@ -127,13 +127,13 @@ def test_slice_within_and_across_records(tmp_path, n_records):
     with ColStoreReader(path) as ds:
         truth = expected_column_values(records, "i32")
         # Slice strictly inside the first record.
-        assert np.array_equal(ds[0:3, "i32"].to_array(), truth[0:3])
+        assert np.array_equal(ds[0:3, "i32"].array(), truth[0:3])
         # Slice spanning record boundaries (when R > 1).
-        assert np.array_equal(ds[2 : total - 2, "i32"].to_array(), truth[2 : total - 2])
+        assert np.array_equal(ds[2 : total - 2, "i32"].array(), truth[2 : total - 2])
         # Full slice.
-        assert np.array_equal(ds[0:total, "i32"].to_array(), truth)
+        assert np.array_equal(ds[0:total, "i32"].array(), truth)
         # Empty slice.
-        assert np.array_equal(ds[5:5, "i32"].to_array(), truth[5:5])
+        assert np.array_equal(ds[5:5, "i32"].array(), truth[5:5])
 
 
 @pytest.mark.parametrize("n_records", [1, 3])
@@ -145,12 +145,12 @@ def test_scalar_integer_index(tmp_path, n_records):
     truth = expected_column_values(records, "f64")
     total = truth.shape[0]
     with ColStoreReader(path) as ds:
-        assert np.array_equal(ds[0, "f64"].to_array(), truth[0:1])
+        assert np.array_equal(ds[0, "f64"].array(), truth[0:1])
         # In the middle (likely crosses a record boundary if R > 1).
         mid = total // 2
-        assert np.array_equal(ds[mid, "f64"].to_array(), truth[mid : mid + 1])
+        assert np.array_equal(ds[mid, "f64"].array(), truth[mid : mid + 1])
         # Last row.
-        assert np.array_equal(ds[total - 1, "f64"].to_array(), truth[total - 1 : total])
+        assert np.array_equal(ds[total - 1, "f64"].array(), truth[total - 1 : total])
 
 
 @pytest.mark.parametrize("n_records", [1, 3])
@@ -176,7 +176,7 @@ def test_fancy_index_returns_correct_values(tmp_path, n_records, pattern):
     indices = indices.astype(np.int64)
 
     with ColStoreReader(path) as ds:
-        got = ds[indices, "i32"].to_array()
+        got = ds[indices, "i32"].array()
         assert np.array_equal(got, truth[indices])
 
 
@@ -189,7 +189,7 @@ def test_boolean_mask(tmp_path, n_records):
     truth = expected_column_values(records, "i32")
     mask = (truth % 3) == 0
     with ColStoreReader(path) as ds:
-        assert np.array_equal(ds[mask, "i32"].to_array(), truth[mask])
+        assert np.array_equal(ds[mask, "i32"].array(), truth[mask])
 
 
 @pytest.mark.parametrize("n_records", [1, 3])
@@ -202,22 +202,22 @@ def test_negative_indices_fold(tmp_path, n_records):
     total = truth.shape[0]
     indices = np.array([-1, -2, 0, -total])
     with ColStoreReader(path) as ds:
-        assert np.array_equal(ds[indices, "i32"].to_array(), truth[indices])
+        assert np.array_equal(ds[indices, "i32"].array(), truth[indices])
 
 
 # ---- Multi-column reads -----------------------------------------------------
 
 
 @pytest.mark.parametrize("n_records", [1, 3])
-def test_multi_column_to_dict(tmp_path, n_records):
-    """``ds[indices, [...]].to_dict()`` returns each column correctly."""
+def test_multi_column_dict(tmp_path, n_records):
+    """``ds[indices, [...]].dict()`` returns each column correctly."""
     path = tmp_path / "multi.cstore"
     records = _make_records(n_records)
     write_record_file(path, _schema(), records)
     truth = {name: expected_column_values(records, name) for name, _ in _schema()}
     indices = np.array([0, 3, len(truth["i32"]) - 1])
     with ColStoreReader(path) as ds:
-        got = ds[indices, ["i32", "f64", "i8"]].to_dict()
+        got = ds[indices, ["i32", "f64", "i8"]].dict()
         for name in got:
             assert np.array_equal(got[name], truth[name][indices]), f"col {name}"
 
@@ -245,8 +245,8 @@ def test_record_body_padding_to_8_bytes(tmp_path):
         # header was found at the right offset despite the first body padding.
         truth_a = expected_column_values(records, "a")
         truth_b = expected_column_values(records, "b")
-        assert np.array_equal(ds[:, "a"].to_array(), truth_a)
-        assert np.array_equal(ds[:, "b"].to_array(), truth_b)
+        assert np.array_equal(ds[:, "a"].array(), truth_a)
+        assert np.array_equal(ds[:, "b"].array(), truth_b)
 
 
 # ---- Error paths ------------------------------------------------------------
@@ -337,7 +337,7 @@ def test_slice_boundary_starting_exactly_on_record_boundary(tmp_path):
     # First row of record 1 = total rows in record 0.
     record1_start = len(records[0]["i32"])
     with ColStoreReader(path) as ds:
-        got = ds[record1_start:, "i32"].to_array()
+        got = ds[record1_start:, "i32"].array()
         assert np.array_equal(got, truth[record1_start:])
 
 
@@ -355,7 +355,7 @@ def test_slice_boundary_ending_exactly_on_record_boundary(tmp_path):
     # End-of-record-1 boundary.
     boundary = len(records[0]["i32"]) + len(records[1]["i32"])
     with ColStoreReader(path) as ds:
-        got = ds[:boundary, "i32"].to_array()
+        got = ds[:boundary, "i32"].array()
         assert np.array_equal(got, truth[:boundary])
 
 
@@ -369,7 +369,7 @@ def test_slice_fully_inside_one_record(tmp_path):
     r0, r1, r2 = (len(records[i]["i32"]) for i in range(3))
     a, b = r0 + r1 + 1, r0 + r1 + r2 - 1
     with ColStoreReader(path) as ds:
-        got = ds[a:b, "i32"].to_array()
+        got = ds[a:b, "i32"].array()
         assert np.array_equal(got, truth[a:b])
 
 
@@ -385,9 +385,9 @@ def test_slice_with_non_unit_step_still_correct(tmp_path):
     write_record_file(path, _schema(), records)
     truth = expected_column_values(records, "i32")
     with ColStoreReader(path) as ds:
-        got = ds[1:20:3, "i32"].to_array()
+        got = ds[1:20:3, "i32"].array()
         assert np.array_equal(got, truth[1:20:3])
-        got = ds[::5, "i32"].to_array()
+        got = ds[::5, "i32"].array()
         assert np.array_equal(got, truth[::5])
 
 
@@ -410,8 +410,8 @@ def test_sorted_fancy_index_matches_unsorted_fancy_index(tmp_path):
     permutation = rng.permutation(sorted_idx.shape[0])
     unsorted_idx = sorted_idx[permutation]
     with ColStoreReader(path) as ds:
-        sorted_out = ds[sorted_idx, "i32"].to_array()
-        unsorted_out = ds[unsorted_idx, "i32"].to_array()
+        sorted_out = ds[sorted_idx, "i32"].array()
+        unsorted_out = ds[unsorted_idx, "i32"].array()
         # The two reads produce the same values in different orders.
         assert np.array_equal(sorted_out, truth[sorted_idx])
         assert np.array_equal(unsorted_out, truth[unsorted_idx])
@@ -435,7 +435,7 @@ def test_sorted_with_duplicates_uses_correct_path(tmp_path):
     idx = np.array([0, 0, 1, boundary - 1, boundary, boundary, boundary + 1], dtype=np.int64)
     assert np.all(idx[1:] >= idx[:-1])  # confirm sortedness predicate
     with ColStoreReader(path) as ds:
-        got = ds[idx, "i32"].to_array()
+        got = ds[idx, "i32"].array()
         assert np.array_equal(got, truth[idx])
 
 
@@ -469,7 +469,7 @@ def test_slice_across_zero_row_record(tmp_path):
     truth = expected_column_values(records, "i32")
     with ColStoreReader(path) as ds:
         # Slice spans the zero-row record.
-        got = ds[3:7, "i32"].to_array()
+        got = ds[3:7, "i32"].array()
         assert np.array_equal(got, truth[3:7])
         # Full read also has to walk past the zero-row record.
-        assert np.array_equal(ds[:, "i32"].to_array(), truth)
+        assert np.array_equal(ds[:, "i32"].array(), truth)
