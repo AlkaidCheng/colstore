@@ -61,6 +61,8 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
+from ._api import create, open, recreate, store, update
+from ._store import ColStore
 from .autotune import (
     apply_cached_cap_if_present,
     calibrate,
@@ -78,20 +80,22 @@ from .config import (
 )
 from .format import FILE_EXTENSION, FormatError
 from .kernels import cpp_available, max_threads, numba_available
-from ._store import ColStore
 from .view import ColumnView, TableView
+from .writer import ColWriter
 
 apply_cached_cap_if_present()
 
 __all__ = [
     "FILE_EXTENSION",
     "ColStore",
+    "ColWriter",
     "ColumnView",
     "FormatError",
     "TableView",
     "__version__",
     "calibrate",
     "cpp_available",
+    "create",
     "ensure_calibrated",
     "get_default_backend",
     "get_default_madvise",
@@ -99,9 +103,13 @@ __all__ = [
     "get_max_workers",
     "max_threads",
     "numba_available",
+    "open",
+    "recreate",
     "set_default_backend",
     "set_default_madvise",
     "set_gather_thread_cap",
     "set_max_workers",
+    "store",
+    "update",
     "use_passive_openmp_wait",
 ]

@@ -30,7 +30,7 @@ from . import config, format, kernels
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
-    import pandas as pd
+    pass
 
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
@@ -164,69 +164,6 @@ class ColStore:
 
         self._backend = backend or config.get_default_backend()
         self._max_workers_override = max_workers
-
-    # ---- Factory methods -----------------------------------------------
-
-    @classmethod
-    def from_dataframe(
-        cls,
-        frame: pd.DataFrame,
-        path: str | os.PathLike[str],
-        *,
-        batch_size: int | None = 100_000,
-        show_progress: bool = True,
-        **open_kwargs: Any,
-    ) -> ColStore:
-        """Write a pandas DataFrame to disk and open the result."""
-        columns: dict[str, NDArray[Any]] = {}
-        for column_name in frame.columns:
-            series = frame[column_name]
-            array = series.to_numpy()
-            if array.dtype.kind == "O":
-                raise TypeError(
-                    f"Column {column_name!r} (pandas dtype {series.dtype}) converts to "
-                    f"an object array and cannot be stored. Cast it to a fixed-size NumPy "
-                    f"dtype (e.g. float64, int64, or a fixed-width string like 'S16') first."
-                )
-            columns[str(column_name)] = array
-        format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
-        return cls(path, **open_kwargs)
-
-    @classmethod
-    def from_dict(
-        cls,
-        columns: dict[str, NDArray[Any]],
-        path: str | os.PathLike[str],
-        *,
-        batch_size: int | None = 100_000,
-        show_progress: bool = True,
-        **open_kwargs: Any,
-    ) -> ColStore:
-        """Write a dict of 1D NumPy column arrays to disk and open the result."""
-        normalized: dict[str, NDArray[Any]] = {
-            str(name): np.ascontiguousarray(array) for name, array in columns.items()
-        }
-        format.write_dataset(normalized, path, batch_size=batch_size, show_progress=show_progress)
-        return cls(path, **open_kwargs)
-
-    @classmethod
-    def from_records(
-        cls,
-        records: NDArray[Any],
-        path: str | os.PathLike[str],
-        *,
-        batch_size: int = 100_000,
-        show_progress: bool = True,
-        **open_kwargs: Any,
-    ) -> ColStore:
-        """Write a structured (record) NumPy array to disk and open the result."""
-        if records.dtype.names is None:
-            raise TypeError("Expected a structured ndarray with named fields.")
-        columns: dict[str, NDArray[Any]] = {
-            name: np.ascontiguousarray(records[name]) for name in records.dtype.names
-        }
-        format.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
-        return cls(path, **open_kwargs)
 
     # ---- Read-only properties ------------------------------------------
 

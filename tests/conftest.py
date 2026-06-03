@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import colstore
 from colstore import ColStore
 
 
@@ -29,7 +30,7 @@ def small_frame() -> pd.DataFrame:
 def small_store(tmp_path, small_frame) -> ColStore:
     """A small opened ColStore built from `small_frame`."""
     store_path = tmp_path / "small.cstore"
-    store = ColStore.from_dataframe(small_frame, store_path, show_progress=False)
+    store = colstore.store(small_frame, store_path, show_progress=False)
     yield store
     store.close()
 
@@ -52,6 +53,6 @@ def medium_frame() -> pd.DataFrame:
 @pytest.fixture
 def medium_store(tmp_path, medium_frame) -> ColStore:
     store_path = tmp_path / "medium.cstore"
-    store = ColStore.from_dataframe(medium_frame, store_path, show_progress=False)
+    store = colstore.store(medium_frame, store_path, show_progress=False)
     yield store
     store.close()

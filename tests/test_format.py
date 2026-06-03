@@ -15,6 +15,7 @@ import warnings
 import numpy as np
 import pytest
 
+import colstore
 from colstore import FILE_EXTENSION, ColStore, FormatError
 from colstore import format as fmt
 from colstore.format import (
@@ -162,7 +163,7 @@ def test_write_rejects_unsupported_dtype_kind(tmp_path):
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_fixed_width_bytes_roundtrip(tmp_path, backend):
     columns = {"name": np.array([b"alice", b"bob", b"carol"], dtype="S8")}
-    store = ColStore.from_dict(columns, tmp_path / "s.cstore", show_progress=False, backend=backend)
+    store = colstore.store(columns, tmp_path / "s.cstore", show_progress=False, backend=backend)
     result = store[np.array([2, 0]), "name"].to_array()
     assert result.tolist() == [b"carol", b"alice"]
     store.close()
@@ -171,7 +172,7 @@ def test_fixed_width_bytes_roundtrip(tmp_path, backend):
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_fixed_width_unicode_roundtrip(tmp_path, backend):
     columns = {"label": np.array(["alpha", "beta", "gamma"], dtype="U10")}
-    store = ColStore.from_dict(columns, tmp_path / "u.cstore", show_progress=False, backend=backend)
+    store = colstore.store(columns, tmp_path / "u.cstore", show_progress=False, backend=backend)
     assert store[1:3, "label"].to_array().tolist() == ["beta", "gamma"]
     # Fancy index exercises the kernel-fallback path for unicode.
     assert store[np.array([2, 0]), "label"].to_array().tolist() == ["gamma", "alpha"]
@@ -184,7 +185,7 @@ def test_datetime64_roundtrip(tmp_path, backend):
     # cpp/numba backends must not warn here; they silently fall back to NumPy.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        store = ColStore.from_dict(
+        store = colstore.store(
             {"t": values}, tmp_path / "dt.cstore", show_progress=False, backend=backend
         )
         result = store[np.array([1, 0]), "t"].to_array()
