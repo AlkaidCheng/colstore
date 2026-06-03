@@ -51,7 +51,7 @@ from typing import IO, Any
 
 import numpy as np
 
-from ._progress import progress_bar
+from .progress import progress_bar
 
 FILE_EXTENSION = ".cstore"
 _MAGIC = b"CSTORE\x00\x01"

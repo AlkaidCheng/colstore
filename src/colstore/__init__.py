@@ -61,8 +61,8 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from ._api import create, open, recreate, store, update
-from ._store import ColStore
+from .api import create, open, recreate, store, update
+from .reader import ColStore
 from .autotune import (
     apply_cached_cap_if_present,
     calibrate,

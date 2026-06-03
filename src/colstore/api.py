@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from . import format as fmt
-from ._store import ColStore
+from .reader import ColStore
 from .writer import ColWriter
 
 

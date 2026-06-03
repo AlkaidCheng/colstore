@@ -156,7 +156,7 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
     # on the divided value the dispatcher computes, and on correct output.
     captured: dict[str, int | None] = {}
 
-    import colstore._store as store_mod
+    import colstore.reader as store_mod
 
     real_gather_one = store_mod.ColStore._gather_one
 
@@ -189,7 +189,7 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
 def test_gather_many_cap_never_below_one(tmp_path, monkeypatch):
     # With more concurrent columns than the cap, each kernel floors at 1 thread.
     captured: dict[str, int | None] = {}
-    import colstore._store as store_mod
+    import colstore.reader as store_mod
 
     real = store_mod.ColStore._gather_one
 
