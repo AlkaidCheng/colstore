@@ -422,33 +422,28 @@ def _to_little_endian(array: np.ndarray[Any, np.dtype[Any]]) -> np.ndarray[Any, 
     return array
 
 
-def write_dataset(
+def normalize_columns(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
-    path: PathLike,
     *,
-    batch_size: int | None,
-    show_progress: bool,
-) -> None:
-    """Serialize a dict of 1D NumPy columns to disk in colstore format.
+    expected_schema: list[dict[str, Any]] | None = None,
+) -> tuple[list[str], int, dict[str, np.ndarray[Any, np.dtype[Any]]], list[dict[str, Any]]]:
+    """Validate a column dict and return the pieces needed to write a record.
 
-    Writes a single-record file: file header + 32B record header + column-
-    major body + 8B padding.
+    Returns ``(column_names, n_rows, little_endian_columns, columns_meta)``.
 
-    Parameters
-    ----------
-    columns : dict[str, numpy.ndarray]
-        Mapping of column name to a 1D fixed-size array. All columns must share
-        the same length.
-    path : str or os.PathLike
-        Destination path.
-    batch_size : int or None
-        Number of rows written per ``tofile`` call, used only to drive the
-        progress bar. ``None`` or any value ``<= 0`` writes each column in a
-        single call (no batching). Has no effect on the bytes written.
-    show_progress : bool
-        Whether to display a tqdm progress bar.
+    If ``expected_schema`` is given (non-None), the columns must match it
+    exactly: same names in the same order, same dtypes. This is what the
+    streaming writer uses for second-and-later ``write()`` calls. If
+    ``expected_schema`` is None, the schema is inferred from the columns
+    (the first-write case).
+
+    Raises
+    ------
+    ValueError
+        On an empty dict, ragged columns, or schema/dtype mismatch.
+    TypeError
+        On unsupported dtype kinds (object, void, etc.).
     """
-
     if not columns:
         raise ValueError("Cannot write an empty column mapping.")
 
@@ -481,6 +476,56 @@ def write_dataset(
         }
         for name in column_names
     ]
+
+    if expected_schema is not None:
+        if len(expected_schema) != len(columns_meta):
+            raise ValueError(
+                f"Schema mismatch: file has {len(expected_schema)} columns, "
+                f"got {len(columns_meta)}."
+            )
+        for expected, actual in zip(expected_schema, columns_meta, strict=True):
+            if expected["name"] != actual["name"]:
+                raise ValueError(
+                    f"Column name mismatch: file expects {expected['name']!r}, "
+                    f"got {actual['name']!r}."
+                )
+            if expected["dtype"] != actual["dtype"]:
+                raise ValueError(
+                    f"Column {expected['name']!r}: file dtype {expected['dtype']!r} "
+                    f"does not match write dtype {actual['dtype']!r}."
+                )
+
+    return column_names, n_rows, little_endian_columns, columns_meta
+
+
+def write_dataset(
+    columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
+    path: PathLike,
+    *,
+    batch_size: int | None,
+    show_progress: bool,
+) -> None:
+    """Serialize a dict of 1D NumPy columns to disk in colstore format.
+
+    Writes a single-record file: file header + 32B record header + column-
+    major body + 8B padding. For multi-record streaming writes, use
+    :class:`colstore.ColWriter`.
+
+    Parameters
+    ----------
+    columns : dict[str, numpy.ndarray]
+        Mapping of column name to a 1D fixed-size array. All columns must share
+        the same length.
+    path : str or os.PathLike
+        Destination path.
+    batch_size : int or None
+        Number of rows written per ``tofile`` call, used only to drive the
+        progress bar. ``None`` or any value ``<= 0`` writes each column in a
+        single call (no batching). Has no effect on the bytes written.
+    show_progress : bool
+        Whether to display a tqdm progress bar.
+    """
+    column_names, n_rows, little_endian_columns, columns_meta = normalize_columns(columns)
 
     # ``None`` or any non-positive value means "write each column in one call".
     effective_batch = batch_size if (batch_size is not None and batch_size > 0) else 0
