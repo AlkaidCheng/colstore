@@ -53,7 +53,8 @@ def test_write_then_read_header_roundtrips_metadata(tmp_path):
     write_dataset(columns, path, batch_size=50, show_progress=False)
     manifest, data_offset = read_header(path)
     assert manifest["format_version"] == 1
-    assert manifest["n_rows"] == 100
+    assert manifest["n_records"] == 1
+    assert manifest["committed_rows"] == 100
     assert [c["name"] for c in manifest["columns"]] == ["x", "y"]
     assert data_offset % 64 == 0
 
@@ -66,10 +67,13 @@ def test_column_layout_offsets_are_contiguous(tmp_path):
     }
     write_dataset(columns, path, batch_size=10, show_progress=False)
     manifest, data_offset = read_header(path)
-    layout = build_column_layout(manifest, data_offset)
+    n_rows = int(manifest["committed_rows"])
+    body_offset = data_offset + fmt._RECORD_HEADER_SIZE
+    layout = build_column_layout(manifest, body_offset, n_rows)
     a_offset, a_dtype = layout["a"]
     b_offset, _b_dtype = layout["b"]
-    assert a_offset == data_offset
+    # Columns start at the record body offset (data_offset + 32).
+    assert a_offset == body_offset
     assert b_offset == a_offset + 10 * a_dtype.itemsize
 
 
@@ -126,7 +130,8 @@ def test_dtype_is_preserved_byte_for_byte(tmp_path):
     }
     write_dataset(columns, path, batch_size=32, show_progress=False)
     manifest, data_offset = read_header(path)
-    layout = build_column_layout(manifest, data_offset)
+    n_rows = int(manifest["committed_rows"])
+    layout = build_column_layout(manifest, data_offset + fmt._RECORD_HEADER_SIZE, n_rows)
 
     raw_bytes = path.read_bytes()
     for name, expected in columns.items():
@@ -253,17 +258,20 @@ def test_unsupported_version_raises(tmp_path):
     write_dataset({"x": np.arange(4, dtype=np.float64)}, path, batch_size=None, show_progress=False)
     manifest, data_offset = read_header(path)
     manifest["format_version"] = 999
-    manifest["manifest_crc32"] = fmt._manifest_checksum(manifest["columns"], manifest["n_rows"])
+    manifest["manifest_crc32"] = fmt._manifest_checksum(
+        manifest["columns"], manifest["n_records"], manifest["committed_rows"]
+    )
     manifest_bytes = json.dumps(manifest).encode("utf-8")
     header_size = len(fmt._MAGIC) + fmt._MANIFEST_LEN_SIZE + len(manifest_bytes)
     new_offset = align_up(header_size)
-    column_bytes = path.read_bytes()[data_offset:]
+    # Everything past data_offset (record header + body) is preserved verbatim.
+    body_bytes = path.read_bytes()[data_offset:]
     with open(path, "wb") as handle:
         handle.write(fmt._MAGIC)
         handle.write(struct.pack(fmt._MANIFEST_LEN_FMT, len(manifest_bytes)))
         handle.write(manifest_bytes)
         handle.write(b"\x00" * (new_offset - header_size))
-        handle.write(column_bytes)
+        handle.write(body_bytes)
     with pytest.raises(FormatError, match="format_version"):
         ColStore(path)
 
