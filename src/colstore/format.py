@@ -296,15 +296,14 @@ def write_header(
 def write_counters(file: IO[bytes], n_records: int, committed_rows: int) -> None:
     """Rewrite the 32-byte counters block at its fixed offset.
 
-    Used by :meth:`ColStoreWriter.close` to commit the new record count and row
-    total atomically. The 32-byte block is small enough that a single
-    ``write()`` is generally atomic on common filesystems; even if it
-    isn't, the embedded CRC catches a torn write on the next open.
-
-    The caller must position the file at the right offset itself (the
-    helper just packs and writes the 32 bytes), or use ``file.seek`` to
-    move there before calling.
+    Seeks to the counters block first, so callers don't need to know
+    where it lives on disk. Used by :meth:`ColStoreWriter.close` to
+    commit the new record count and row total atomically. The 32-byte
+    block is small enough that a single ``write()`` is generally atomic
+    on common filesystems; even if it isn't, the embedded CRC catches a
+    torn write on the next open.
     """
+    file.seek(_COUNTERS_OFFSET)
     file.write(_pack_counters(n_records, committed_rows))
 
 

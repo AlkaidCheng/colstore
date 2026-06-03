@@ -193,7 +193,10 @@ def _write_compacted(
                     progress.update(1)
 
         # ---- Record body padding. -----------------------------------------
-        pad = fmt.align_up(body_bytes, fmt._RECORD_BODY_ALIGNMENT) - body_bytes
+        # record_body_size returns the body's on-disk size *including* the
+        # 8-byte alignment pad; subtracting what we've actually written
+        # gives the pad length without reaching into format internals.
+        pad = fmt.record_body_size(committed_rows, itemsizes) - body_bytes
         if pad:
             dst_fp.write(b"\x00" * pad)
 
