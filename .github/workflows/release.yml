@@ -121,9 +121,11 @@ jobs:
           # The kernel's OpenMP path requires libomp on macOS;
           # manylinux images already include it.
           CIBW_BEFORE_ALL_MACOS: brew install libomp
-          # Quick smoke test on the built wheel before declaring it good.
+          # Run the full test suite against the built wheel before
+          # declaring it good. Matches what ci.yml does on the source
+          # tree; no hand-maintained smoke list to drift out of sync.
           CIBW_TEST_REQUIRES: pytest pandas
-          CIBW_TEST_COMMAND: pytest -q {project}/tests/test_format.py {project}/tests/test_factory.py
+          CIBW_TEST_COMMAND: pytest -q {project}/tests/
 
       - name: List built artifacts
         run: ls -l wheelhouse/
