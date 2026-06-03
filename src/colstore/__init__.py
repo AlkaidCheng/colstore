@@ -63,6 +63,7 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # `ensure_calibrated()` explicitly.
 from .api import (
     ColStoreInfo,
+    compact,
     create,
     info,
     open,
@@ -104,6 +105,7 @@ __all__ = [
     "TableView",
     "__version__",
     "calibrate",
+    "compact",
     "cpp_available",
     "create",
     "ensure_calibrated",

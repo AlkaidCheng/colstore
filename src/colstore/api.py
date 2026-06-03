@@ -1,5 +1,5 @@
 """Module-level convenience functions: open, create, recreate, update, store,
-info, schema.
+compact, info, schema.
 
 These thin wrappers around :class:`ColStoreReader` and :class:`ColStoreWriter`
 give the package a uproot-style entry-point surface where each function does
@@ -16,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from . import format as fmt
+from .compaction import compact_file
 from .reader import ColStoreReader
 from .writer import ColStoreWriter
 
@@ -145,6 +146,63 @@ def _dataframe_to_columns(frame: Any) -> dict[str, np.ndarray[Any, np.dtype[Any]
             )
         columns[str(column_name)] = array
     return columns
+
+
+# ---- Compaction --------------------------------------------------------
+
+
+def compact(
+    path: str | os.PathLike[str],
+    *,
+    out: str | os.PathLike[str] | None = None,
+    show_progress: bool = True,
+) -> Path:
+    """Collapse a multi-record file into a single-record file.
+
+    A streamed writer produces files with one record per :meth:`write`
+    call. Reads of slice / sorted-fancy patterns scale near-flat with
+    record count, but unsorted-fancy reads degrade as records
+    accumulate. Compaction concatenates every record's column bytes
+    into one contiguous block per column, after which all reads take
+    the single-record fast path.
+
+    The byte splice is done via :func:`os.sendfile` where available, so
+    memory footprint is bounded by the kernel's I/O buffer (tens of KB)
+    regardless of file size. Files much larger than RAM compact fine.
+
+    Parameters
+    ----------
+    path : str or os.PathLike
+        Source file. Must be a valid colstore file.
+    out : str or os.PathLike, optional
+        Destination. If ``None`` (the default), compaction is done
+        in-place via a sibling temp file and an atomic
+        :func:`os.replace`; the original is overwritten on success and
+        untouched on failure. If given and different from ``path``, the
+        compacted result is written there and the original is left as-is.
+        If equal to ``path``, behaves as in-place.
+    show_progress : bool, default True
+        Whether to display a tqdm progress bar during the copy.
+
+    Returns
+    -------
+    pathlib.Path
+        The path the compacted file was written to (``path`` for
+        in-place; ``out`` for out-of-place).
+
+    Notes
+    -----
+    Already-compact files (``n_records <= 1``) are a no-op when ``out``
+    is ``None`` or points to the same file. When ``out`` points
+    elsewhere, the source is copied byte-for-byte (since the source is
+    already in the optimal layout).
+
+    Takes an advisory ``fcntl.flock`` on the source for the duration; a
+    concurrent :func:`colstore.update` writer is blocked. Readers are
+    unaffected (they don't take the lock, and on POSIX they continue
+    reading the unlinked inode after the rename).
+    """
+    return compact_file(path, out, show_progress=show_progress)
 
 
 # ---- Introspection: info / schema --------------------------------------
