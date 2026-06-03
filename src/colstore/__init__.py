@@ -61,7 +61,16 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from .api import create, open, recreate, store, update
+from .api import (
+    ColStoreInfo,
+    create,
+    info,
+    open,
+    recreate,
+    schema,
+    store,
+    update,
+)
 from .autotune import (
     apply_cached_cap_if_present,
     calibrate,
@@ -87,6 +96,7 @@ apply_cached_cap_if_present()
 
 __all__ = [
     "FILE_EXTENSION",
+    "ColStoreInfo",
     "ColStoreReader",
     "ColStoreWriter",
     "ColumnView",
@@ -101,10 +111,12 @@ __all__ = [
     "get_default_madvise",
     "get_gather_thread_cap",
     "get_max_workers",
+    "info",
     "max_threads",
     "numba_available",
     "open",
     "recreate",
+    "schema",
     "set_default_backend",
     "set_default_madvise",
     "set_gather_thread_cap",

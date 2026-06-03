@@ -1,13 +1,16 @@
-"""Module-level convenience functions: open, create, recreate, update, store.
+"""Module-level convenience functions: open, create, recreate, update, store,
+info, schema.
 
-These thin wrappers around :class:`ColStoreReader` and :class:`ColStoreWriter` give the
-package a uroot-style entry-point surface where each function does one
-obvious thing.
+These thin wrappers around :class:`ColStoreReader` and :class:`ColStoreWriter`
+give the package a uproot-style entry-point surface where each function does
+one obvious thing.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -142,3 +145,95 @@ def _dataframe_to_columns(frame: Any) -> dict[str, np.ndarray[Any, np.dtype[Any]
             )
         columns[str(column_name)] = array
     return columns
+
+
+# ---- Introspection: info / schema --------------------------------------
+
+
+@dataclass(frozen=True)
+class ColStoreInfo:
+    """Summary of a colstore file's contents and on-disk shape.
+
+    Returned by :func:`info`. Fields are populated from the file header
+    without scanning any record bodies, so the call is fast even on
+    large files.
+
+    Attributes
+    ----------
+    path : pathlib.Path
+        Filesystem path the info was read from.
+    format_version : int
+        On-disk format version. Currently always ``1``.
+    n_rows : int
+        Total committed row count across all records.
+    n_records : int
+        Number of records in the file. A one-shot write or a fully
+        compacted file has ``n_records == 1``.
+    columns : list[dict]
+        Schema: one ``{"name": ..., "dtype": ..., "encoding": ...,
+        "nullable": ...}`` per column, in declaration order.
+    file_size : int
+        Size of the file in bytes (``os.path.getsize``).
+    """
+
+    path: Path
+    format_version: int
+    n_rows: int
+    n_records: int
+    columns: list[dict[str, Any]] = field(repr=False)
+    file_size: int
+
+    @property
+    def needs_compaction(self) -> bool:
+        """``True`` if collapsing the file to one record would help.
+
+        A multi-record file pays a per-pattern dispatch cost on reads
+        (cheap for slice and sorted-fancy, expensive for unsorted-fancy
+        as records accumulate). After :func:`compact`, all reads take
+        the single-record fast path.
+        """
+        return self.n_records > 1
+
+    def __repr__(self) -> str:
+        col_summary = ", ".join(f"{c['name']}:{c['dtype']}" for c in self.columns)
+        return (
+            f"ColStoreInfo(path={self.path.name!r}, n_rows={self.n_rows:,}, "
+            f"n_records={self.n_records}, columns=[{col_summary}], "
+            f"file_size={self.file_size:,}B"
+            f"{', needs_compaction=True' if self.needs_compaction else ''})"
+        )
+
+
+def info(path: str | os.PathLike[str]) -> ColStoreInfo:
+    """Return a summary of the file at ``path`` without reading any record bodies.
+
+    The summary is built from the validated file header (magic, counters
+    block CRC, format version, manifest CRC). If any of those checks
+    fail, the underlying :class:`FormatError` propagates -- ``info`` is
+    therefore also useful as a cheap "is this a valid colstore file?"
+    probe.
+
+    See :class:`ColStoreInfo` for the returned fields.
+    """
+    manifest, _ = fmt.read_header(path)
+    file_size = os.path.getsize(path)
+    return ColStoreInfo(
+        path=Path(path),
+        format_version=int(manifest["format_version"]),
+        n_rows=int(manifest["committed_rows"]),
+        n_records=int(manifest["n_records"]),
+        columns=list(manifest["columns"]),
+        file_size=file_size,
+    )
+
+
+def schema(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """Return the column schema of ``path`` without reading any record bodies.
+
+    Each entry is a dict with at least ``"name"`` and ``"dtype"`` keys
+    (and may carry ``"encoding"`` / ``"nullable"`` from the on-disk
+    manifest). Use :func:`info` for the broader summary including row
+    count and record count.
+    """
+    manifest, _ = fmt.read_header(path)
+    return list(manifest["columns"])
