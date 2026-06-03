@@ -346,7 +346,11 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
             raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
         n_records, committed_rows = _unpack_counters(input_file.read(_COUNTERS_SIZE))
         manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
-        manifest = json.loads(input_file.read(manifest_size))
+        manifest_bytes = input_file.read(manifest_size)
+    try:
+        manifest = json.loads(manifest_bytes)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        raise FormatError(f"Manifest is not valid JSON; the header is corrupt ({e}).") from e
 
     version = manifest.get("format_version")
     if version not in _SUPPORTED_VERSIONS:

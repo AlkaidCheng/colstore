@@ -91,6 +91,40 @@ The writer commits records atomically on `close()` by rewriting a 32-byte
 counters block. A reader opening the file mid-write sees only what the
 last successful close committed.
 
+## Compaction
+
+A streaming write produces one record per `write()` call. Reads of
+slice and sorted-fancy index patterns scale near-flat with record count,
+but unsorted-fancy reads degrade as records accumulate. `colstore.compact`
+collapses all records into one, so every read pattern takes the
+single-record fast path:
+
+```python
+colstore.compact("data.cstore")                 # in-place
+colstore.compact("data.cstore", out="new.cstore")  # leave source untouched
+```
+
+In-place compaction writes to a sibling temp file and atomically renames
+into place; the source is untouched on failure. The byte copy uses
+`os.sendfile` where available, so memory footprint is bounded by the
+kernel's I/O buffer (tens of KB) regardless of file size — files much
+larger than RAM compact fine.
+
+## Introspection
+
+```python
+i = colstore.info("data.cstore")
+# ColStoreInfo(path='data.cstore', n_rows=1_000_000, n_records=42,
+#              columns=[a:<f4, b:<i8], file_size=8_001_232B,
+#              needs_compaction=True)
+
+colstore.schema("data.cstore")
+# [{'name': 'a', 'dtype': '<f4', 'encoding': 'raw', 'nullable': False}, ...]
+```
+
+Both `info` and `schema` read only the file header (no record bodies are
+scanned), so they're cheap on multi-GB files.
+
 ## Configuration
 
 ```python
