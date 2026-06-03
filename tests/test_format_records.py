@@ -448,15 +448,21 @@ def test_slice_across_zero_row_record(tmp_path):
     """
     path = tmp_path / "zero_rec.cstore"
     records = [
-        {"i32": np.arange(5, dtype=np.int32),
-         "f64": np.arange(5, dtype=np.float64),
-         "i8": np.arange(5, dtype=np.int8)},
-        {"i32": np.empty(0, dtype=np.int32),
-         "f64": np.empty(0, dtype=np.float64),
-         "i8": np.empty(0, dtype=np.int8)},
-        {"i32": np.arange(100, 105, dtype=np.int32),
-         "f64": np.arange(100, 105, dtype=np.float64),
-         "i8": (np.arange(5, dtype=np.int8) + 50)},
+        {
+            "i32": np.arange(5, dtype=np.int32),
+            "f64": np.arange(5, dtype=np.float64),
+            "i8": np.arange(5, dtype=np.int8),
+        },
+        {
+            "i32": np.empty(0, dtype=np.int32),
+            "f64": np.empty(0, dtype=np.float64),
+            "i8": np.empty(0, dtype=np.int8),
+        },
+        {
+            "i32": np.arange(100, 105, dtype=np.int32),
+            "f64": np.arange(100, 105, dtype=np.float64),
+            "i8": (np.arange(5, dtype=np.int8) + 50),
+        },
     ]
     write_record_file(path, _schema(), records)
     truth = expected_column_values(records, "i32")
