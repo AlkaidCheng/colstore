@@ -520,30 +520,61 @@ class ColStore:
 
         # ---- Fancy-index path. Choose how to bin indices to records.
         record_starts_rows = self._record_starts_rows
+        record_starts_bytes = self._record_starts_bytes
+        n_rows_per_record = self._n_rows_per_record
         # Sortedness check is O(K) but ~100x faster than a searchsorted at
         # K=200K, so the early exit is essentially free in the unsorted case.
         if n > 1 and bool(np.all(indices[1:] >= indices[:-1])):
-            # Sorted: count how many indices fall in each record by locating
-            # the record boundaries *within the indices array*. R searchsorts
-            # of size K -> O(R log K). Then a single np.repeat produces the
-            # record_id array.
+            # Sorted path. Two-part optimization:
+            #
+            # (1) Boundary-based partition. ``np.searchsorted`` on the
+            #     *record-row boundaries* against the indices array
+            #     (O(R log K)) replaces searchsorted on the *indices* against
+            #     the boundaries (O(K log R)).
+            #
+            # (2) Per-record byte_offset arithmetic. For each record-bucket
+            #     [lo, hi), all entries share the same record body offset,
+            #     so:
+            #
+            #         byte_offsets[i] = rsb[r] + col_prefix * nrr[r]
+            #                                  + (indices[i] - rsr[r]) * itemsize
+            #                         = base_for_record_r + indices[i] * itemsize
+            #
+            #     where base_for_record_r = rsb[r] + col_prefix*nrr[r]
+            #                               - rsr[r]*itemsize is a scalar.
+            #
+            #     This is much cheaper than the generic vectorized form,
+            #     which would allocate four K-sized int64 temporaries
+            #     (record_id, within_record, two intermediate gathers). At
+            #     K=1M the generic form costs ~11ms in allocator/cache
+            #     traffic alone; the per-record loop costs ~1ms.
             crossings = np.searchsorted(indices, record_starts_rows, side="left")
-            counts = np.diff(crossings)  # length R, sums to n
-            record_id = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
+            byte_offsets = np.empty(n, dtype=np.int64)
+            for r in range(crossings.shape[0] - 1):
+                lo = int(crossings[r])
+                hi = int(crossings[r + 1])
+                if hi == lo:
+                    continue
+                base = (
+                    int(record_starts_bytes[r])
+                    + col_prefix * int(n_rows_per_record[r])
+                    - int(record_starts_rows[r]) * itemsize
+                )
+                np.multiply(indices[lo:hi], itemsize, out=byte_offsets[lo:hi])
+                np.add(byte_offsets[lo:hi], base, out=byte_offsets[lo:hi])
         else:
-            # Unsorted (or n == 1). searchsorted on the boundaries is K log R.
+            # Unsorted (or n == 1). The generic searchsorted is O(K log R)
+            # and the byte_offset materialization allocates several K-sized
+            # int64 temporaries -- both are significant at large K, and
+            # we've measured no cheaper alternative (argsort + sorted-path
+            # is strictly worse because argsort dominates).
             record_id = np.searchsorted(record_starts_rows, indices, side="right") - 1
-
-        within_record = indices - record_starts_rows[record_id]
-        # Byte address of each requested element:
-        #   record body offset
-        #   + column prefix within the record (= col_prefix * n_rows_in_record)
-        #   + within-record row offset (= within_record * itemsize)
-        byte_offsets = (
-            self._record_starts_bytes[record_id]
-            + col_prefix * self._n_rows_per_record[record_id]
-            + within_record * itemsize
-        )
+            within_record = indices - record_starts_rows[record_id]
+            byte_offsets = (
+                record_starts_bytes[record_id]
+                + col_prefix * n_rows_per_record[record_id]
+                + within_record * itemsize
+            )
 
         output = np.empty(n, dtype=native_dtype)
         effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
