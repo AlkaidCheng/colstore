@@ -8,13 +8,19 @@ implementation. The work splits into two halves:
   cost is negligible.
 * A *byte splice* of each column's payload from every input record into one
   contiguous run in the output. This is bandwidth-bound and dominates the
-  runtime. We hand the splice to the kernel via :func:`os.sendfile` where
-  available, falling back to :func:`shutil.copyfileobj` on platforms (Windows)
-  that lack ``sendfile`` for file-to-file copies.
+  runtime. We use :func:`os.sendfile` on Linux (kernel-space copy, no
+  Python-side surfacing) and :func:`shutil.copyfileobj` on other platforms.
 
-Memory footprint is bounded by the I/O buffer the kernel chooses (tens of
-KB), independent of file size. The output file can be many times larger than
-RAM.
+  An earlier draft tried to use ``os.sendfile`` on any POSIX platform.
+  That was wrong: on macOS, ``os.sendfile`` requires the destination fd
+  to be a *socket* and raises ``ENOTSOCK`` for our file-to-file use case.
+  Linux's ``sendfile`` accepts a regular-file destination since kernel
+  2.6.33 (which is everywhere modern). The platform gate is
+  ``sys.platform == "linux"``, not ``os.name == "posix"``.
+
+Memory footprint is bounded by the kernel's sendfile buffer on Linux and
+by ``shutil.COPY_BUFSIZE`` (64 KB) elsewhere, independent of file size.
+The output file can be many times larger than RAM.
 
 Atomicity (in-place mode): the output is written to a sibling temp file and
 moved into place with :func:`os.replace`. On any error the temp file is
@@ -28,6 +34,7 @@ import contextlib
 import fcntl
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import IO, Any
 
@@ -36,9 +43,10 @@ import numpy as np
 from . import format as fmt
 from .progress import progress_bar
 
-# Linux/macOS expose os.sendfile for file-to-file copies. Windows does not;
-# the fallback path uses shutil.copyfileobj which is portable but slower.
-_HAS_SENDFILE = hasattr(os, "sendfile") and os.name == "posix"
+# Linux's os.sendfile accepts regular-file destinations. macOS's sendfile
+# requires a socket destination and raises ENOTSOCK for our use case.
+# Windows has no os.sendfile at all. We dispatch by platform.
+_USE_SENDFILE = sys.platform == "linux" and hasattr(os, "sendfile")
 
 
 def compact_file(
@@ -155,7 +163,6 @@ def _write_compacted(
     col_prefixes = np.cumsum([0, *itemsizes[:-1]])
 
     with open(src_path, "rb") as src_fp, open(target_path, "wb") as dst_fp:
-        src_fd = src_fp.fileno()
         # ---- File header with FINAL counters. -----------------------------
         # The writer normally writes n_records=0 here and rewrites on close;
         # we know the answer up front, so we bake it in.
@@ -185,7 +192,7 @@ def _write_compacted(
                         continue
                     src_offset = int(record_body_offsets[record_index]) + col_prefix * n_rows
                     nbytes = n_rows * itemsize
-                    _copy_range(src_fd, dst_fp, src_offset, nbytes)
+                    _copy_range(src_fp, dst_fp, src_offset, nbytes)
                     body_bytes += nbytes
                     progress.update(1)
 
@@ -201,26 +208,30 @@ def _write_compacted(
         os.fsync(dst_fp.fileno())
 
 
-def _copy_range(src_fd: int, dst_fp: IO[bytes], offset: int, count: int) -> None:
-    """Copy ``count`` bytes from ``offset`` in ``src_fd`` to ``dst_fp``'s current position.
+def _copy_range(src_fp: IO[bytes], dst_fp: IO[bytes], offset: int, count: int) -> None:
+    """Copy ``count`` bytes from ``offset`` in ``src_fp`` to ``dst_fp``'s current position.
 
-    On Linux/macOS this is a single ``sendfile`` call (or a small loop if the
-    kernel returns partial counts) that copies in kernel space without
-    surfacing the bytes through Python. On Windows we fall back to
-    ``shutil.copyfileobj`` with a per-range bounded reader.
+    On Linux, this is one or more ``os.sendfile`` calls -- a kernel-space
+    copy that never surfaces the bytes through Python. On macOS and
+    Windows, it's a :func:`shutil.copyfileobj` call wrapped in a
+    :class:`_BoundedReader` so it can't read past the requested range.
+
+    On both paths the memory footprint is independent of ``count``:
+    bounded by the kernel's sendfile buffer on Linux, by
+    ``shutil.COPY_BUFSIZE`` (64 KB) elsewhere.
     """
     if count == 0:
         return
-    if _HAS_SENDFILE:
+
+    if _USE_SENDFILE:
         # sendfile may copy less than requested in one call; loop until done.
-        # The first arg is the destination fd; the in_offset argument
-        # advances as we go.
+        # Flush dst's Python buffer first so we don't interleave Python-
+        # buffered writes with kernel-direct writes to the same fd.
+        dst_fp.flush()
+        dst_fd = dst_fp.fileno()
+        src_fd = src_fp.fileno()
         remaining = count
         cur_offset = offset
-        dst_fd = dst_fp.fileno()
-        # Ensure the dst_fp's buffered position is flushed to the underlying
-        # fd before we write to that fd directly.
-        dst_fp.flush()
         while remaining > 0:
             sent = os.sendfile(dst_fd, src_fd, cur_offset, remaining)
             if sent == 0:  # pragma: no cover -- EOF before count satisfied
@@ -232,11 +243,9 @@ def _copy_range(src_fd: int, dst_fp: IO[bytes], offset: int, count: int) -> None
             remaining -= sent
         return
 
-    # Fallback: read+write via Python buffer. Slower but portable.
-    # pragma: no cover -- only runs on Windows.
-    os.lseek(src_fd, offset, os.SEEK_SET)  # pragma: no cover
-    with os.fdopen(os.dup(src_fd), "rb", closefd=True) as src_fp:  # pragma: no cover
-        shutil.copyfileobj(_BoundedReader(src_fp, count), dst_fp)  # pragma: no cover
+    # macOS / Windows: read+write via Python buffer.
+    src_fp.seek(offset)
+    shutil.copyfileobj(_BoundedReader(src_fp, count), dst_fp)
 
 
 def _copy_whole_file(src: Path, dst: Path) -> None:
@@ -245,16 +254,19 @@ def _copy_whole_file(src: Path, dst: Path) -> None:
     Used only for the ``out_path != src`` + ``n_records == 1`` short-circuit,
     where the bytes are already optimally arranged and we just want a copy
     at the new path. ``shutil.copyfile`` already uses ``os.sendfile`` /
-    ``copy_file_range`` internally where available.
+    ``copy_file_range`` internally where available -- including on macOS for
+    same-filesystem clones via ``fclonefileat`` -- so it's the right tool
+    for whole-file copies even though we can't use it for range copies.
     """
     shutil.copyfile(src, dst)
 
 
-class _BoundedReader:  # pragma: no cover -- Windows fallback only
+class _BoundedReader:
     """Restrict a file-like to at most ``n`` bytes from current position.
 
-    Used to bound ``shutil.copyfileobj`` so it doesn't read past the end of
-    the requested range.
+    Used to bound :func:`shutil.copyfileobj` so it doesn't read past the
+    end of the requested range. Only used on the non-Linux fallback path
+    (Linux uses ``os.sendfile`` directly).
     """
 
     __slots__ = ("_remaining", "_src")

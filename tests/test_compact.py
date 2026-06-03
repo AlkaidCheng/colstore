@@ -345,3 +345,42 @@ def test_compact_memory_bounded_on_large_file(tmp_path):
         assert np.array_equal(ds[:100, "x"].to_array(), first_few)
         assert np.array_equal(ds[-100:, "x"].to_array(), last_few)
         assert colstore.info(path).n_records == 1
+
+
+# ---- Platform fallback (non-Linux portable path) --------------------------
+
+
+def test_compact_works_on_non_linux_fallback_path(tmp_path, monkeypatch):
+    """The non-Linux code path (shutil.copyfileobj + _BoundedReader) must
+    produce byte-identical output to the Linux sendfile path.
+
+    macOS and Windows take the fallback in production; this test exercises
+    it from Linux CI by patching the platform gate. Regression guard for
+    the original bug where ``os.sendfile`` was used unconditionally on
+    POSIX (and failed with ENOTSOCK on macOS).
+    """
+    from colstore import compaction
+
+    monkeypatch.setattr(compaction, "_USE_SENDFILE", False)
+
+    path = tmp_path / "fallback.cstore"
+    rng = np.random.default_rng(0)
+    with colstore.create(path) as f:
+        for _ in range(4):
+            f.write(
+                {
+                    "x": rng.standard_normal(100).astype(np.float32),
+                    "y": rng.integers(-1000, 1000, size=100, dtype=np.int64),
+                }
+            )
+
+    with colstore.open(path) as ds:
+        x_before = ds[:, "x"].to_array().copy()
+        y_before = ds[:, "y"].to_array().copy()
+
+    colstore.compact(path, show_progress=False)
+
+    assert colstore.info(path).n_records == 1
+    with colstore.open(path) as ds:
+        assert np.array_equal(ds[:, "x"].to_array(), x_before)
+        assert np.array_equal(ds[:, "y"].to_array(), y_before)
