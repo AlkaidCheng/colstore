@@ -306,10 +306,11 @@ def test_simulated_crash_loses_only_uncommitted(tmp_path):
     # crash. We have to suppress the close-on-del ResourceWarning since it
     # would try to commit; we manually invalidate state so __del__ skips.
     w2._has_header = True  # ensure not deleted on close path
-    # Force-release the lock and close the fd without commit.
-    import fcntl
+    # Force-release the lock and close the fd without commit. Use the
+    # cross-platform _lock helper so this test runs on Windows too.
+    from colstore import _lock
 
-    fcntl.flock(w2._file.fileno(), fcntl.LOCK_UN)
+    _lock.unlock(w2._file.fileno())
     w2._file.close()
     w2._closed = True  # tell __del__ to leave us alone
 

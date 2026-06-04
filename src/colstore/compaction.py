@@ -21,13 +21,13 @@ The output file can be many times larger than RAM.
 Atomicity (in-place mode): the output is written to a sibling temp file and
 moved into place with :func:`os.replace`. On any error the temp file is
 removed and the source is untouched. Concurrent writers are blocked for the
-duration via an advisory ``fcntl.flock`` on the source.
+duration via an advisory lock on the source (``fcntl.flock`` on POSIX,
+``msvcrt.locking`` on Windows; see :mod:`colstore._lock`).
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import shutil
 import sys
@@ -36,6 +36,7 @@ from typing import IO, Any
 
 import numpy as np
 
+from . import _lock
 from . import format as fmt
 from .progress import progress_bar
 
@@ -92,12 +93,13 @@ def compact_file(
 
     # Take an advisory lock on the source to block concurrent writers from
     # appending while we copy. We open the lock fd separately from the
-    # sendfile read fd so we can keep it through the rename without
-    # conflicting with the writer's own flock conventions.
+    # read fd so we can keep it through the rename without conflicting
+    # with the writer's own lock conventions. See :mod:`colstore._lock`
+    # for the cross-platform locking primitive.
     lock_fd = os.open(src, os.O_RDONLY)
     try:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock.lock_exclusive_nonblocking(lock_fd)
         except BlockingIOError as e:
             raise OSError(f"Cannot compact {src}: a writer holds the lock. Close it first.") from e
 
@@ -129,8 +131,7 @@ def compact_file(
         return target
 
     finally:
-        with contextlib.suppress(OSError):
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        _lock.unlock(lock_fd)
         os.close(lock_fd)
 
 
