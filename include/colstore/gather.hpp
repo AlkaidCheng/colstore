@@ -32,6 +32,17 @@
 #define COLSTORE_PREFETCH(addr) __builtin_prefetch((addr), 0, 0)
 #endif
 
+// Portable restrict qualifier. GCC and Clang spell it ``__restrict__``;
+// MSVC spells it ``__restrict`` (no trailing underscores). C99 has plain
+// ``restrict`` but it's not standard C++ -- every compiler has its own
+// non-standard equivalent. The qualifier tells the compiler that pointers
+// don't alias, enabling load/store vectorization of the inner loop.
+#if defined(_MSC_VER)
+#define COLSTORE_RESTRICT __restrict
+#else
+#define COLSTORE_RESTRICT __restrict__
+#endif
+
 namespace colstore {
 
 // Default prefetch distance in elements. Eight iterations ahead is roughly
