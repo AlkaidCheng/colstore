@@ -20,6 +20,18 @@
 #include <cstddef>
 #include <cstdint>
 
+// Portable software-prefetch hint. GCC and Clang expose __builtin_prefetch;
+// MSVC has no equivalent builtin but provides _mm_prefetch via xmmintrin.h.
+// The MSVC arguments (_MM_HINT_NTA = non-temporal, no cache locality)
+// match GCC's "rw=0, locality=0" -- the read-once-and-discard hint we
+// want for a scattered gather where the source bytes won't be revisited.
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#define COLSTORE_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_NTA)
+#else
+#define COLSTORE_PREFETCH(addr) __builtin_prefetch((addr), 0, 0)
+#endif
+
 namespace colstore {
 
 // Default prefetch distance in elements. Eight iterations ahead is roughly

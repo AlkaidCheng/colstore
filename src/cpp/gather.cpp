@@ -24,8 +24,10 @@
 //
 //  * OpenMP parallel for. Loop body is independent across i; static schedule
 //    keeps overhead minimal.
-//  * Software prefetching. ``__builtin_prefetch`` issues a memory hint a few
-//    iterations ahead, hiding L3/DRAM miss latency for scattered loads.
+//  * Software prefetching. ``COLSTORE_PREFETCH`` (defined in the header
+//    as ``__builtin_prefetch`` on GCC/Clang, ``_mm_prefetch`` on MSVC)
+//    issues a memory hint a few iterations ahead, hiding L3/DRAM miss
+//    latency for scattered loads.
 //  * ``__restrict__`` pointer qualifiers. Compiler can assume base, indices,
 //    and output do not alias, enabling vectorization of the store stream.
 //  * Typed dereferences inside the templated loop. ``*(T*)(base + ...)`` is
@@ -95,7 +97,7 @@ void gather_indexed_typed(const std::uint8_t* __restrict__ base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (i + prefetch_distance < n_indices) {
-      __builtin_prefetch(&src[indices[i + prefetch_distance]], 0, 0);
+      COLSTORE_PREFETCH(&src[indices[i + prefetch_distance]]);
     }
     dst[i] = src[indices[i]];
   }
@@ -124,7 +126,7 @@ void gather_bytes_typed(const std::uint8_t* __restrict__ base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (i + prefetch_distance < n_indices) {
-      __builtin_prefetch(base + byte_offsets[i + prefetch_distance], 0, 0);
+      COLSTORE_PREFETCH(base + byte_offsets[i + prefetch_distance]);
     }
     dst[i] = *reinterpret_cast<const T*>(base + byte_offsets[i]);
   }
