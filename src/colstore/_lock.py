@@ -7,20 +7,25 @@ whole-file advisory case; Windows has no direct equivalent and uses
 :func:`msvcrt.locking` for byte-range locks instead. This module hides
 the difference.
 
-The Windows path locks one byte at offset 0 of the file. msvcrt's lock
-is *mandatory* (the kernel enforces it for all I/O, not just cooperating
-processes), but byte 0 is part of the immutable 8-byte magic constant
-``b"CSTORE\\x00\\x01"`` -- no non-cooperating code path needs to touch
-it once the file is open, so mandatory-vs-advisory doesn't matter in
-practice. The lock is automatically released when the file descriptor
-closes, so a forgotten :func:`unlock` is recovered the moment the
-process exits.
+The Windows path locks a single byte at a sentinel offset far beyond any
+practical file size (``1 << 62`` -- 4 exabytes). msvcrt's byte-range lock
+is *mandatory*: it blocks reads and writes of the locked bytes from any
+other handle, even within the same process. That property is exactly
+what we want for contention detection (a second lock attempt at the
+same offset raises ``OSError`` -> we normalize to ``BlockingIOError``),
+but it also means we must NOT lock a byte that any read path touches --
+otherwise calls like :func:`colstore.info` and :func:`colstore.open`
+would fail with ``PermissionError`` while a writer is active. Locking
+far past EOF avoids that entirely: the lock exists only as a logical
+record in the kernel's lock table, no real data sits at that offset,
+no read path ever reaches it, and the file is not extended
+(msvcrt.locking past EOF does not allocate).
 
 Both functions take a raw file descriptor (the result of
 ``os.open()`` or ``file_obj.fileno()``) rather than a file object, so
 the caller is free to choose how it tracks the file. The Windows
-implementation save/restores the fd's offset around the lock call so
-the caller's logical file position is undisturbed.
+implementation saves and restores the fd's offset around the lock
+call so the caller's logical file position is undisturbed.
 """
 
 from __future__ import annotations
@@ -32,10 +37,16 @@ if sys.platform == "win32":
     import msvcrt
     import os
 
+    # Sentinel offset for the Windows byte-range lock. 4 EiB -- well beyond
+    # any practical colstore file (or any filesystem's maximum file size).
+    # msvcrt.locking at this offset creates a logical lock record without
+    # extending the file, so it doesn't collide with any reader path.
+    _LOCK_OFFSET = 1 << 62
+
     def lock_exclusive_nonblocking(fd: int) -> None:
         """Acquire an exclusive non-blocking lock; raise BlockingIOError if held."""
         saved_position = os.lseek(fd, 0, os.SEEK_CUR)
-        os.lseek(fd, 0, os.SEEK_SET)
+        os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
         try:
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as e:
@@ -50,7 +61,7 @@ if sys.platform == "win32":
         """Release a previously-acquired lock. Idempotent: errors are suppressed."""
         saved_position = os.lseek(fd, 0, os.SEEK_CUR)
         try:
-            os.lseek(fd, 0, os.SEEK_SET)
+            os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
             with contextlib.suppress(OSError):
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         finally:

@@ -341,6 +341,11 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
     header) are validated by :func:`read_record_index`, which the caller
     runs immediately after this to build the per-record index.
 
+    For callers that already hold an open file handle (notably the writer
+    in update mode and the compactor while holding its lock), use
+    :func:`read_header_from_file` instead so we don't open a second
+    handle. Saves a syscall and matches the caller's lifecycle.
+
     Raises
     ------
     FormatError
@@ -348,12 +353,24 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
         ``format_version``, or manifest CRC mismatch.
     """
     with open(path, "rb") as input_file:
-        magic = input_file.read(len(_MAGIC))
-        if magic != _MAGIC:
-            raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
-        n_records, committed_rows = _unpack_counters(input_file.read(_COUNTERS_SIZE))
-        manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
-        manifest_bytes = input_file.read(manifest_size)
+        return read_header_from_file(input_file)
+
+
+def read_header_from_file(input_file: IO[bytes]) -> tuple[dict[str, Any], int]:
+    """Variant of :func:`read_header` that reads from an already-open file.
+
+    Reads starting from the current file position. The position is left
+    just past the manifest JSON; the caller can seek wherever it needs
+    next. Used by :class:`ColStoreWriter` in update mode so the header
+    read goes through the writer's own fd (the one that holds the
+    byte-0 lock on Windows).
+    """
+    magic = input_file.read(len(_MAGIC))
+    if magic != _MAGIC:
+        raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
+    n_records, committed_rows = _unpack_counters(input_file.read(_COUNTERS_SIZE))
+    manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
+    manifest_bytes = input_file.read(manifest_size)
     try:
         manifest = json.loads(manifest_bytes)
     except (json.JSONDecodeError, UnicodeDecodeError) as e:

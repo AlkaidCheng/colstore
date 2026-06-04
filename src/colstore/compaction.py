@@ -57,51 +57,75 @@ def compact_file(
     if not src.exists():
         raise FileNotFoundError(f"{src} does not exist.")
 
-    # Read and validate header. Cheap, also catches corrupt files early.
-    manifest, src_data_offset = fmt.read_header(src)
-    src_n_records = int(manifest["n_records"])
-    src_committed_rows = int(manifest["committed_rows"])
-    columns = list(manifest["columns"])
-
     out = Path(out_path) if out_path is not None else None
     same_target = out is None or out.resolve() == src.resolve()
 
-    # Fast path: source is already compact.
-    #   - In-place: no work to do. Return the source path.
-    #   - Out-of-place: user asked for a copy at `out`; do a kernel-level
-    #     file copy (much cheaper than re-running the format work and
-    #     produces a byte-identical result).
-    if src_n_records <= 1:
-        if same_target:
-            return src
-        assert out is not None
-        _copy_whole_file(src, out)
-        return out
-
-    # ---- Non-trivial compaction. -----------------------------------------
-    # Walk every record header to validate them and to learn each record's
-    # body offset and row count. The reader's _gather_one path does the same
-    # thing; we reuse the same helper.
-    itemsizes = [np.dtype(col["dtype"]).itemsize for col in columns]
-    _, record_body_offsets, n_rows_per_record = fmt.read_record_index(
-        src, src_data_offset, src_n_records, itemsizes
-    )
-
-    target = (
-        out if (out is not None and not same_target) else src.with_name(src.name + ".compacting")
-    )
-
-    # Take an advisory lock on the source to block concurrent writers from
-    # appending while we copy. We open the lock fd separately from the
-    # read fd so we can keep it through the rename without conflicting
-    # with the writer's own lock conventions. See :mod:`colstore._lock`
-    # for the cross-platform locking primitive.
+    # Take the lock BEFORE reading the header. The ordering doesn't matter
+    # for correctness (the lock is on a sentinel offset that nothing else
+    # touches; see :mod:`colstore._lock`), but a contended open this way
+    # yields a clean "writer holds the lock" error before we attempt any
+    # format work -- the error precedence is friendlier to the caller.
+    #
+    # Lock lifecycle: protects the byte copy only. We release and close
+    # lock_fd BEFORE os.replace, because:
+    #
+    #   1. Windows refuses to replace a file that anyone has open
+    #      (WinError 5: Access is denied). Our lock_fd is exactly that.
+    #
+    #   2. Once os.replace runs, the lock is meaningless anyway. POSIX
+    #      rename unlinks the old inode; our lock_fd still references it,
+    #      but a new writer opening `src` lands on the NEW inode and is
+    #      unaffected by the old lock. The protection window structurally
+    #      ends at the rename; the explicit unlock just matches.
     lock_fd = os.open(src, os.O_RDONLY)
+    lock_acquired = False
     try:
         try:
             _lock.lock_exclusive_nonblocking(lock_fd)
+            lock_acquired = True
         except BlockingIOError as e:
             raise OSError(f"Cannot compact {src}: a writer holds the lock. Close it first.") from e
+
+        # Read the header through the locking fd. We could use a fresh
+        # open() -- the lock is at a sentinel offset that doesn't block
+        # reads of any data byte -- but reusing lock_fd saves a syscall
+        # and matches the writer's pattern. closefd=False keeps lock_fd
+        # alive past the wrapper's close so we can manage its lifetime
+        # explicitly below.
+        with os.fdopen(lock_fd, "rb", closefd=False) as lock_file:
+            lock_file.seek(0)
+            manifest, src_data_offset = fmt.read_header_from_file(lock_file)
+
+        src_n_records = int(manifest["n_records"])
+        src_committed_rows = int(manifest["committed_rows"])
+        columns = list(manifest["columns"])
+
+        # Fast path: source is already compact.
+        #   - In-place: no work to do. Return the source path.
+        #   - Out-of-place: user asked for a copy at `out`; do a kernel-level
+        #     file copy (much cheaper than re-running the format work and
+        #     produces a byte-identical result).
+        if src_n_records <= 1:
+            if same_target:
+                return src
+            assert out is not None
+            _copy_whole_file(src, out)
+            return out
+
+        # ---- Non-trivial compaction. -----------------------------------------
+        # Walk every record header to validate them and to learn each record's
+        # body offset and row count. The reader's _gather_one path does the
+        # same thing; we reuse the same helper.
+        itemsizes = [np.dtype(col["dtype"]).itemsize for col in columns]
+        _, record_body_offsets, n_rows_per_record = fmt.read_record_index(
+            src, src_data_offset, src_n_records, itemsizes
+        )
+
+        target = (
+            out
+            if (out is not None and not same_target)
+            else src.with_name(src.name + ".compacting")
+        )
 
         try:
             _write_compacted(
@@ -122,17 +146,24 @@ def compact_file(
                 target.unlink()
             raise
 
+        # Release lock + close lock_fd BEFORE the rename -- see Windows
+        # os.replace note in the lock-acquisition comment above.
+        _lock.unlock(lock_fd)
+        lock_acquired = False
+        os.close(lock_fd)
+        lock_fd = -1
+
         # All bytes written and fsynced. Atomic rename into place.
-        # os.replace is atomic on POSIX for same-filesystem moves and works
-        # on Windows for non-open destinations.
         if same_target:
             os.replace(target, src)
             return src
         return target
 
     finally:
-        _lock.unlock(lock_fd)
-        os.close(lock_fd)
+        if lock_acquired:
+            _lock.unlock(lock_fd)
+        if lock_fd != -1:
+            os.close(lock_fd)
 
 
 def _write_compacted(
