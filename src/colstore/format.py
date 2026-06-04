@@ -674,6 +674,40 @@ def _resolve_rows_per_step(
     return [max(1, bytes_per_step // max(1, itemsize)) for itemsize in column_itemsizes]
 
 
+# ---- Throughput formatting -----------------------------------------------
+#
+# Used by ``write_dataset`` to attach a human-readable rows/s and bytes/s
+# to the progress bar postfix.
+
+
+def _format_bytes_per_sec(bytes_per_sec: float) -> str:
+    """Auto-scaled bytes/s: '47.5 MB/s', '1.23 GB/s', '850 KB/s', etc."""
+    if bytes_per_sec >= 1024**3:
+        return f"{bytes_per_sec / 1024**3:.2f} GB/s"
+    if bytes_per_sec >= 1024**2:
+        return f"{bytes_per_sec / 1024**2:.2f} MB/s"
+    if bytes_per_sec >= 1024:
+        return f"{bytes_per_sec / 1024:.2f} KB/s"
+    return f"{bytes_per_sec:.0f} B/s"
+
+
+def _format_rows_per_sec(rows_per_sec: float) -> str:
+    """Auto-scaled rows/s with a space between number and unit.
+
+    Output: ``'1.25 Mrows/s'``, ``'125.00 Krows/s'``, ``'850 rows/s'``.
+    The unit name follows SI convention -- prefix (K/M/G) sits flush with
+    the noun (no space inside the unit), space goes between number and
+    unit.
+    """
+    if rows_per_sec >= 1_000_000_000:
+        return f"{rows_per_sec / 1_000_000_000:.2f} Grows/s"
+    if rows_per_sec >= 1_000_000:
+        return f"{rows_per_sec / 1_000_000:.2f} Mrows/s"
+    if rows_per_sec >= 1_000:
+        return f"{rows_per_sec / 1_000:.2f} Krows/s"
+    return f"{rows_per_sec:.0f} rows/s"
+
+
 def write_dataset(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
     path: PathLike,
@@ -708,7 +742,8 @@ def write_dataset(
           on steady-state batch size -- the medium decides. Datasets
           under 16 MiB single-pass.
     show_progress : bool
-        Whether to display a tqdm progress bar.
+        Whether to display a tqdm progress bar. The bar's postfix shows
+        cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
     """
     column_names, n_rows, little_endian_columns, columns_meta = normalize_columns(columns)
     column_itemsizes = [little_endian_columns[name].dtype.itemsize for name in column_names]
@@ -748,7 +783,7 @@ def write_dataset(
     with (
         open(path, "wb") as output_file,
         progress_bar(
-            total_units, desc="Writing colstore", unit="batch", enabled=show_progress
+            total_units, desc="Writing colstore", unit=" batch", enabled=show_progress
         ) as progress,
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
@@ -756,6 +791,8 @@ def write_dataset(
         # file take the fast path (per-column memmaps, contiguous gather).
         write_record_header(output_file, record_index=0, n_rows=n_rows)
         body_bytes = 0
+        cum_rows = 0
+        start_time = time.monotonic()
         # Adaptive-mode state: only used when use_adaptive is True. The
         # EMA bandwidth starts None (initialized from the first measurement),
         # and the per-batch byte target ramps via the growth-rate cap.
@@ -783,16 +820,26 @@ def write_dataset(
                     chunk_rows = rps if 0 < rps < n_rows else n_rows - offset
                 chunk_rows = min(chunk_rows, n_rows - offset)
 
-                if use_adaptive:
-                    t_batch_start = time.monotonic()
+                t_batch_start = time.monotonic()
                 chunk = array[offset : offset + chunk_rows]
                 chunk.tofile(output_file)
-                if use_adaptive:
-                    t_batch_end = time.monotonic()
+                t_batch_end = time.monotonic()
 
                 chunk_bytes = chunk.nbytes
                 body_bytes += chunk_bytes
+                cum_rows += chunk_rows
                 offset += chunk_rows
+
+                # Update postfix with cumulative throughput. The order
+                # (rows first, then data) matches the request format
+                # "batch/s, row/s, memory/s" -- batch/s comes from tqdm's
+                # own unit handling, the rest from this postfix.
+                elapsed = t_batch_end - start_time
+                if elapsed > 0:
+                    progress.set_postfix(
+                        rows=_format_rows_per_sec(cum_rows / elapsed),
+                        data=_format_bytes_per_sec(body_bytes / elapsed),
+                    )
                 progress.update(1)
 
                 # Update adaptive state for the next batch. Two-stage smoothing:

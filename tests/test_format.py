@@ -489,6 +489,24 @@ def test_resolve_rows_per_step_zero_rows_returns_single_pass():
     assert rows_per_step == [0, 0, 0]
 
 
+def test_format_bytes_per_sec_auto_scales():
+    assert fmt._format_bytes_per_sec(0) == "0 B/s"
+    assert fmt._format_bytes_per_sec(512) == "512 B/s"
+    assert fmt._format_bytes_per_sec(2048) == "2.00 KB/s"
+    assert fmt._format_bytes_per_sec(1.5 * 1024**2) == "1.50 MB/s"
+    assert fmt._format_bytes_per_sec(2.5 * 1024**3) == "2.50 GB/s"
+    # Very large bandwidth stays in GB/s (no TB/s tier yet -- not needed).
+    assert fmt._format_bytes_per_sec(1024**4).endswith("GB/s")
+
+
+def test_format_rows_per_sec_auto_scales():
+    assert fmt._format_rows_per_sec(0) == "0 rows/s"
+    assert fmt._format_rows_per_sec(500) == "500 rows/s"
+    assert fmt._format_rows_per_sec(1500) == "1.50 Krows/s"
+    assert fmt._format_rows_per_sec(2_500_000) == "2.50 Mrows/s"
+    assert fmt._format_rows_per_sec(3.5 * 1_000_000_000) == "3.50 Grows/s"
+
+
 def test_auto_adaptive_constants_form_a_sensible_ramp():
     """The growth-rate cap means a wildly-wrong first measurement is bounded.
 
