@@ -52,6 +52,7 @@ inside the manifest, not by changing the magic.
 
 import json
 import os
+import re
 import struct
 import sys
 import zlib
@@ -526,11 +527,114 @@ def normalize_columns(
     return column_names, n_rows, little_endian_columns, columns_meta
 
 
+# ---- Batch size resolution -----------------------------------------------
+#
+# ``write_dataset``'s ``batch_size`` parameter is polymorphic:
+#
+#   * ``None`` -- single pass (one tofile call per column, no batching).
+#   * ``int N`` -- "rows x cols per logical batch". Per inner step (which
+#     writes one column at a time), ``rows_per_step = N // n_columns``.
+#   * ``str "100 MB"`` / ``"1.5 GiB"`` etc. -- bytes per progress step.
+#     Each column's rows-per-step derives from its own itemsize so the
+#     byte granularity stays uniform across columns of different dtypes.
+#
+# All multipliers in size strings are binary (1 KB = 1024 B, 1 MB = 2**20 B,
+# etc.). This matches what ``ls -lh`` and ``du -h`` display, which is what
+# most users mean when they write "100 MB" in a file-size context.
+
+_BYTE_UNITS: dict[str, int] = {
+    "": 1,
+    "B": 1,
+    "K": 1024,
+    "KB": 1024,
+    "KIB": 1024,
+    "M": 1024**2,
+    "MB": 1024**2,
+    "MIB": 1024**2,
+    "G": 1024**3,
+    "GB": 1024**3,
+    "GIB": 1024**3,
+    "T": 1024**4,
+    "TB": 1024**4,
+    "TIB": 1024**4,
+}
+
+_BYTE_SIZE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$")
+
+
+def _parse_byte_size(size: str) -> int:
+    """Parse a size string like ``"100 MB"`` or ``"1.5 GiB"`` to bytes.
+
+    Binary multipliers throughout: ``MB`` is treated as ``MiB`` (1024**2),
+    matching the convention used by ``ls -lh`` / ``du -h``.
+    """
+    match = _BYTE_SIZE_PATTERN.match(size)
+    if not match:
+        raise ValueError(
+            f"Cannot parse byte size {size!r}; expected a number with optional unit "
+            f"(e.g., '100 MB', '1.5 GiB', '4 KB')."
+        )
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    if unit not in _BYTE_UNITS:
+        supported = sorted({u for u in _BYTE_UNITS if u})
+        raise ValueError(
+            f"Unknown unit {match.group(2)!r} in byte size {size!r}; "
+            f"expected one of {supported}."
+        )
+    result = int(value * _BYTE_UNITS[unit])
+    if result < 1:
+        raise ValueError(f"Byte size must be at least 1 byte; {size!r} resolves to {result}.")
+    return result
+
+
+def _resolve_rows_per_step(
+    batch_size: int | str | None,
+    *,
+    n_rows: int,
+    n_columns: int,
+    total_bytes: int,
+    column_itemsizes: list[int],
+) -> list[int]:
+    """Resolve a fixed-size ``batch_size`` to per-column rows-per-progress-step.
+
+    Caller must NOT pass ``"auto"`` here -- the adaptive path uses a
+    different code path (see ``write_dataset``). This function handles
+    ``None``, ``int``, and concrete size strings only.
+
+    Returns a list of length ``n_columns`` giving the chunk size (in rows)
+    to use for each column's write loop. A value ``>= n_rows`` means
+    "single-pass for this column" (one tofile call, one progress update).
+    """
+    if n_rows == 0 or batch_size is None:
+        return [n_rows] * n_columns
+
+    # bool is a subclass of int in Python; reject it explicitly to avoid
+    # confusing behavior like batch_size=True silently meaning 1.
+    if isinstance(batch_size, bool) or not isinstance(batch_size, (int, str)):
+        raise TypeError(f"batch_size must be int, str, or None; got {type(batch_size).__name__}.")
+
+    if isinstance(batch_size, int):
+        if batch_size <= 0:
+            return [n_rows] * n_columns
+        # User's "rows x cols per logical batch" semantics: each inner step
+        # writes one column, so rows_per_step = batch_size / n_columns.
+        rows_per_step = max(1, batch_size // max(1, n_columns))
+        return [rows_per_step] * n_columns
+
+    # str (caller has already filtered out "auto")
+    bytes_per_step = _parse_byte_size(batch_size.strip())
+    # Per-column rows-per-step: each column gets enough rows to fill roughly
+    # ``bytes_per_step`` bytes, so a wide-dtype column does fewer rows per
+    # step than a narrow-dtype one. Uniform byte granularity across columns.
+    return [max(1, bytes_per_step // max(1, itemsize)) for itemsize in column_itemsizes]
+
+
 def write_dataset(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
     path: PathLike,
     *,
-    batch_size: int | None,
+    batch_size: int | str | None,
     show_progress: bool,
 ) -> None:
     """Serialize a dict of 1D NumPy columns to disk in colstore format.
@@ -546,28 +650,43 @@ def write_dataset(
         the same length.
     path : str or os.PathLike
         Destination path.
-    batch_size : int or None
-        Number of rows written per ``tofile`` call, used only to drive the
-        progress bar. ``None`` or any value ``<= 0`` writes each column in a
-        single call (no batching). Has no effect on the bytes written.
+    batch_size : int, str, or None
+        Controls how the column write is chunked for the progress bar. Has
+        no effect on the bytes written.
+
+        * ``None`` -- single pass per column.
+        * ``int N`` -- ``N`` cells (rows x columns) per logical batch.
+        * ``str`` like ``"100 MB"`` / ``"1.5 GiB"`` -- bytes per batch
+          (binary multipliers; ``MB`` ≡ ``MiB``).
     show_progress : bool
         Whether to display a tqdm progress bar.
     """
     column_names, n_rows, little_endian_columns, columns_meta = normalize_columns(columns)
+    column_itemsizes = [little_endian_columns[name].dtype.itemsize for name in column_names]
+    total_bytes = sum(little_endian_columns[name].nbytes for name in column_names)
+    n_columns = len(column_names)
 
-    # ``None`` or any non-positive value means "write each column in one call".
-    effective_batch = batch_size if (batch_size is not None and batch_size > 0) else 0
-    if effective_batch > 0:
-        total_units = (-(-n_rows // effective_batch)) * len(column_names)
-        unit = "batch"
+    rows_per_step_per_col = _resolve_rows_per_step(
+        batch_size,
+        n_rows=n_rows,
+        n_columns=n_columns,
+        total_bytes=total_bytes,
+        column_itemsizes=column_itemsizes,
+    )
+
+    # Total progress units = sum over columns of ceil(n_rows / rows_per_step),
+    # where rows_per_step >= n_rows collapses to one unit (single-pass for that column).
+    if n_rows == 0:
+        total_units = n_columns
     else:
-        total_units = len(column_names)
-        unit = "col"
+        total_units = sum(
+            1 if rps >= n_rows else -(-n_rows // rps) for rps in rows_per_step_per_col
+        )
 
     with (
         open(path, "wb") as output_file,
         progress_bar(
-            total_units, desc="Writing colstore", unit=unit, enabled=show_progress
+            total_units, desc="Writing colstore", unit="batch", enabled=show_progress
         ) as progress,
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
@@ -575,15 +694,16 @@ def write_dataset(
         # file take the fast path (per-column memmaps, contiguous gather).
         write_record_header(output_file, record_index=0, n_rows=n_rows)
         body_bytes = 0
-        for name in column_names:
+        for col_idx, name in enumerate(column_names):
             array = little_endian_columns[name]
-            if effective_batch <= 0:
+            rows_per_step = rows_per_step_per_col[col_idx]
+            if rows_per_step >= n_rows or rows_per_step <= 0:
                 array.tofile(output_file)
                 body_bytes += array.nbytes
                 progress.update(1)
                 continue
-            for batch_start in range(0, n_rows, effective_batch):
-                batch_end = min(batch_start + effective_batch, n_rows)
+            for batch_start in range(0, n_rows, rows_per_step):
+                batch_end = min(batch_start + rows_per_step, n_rows)
                 chunk = array[batch_start:batch_end]
                 chunk.tofile(output_file)
                 body_bytes += chunk.nbytes

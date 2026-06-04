@@ -315,3 +315,144 @@ def test_unbatched_write_matches_batched(tmp_path, batch_size):
     write_dataset(columns, batched, batch_size=100, show_progress=False)
     write_dataset(columns, unbatched, batch_size=batch_size, show_progress=False)
     assert batched.read_bytes() == unbatched.read_bytes()
+
+
+# ---- Polymorphic batch_size: bytes per batch ------------------------------
+
+
+def test_string_batch_size_matches_int_byte_equivalent(tmp_path):
+    """A '4 KB' batch should produce the same bytes as the int equivalent."""
+    # 1000 float32 values across one column = 4000 bytes total.
+    # "4 KB" = 4096 bytes per batch -> single batch per column.
+    # Int 1000 with 1 column = 1000 rows per inner step -> single batch per column.
+    columns = {"x": np.arange(1000, dtype=np.float32)}
+    a = tmp_path / "a.cstore"
+    b = tmp_path / "b.cstore"
+    write_dataset(columns, a, batch_size="4 KB", show_progress=False)
+    write_dataset(columns, b, batch_size=1000, show_progress=False)
+    assert a.read_bytes() == b.read_bytes()
+
+
+@pytest.mark.parametrize("batch_size", ["1 KB", "1 KiB", "1024 B", "1024"])
+def test_string_batch_size_accepts_various_units(tmp_path, batch_size):
+    """All these should mean exactly 1024 bytes per batch."""
+    columns = {"x": np.arange(2000, dtype=np.int32)}  # 8 KB total
+    path = tmp_path / "x.cstore"
+    write_dataset(columns, path, batch_size=batch_size, show_progress=False)
+    # Just verify it wrote a valid file; bytes-equivalence to the int form
+    # is covered by other tests.
+    manifest, _ = read_header(path)
+    assert manifest["committed_rows"] == 2000
+
+
+def test_int_batch_size_divides_across_columns(tmp_path):
+    """``batch_size=N`` with C columns means N/C rows per inner step."""
+    # 5 columns x 100 rows. batch_size=50 -> rows_per_step=10 per column.
+    # Output bytes are independent of step count, so compare to single-pass.
+    columns = {f"c{i}": np.arange(100, dtype=np.float64) for i in range(5)}
+    batched = tmp_path / "b.cstore"
+    one_shot = tmp_path / "o.cstore"
+    write_dataset(columns, batched, batch_size=50, show_progress=False)
+    write_dataset(columns, one_shot, batch_size=None, show_progress=False)
+    assert batched.read_bytes() == one_shot.read_bytes()
+
+
+def test_string_batch_size_handles_mixed_dtypes(tmp_path):
+    """Bytes-per-batch with mixed dtypes still writes correct bytes."""
+    columns = {
+        "tiny": np.arange(500, dtype=np.int8),  # 500 bytes
+        "big": np.arange(500, dtype=np.float64),  # 4000 bytes
+    }
+    a = tmp_path / "a.cstore"
+    b = tmp_path / "b.cstore"
+    write_dataset(columns, a, batch_size="256 B", show_progress=False)
+    write_dataset(columns, b, batch_size=None, show_progress=False)
+    assert a.read_bytes() == b.read_bytes()
+
+
+@pytest.mark.parametrize("bad", [1.5, [100], {"size": 100}, object()])
+def test_batch_size_rejects_non_int_non_str(tmp_path, bad):
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bad.cstore"
+    with pytest.raises(TypeError, match="batch_size"):
+        write_dataset(columns, path, batch_size=bad, show_progress=False)
+
+
+def test_batch_size_rejects_bool(tmp_path):
+    """``True`` would silently mean 1 row per step; reject it explicitly."""
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bool.cstore"
+    with pytest.raises(TypeError, match="batch_size"):
+        write_dataset(columns, path, batch_size=True, show_progress=False)
+
+
+def test_string_batch_size_rejects_unparseable(tmp_path):
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bad.cstore"
+    with pytest.raises(ValueError, match="Cannot parse byte size"):
+        write_dataset(columns, path, batch_size="not a size", show_progress=False)
+
+
+def test_string_batch_size_rejects_unknown_unit(tmp_path):
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bad.cstore"
+    with pytest.raises(ValueError, match="Unknown unit"):
+        write_dataset(columns, path, batch_size="100 XB", show_progress=False)
+
+
+# ---- Unit tests for the parser/resolver/formatter internals ---------------
+
+
+def test_parse_byte_size_basic_units():
+    assert fmt._parse_byte_size("100") == 100
+    assert fmt._parse_byte_size("100 B") == 100
+    assert fmt._parse_byte_size("1 KB") == 1024
+    assert fmt._parse_byte_size("1 KiB") == 1024
+    assert fmt._parse_byte_size("1 MB") == 1024**2
+    assert fmt._parse_byte_size("1 MiB") == 1024**2
+    assert fmt._parse_byte_size("1 GB") == 1024**3
+    assert fmt._parse_byte_size("1.5 MB") == int(1.5 * 1024**2)
+
+
+def test_parse_byte_size_whitespace_and_case():
+    assert fmt._parse_byte_size("  100mb  ") == 100 * 1024**2
+    assert fmt._parse_byte_size("100MIB") == 100 * 1024**2
+    assert fmt._parse_byte_size("100m") == 100 * 1024**2
+
+
+def test_resolve_rows_per_step_returns_per_column_list():
+    # 2 columns, different itemsizes, bytes-per-step uses each column's
+    # itemsize to compute its rows_per_step.
+    rows_per_step = fmt._resolve_rows_per_step(
+        "1024 B",
+        n_rows=1000,
+        n_columns=2,
+        total_bytes=12_000,
+        column_itemsizes=[1, 8],  # int8 + float64
+    )
+    # 1024 / 1 = 1024 rows per step for the int8 column
+    # 1024 / 8 = 128 rows per step for the float64 column
+    assert rows_per_step == [1024, 128]
+
+
+def test_resolve_rows_per_step_int_divides_by_columns():
+    # batch_size=100 with 5 columns -> 20 rows per inner step.
+    rows_per_step = fmt._resolve_rows_per_step(
+        100,
+        n_rows=1000,
+        n_columns=5,
+        total_bytes=20_000,
+        column_itemsizes=[4] * 5,
+    )
+    assert rows_per_step == [20, 20, 20, 20, 20]
+
+
+def test_resolve_rows_per_step_zero_rows_returns_single_pass():
+    rows_per_step = fmt._resolve_rows_per_step(
+        100,
+        n_rows=0,
+        n_columns=3,
+        total_bytes=0,
+        column_itemsizes=[4, 4, 4],
+    )
+    assert rows_per_step == [0, 0, 0]
