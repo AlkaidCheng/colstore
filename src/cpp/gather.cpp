@@ -24,10 +24,14 @@
 //
 //  * OpenMP parallel for. Loop body is independent across i; static schedule
 //    keeps overhead minimal.
-//  * Software prefetching. ``__builtin_prefetch`` issues a memory hint a few
-//    iterations ahead, hiding L3/DRAM miss latency for scattered loads.
-//  * ``__restrict__`` pointer qualifiers. Compiler can assume base, indices,
-//    and output do not alias, enabling vectorization of the store stream.
+//  * Software prefetching. ``COLSTORE_PREFETCH`` (defined in the header
+//    as ``__builtin_prefetch`` on GCC/Clang, ``_mm_prefetch`` on MSVC)
+//    issues a memory hint a few iterations ahead, hiding L3/DRAM miss
+//    latency for scattered loads.
+//  * ``COLSTORE_RESTRICT`` pointer qualifiers (``__restrict__`` on
+//    GCC/Clang, ``__restrict`` on MSVC). Compiler can assume base,
+//    indices, and output do not alias, enabling vectorization of the
+//    store stream.
 //  * Typed dereferences inside the templated loop. ``*(T*)(base + ...)`` is
 //    treated by the compiler as a natural-alignment load and emits the same
 //    instructions as ``source[i]`` would in the old per-dtype kernel.
@@ -78,9 +82,9 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
 // T* source[i]`` body. T is one of the unsigned integer types (uint8_t/16_t/
 // 32_t/64_t); the bytes copied are agnostic to the user-facing dtype kind.
 template <typename T>
-void gather_indexed_typed(const std::uint8_t* __restrict__ base,
-                          const std::int64_t* __restrict__ indices,
-                          std::uint8_t* __restrict__ output,
+void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                          const std::int64_t* COLSTORE_RESTRICT indices,
+                          std::uint8_t* COLSTORE_RESTRICT output,
                           std::ptrdiff_t n_indices,
                           int thread_cap,
                           std::ptrdiff_t prefetch_distance) {
@@ -95,7 +99,7 @@ void gather_indexed_typed(const std::uint8_t* __restrict__ base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (i + prefetch_distance < n_indices) {
-      __builtin_prefetch(&src[indices[i + prefetch_distance]], 0, 0);
+      COLSTORE_PREFETCH(&src[indices[i + prefetch_distance]]);
     }
     dst[i] = src[indices[i]];
   }
@@ -108,9 +112,9 @@ void gather_indexed_typed(const std::uint8_t* __restrict__ base,
 // kernel reinterprets the loaded bytes as T to give the compiler the same
 // typed-alignment information; caller guarantees offsets are T-aligned.
 template <typename T>
-void gather_bytes_typed(const std::uint8_t* __restrict__ base,
-                        const std::int64_t* __restrict__ byte_offsets,
-                        std::uint8_t* __restrict__ output,
+void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                        const std::int64_t* COLSTORE_RESTRICT byte_offsets,
+                        std::uint8_t* COLSTORE_RESTRICT output,
                         std::ptrdiff_t n_indices,
                         int thread_cap,
                         std::ptrdiff_t prefetch_distance) {
@@ -124,7 +128,7 @@ void gather_bytes_typed(const std::uint8_t* __restrict__ base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (i + prefetch_distance < n_indices) {
-      __builtin_prefetch(base + byte_offsets[i + prefetch_distance], 0, 0);
+      COLSTORE_PREFETCH(base + byte_offsets[i + prefetch_distance]);
     }
     dst[i] = *reinterpret_cast<const T*>(base + byte_offsets[i]);
   }

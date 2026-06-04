@@ -200,10 +200,11 @@ def compact(
     elsewhere, the source is copied byte-for-byte (since the source is
     already in the optimal layout).
 
-    Takes an advisory ``fcntl.flock`` on the source for the duration; a
-    concurrent :func:`colstore.update` writer is blocked. Readers are
-    unaffected (they don't take the lock, and on POSIX they continue
-    reading the unlinked inode after the rename).
+    Takes an advisory file lock on the source for the duration (``fcntl.flock``
+    on POSIX, ``msvcrt.locking`` on Windows); a concurrent
+    :func:`colstore.update` writer is blocked. Readers are unaffected
+    (they don't take the lock, and on POSIX they continue reading the
+    unlinked inode after the rename).
     """
     return compact_file(path, out, show_progress=show_progress)
 

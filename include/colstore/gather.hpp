@@ -20,6 +20,29 @@
 #include <cstddef>
 #include <cstdint>
 
+// Portable software-prefetch hint. GCC and Clang expose __builtin_prefetch;
+// MSVC has no equivalent builtin but provides _mm_prefetch via xmmintrin.h.
+// The MSVC arguments (_MM_HINT_NTA = non-temporal, no cache locality)
+// match GCC's "rw=0, locality=0" -- the read-once-and-discard hint we
+// want for a scattered gather where the source bytes won't be revisited.
+#if defined(_MSC_VER)
+#include <xmmintrin.h>
+#define COLSTORE_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_NTA)
+#else
+#define COLSTORE_PREFETCH(addr) __builtin_prefetch((addr), 0, 0)
+#endif
+
+// Portable restrict qualifier. GCC and Clang spell it ``__restrict__``;
+// MSVC spells it ``__restrict`` (no trailing underscores). C99 has plain
+// ``restrict`` but it's not standard C++ -- every compiler has its own
+// non-standard equivalent. The qualifier tells the compiler that pointers
+// don't alias, enabling load/store vectorization of the inner loop.
+#if defined(_MSC_VER)
+#define COLSTORE_RESTRICT __restrict
+#else
+#define COLSTORE_RESTRICT __restrict__
+#endif
+
 namespace colstore {
 
 // Default prefetch distance in elements. Eight iterations ahead is roughly

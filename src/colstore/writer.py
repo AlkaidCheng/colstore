@@ -33,9 +33,11 @@ in-progress write that died.
 Lifecycle
 ---------
 
-The writer holds an advisory ``fcntl.flock`` on the file for the
-duration of the session. Concurrent writers on the same path are
-rejected at :func:`__init__`. The lock is released on :meth:`close`.
+The writer holds an advisory file lock for the
+duration of the session (``fcntl.flock`` on POSIX, ``msvcrt.locking``
+on Windows; see :mod:`colstore._lock`). Concurrent writers on the
+same path are rejected at :func:`__init__`. The lock is released on
+:meth:`close`.
 
 Closing twice is a no-op. Forgetting to close emits a
 :class:`ResourceWarning` and runs a best-effort commit from
@@ -46,7 +48,6 @@ explicitly because GC timing is not guaranteed.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
 import warnings
 from pathlib import Path
@@ -55,6 +56,7 @@ from typing import Any
 
 import numpy as np
 
+from . import _lock
 from . import format as fmt
 
 
@@ -100,25 +102,39 @@ class ColStoreWriter:
                     f"to make a new file."
                 )
             self._file = open(self._path, "r+b")  # noqa: SIM115
-            self._load_existing_state_for_update()
             self._has_header = True
             self._wrote_anything = True  # something is already there
 
-        # Take an advisory lock on the file. Catches concurrent writers on the
-        # same path. flock is no-op on platforms that don't support it; on
-        # Linux/macOS this is a per-file-descriptor advisory lock that
-        # readers also don't see (they don't take it).
+        # Take the advisory lock BEFORE any destructive operations. In update
+        # mode the load step below truncates orphan bytes past the last
+        # committed record, so if we tried to load first and then lock, a
+        # losing-the-race writer would corrupt a winning writer's in-progress
+        # data. Lock first, load second: a contended open leaves the file
+        # byte-for-byte unchanged. The cross-platform shim in
+        # :mod:`colstore._lock` dispatches to fcntl.flock on POSIX and
+        # msvcrt.locking on Windows; both raise BlockingIOError on contention.
         try:
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock.lock_exclusive_nonblocking(self._file.fileno())
         except BlockingIOError as e:
             self._file.close()
             raise OSError(f"Another writer holds the lock on {self._path}; close it first.") from e
 
+        if mode == "update":
+            self._load_existing_state_for_update()
+
     # ---- internals ----------------------------------------------------
 
     def _load_existing_state_for_update(self) -> None:
-        """Read schema + counters from disk; seek to end of last committed record."""
-        manifest, data_offset = fmt.read_header(self._path)
+        """Read schema + counters from disk; seek to end of last committed record.
+
+        Reads the header through ``self._file`` rather than re-opening
+        the path. This is a small efficiency win on every platform (one
+        fewer ``open`` syscall) and matches the writer's lifecycle --
+        the file is already open and at offset 0 from the ``r+b`` open
+        above, so reading the header from it costs nothing extra.
+        """
+        self._file.seek(0)
+        manifest, data_offset = fmt.read_header_from_file(self._file)
         self._schema = manifest["columns"]
         self._n_records = int(manifest["n_records"])
         self._committed_rows = int(manifest["committed_rows"])
@@ -275,8 +291,7 @@ class ColStoreWriter:
                 # create/recreate, never wrote: drop the empty file.
                 pass
         finally:
-            with contextlib.suppress(OSError):
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            _lock.unlock(self._file.fileno())
             self._file.close()
             if not self._has_header and self._mode in ("create", "recreate"):
                 # Remove the zero-byte file we created.
