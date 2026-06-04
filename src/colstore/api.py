@@ -64,6 +64,7 @@ def store(
     path: str | os.PathLike[str],
     *,
     mode: str = "create",
+    batch_size: int | str | None = "auto",
     show_progress: bool = True,
     **open_kwargs: Any,
 ) -> ColStoreReader:
@@ -81,6 +82,30 @@ def store(
     writes, use :func:`create` / :func:`recreate` / :func:`update`
     directly.
 
+    Parameters
+    ----------
+    batch_size : int, str, or None, default ``"auto"``
+        Controls how the write is chunked for the progress bar. No effect
+        on the bytes written.
+
+        * ``"auto"`` (default) -- adaptive. Probes with a 1 MiB initial
+          batch and grows the batch size from EMA-smoothed measured
+          bandwidth, capped at 2x growth per batch. Tracks the medium
+          automatically: fast NVMe ramps to GiB-class batches, slow
+          disks settle at tens of MiB. Files under 16 MiB single-pass.
+        * ``None`` -- single pass: one ``tofile`` call per column, no
+          batching, one progress update per column.
+        * ``int N`` -- batch size as rows x columns per logical batch.
+          ``batch_size=100_000`` with 5 columns chunks each column into
+          20 000-row writes.
+        * ``str`` like ``"100 MB"``, ``"1.5 GiB"``, ``"512 KB"`` -- bytes
+          per batch. Binary multipliers throughout: ``MB`` ≡ ``MiB`` =
+          1024² bytes (the convention used by ``ls -lh`` / ``du -h``).
+
+    show_progress : bool, default ``True``
+        Whether to display a tqdm progress bar. The bar's postfix shows
+        cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
+
     Returns the opened :class:`ColStoreReader` for immediate use.
     """
     if mode not in ("create", "recreate"):
@@ -94,7 +119,7 @@ def store(
     # right the first time) and surfaces a progress bar.
     if mode == "create" and os.path.exists(path):
         raise FileExistsError(f"{path} already exists; use mode='recreate' to overwrite.")
-    fmt.write_dataset(columns, path, batch_size=100_000, show_progress=show_progress)
+    fmt.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
     return ColStoreReader(path, **open_kwargs)
 
 
