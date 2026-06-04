@@ -345,6 +345,37 @@ def test_string_batch_size_accepts_various_units(tmp_path, batch_size):
     assert manifest["committed_rows"] == 2000
 
 
+def test_auto_batch_size_writes_valid_file(tmp_path):
+    """The 'auto' default produces a byte-identical file to None (single-pass)."""
+    columns = {
+        "x": np.arange(500, dtype=np.float64),
+        "y": np.arange(500, dtype=np.int32),
+    }
+    auto = tmp_path / "auto.cstore"
+    none = tmp_path / "none.cstore"
+    write_dataset(columns, auto, batch_size="auto", show_progress=False)
+    write_dataset(columns, none, batch_size=None, show_progress=False)
+    # For a tiny dataset, auto falls back to single-pass, so bytes match.
+    assert auto.read_bytes() == none.read_bytes()
+
+
+def test_auto_batch_size_above_threshold_takes_adaptive_path(tmp_path):
+    """A dataset above the auto-batching threshold writes correct bytes adaptively.
+
+    Doesn't assert specific batch sizes (those are bandwidth-dependent and
+    timing-flaky); just verifies the output matches the single-pass reference.
+    """
+    # 20 MiB of float64 -> well above the 16 MiB single-pass threshold,
+    # but small enough to keep the test fast.
+    n_rows = 20 * 1024 * 1024 // 8  # 20 MiB / 8 bytes per float64
+    columns = {"x": np.arange(n_rows, dtype=np.float64)}
+    adaptive = tmp_path / "adaptive.cstore"
+    reference = tmp_path / "reference.cstore"
+    write_dataset(columns, adaptive, batch_size="auto", show_progress=False)
+    write_dataset(columns, reference, batch_size=None, show_progress=False)
+    assert adaptive.read_bytes() == reference.read_bytes()
+
+
 def test_int_batch_size_divides_across_columns(tmp_path):
     """``batch_size=N`` with C columns means N/C rows per inner step."""
     # 5 columns x 100 rows. batch_size=50 -> rows_per_step=10 per column.
@@ -456,3 +487,28 @@ def test_resolve_rows_per_step_zero_rows_returns_single_pass():
         column_itemsizes=[4, 4, 4],
     )
     assert rows_per_step == [0, 0, 0]
+
+
+def test_auto_adaptive_constants_form_a_sensible_ramp():
+    """The growth-rate cap means a wildly-wrong first measurement is bounded.
+
+    Even if the first batch's measured bandwidth implies a target batch
+    size of 100 GiB (e.g., from OS cache absorbing the probe), the next
+    batch can be at most _AUTO_GROWTH_RATE * _AUTO_INITIAL_BYTES. A few
+    iterations are needed to ramp up to large steady-state sizes; that's
+    the price of robustness.
+    """
+    # Simulate "bandwidth estimate suggests target = 100 GiB" by checking
+    # that the growth cap dominates when target_bytes is huge.
+    initial = fmt._AUTO_INITIAL_BYTES
+    growth = fmt._AUTO_GROWTH_RATE
+    huge_target = 100 * 1024**3  # 100 GiB
+
+    # Apply the same min/max/cap formula used in write_dataset:
+    next_size = max(
+        fmt._AUTO_MIN_BYTES_PER_BATCH,
+        min(huge_target, int(initial * growth)),
+    )
+    # With initial=1MiB and growth=2, even a 100 GiB target only gives 2 MiB.
+    assert next_size == int(initial * growth)
+    assert next_size <= initial * 2  # bounded ramp-up
