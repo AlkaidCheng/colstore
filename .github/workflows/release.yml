@@ -95,8 +95,8 @@ jobs:
   # colstore has a C++/Cython extension, so we can't ship a single
   # py3-none-any wheel like a pure-Python package would. cibuildwheel
   # runs the build inside manylinux containers for Linux and natively
-  # on macOS, producing wheels that pip can install on the same
-  # ABI/arch without a compiler on the user's machine.
+  # on macOS and Windows, producing wheels that pip can install on the
+  # same ABI/arch without a compiler on the user's machine.
   # ---------------------------------------------------------------------
   build_wheels:
     name: Build wheels (${{ matrix.os }})
@@ -105,7 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -116,10 +116,11 @@ jobs:
         uses: pypa/cibuildwheel@v2.21
         env:
           # We support 3.10+; skip older interpreters, PyPy, 32-bit
-          # Linux, and musllinux (we don't test it).
-          CIBW_SKIP: "cp36-* cp37-* cp38-* cp39-* pp* *-manylinux_i686 *-musllinux*"
-          # The kernel's OpenMP path requires libomp on macOS;
-          # manylinux images already include it.
+          # Linux, 32-bit Windows, and musllinux (we don't test it).
+          CIBW_SKIP: "cp36-* cp37-* cp38-* cp39-* pp* *-manylinux_i686 *-musllinux* *-win32"
+          # OpenMP on macOS comes from Homebrew libomp; manylinux
+          # images and MSVC on Windows have OpenMP built in, so no
+          # before-all step is needed there.
           CIBW_BEFORE_ALL_MACOS: brew install libomp
           # Run the full test suite against the built wheel before
           # declaring it good. Matches what ci.yml does on the source
