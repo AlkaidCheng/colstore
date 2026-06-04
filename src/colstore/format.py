@@ -708,6 +708,27 @@ def _format_rows_per_sec(rows_per_sec: float) -> str:
     return f"{rows_per_sec:.0f} rows/s"
 
 
+def _estimate_total_batches(batches_done: int, remaining_bytes: int, bytes_per_batch: int) -> int:
+    """Project the total batch count from the current adaptive batch size.
+
+    Used during adaptive ramp-up to give the progress bar a meaningful
+    target instead of an open-ended ``?``. The estimate converges as
+    ``bytes_per_batch`` converges to its steady-state value.
+
+    ``batches_done`` is the number already written (``progress.n``);
+    ``remaining_bytes`` is the byte volume still to be written across
+    all remaining columns; ``bytes_per_batch`` is the projected size
+    of the next batch (``current_bytes_per_batch``).
+    """
+    if remaining_bytes <= 0:
+        return batches_done
+    if bytes_per_batch <= 0:
+        return batches_done + 1
+    # Ceiling division: any leftover bytes need at least one more batch.
+    batches_remaining = -(-remaining_bytes // bytes_per_batch)
+    return batches_done + batches_remaining
+
+
 def write_dataset(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
     path: PathLike,
@@ -767,13 +788,14 @@ def write_dataset(
             column_itemsizes=column_itemsizes,
         )
 
-    # tqdm needs a target only for the percentage display. Fixed-mode totals
-    # are exact; adaptive-mode totals can't be known up-front (bandwidth
-    # determines batch count), so we leave it None and tqdm shows an
-    # open-ended bar with the elapsed time and throughput.
-    total_units: int | None
+    # Adaptive mode starts with a coarse over-estimate (assume every batch
+    # stays at the 1 MiB probe size) and refines after each batch using
+    # the current bandwidth-derived batch size. The estimate freezes once
+    # the growth-rate cap stops binding (we're at steady state). Fixed
+    # modes know their batch count exactly up-front.
+    total_units: int
     if use_adaptive:
-        total_units = None
+        total_units = max(1, total_bytes // _AUTO_INITIAL_BYTES)
     elif n_rows == 0:
         total_units = n_columns
     else:
@@ -796,8 +818,12 @@ def write_dataset(
         # Adaptive-mode state: only used when use_adaptive is True. The
         # EMA bandwidth starts None (initialized from the first measurement),
         # and the per-batch byte target ramps via the growth-rate cap.
+        # total_frozen flips to True the first time the growth-rate cap
+        # stops binding (= we've reached EMA-driven steady state), after
+        # which the progress total stops being recomputed.
         current_bytes_per_batch = _AUTO_INITIAL_BYTES
         bandwidth_ema: float | None = None
+        total_frozen = False
 
         for col_idx, name in enumerate(column_names):
             array = little_endian_columns[name]
@@ -871,6 +897,21 @@ def write_dataset(
                             _AUTO_MIN_BYTES_PER_BATCH,
                             min(target_bytes, growth_cap),
                         )
+
+                        # Refine the projected total batch count while we're
+                        # still ramping. Once the growth-rate cap stops
+                        # binding (target_bytes <= growth_cap), batch sizes
+                        # are EMA-driven and roughly stable, so we freeze
+                        # the total to avoid jitter in the displayed ETA.
+                        if not total_frozen:
+                            progress.total = _estimate_total_batches(
+                                progress.n,
+                                total_bytes - body_bytes,
+                                current_bytes_per_batch,
+                            )
+                            progress.refresh()
+                            if target_bytes <= growth_cap:
+                                total_frozen = True
 
         # Pad the record body up to _RECORD_BODY_ALIGNMENT so any future
         # record (if this file were later opened for append) would start at
