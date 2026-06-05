@@ -315,3 +315,261 @@ def test_unbatched_write_matches_batched(tmp_path, batch_size):
     write_dataset(columns, batched, batch_size=100, show_progress=False)
     write_dataset(columns, unbatched, batch_size=batch_size, show_progress=False)
     assert batched.read_bytes() == unbatched.read_bytes()
+
+
+# ---- Polymorphic batch_size: bytes per batch ------------------------------
+
+
+def test_string_batch_size_matches_int_byte_equivalent(tmp_path):
+    """A '4 KB' batch should produce the same bytes as the int equivalent."""
+    # 1000 float32 values across one column = 4000 bytes total.
+    # "4 KB" = 4096 bytes per batch -> single batch per column.
+    # Int 1000 with 1 column = 1000 rows per inner step -> single batch per column.
+    columns = {"x": np.arange(1000, dtype=np.float32)}
+    a = tmp_path / "a.cstore"
+    b = tmp_path / "b.cstore"
+    write_dataset(columns, a, batch_size="4 KB", show_progress=False)
+    write_dataset(columns, b, batch_size=1000, show_progress=False)
+    assert a.read_bytes() == b.read_bytes()
+
+
+@pytest.mark.parametrize("batch_size", ["1 KB", "1 KiB", "1024 B", "1024"])
+def test_string_batch_size_accepts_various_units(tmp_path, batch_size):
+    """All these should mean exactly 1024 bytes per batch."""
+    columns = {"x": np.arange(2000, dtype=np.int32)}  # 8 KB total
+    path = tmp_path / "x.cstore"
+    write_dataset(columns, path, batch_size=batch_size, show_progress=False)
+    # Just verify it wrote a valid file; bytes-equivalence to the int form
+    # is covered by other tests.
+    manifest, _ = read_header(path)
+    assert manifest["committed_rows"] == 2000
+
+
+def test_auto_batch_size_writes_valid_file(tmp_path):
+    """The 'auto' default produces a byte-identical file to None (single-pass)."""
+    columns = {
+        "x": np.arange(500, dtype=np.float64),
+        "y": np.arange(500, dtype=np.int32),
+    }
+    auto = tmp_path / "auto.cstore"
+    none = tmp_path / "none.cstore"
+    write_dataset(columns, auto, batch_size="auto", show_progress=False)
+    write_dataset(columns, none, batch_size=None, show_progress=False)
+    # For a tiny dataset, auto falls back to single-pass, so bytes match.
+    assert auto.read_bytes() == none.read_bytes()
+
+
+def test_auto_batch_size_above_threshold_takes_adaptive_path(tmp_path):
+    """A dataset above the auto-batching threshold writes correct bytes adaptively.
+
+    Doesn't assert specific batch sizes (those are bandwidth-dependent and
+    timing-flaky); just verifies the output matches the single-pass reference.
+    """
+    # 20 MiB of float64 -> well above the 16 MiB single-pass threshold,
+    # but small enough to keep the test fast.
+    n_rows = 20 * 1024 * 1024 // 8  # 20 MiB / 8 bytes per float64
+    columns = {"x": np.arange(n_rows, dtype=np.float64)}
+    adaptive = tmp_path / "adaptive.cstore"
+    reference = tmp_path / "reference.cstore"
+    write_dataset(columns, adaptive, batch_size="auto", show_progress=False)
+    write_dataset(columns, reference, batch_size=None, show_progress=False)
+    assert adaptive.read_bytes() == reference.read_bytes()
+
+
+def test_int_batch_size_divides_across_columns(tmp_path):
+    """``batch_size=N`` with C columns means N/C rows per inner step."""
+    # 5 columns x 100 rows. batch_size=50 -> rows_per_step=10 per column.
+    # Output bytes are independent of step count, so compare to single-pass.
+    columns = {f"c{i}": np.arange(100, dtype=np.float64) for i in range(5)}
+    batched = tmp_path / "b.cstore"
+    one_shot = tmp_path / "o.cstore"
+    write_dataset(columns, batched, batch_size=50, show_progress=False)
+    write_dataset(columns, one_shot, batch_size=None, show_progress=False)
+    assert batched.read_bytes() == one_shot.read_bytes()
+
+
+def test_string_batch_size_handles_mixed_dtypes(tmp_path):
+    """Bytes-per-batch with mixed dtypes still writes correct bytes."""
+    columns = {
+        "tiny": np.arange(500, dtype=np.int8),  # 500 bytes
+        "big": np.arange(500, dtype=np.float64),  # 4000 bytes
+    }
+    a = tmp_path / "a.cstore"
+    b = tmp_path / "b.cstore"
+    write_dataset(columns, a, batch_size="256 B", show_progress=False)
+    write_dataset(columns, b, batch_size=None, show_progress=False)
+    assert a.read_bytes() == b.read_bytes()
+
+
+@pytest.mark.parametrize("bad", [1.5, [100], {"size": 100}, object()])
+def test_batch_size_rejects_non_int_non_str(tmp_path, bad):
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bad.cstore"
+    with pytest.raises(TypeError, match="batch_size"):
+        write_dataset(columns, path, batch_size=bad, show_progress=False)
+
+
+def test_batch_size_rejects_bool(tmp_path):
+    """``True`` would silently mean 1 row per step; reject it explicitly."""
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bool.cstore"
+    with pytest.raises(TypeError, match="batch_size"):
+        write_dataset(columns, path, batch_size=True, show_progress=False)
+
+
+def test_string_batch_size_rejects_unparseable(tmp_path):
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bad.cstore"
+    with pytest.raises(ValueError, match="Cannot parse byte size"):
+        write_dataset(columns, path, batch_size="not a size", show_progress=False)
+
+
+def test_string_batch_size_rejects_unknown_unit(tmp_path):
+    columns = {"x": np.arange(10, dtype=np.int32)}
+    path = tmp_path / "bad.cstore"
+    with pytest.raises(ValueError, match="Unknown unit"):
+        write_dataset(columns, path, batch_size="100 XB", show_progress=False)
+
+
+# ---- Unit tests for the parser/resolver/formatter internals ---------------
+
+
+def test_parse_byte_size_basic_units():
+    assert fmt._parse_byte_size("100") == 100
+    assert fmt._parse_byte_size("100 B") == 100
+    assert fmt._parse_byte_size("1 KB") == 1024
+    assert fmt._parse_byte_size("1 KiB") == 1024
+    assert fmt._parse_byte_size("1 MB") == 1024**2
+    assert fmt._parse_byte_size("1 MiB") == 1024**2
+    assert fmt._parse_byte_size("1 GB") == 1024**3
+    assert fmt._parse_byte_size("1.5 MB") == int(1.5 * 1024**2)
+
+
+def test_parse_byte_size_whitespace_and_case():
+    assert fmt._parse_byte_size("  100mb  ") == 100 * 1024**2
+    assert fmt._parse_byte_size("100MIB") == 100 * 1024**2
+    assert fmt._parse_byte_size("100m") == 100 * 1024**2
+
+
+def test_resolve_rows_per_step_returns_per_column_list():
+    # 2 columns, different itemsizes, bytes-per-step uses each column's
+    # itemsize to compute its rows_per_step.
+    rows_per_step = fmt._resolve_rows_per_step(
+        "1024 B",
+        n_rows=1000,
+        n_columns=2,
+        total_bytes=12_000,
+        column_itemsizes=[1, 8],  # int8 + float64
+    )
+    # 1024 / 1 = 1024 rows per step for the int8 column
+    # 1024 / 8 = 128 rows per step for the float64 column
+    assert rows_per_step == [1024, 128]
+
+
+def test_resolve_rows_per_step_int_divides_by_columns():
+    # batch_size=100 with 5 columns -> 20 rows per inner step.
+    rows_per_step = fmt._resolve_rows_per_step(
+        100,
+        n_rows=1000,
+        n_columns=5,
+        total_bytes=20_000,
+        column_itemsizes=[4] * 5,
+    )
+    assert rows_per_step == [20, 20, 20, 20, 20]
+
+
+def test_resolve_rows_per_step_zero_rows_returns_single_pass():
+    rows_per_step = fmt._resolve_rows_per_step(
+        100,
+        n_rows=0,
+        n_columns=3,
+        total_bytes=0,
+        column_itemsizes=[4, 4, 4],
+    )
+    assert rows_per_step == [0, 0, 0]
+
+
+def test_format_rows_per_sec_auto_scales():
+    assert fmt._format_rows_per_sec(0) == "0 rows/s"
+    assert fmt._format_rows_per_sec(500) == "500 rows/s"
+    assert fmt._format_rows_per_sec(1500) == "1.50 Krows/s"
+    assert fmt._format_rows_per_sec(2_500_000) == "2.50 Mrows/s"
+    assert fmt._format_rows_per_sec(3.5 * 1_000_000_000) == "3.50 Grows/s"
+
+
+def test_auto_adaptive_constants_form_a_sensible_ramp():
+    """The growth-rate cap means a wildly-wrong first measurement is bounded.
+
+    Even if the first batch's measured bandwidth implies a target batch
+    size of 100 GiB (e.g., from OS cache absorbing the probe), the next
+    batch can be at most _AUTO_GROWTH_RATE * _AUTO_INITIAL_BYTES. A few
+    iterations are needed to ramp up to large steady-state sizes; that's
+    the price of robustness.
+    """
+    # Simulate "bandwidth estimate suggests target = 100 GiB" by checking
+    # that the growth cap dominates when target_bytes is huge.
+    initial = fmt._AUTO_INITIAL_BYTES
+    growth = fmt._AUTO_GROWTH_RATE
+    huge_target = 100 * 1024**3  # 100 GiB
+
+    # Apply the same min/max/cap formula used in write_dataset:
+    next_size = max(
+        fmt._AUTO_MIN_BYTES_PER_BATCH,
+        min(huge_target, int(initial * growth)),
+    )
+    # With initial=1MiB and growth=2, even a 100 GiB target only gives 2 MiB.
+    assert next_size == int(initial * growth)
+    assert next_size <= initial * 2  # bounded ramp-up
+
+
+def test_auto_progress_bar_is_byte_counted(tmp_path, monkeypatch):
+    """Regression guard: the adaptive progress bar uses bytes, not batches.
+
+    The earlier batch-counted design needed a moving estimate of the
+    eventual batch count; that estimate fluctuated whenever bandwidth
+    drifted (OS cache filling, slower disk region, contention), so the
+    displayed total kept changing and the n/total ratio stayed tiny --
+    a write that was 90% done by bytes still showed a barely-filled bar.
+
+    The fix: use total_bytes as the progress total directly. Each batch
+    advances by chunk_bytes. The total is known up front, monotonically
+    fills, and the bar fraction always matches actual byte progress.
+    """
+    from contextlib import contextmanager
+
+    captured: dict[str, object] = {}
+
+    class _Stub:
+        n: int = 0
+
+        def update(self, n: int = 1) -> None:
+            self.n += n
+
+        def set_postfix(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def set_description(self, *args: object, **kwargs: object) -> None:
+            pass
+
+    @contextmanager
+    def stub_progress_bar(total: int | None, **kwargs: object):
+        captured["total"] = total
+        captured["unit"] = kwargs.get("unit")
+        captured["unit_scale"] = kwargs.get("unit_scale")
+        stub = _Stub()
+        yield stub
+        captured["final_n"] = stub.n
+
+    monkeypatch.setattr("colstore.format.progress_bar", stub_progress_bar)
+
+    # 20 MiB float64 -> above the 16 MiB adaptive threshold.
+    n_rows = 20 * 1024 * 1024 // 8
+    columns = {"x": np.arange(n_rows, dtype=np.float64)}
+    write_dataset(columns, tmp_path / "x.cstore", batch_size="auto", show_progress=True)
+
+    # progress_bar must be invoked with total=total_bytes, byte-unit display.
+    assert captured["total"] == n_rows * 8
+    assert captured["unit"] == "B"
+    assert captured["unit_scale"] is True
+    # All bytes must be accounted for via update() calls.
+    assert captured["final_n"] == n_rows * 8

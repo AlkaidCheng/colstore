@@ -52,8 +52,10 @@ inside the manifest, not by changing the magic.
 
 import json
 import os
+import re
 import struct
 import sys
+import time
 import zlib
 from typing import IO, Any
 
@@ -526,11 +528,181 @@ def normalize_columns(
     return column_names, n_rows, little_endian_columns, columns_meta
 
 
+# ---- Batch size resolution -----------------------------------------------
+#
+# ``write_dataset``'s ``batch_size`` parameter is polymorphic:
+#
+#   * ``None`` -- single pass (one tofile call per column, no batching).
+#   * ``int N`` -- "rows x cols per logical batch". Per inner step (which
+#     writes one column at a time), ``rows_per_step = N // n_columns``.
+#   * ``str "100 MB"`` / ``"1.5 GiB"`` etc. -- bytes per progress step.
+#     Each column's rows-per-step derives from its own itemsize so the
+#     byte granularity stays uniform across columns of different dtypes.
+#   * ``str "auto"`` (default in the public ``store`` API) -- adaptive.
+#     Probe with a 1 MiB initial batch, then size subsequent batches from
+#     an EMA-smoothed bandwidth estimate, with a 2x growth-rate cap per
+#     batch. The growth-rate cap is what bounds the impact of a single
+#     wildly-wrong measurement (so a bad probe doubles the next batch,
+#     not 1000x's it); the EMA smooths transient spikes once we're in
+#     steady state. No upper bound on batch size -- the medium decides.
+#     For datasets under _AUTO_MIN_TOTAL_FOR_BATCHING bytes, auto
+#     degrades to single-pass because batching overhead dominates.
+#
+# All multipliers in size strings are binary (1 KB = 1024 B, 1 MB = 2**20 B,
+# etc.). This matches what ``ls -lh`` and ``du -h`` display, which is what
+# most users mean when they write "100 MB" in a file-size context.
+
+# Below this total size, auto goes single-pass -- batching overhead is
+# bigger than the I/O savings.
+_AUTO_MIN_TOTAL_FOR_BATCHING = 16 * 1024 * 1024  # 16 MiB
+
+# Initial probe batch size in adaptive mode. Small enough that a wildly
+# wrong measurement (e.g., from OS page-cache absorption) on the first
+# batch is bounded -- the next batch is at most _AUTO_GROWTH_RATE * 1 MiB,
+# not gigabytes. Large enough to amortize syscall overhead.
+_AUTO_INITIAL_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+# Steady-state target time per batch in adaptive mode. 0.5s gives a smooth
+# progress bar (~2 updates/sec) while keeping per-batch overhead negligible.
+_AUTO_TARGET_SECONDS = 0.5
+
+# Floor for adaptive batch size. Below this, syscall overhead dominates
+# real I/O work. There is intentionally NO upper cap -- the medium decides
+# steady-state batch size, and the growth-rate cap (below) protects
+# against a single wildly-wrong bandwidth estimate.
+_AUTO_MIN_BYTES_PER_BATCH = 1 * 1024 * 1024  # 1 MiB
+
+# Maximum factor by which each successive batch can grow vs. the previous
+# one. Together with the EMA smoothing below, this forms a TCP-slow-start-
+# like ramp: a bad first measurement only doubles the next batch (not
+# 1000x), and several measurements converge on the true bandwidth before
+# we commit to large batches.
+_AUTO_GROWTH_RATE = 2.0
+
+# Exponential moving average weight on the most recent measurement when
+# updating the bandwidth estimate. Higher = more responsive to changing
+# conditions, lower = smoother. 0.5 weights the most recent batch equally
+# with the smoothed history -- adapts quickly during ramp-up while still
+# damping transient spikes once in steady state.
+_AUTO_EMA_ALPHA = 0.5
+
+_BYTE_UNITS: dict[str, int] = {
+    "": 1,
+    "B": 1,
+    "K": 1024,
+    "KB": 1024,
+    "KIB": 1024,
+    "M": 1024**2,
+    "MB": 1024**2,
+    "MIB": 1024**2,
+    "G": 1024**3,
+    "GB": 1024**3,
+    "GIB": 1024**3,
+    "T": 1024**4,
+    "TB": 1024**4,
+    "TIB": 1024**4,
+}
+
+_BYTE_SIZE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$")
+
+
+def _parse_byte_size(size: str) -> int:
+    """Parse a size string like ``"100 MB"`` or ``"1.5 GiB"`` to bytes.
+
+    Binary multipliers throughout: ``MB`` is treated as ``MiB`` (1024**2),
+    matching the convention used by ``ls -lh`` / ``du -h``.
+    """
+    match = _BYTE_SIZE_PATTERN.match(size)
+    if not match:
+        raise ValueError(
+            f"Cannot parse byte size {size!r}; expected a number with optional unit "
+            f"(e.g., '100 MB', '1.5 GiB', '4 KB')."
+        )
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+    if unit not in _BYTE_UNITS:
+        supported = sorted({u for u in _BYTE_UNITS if u})
+        raise ValueError(
+            f"Unknown unit {match.group(2)!r} in byte size {size!r}; "
+            f"expected one of {supported}."
+        )
+    result = int(value * _BYTE_UNITS[unit])
+    if result < 1:
+        raise ValueError(f"Byte size must be at least 1 byte; {size!r} resolves to {result}.")
+    return result
+
+
+def _resolve_rows_per_step(
+    batch_size: int | str | None,
+    *,
+    n_rows: int,
+    n_columns: int,
+    total_bytes: int,
+    column_itemsizes: list[int],
+) -> list[int]:
+    """Resolve a fixed-size ``batch_size`` to per-column rows-per-progress-step.
+
+    Caller must NOT pass ``"auto"`` here -- the adaptive path uses a
+    different code path (see ``write_dataset``). This function handles
+    ``None``, ``int``, and concrete size strings only.
+
+    Returns a list of length ``n_columns`` giving the chunk size (in rows)
+    to use for each column's write loop. A value ``>= n_rows`` means
+    "single-pass for this column" (one tofile call, one progress update).
+    """
+    if n_rows == 0 or batch_size is None:
+        return [n_rows] * n_columns
+
+    # bool is a subclass of int in Python; reject it explicitly to avoid
+    # confusing behavior like batch_size=True silently meaning 1.
+    if isinstance(batch_size, bool) or not isinstance(batch_size, (int, str)):
+        raise TypeError(f"batch_size must be int, str, or None; got {type(batch_size).__name__}.")
+
+    if isinstance(batch_size, int):
+        if batch_size <= 0:
+            return [n_rows] * n_columns
+        # User's "rows x cols per logical batch" semantics: each inner step
+        # writes one column, so rows_per_step = batch_size / n_columns.
+        rows_per_step = max(1, batch_size // max(1, n_columns))
+        return [rows_per_step] * n_columns
+
+    # str (caller has already filtered out "auto")
+    bytes_per_step = _parse_byte_size(batch_size.strip())
+    # Per-column rows-per-step: each column gets enough rows to fill roughly
+    # ``bytes_per_step`` bytes, so a wide-dtype column does fewer rows per
+    # step than a narrow-dtype one. Uniform byte granularity across columns.
+    return [max(1, bytes_per_step // max(1, itemsize)) for itemsize in column_itemsizes]
+
+
+# ---- Throughput formatting -----------------------------------------------
+#
+# Used by ``write_dataset`` to attach a human-readable rows/s line to the
+# progress bar postfix. (Bytes/s is rendered natively by tqdm because the
+# bar is byte-counted, with ``unit="B"`` and ``unit_scale=True``.)
+
+
+def _format_rows_per_sec(rows_per_sec: float) -> str:
+    """Auto-scaled rows/s with a space between number and unit.
+
+    Output: ``'1.25 Mrows/s'``, ``'125.00 Krows/s'``, ``'850 rows/s'``.
+    The unit name follows SI convention -- prefix (K/M/G) sits flush with
+    the noun (no space inside the unit), space goes between number and
+    unit.
+    """
+    if rows_per_sec >= 1_000_000_000:
+        return f"{rows_per_sec / 1_000_000_000:.2f} Grows/s"
+    if rows_per_sec >= 1_000_000:
+        return f"{rows_per_sec / 1_000_000:.2f} Mrows/s"
+    if rows_per_sec >= 1_000:
+        return f"{rows_per_sec / 1_000:.2f} Krows/s"
+    return f"{rows_per_sec:.0f} rows/s"
+
+
 def write_dataset(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
     path: PathLike,
     *,
-    batch_size: int | None,
+    batch_size: int | str | None,
     show_progress: bool,
 ) -> None:
     """Serialize a dict of 1D NumPy columns to disk in colstore format.
@@ -546,28 +718,62 @@ def write_dataset(
         the same length.
     path : str or os.PathLike
         Destination path.
-    batch_size : int or None
-        Number of rows written per ``tofile`` call, used only to drive the
-        progress bar. ``None`` or any value ``<= 0`` writes each column in a
-        single call (no batching). Has no effect on the bytes written.
+    batch_size : int, str, or None
+        Controls how the column write is chunked for the progress bar. Has
+        no effect on the bytes written.
+
+        * ``None`` -- single pass per column.
+        * ``int N`` -- ``N`` cells (rows x columns) per logical batch.
+        * ``str`` like ``"100 MB"`` / ``"1.5 GiB"`` -- bytes per batch
+          (binary multipliers; ``MB`` ≡ ``MiB``).
+        * ``str "auto"`` -- adaptive: probe with a 1 MiB initial batch,
+          then size subsequent batches based on EMA-smoothed measured
+          bandwidth with a 2x growth-rate cap per batch. No upper bound
+          on steady-state batch size -- the medium decides. Datasets
+          under 16 MiB single-pass.
     show_progress : bool
-        Whether to display a tqdm progress bar.
+        Whether to display a tqdm progress bar. The bar's postfix shows
+        cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
     """
     column_names, n_rows, little_endian_columns, columns_meta = normalize_columns(columns)
+    column_itemsizes = [little_endian_columns[name].dtype.itemsize for name in column_names]
+    total_bytes = sum(little_endian_columns[name].nbytes for name in column_names)
+    n_columns = len(column_names)
 
-    # ``None`` or any non-positive value means "write each column in one call".
-    effective_batch = batch_size if (batch_size is not None and batch_size > 0) else 0
-    if effective_batch > 0:
-        total_units = (-(-n_rows // effective_batch)) * len(column_names)
-        unit = "batch"
-    else:
-        total_units = len(column_names)
-        unit = "col"
+    # Decide between adaptive ("auto" on a non-trivial dataset) and fixed
+    # (everything else, including "auto" on a tiny dataset).
+    is_auto_request = isinstance(batch_size, str) and batch_size.strip().lower() == "auto"
+    use_adaptive = is_auto_request and total_bytes >= _AUTO_MIN_TOTAL_FOR_BATCHING
+
+    fixed_rows_per_step: list[int] | None = None
+    if not use_adaptive:
+        # Either non-auto, or auto on a tiny dataset (degrades to single-pass).
+        resolved_batch_size: int | str | None = None if is_auto_request else batch_size
+        fixed_rows_per_step = _resolve_rows_per_step(
+            resolved_batch_size,
+            n_rows=n_rows,
+            n_columns=n_columns,
+            total_bytes=total_bytes,
+            column_itemsizes=column_itemsizes,
+        )
+
+    # Progress bar is byte-counted: total = total_bytes, each batch updates
+    # by chunk_bytes. tqdm's native unit_scale renders this as e.g.
+    # "47.5MB/200MB [00:01<00:03, 50.2MB/s]" -- the bar fill, percentage,
+    # and rate all derive directly from bytes written / total bytes, so
+    # there is no estimation phase, no "?" total, and the bar fill always
+    # matches the displayed percentage. The adaptive batch sizing (below)
+    # is unchanged; it just affects HOW MANY tofile() calls happen, not
+    # WHAT is shown to the user.
 
     with (
         open(path, "wb") as output_file,
         progress_bar(
-            total_units, desc="Writing colstore", unit=unit, enabled=show_progress
+            total_bytes,
+            desc="Writing colstore",
+            unit="B",
+            unit_scale=True,
+            enabled=show_progress,
         ) as progress,
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
@@ -575,19 +781,86 @@ def write_dataset(
         # file take the fast path (per-column memmaps, contiguous gather).
         write_record_header(output_file, record_index=0, n_rows=n_rows)
         body_bytes = 0
-        for name in column_names:
+        cum_rows = 0
+        cum_batches = 0
+        start_time = time.monotonic()
+        # Adaptive-mode state: only used when use_adaptive is True. The
+        # EMA bandwidth starts None (initialized from the first measurement);
+        # current_bytes_per_batch ramps via the growth-rate cap.
+        current_bytes_per_batch = _AUTO_INITIAL_BYTES
+        bandwidth_ema: float | None = None
+
+        for col_idx, name in enumerate(column_names):
             array = little_endian_columns[name]
-            if effective_batch <= 0:
+            itemsize = column_itemsizes[col_idx]
+
+            if n_rows == 0:
+                # Zero-row column: emit a single zero-byte write. Nothing
+                # to add to the byte-counted progress bar.
                 array.tofile(output_file)
-                body_bytes += array.nbytes
-                progress.update(1)
                 continue
-            for batch_start in range(0, n_rows, effective_batch):
-                batch_end = min(batch_start + effective_batch, n_rows)
-                chunk = array[batch_start:batch_end]
+
+            offset = 0
+            while offset < n_rows:
+                if use_adaptive:
+                    chunk_rows = max(1, current_bytes_per_batch // max(1, itemsize))
+                else:
+                    assert fixed_rows_per_step is not None
+                    rps = fixed_rows_per_step[col_idx]
+                    chunk_rows = rps if 0 < rps < n_rows else n_rows - offset
+                chunk_rows = min(chunk_rows, n_rows - offset)
+
+                t_batch_start = time.monotonic()
+                chunk = array[offset : offset + chunk_rows]
                 chunk.tofile(output_file)
-                body_bytes += chunk.nbytes
-                progress.update(1)
+                t_batch_end = time.monotonic()
+
+                chunk_bytes = chunk.nbytes
+                body_bytes += chunk_bytes
+                cum_rows += chunk_rows
+                cum_batches += 1
+                offset += chunk_rows
+
+                # Update adaptive state for the next batch. Two-stage smoothing:
+                #
+                # 1. EMA on bandwidth: bandwidth_ema combines the current
+                #    measurement (weight alpha) with the running estimate
+                #    (weight 1-alpha). Damps single-batch noise.
+                #
+                # 2. Growth-rate cap on batch size: each batch can grow by
+                #    at most _AUTO_GROWTH_RATE x the previous one. Even an
+                #    extreme bandwidth estimate (e.g., a transient cache hit
+                #    making the first probe look 1000x faster than reality)
+                #    only doubles the next batch, giving us another
+                #    measurement before we commit to a big batch.
+                if use_adaptive:
+                    chunk_elapsed = t_batch_end - t_batch_start
+                    if chunk_elapsed > 0:
+                        measured_bw = chunk_bytes / chunk_elapsed
+                        if bandwidth_ema is None:
+                            bandwidth_ema = measured_bw
+                        else:
+                            bandwidth_ema = (
+                                _AUTO_EMA_ALPHA * measured_bw
+                                + (1.0 - _AUTO_EMA_ALPHA) * bandwidth_ema
+                            )
+                        target_bytes = int(bandwidth_ema * _AUTO_TARGET_SECONDS)
+                        growth_cap = int(current_bytes_per_batch * _AUTO_GROWTH_RATE)
+                        current_bytes_per_batch = max(
+                            _AUTO_MIN_BYTES_PER_BATCH,
+                            min(target_bytes, growth_cap),
+                        )
+
+                # Postfix shows rows/s and the batch count. Bytes/s and the
+                # bar fill come from tqdm itself via unit="B"/unit_scale=True.
+                elapsed = t_batch_end - start_time
+                if elapsed > 0:
+                    progress.set_postfix(
+                        batches=str(cum_batches),
+                        rows=_format_rows_per_sec(cum_rows / elapsed),
+                    )
+                progress.update(chunk_bytes)
+
         # Pad the record body up to _RECORD_BODY_ALIGNMENT so any future
         # record (if this file were later opened for append) would start at
         # a naturally-aligned offset.

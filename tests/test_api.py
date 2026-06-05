@@ -184,3 +184,24 @@ def test_store_invalid_mode_raises(tmp_path):
     """Only 'create' and 'recreate' are valid for store()."""
     with pytest.raises(ValueError, match="mode"):
         colstore.store({"a": np.arange(3)}, tmp_path / "x.cstore", mode="update")
+
+
+def test_store_default_batch_size_is_auto(tmp_path):
+    """Default batch_size='auto' produces a readable file for small data."""
+    path = tmp_path / "auto.cstore"
+    src = {"a": np.arange(100, dtype=np.int32), "b": np.arange(100, dtype=np.float64)}
+    ds = colstore.store(src, path, show_progress=False)
+    assert ds.n_rows == 100
+    assert np.array_equal(ds[:, "a"].array(), src["a"])
+    assert np.array_equal(ds[:, "b"].array(), src["b"])
+
+
+@pytest.mark.parametrize("batch_size", [None, 1000, "auto", "4 KB", "1 MiB"])
+def test_store_batch_size_variants_all_roundtrip(tmp_path, batch_size):
+    """Every flavor of batch_size yields the same logical data."""
+    src = {"x": np.arange(500, dtype=np.float32), "y": np.arange(500, dtype=np.int16)}
+    path = tmp_path / "bs.cstore"
+    ds = colstore.store(src, path, batch_size=batch_size, show_progress=False)
+    assert ds.n_rows == 500
+    assert np.array_equal(ds[:, "x"].array(), src["x"])
+    assert np.array_equal(ds[:, "y"].array(), src["y"])

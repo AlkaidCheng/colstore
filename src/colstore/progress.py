@@ -28,6 +28,7 @@ def progress_bar(
     *,
     desc: str | None = None,
     unit: str = "it",
+    unit_scale: bool = False,
     enabled: bool = True,
 ) -> Iterator[ProgressBar]:
     if not enabled:
@@ -47,5 +48,5 @@ def progress_bar(
         yield NullProgressBar()
         return
 
-    with tqdm(total=total, desc=desc, unit=unit) as bar:
+    with tqdm(total=total, desc=desc, unit=unit, unit_scale=unit_scale) as bar:
         yield bar
