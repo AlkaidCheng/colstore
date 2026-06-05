@@ -82,6 +82,28 @@ void gather_bytes_typed(const std::uint8_t* base,
                         int thread_cap = 0,
                         std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Contiguous multi-record range copy. Copies global rows ``[start, stop)`` of
+// one column out of a multi-record file into ``output``, packed contiguously.
+// The column's data for a record ``r`` lives at
+//   record_starts_bytes[r] + col_prefix_bytes * n_rows_per_record[r]
+// and a global row ``idx`` maps to record ``r`` with
+//   record_starts_rows[r] <= idx < record_starts_rows[r + 1].
+// The range spans one or more whole records; each overlapping record
+// contributes one contiguous ``std::memcpy`` of ``count * itemsize`` bytes.
+// This is a raw byte copy: the caller guarantees the on-disk dtype is in the
+// host's native byte order (a byte copy cannot byteswap). ``record_starts_rows``
+// has ``n_records + 1`` entries; the other two index arrays have ``n_records``.
+void copy_multirecord_range(const std::uint8_t* base,
+                            std::uint8_t* output,
+                            std::int64_t start,
+                            std::int64_t stop,
+                            const std::int64_t* record_starts_rows,
+                            const std::int64_t* record_starts_bytes,
+                            const std::int64_t* n_rows_per_record,
+                            std::int64_t n_records,
+                            std::int64_t col_prefix_bytes,
+                            std::int64_t itemsize);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -123,6 +145,19 @@ void colstore_gather_bytes_8(const std::uint8_t* base,
                              const std::int64_t* byte_offsets,
                              std::uint8_t* output,
                              std::ptrdiff_t n, int thread_cap);
+
+// Contiguous multi-record range copy (size-agnostic; one memcpy per record).
+// See colstore::copy_multirecord_range for the addressing contract.
+void colstore_copy_multirecord_range(const std::uint8_t* base,
+                                     std::uint8_t* output,
+                                     std::int64_t start,
+                                     std::int64_t stop,
+                                     const std::int64_t* record_starts_rows,
+                                     const std::int64_t* record_starts_bytes,
+                                     const std::int64_t* n_rows_per_record,
+                                     std::int64_t n_records,
+                                     std::int64_t col_prefix_bytes,
+                                     std::int64_t itemsize);
 
 // Returns the OpenMP thread cap that gathers will use, or 1 if OpenMP is
 // not compiled in. Exposed for diagnostics.

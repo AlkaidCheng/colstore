@@ -43,6 +43,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 
 namespace colstore {
 
@@ -176,6 +177,68 @@ template void gather_bytes_typed<std::uint64_t>(const std::uint8_t*,
                                                 std::ptrdiff_t, int,
                                                 std::ptrdiff_t);
 
+// Contiguous multi-record range copy. See header for the addressing contract.
+//
+// The range [start, stop) is split at record boundaries; each overlapping
+// record contributes one contiguous memcpy. The record holding ``start`` is
+// found by binary search over ``record_starts_rows`` (R+1 cumulative counts);
+// from there we walk forward, because successive records are adjacent in the
+// global row space. ``write_pos`` tracks the packed output position in rows.
+//
+// This is deliberately serial: the work is a sequence of memcpys, and a single
+// core saturates memory bandwidth on a large contiguous copy. The win over the
+// former Python loop is the elimination of per-record interpreter overhead
+// (one np.frombuffer construction and one slice assignment per record), which
+// dominates when the range spans many small records.
+void copy_multirecord_range(const std::uint8_t* COLSTORE_RESTRICT base,
+                            std::uint8_t* COLSTORE_RESTRICT output,
+                            std::int64_t start,
+                            std::int64_t stop,
+                            const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
+                            const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
+                            const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
+                            std::int64_t n_records,
+                            std::int64_t col_prefix_bytes,
+                            std::int64_t itemsize) {
+  if (stop <= start || n_records <= 0) {
+    return;
+  }
+  // Largest r with record_starts_rows[r] <= start. ``record_starts_rows`` is
+  // sorted ascending with R+1 entries; upper_bound gives the first entry
+  // strictly greater than start, so the record index is one before it.
+  const std::int64_t* rows_end = record_starts_rows + n_records + 1;
+  const std::int64_t* it =
+      std::upper_bound(record_starts_rows, rows_end, start);
+  std::int64_t r = (it - record_starts_rows) - 1;
+  if (r < 0) {
+    r = 0;  // start clamps to row 0 if it preceded the first record
+  }
+
+  std::int64_t write_pos = 0;  // packed output position, in rows
+  for (; r < n_records; ++r) {
+    const std::int64_t rec_row_start = record_starts_rows[r];
+    if (rec_row_start >= stop) {
+      break;  // this record begins past the requested range
+    }
+    const std::int64_t rec_n = n_rows_per_record[r];
+    const std::int64_t rec_row_end = rec_row_start + rec_n;
+    const std::int64_t within_lo =
+        (start > rec_row_start ? start : rec_row_start) - rec_row_start;
+    const std::int64_t within_hi =
+        (stop < rec_row_end ? stop : rec_row_end) - rec_row_start;
+    const std::int64_t count = within_hi - within_lo;
+    if (count <= 0) {
+      continue;
+    }
+    const std::int64_t src_off = record_starts_bytes[r] +
+                                 col_prefix_bytes * rec_n +
+                                 within_lo * itemsize;
+    std::memcpy(output + write_pos * itemsize, base + src_off,
+                static_cast<std::size_t>(count * itemsize));
+    write_pos += count;
+  }
+}
+
 }  // namespace colstore
 
 extern "C" {
@@ -236,6 +299,22 @@ void colstore_gather_bytes_8(const std::uint8_t* base,
                              std::ptrdiff_t n, int thread_cap) {
   colstore::gather_bytes_typed<std::uint64_t>(base, byte_offsets, output, n,
                                               thread_cap);
+}
+
+void colstore_copy_multirecord_range(const std::uint8_t* base,
+                                     std::uint8_t* output,
+                                     std::int64_t start,
+                                     std::int64_t stop,
+                                     const std::int64_t* record_starts_rows,
+                                     const std::int64_t* record_starts_bytes,
+                                     const std::int64_t* n_rows_per_record,
+                                     std::int64_t n_records,
+                                     std::int64_t col_prefix_bytes,
+                                     std::int64_t itemsize) {
+  colstore::copy_multirecord_range(base, output, start, stop,
+                                   record_starts_rows, record_starts_bytes,
+                                   n_rows_per_record, n_records,
+                                   col_prefix_bytes, itemsize);
 }
 
 int colstore_max_threads() {
