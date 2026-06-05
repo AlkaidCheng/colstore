@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING, Any, overload
 import numpy as np
 from numpy.typing import NDArray
 
-from . import config, format, kernels
+from . import _numa, config, format, kernels
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
@@ -297,6 +297,10 @@ class ColStoreReader:
 
         if madvise == _USE_DEFAULT_MADVISE:
             madvise = config.get_default_madvise()
+        # NUMA policy is applied *before* madvise and any data access so
+        # that the policy is in place when pages first fault in. mbind
+        # without MPOL_MF_MOVE doesn't migrate already-populated pages.
+        self._apply_numa_policy()
         if madvise is not None:
             self._apply_madvise(madvise)
         if mlock:
@@ -461,6 +465,29 @@ class ColStoreReader:
         for memmap_view in self._memmaps.values():
             with contextlib.suppress(AttributeError, OSError):
                 memmap_view._mmap.madvise(flag)  # type: ignore[attr-defined]
+
+    def _apply_numa_policy(self) -> None:
+        """Apply the configured NUMA policy to all file-backed memmaps.
+
+        Called once at open time, before any access faults pages in.
+        The default ``"auto"`` policy applies ``MPOL_INTERLEAVE`` on
+        multi-node Linux and is a no-op everywhere else.
+
+        ``"local"`` is the opt-out for low-concurrency workloads where
+        forced interleaving costs more than it saves (e.g. a single
+        consumer thread reading 1 GB ends up doing remote loads for
+        7/8 of the pages on an 8-node host).
+        """
+        policy = config.get_numa_policy()
+        if policy == "local":
+            return
+        if not _numa.is_available():
+            return
+        if self._is_multi_record:
+            _numa.apply_interleave_to_memmap(self._file_mmap)
+            return
+        for memmap_view in self._memmaps.values():
+            _numa.apply_interleave_to_memmap(memmap_view)
 
     def _apply_mlock(self) -> None:
         libc_name = ctypes.util.find_library("c")
