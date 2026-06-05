@@ -110,3 +110,68 @@ def test_lazy_view_does_not_read_until_materialized(small_store):
     # than a single read; assertion below sanity-checks values.
     materialized = small_store[100:200, ["price", "qty"]].dict()
     assert materialized["price"].shape == (100,)
+
+
+# ---- Whole-store materialization shortcuts on ColStoreReader -----------
+
+
+def test_reader_dict_returns_all_columns_in_order(small_store):
+    """``ds.dict()`` returns one entry per column in on-disk order."""
+    result = small_store.dict()
+    assert list(result) == small_store.columns
+    for name, arr in result.items():
+        assert arr.shape == (small_store.n_rows,)
+        assert arr.dtype == small_store.dtypes[name]
+
+
+def test_reader_dict_matches_explicit_slice_view(small_store):
+    """``ds.dict()`` is equivalent to ``ds[:].dict()``."""
+    direct = small_store.dict()
+    via_view = small_store[:].dict()
+    assert list(direct) == list(via_view)
+    for name in direct:
+        np.testing.assert_array_equal(direct[name], via_view[name])
+
+
+def test_reader_recarray_returns_structured_with_all_columns(small_store):
+    """``ds.recarray()`` returns a structured ndarray with one field per column."""
+    rec = small_store.recarray()
+    assert rec.dtype.names == tuple(small_store.columns)
+    assert rec.shape == (small_store.n_rows,)
+    for name in small_store.columns:
+        assert rec[name].dtype == small_store.dtypes[name]
+
+
+def test_reader_recarray_matches_explicit_slice_view(small_store):
+    """``ds.recarray()`` is equivalent to ``ds[:].recarray()``."""
+    direct = small_store.recarray()
+    via_view = small_store[:].recarray()
+    np.testing.assert_array_equal(direct, via_view)
+
+
+def test_reader_frame_returns_dataframe_with_all_columns(small_store):
+    """``ds.frame()`` returns a DataFrame whose columns match the on-disk order."""
+    df = small_store.frame()
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == small_store.columns
+    assert len(df) == small_store.n_rows
+
+
+def test_reader_frame_matches_explicit_slice_view(small_store):
+    """``ds.frame()`` is equivalent to ``ds[:].frame()``."""
+    direct = small_store.frame()
+    via_view = small_store[:].frame()
+    pd.testing.assert_frame_equal(direct, via_view)
+
+
+def test_reader_dict_after_close_raises(small_store):
+    """The shortcut methods refuse to operate after close()."""
+    import pytest
+
+    small_store.close()
+    with pytest.raises(ValueError, match="closed"):
+        small_store.dict()
+    with pytest.raises(ValueError, match="closed"):
+        small_store.recarray()
+    with pytest.raises(ValueError, match="closed"):
+        small_store.frame()

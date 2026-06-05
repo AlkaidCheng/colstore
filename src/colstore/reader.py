@@ -21,13 +21,16 @@ from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import config, format, kernels
 from .view import ColumnView, TableView
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
@@ -602,3 +605,55 @@ class ColStoreReader:
                 for name in column_names
             }
             return {name: futures[name].result() for name in column_names}
+
+    # ---- Whole-store materialization shortcuts -------------------------
+    #
+    # Equivalent to ``self[:].dict()`` / ``.recarray()`` / ``.frame()`` but
+    # skip the intermediate ``TableView`` construction. The common
+    # "open and convert" idiom -- ``colstore.open(path).dict()`` -- doesn't
+    # need a row indexer or the lazy-view machinery, and these methods
+    # make that path direct. Placed at the bottom of the class so the
+    # method ``dict`` does not shadow the builtin ``dict`` in the
+    # annotation scope of earlier methods (mypy resolves annotations in
+    # declaration order against the class namespace).
+
+    def dict(self) -> dict[str, NDArray[Any]]:
+        """Materialize the whole store as a dict mapping column name to ndarray.
+
+        Returns
+        -------
+        dict[str, numpy.ndarray]
+            Owning arrays in on-disk column order; each column's stored
+            dtype is preserved (native byte order).
+        """
+        if self._closed:
+            raise ValueError("ColStoreReader is closed.")
+        return self._gather_many(list(self._column_dtypes), None)
+
+    def recarray(self) -> NDArray[Any]:
+        """Materialize the whole store as a structured ndarray.
+
+        Returns
+        -------
+        numpy.ndarray
+            Structured 1D array with one field per column. ``result[name]``
+            returns the column.
+        """
+        column_data = self.dict()
+        record_dtype = np.dtype([(name, column_data[name].dtype) for name in self._column_dtypes])
+        record_array = np.empty(self._n_rows, dtype=record_dtype)
+        for name in self._column_dtypes:
+            record_array[name] = column_data[name]
+        return record_array
+
+    def frame(self) -> pd.DataFrame:
+        """Materialize the whole store as a pandas DataFrame.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Columns in on-disk order with their stored dtypes preserved.
+        """
+        import pandas as pd
+
+        return pd.DataFrame(self.dict())
