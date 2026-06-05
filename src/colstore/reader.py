@@ -106,6 +106,82 @@ def _parallel_contiguous_copy(
     return out
 
 
+# ---- DataFrame construction --------------------------------------------
+#
+# ``pd.DataFrame(dict_of_arrays)`` groups columns by dtype and copies
+# them into one 2D ``Block`` per dtype group ("consolidation"). On a 1 GB
+# / 50-column store of all-float64 data, that's a 1 GB extra allocation
+# plus memcpy on top of the dict already owning a 1 GB copy of the data
+# -- it dominates ``frame()`` (~700 ms vs ~70 ms for ``dict()`` on the
+# same data, measured on 256-core hardware). The optimized path
+# constructs the ``BlockManager`` with one ``Block`` per column instead,
+# sharing memory with the input arrays and skipping the consolidation
+# copy.
+
+
+def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataFrame:
+    """Build a pandas DataFrame from a column dict without dtype-block consolidation.
+
+    The returned DataFrame is "fragmented" relative to one built by
+    ``pd.DataFrame(columns)``: it has one ``Block`` per column rather
+    than one ``Block`` per dtype group. The two are functionally
+    identical through the public DataFrame API; pandas consolidates on
+    demand for operations that benefit from it. For the
+    read-once-and-pass-along workload this method targets, paying the
+    consolidation cost eagerly is wasted work.
+
+    Uses the pandas private API ``create_block_manager_from_column_arrays``
+    plus ``DataFrame._from_mgr`` (both stable in pandas 2.0+). On any of:
+
+      * ``ImportError`` -- a symbol is gone (e.g. ``_from_mgr`` not
+        present on pandas 1.x, or the ``managers`` submodule moved);
+      * ``AttributeError`` -- a classmethod or attribute is gone; or
+      * ``TypeError`` -- the call signature has shifted (a keyword was
+        renamed or removed, ``refs`` semantics changed, etc.);
+
+    the helper falls back to ``pd.DataFrame(columns)`` and emits a
+    one-shot ``UserWarning`` so the regression is visible without
+    breaking user code. The fallback is functionally identical but
+    pays the consolidation copy, so on whole-store materialization
+    it's roughly an order of magnitude slower.
+
+    ``ValueError`` is intentionally NOT caught: it almost certainly
+    signals a data-validation problem (mismatched shapes, etc.) that
+    the fallback path would surface in the same way, and catching it
+    would mask the original error.
+    """
+    import pandas as pd
+
+    if not columns:
+        return pd.DataFrame(columns)
+
+    try:
+        from pandas import Index, RangeIndex
+        from pandas.core.internals.managers import (
+            create_block_manager_from_column_arrays,
+        )
+
+        arrays = list(columns.values())
+        n_rows = arrays[0].shape[0]
+        block_manager = create_block_manager_from_column_arrays(
+            arrays,
+            axes=[Index(list(columns)), RangeIndex(n_rows)],
+            consolidate=False,
+            refs=[None] * len(arrays),
+        )
+        return pd.DataFrame._from_mgr(block_manager, axes=block_manager.axes)
+    except (ImportError, AttributeError, TypeError) as exc:
+        warnings.warn(
+            f"colstore.frame() optimized construction unavailable on this "
+            f"pandas ({pd.__version__}); falling back to pd.DataFrame(dict). "
+            f"The result is functionally identical but slower for whole-store "
+            f"materialization. This usually indicates a pandas internal API "
+            f"change. Cause: {type(exc).__name__}: {exc}",
+            stacklevel=2,
+        )
+        return pd.DataFrame(columns)
+
+
 class ColStoreReader:
     """Memory-mapped columnar store with lazy, NumPy-style indexing.
 
@@ -725,7 +801,8 @@ class ColStoreReader:
         -------
         pandas.DataFrame
             Columns in on-disk order with their stored dtypes preserved.
+            The frame skips dtype-block consolidation (one ``Block`` per
+            column) -- see :func:`_make_dataframe_no_consolidate` for
+            rationale and details.
         """
-        import pandas as pd
-
-        return pd.DataFrame(self.dict())
+        return _make_dataframe_no_consolidate(self.dict())
