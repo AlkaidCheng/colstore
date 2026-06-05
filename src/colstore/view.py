@@ -230,7 +230,11 @@ class TableView(_BaseView):
         -------
         pandas.DataFrame
             Columns are in selection order with their stored dtypes preserved.
+            The frame skips dtype-block consolidation (one ``Block`` per
+            column) -- see
+            :func:`colstore.reader._make_dataframe_no_consolidate` for
+            rationale and details.
         """
-        import pandas as pd
+        from .reader import _make_dataframe_no_consolidate
 
-        return pd.DataFrame(self.dict())
+        return _make_dataframe_no_consolidate(self.dict())
