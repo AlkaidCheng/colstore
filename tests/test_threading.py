@@ -66,6 +66,23 @@ def test_thread_count_resolution_rules():
     # At/above threshold the count is >= 1 and never exceeds the cap.
     big = _gather.thread_count_for(50_000_000, 4)
     assert 1 <= big <= 4
+    # A caller cap of 1 forces serial regardless of n (invariant, any host).
+    assert _gather.thread_count_for(50_000_000, 1) == 1
+
+    # The work-proportional ramp only grants extra threads when OpenMP actually
+    # has them; on a single-core host omp_get_max_threads() == 1 and every
+    # resolution is serial. Gate the scaling assertions on that.
+    omp_max = _gather.max_threads()
+    if omp_max >= 2:
+        # Regression guard for the fixed by_work floor: a gather of 256K-1M
+        # elements is past PARALLEL_THRESHOLD and must get >= 2 threads. The
+        # old ``n / ELEMENTS_PER_THREAD + 1`` floored this band to 1 thread,
+        # silently overriding the threshold and leaving a measured ~2x unused.
+        assert _gather.thread_count_for(1 << 18, 8) >= 2
+        assert _gather.thread_count_for(1_000_000, 8) >= 2
+        # Work-proportional: a much larger gather resolves to at least as many
+        # threads as a smaller one (more elements -> more threads, up to cap).
+        assert _gather.thread_count_for(20_000_000, 32) >= _gather.thread_count_for(1_000_000, 32)
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")

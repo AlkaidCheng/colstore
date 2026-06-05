@@ -65,8 +65,21 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
   if (effective_cap < 1) {
     effective_cap = 1;
   }
-  std::ptrdiff_t by_work = n_indices / ELEMENTS_PER_THREAD + 1;
-  std::ptrdiff_t threads = std::min<std::ptrdiff_t>(effective_cap, by_work);
+  // Work-proportional thread count, ~one thread per ELEMENTS_PER_THREAD
+  // elements. The previous form ``n / ELEMENTS_PER_THREAD + 1`` floored every
+  // n below ELEMENTS_PER_THREAD (1<<20) to a single thread, silently
+  // overriding PARALLEL_THRESHOLD (1<<18): a gather of 256K-1M elements is
+  // past the fork/join floor and measured a clean 2x at 2 threads, but the
+  // floor division forced it serial. Round up instead, and grant at least 2
+  // threads once we are past PARALLEL_THRESHOLD (already guaranteed by the
+  // early return above). Anything below PARALLEL_THRESHOLD never reaches here,
+  // so small-input behavior is unchanged. Above it, the ramp matches the
+  // measured knee (~1 thread per 1<<20 elements; scaling stays near-linear to
+  // the cap on the bandwidth-limited gather).
+  std::ptrdiff_t by_work =
+      (n_indices + ELEMENTS_PER_THREAD - 1) / ELEMENTS_PER_THREAD;
+  std::ptrdiff_t threads =
+      std::min<std::ptrdiff_t>(effective_cap, std::max<std::ptrdiff_t>(2, by_work));
   return std::max<std::ptrdiff_t>(1, threads);
 #else
   (void)n_indices;
