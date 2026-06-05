@@ -42,6 +42,69 @@ _MADVISE_FLAGS: dict[str, int] = {
 
 _USE_DEFAULT_MADVISE = "__default__"
 
+# ---- Parallel contiguous copy ------------------------------------------
+#
+# A contiguous column read is fundamentally one memcpy from the memmap into
+# an owning ndarray. NumPy's copy is single-threaded; on modern multi-core
+# systems with multi-channel memory, one core can't saturate the bus, so
+# splitting the copy across threads is 2-3x faster on a big read. On a
+# memory-bandwidth-bound machine where one core already saturates, the
+# threadpool overhead is wasted and the constants below keep us on the
+# single-thread path.
+#
+# These thresholds are intentionally conservative: any read below
+# _PARALLEL_COPY_MIN_BYTES (~16 MiB) goes single-threaded, and each
+# threadpool worker gets at least _PARALLEL_COPY_BYTES_PER_THREAD of work
+# so the ~1 ms threadpool fork cost is amortized over a few ms of memcpy.
+
+_PARALLEL_COPY_MIN_BYTES = 16 * 1024 * 1024
+_PARALLEL_COPY_BYTES_PER_THREAD = 16 * 1024 * 1024
+
+
+def _parallel_contiguous_copy(
+    source: NDArray[Any],
+    dst_dtype: np.dtype[Any],
+    *,
+    thread_cap: int,
+) -> NDArray[Any]:
+    """Copy a contiguous numpy view into a new owning ndarray, optionally in parallel.
+
+    Falls back to a single ``np.array`` copy when:
+
+      * ``thread_cap <= 1`` (caller doesn't want parallelism, e.g. because
+        the column threadpool is already saturating cores), OR
+      * ``source.nbytes < _PARALLEL_COPY_MIN_BYTES`` (work is too small to
+        amortize threadpool fork), OR
+      * the per-thread share would be below
+        ``_PARALLEL_COPY_BYTES_PER_THREAD`` after dividing by ``thread_cap``.
+
+    Otherwise it spawns up to ``thread_cap`` threads, each doing a slice
+    assignment into a preallocated output. NumPy releases the GIL during
+    the bulk memcpy of slice assignment, so the chunks actually run
+    concurrently on multi-core systems.
+    """
+    n_bytes = source.nbytes
+    if thread_cap <= 1 or n_bytes < _PARALLEL_COPY_MIN_BYTES:
+        return np.array(source, dtype=dst_dtype, copy=True)
+    n_threads = min(thread_cap, max(1, n_bytes // _PARALLEL_COPY_BYTES_PER_THREAD))
+    if n_threads <= 1:
+        return np.array(source, dtype=dst_dtype, copy=True)
+    n_rows = source.shape[0]
+    out: NDArray[Any] = np.empty(n_rows, dtype=dst_dtype)
+    chunk = (n_rows + n_threads - 1) // n_threads
+
+    def copy_chunk(start: int, end: int) -> None:
+        out[start:end] = source[start:end]
+
+    with ThreadPoolExecutor(max_workers=n_threads) as executor:
+        futures = [
+            executor.submit(copy_chunk, i * chunk, min((i + 1) * chunk, n_rows))
+            for i in range(n_threads)
+        ]
+        for future in futures:
+            future.result()
+    return out
+
 
 class ColStoreReader:
     """Memory-mapped columnar store with lazy, NumPy-style indexing.
@@ -358,10 +421,11 @@ class ColStoreReader:
         column is stored little-endian. On a little-endian host this is a
         no-op; on a big-endian host NumPy converts during the copy/gather.
 
-        ``thread_cap`` overrides the per-call OpenMP thread cap for the fancy-
-        index path; ``None`` uses the package default. :meth:`_gather_many`
-        passes a divided budget here so concurrent column reads do not
-        oversubscribe.
+        ``thread_cap`` overrides the per-call thread cap used by both the
+        fancy-index gather (OpenMP) and the contiguous parallel copy
+        (Python threadpool). ``None`` uses the package default.
+        :meth:`_gather_many` passes a divided budget here so concurrent
+        column reads do not oversubscribe.
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
@@ -372,14 +436,22 @@ class ColStoreReader:
         source = self._memmaps[column_name]
         disk_dtype = self._layout[column_name][1]
         native_dtype = disk_dtype.newbyteorder("=")
+        effective_cap = thread_cap if thread_cap is not None else config.get_gather_thread_cap()
         # ``np.array(..., copy=True)`` is typed to return ``NDArray[Any]``;
         # the older ``np.asarray(x).copy()`` chain returns ``Any`` under
         # current numpy stubs, hence the explicit constructor calls.
         if row_indexer is None:
-            return np.array(source, dtype=native_dtype, copy=True)
+            return _parallel_contiguous_copy(source, native_dtype, thread_cap=effective_cap)
         if isinstance(row_indexer, int):
             return np.atleast_1d(np.array(source[row_indexer], dtype=native_dtype, copy=True))
         if isinstance(row_indexer, slice):
+            start, stop, step = row_indexer.indices(self._n_rows)
+            if step == 1:
+                return _parallel_contiguous_copy(
+                    source[start:stop], native_dtype, thread_cap=effective_cap
+                )
+            # Strided slice: cheap rebuild via numpy is fine; not worth
+            # parallelizing the non-contiguous case.
             return np.array(source[row_indexer], dtype=native_dtype, copy=True)
         # Integer ndarray (fancy index): dispatch to chosen backend.
         return kernels.gather(
