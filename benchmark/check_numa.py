@@ -1,37 +1,45 @@
-"""Robust benchmark for the NUMA interleave optimization.
+"""Robust benchmark for the NUMA optimization (writer + reader sides).
 
-Two policies head-to-head on the same process:
+This benchmark is the third revision in the NUMA series. Earlier versions
+opened a fresh ColStoreReader inside the timed region, which dragged
+~30 ms of per-iteration setup cost into every wall-time measurement and
+masked the actual gather delta between policies. This version opens once
+per (file, policy) combination, runs warmups, and times only the gather.
 
-  ``local``      -- no-op; pages fall under the kernel's default
-                    first-touch policy. Mimics colstore behavior
-                    before the NUMA work.
-  ``interleave`` -- apply ``MPOL_INTERLEAVE`` at open time. Page-
-                    cache pages distribute across NUMA nodes as they
-                    fault in.
+Three things this measures:
+
+  1. Writer-side policy A/B: write the SAME data twice -- once under
+     ``"local"`` policy (writer thread's mempolicy = MPOL_DEFAULT, kernel
+     places page-cache pages by first touch), once under ``"interleave"``
+     (writer thread enters ``MPOL_INTERLEAVE`` via set_mempolicy, kernel
+     distributes pages across nodes). Then time reads of each file.
+
+     This is the actual win on warm reads -- the original numactl
+     experiment changed writer-side placement, not reader-side. With
+     the writer-side ``set_mempolicy`` from commit 4, calling
+     ``colstore.store`` under ``config.set_numa_policy("auto")``
+     (the default) produces files whose page-cache pages are spread
+     from the moment they are written.
+
+  2. Reader-side policy A/B (informational): apply ``mbind`` to the
+     reader memmap or not, on the SAME file. This will be ~noise on
+     warm cache (because the writer-side optimization already spread
+     the pages, or because mbind cannot move warm pages) but may
+     show a small effect on cold cache.
+
+  3. End-to-end ``ds.dict()`` / ``ds.frame()`` numbers with the
+     default config so the user can see steady-state behavior after
+     the writer-side change lands.
 
 For each scenario we report:
 
   wall    : best-of-N wall-clock time (ms)
-  cpu     : best-of-N process CPU time (user + sys) (ms)
-  ratio   : cpu / wall (utilization; > 1.0 proves real parallelism)
-  threads : peak active thread count observed during the run
-  faults  : (major, minor) page-fault delta -- major = disk read,
-            minor = page-table walk. Watch the minor count: under
-            interleave it should drop because pages stop bouncing
-            through one node's TLB.
+  cpu     : best-of-N process CPU time (ms)
+  ratio   : cpu / wall (utilization)
+  threads : peak active thread count
+  faults  : (major, minor) page-fault delta
 
-Runs are A/B INTERLEAVED across rounds rather than A...A then B...B.
-Separate runs in separate batches see different page-cache state
-and that confounds the comparison; interleaving keeps both policies
-operating on the same warm pages.
-
-The cold variant explicitly drops the page cache via
-``posix_fadvise(DONTNEED)`` before each timed call, so that the
-INTERLEAVE policy is exercised on first-fault pages -- which is the
-case it actually affects. Warm-cache runs measure steady-state.
-
-Run with ``PYTHONPATH=src`` after building the extension into
-``src/colstore/``.
+Run with ``PYTHONPATH=src`` after building the extension.
 """
 
 from __future__ import annotations
@@ -70,14 +78,14 @@ class Result:
 
     def report(self) -> str:
         if not self.runs:
-            return f"  {self.label:<60}  (no runs)"
+            return f"  {self.label:<62}  (no runs)"
         best = min(self.runs, key=lambda r: r.wall_ms)
         med_threads = statistics.median(r.peak_threads for r in self.runs)
         med_major = statistics.median(r.major_pf for r in self.runs)
         med_minor = statistics.median(r.minor_pf for r in self.runs)
         ratio = best.cpu_ms / best.wall_ms if best.wall_ms > 0 else float("nan")
         return (
-            f"  {self.label:<60} "
+            f"  {self.label:<62} "
             f"wall={best.wall_ms:8.2f}ms  cpu={best.cpu_ms:8.1f}ms  "
             f"ratio={ratio:5.2f}x  threads={int(med_threads):2d}  "
             f"pf={int(med_major)}/{int(med_minor)}"
@@ -147,46 +155,19 @@ def time_call(fn, *, drop_cache_paths: list[Path] | None = None) -> Run:
     )
 
 
-def make_store(td: str, name: str, n_rows: int, n_cols: int, dtype) -> Path:
-    """Materialize a store with `n_cols` columns of `n_rows` rows."""
-    path = Path(td) / name
-    arr = np.arange(n_rows, dtype=dtype)
-    cols = {f"c{i}": arr for i in range(n_cols)}
-    colstore.store(cols, str(path), show_progress=False)
-    return path
-
-
-def bench_interleaved_policies(
-    label_local: str,
-    label_interleave: str,
-    builder,
-    *,
-    drop_cache_paths: list[Path] | None = None,
-    n_iter: int = 5,
-    n_warmup: int = 2,
-) -> tuple[Result, Result]:
-    """Run two policies head-to-head, interleaved.
-
-    ``builder`` is a zero-arg callable that returns a callable to time.
-    A fresh store is opened *inside* the builder for each policy so
-    the policy applied at open time takes effect on first-fault.
-    """
-    res_local = Result(label=label_local)
-    res_inter = Result(label=label_interleave)
-    # warmup
+def bench(fn, *, n_iter=5, n_warmup=2, drop_cache_paths=None) -> Result:
+    """Time `fn` over n_iter rounds after n_warmup throwaways."""
+    result = Result(label="")
     for _ in range(n_warmup):
-        with policy_scope("local"):
-            builder()()
-        with policy_scope("interleave"):
-            builder()()
+        fn()
     for _ in range(n_iter):
-        with policy_scope("local"):
-            fn = builder()
-            res_local.runs.append(time_call(fn, drop_cache_paths=drop_cache_paths))
-        with policy_scope("interleave"):
-            fn = builder()
-            res_inter.runs.append(time_call(fn, drop_cache_paths=drop_cache_paths))
-    return res_local, res_inter
+        result.runs.append(time_call(fn, drop_cache_paths=drop_cache_paths))
+    return result
+
+
+def labeled(label: str, result: Result) -> Result:
+    result.label = label
+    return result
 
 
 @contextmanager
@@ -197,6 +178,19 @@ def policy_scope(policy):
         yield
     finally:
         config.set_numa_policy(previous)
+
+
+def write_store_under_policy(path: Path, columns: dict, policy: str) -> None:
+    """Write a fresh store at `path` with the given NUMA policy active.
+
+    The point of this benchmark is to compare files written under
+    different policies; this helper enforces that each variant gets
+    a clean write under exactly the policy it claims.
+    """
+    if path.exists():
+        path.unlink()
+    with policy_scope(policy):
+        colstore.store(columns, str(path), show_progress=False).close()
 
 
 def banner(s):
@@ -212,117 +206,174 @@ def main():
     print(f"  _numa.allowed_nodes()       = {_numa.allowed_nodes()}")
     if not _numa.is_available():
         print()
-        print("  NOTE: NUMA interleave is a no-op on this host. The benchmark")
+        print("  NOTE: NUMA optimization is a no-op on this host. The benchmark")
         print("  will still run and exercise the code paths, but A/B numbers")
-        print("  will be within noise of each other. To see the real win,")
+        print("  will be within noise of each other. To see the actual win,")
         print("  run on a multi-socket / multi-NPS Linux server.")
 
     with tempfile.TemporaryDirectory() as td:
-        # ---- Scenario A: the hot case ---------------------------------------
-        # 50 cols x 2.5M rows float64 = 1 GB. Maximum NUMA pressure: many
-        # workers, big working set, all-to-one funnel if pages concentrate.
-        many = make_store(td, "many.cstore", 2_500_000, 50, np.float64)
-        per_col = 2_500_000 * 8
-        total = per_col * 50
+        n_rows, n_cols = 2_500_000, 50
+        total_bytes = n_rows * n_cols * 8
 
-        def builder_many_dict():
-            ds = colstore.open(str(many))
-            return lambda: (ds.dict(), ds.close())
+        # Two copies of the same data, written under different policies.
+        local_path = Path(td) / "store_written_under_local.cstore"
+        interleave_path = Path(td) / "store_written_under_interleave.cstore"
+        rng = np.random.default_rng(0)
+        cols = {f"c{i:02d}": rng.standard_normal(n_rows) for i in range(n_cols)}
+        print()
+        print("Writing two stores (one under each writer policy)...")
+        write_store_under_policy(local_path, cols, "local")
+        write_store_under_policy(interleave_path, cols, "interleave")
+        print(f"  {local_path.name}: written under policy=local")
+        print(f"  {interleave_path.name}: written under policy=interleave")
 
-        def builder_many_frame():
-            ds = colstore.open(str(many))
-            return lambda: (ds.frame(), ds.close())
+        # ---- Writer-side A/B, warm cache: SAME reads on two files written
+        # under different writer policies. This is the headline measurement
+        # -- writer-side placement is what actually controls warm-cache
+        # gather throughput, because reader-side mbind cannot move pages
+        # that are already in the page cache (MAP_SHARED read mapping).
+        banner(f"WRITER-SIDE A/B (warm)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.dict()")
+        local_reader = colstore.open(str(local_path))
+        interleave_reader = colstore.open(str(interleave_path))
+        try:
+            with policy_scope("local"):
+                # Reader policy fixed at "local" to isolate the writer-side
+                # effect. Whatever delta we see is attributable to where the
+                # writer placed the pages.
+                r_local = labeled(
+                    "writer=local      reader=local  ds.dict()",
+                    bench(lambda: local_reader.dict()),
+                )
+                r_inter = labeled(
+                    "writer=interleave reader=local  ds.dict()",
+                    bench(lambda: interleave_reader.dict()),
+                )
+            print(r_local.report())
+            print(r_inter.report())
 
-        banner(f"MANY COLS warm 50 x {per_col / 1e6:.0f} MB = {total / 1e9:.1f} GB  ds.dict()")
-        res_l, res_i = bench_interleaved_policies(
-            "policy=local      ds.dict()",
-            "policy=interleave ds.dict()",
-            builder_many_dict,
-        )
-        print(res_l.report())
-        print(res_i.report())
+            banner(f"WRITER-SIDE A/B (warm)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.frame()")
+            with policy_scope("local"):
+                r_local = labeled(
+                    "writer=local      reader=local  ds.frame()",
+                    bench(lambda: local_reader.frame()),
+                )
+                r_inter = labeled(
+                    "writer=interleave reader=local  ds.frame()",
+                    bench(lambda: interleave_reader.frame()),
+                )
+            print(r_local.report())
+            print(r_inter.report())
+        finally:
+            local_reader.close()
+            interleave_reader.close()
 
-        banner(f"MANY COLS warm 50 x {per_col / 1e6:.0f} MB = {total / 1e9:.1f} GB  ds.frame()")
-        res_l, res_i = bench_interleaved_policies(
-            "policy=local      ds.frame()",
-            "policy=interleave ds.frame()",
-            builder_many_frame,
-        )
-        print(res_l.report())
-        print(res_i.report())
+        # ---- Writer-side A/B, COLD cache: drop pages, then time first read.
+        # On cold reads the page-cache allocation happens DURING the gather,
+        # so the reader-side policy on the VMA matters. Writer-side policy
+        # is recorded on the file's inode and may or may not influence
+        # fresh allocation; this scenario reveals which.
+        banner(f"WRITER-SIDE A/B (cold)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.dict()")
+        with policy_scope("local"):
+            local_reader = colstore.open(str(local_path))
+            interleave_reader = colstore.open(str(interleave_path))
+            try:
+                r_local = labeled(
+                    "writer=local      reader=local  ds.dict() cold",
+                    bench(
+                        lambda: local_reader.dict(),
+                        drop_cache_paths=[local_path],
+                        n_warmup=0,
+                        n_iter=3,
+                    ),
+                )
+                r_inter = labeled(
+                    "writer=interleave reader=local  ds.dict() cold",
+                    bench(
+                        lambda: interleave_reader.dict(),
+                        drop_cache_paths=[interleave_path],
+                        n_warmup=0,
+                        n_iter=3,
+                    ),
+                )
+            finally:
+                local_reader.close()
+                interleave_reader.close()
+        print(r_local.report())
+        print(r_inter.report())
 
-        banner(f"MANY COLS cold 50 x {per_col / 1e6:.0f} MB = {total / 1e9:.1f} GB  ds.dict()")
-        res_l, res_i = bench_interleaved_policies(
-            "policy=local      ds.dict() cold",
-            "policy=interleave ds.dict() cold",
-            builder_many_dict,
-            drop_cache_paths=[many],
-            n_warmup=0,
-            n_iter=3,
-        )
-        print(res_l.report())
-        print(res_i.report())
+        # ---- Reader-side A/B on a file written under "local". The writer
+        # placed all pages on one node; reader-side mbind sets a VMA policy
+        # but cannot redistribute warm pages. Expect ~noise. This pin-tests
+        # the diagnosis that warm-cache reader-side mbind is a no-op.
+        banner("READER-SIDE A/B on writer=local file (warm)  ds.dict()")
+        with policy_scope("local"):
+            r_off = labeled(
+                "reader=local      writer=local  ds.dict()",
+                bench(lambda: colstore.open(str(local_path)).dict()),
+            )
+        with policy_scope("interleave"):
+            r_on = labeled(
+                "reader=interleave writer=local  ds.dict()",
+                bench(lambda: colstore.open(str(local_path)).dict()),
+            )
+        print(r_off.report())
+        print(r_on.report())
+        print("  (expected: ~noise -- reader mbind cannot move warm pages)")
 
-        # ---- Scenario B: single column, large ------------------------------
-        # 1 column x 10M rows float64 = 80 MB. Single-column reads stay
-        # within one node's L3 on EPYC parts (~64 MiB per CCD pair) plus
-        # some DRAM, so NUMA effects are modest. Expect ~1.0-1.2x.
-        single = make_store(td, "single.cstore", 10_000_000, 1, np.float64)
-        bytes_total = 10_000_000 * 8
+        # ---- End-to-end: what the user actually sees with config defaults.
+        # With config.set_numa_policy("auto") (the default), the writer
+        # interleaves at write time and the reader's mbind is a small
+        # cold-cache complement. This is the "after the PR lands, what do
+        # the workloads in question look like" number.
+        banner(f"END-TO-END default policy  50 x 20 MB = {total_bytes / 1e9:.1f} GB")
+        end_to_end_path = Path(td) / "end_to_end.cstore"
+        write_store_under_policy(end_to_end_path, cols, "auto")
+        with policy_scope("auto"):
+            ds = colstore.open(str(end_to_end_path))
+            try:
+                r_dict = labeled(
+                    "ds.dict()  writer=auto reader=auto",
+                    bench(lambda: ds.dict()),
+                )
+                r_frame = labeled(
+                    "ds.frame() writer=auto reader=auto",
+                    bench(lambda: ds.frame()),
+                )
+            finally:
+                ds.close()
+        print(r_dict.report())
+        print(r_frame.report())
 
-        def builder_single():
-            ds = colstore.open(str(single))
-            return lambda: (ds.dict(), ds.close())
-
-        banner(f"SINGLE COL warm-cache: 1 x {bytes_total / 1e6:.0f} MB  ds.dict()")
-        res_l, res_i = bench_interleaved_policies(
-            "policy=local      ds.dict()",
-            "policy=interleave ds.dict()",
-            builder_single,
-        )
-        print(res_l.report())
-        print(res_i.report())
-
-        # ---- Scenario C: wide / many small columns -------------------------
-        # 200 cols x 100K rows float64 = 160 MB. Wide stores fit in
-        # aggregate L3 on EPYC parts; expect roughly noise.
-        wide = make_store(td, "wide.cstore", 100_000, 200, np.float64)
-
-        def builder_wide():
-            ds = colstore.open(str(wide))
-            return lambda: (ds.dict(), ds.close())
-
-        banner("WIDE STORE warm-cache: 200 x 0.8 MB = 160 MB  ds.dict()")
-        res_l, res_i = bench_interleaved_policies(
-            "policy=local      ds.dict()",
-            "policy=interleave ds.dict()",
-            builder_wide,
-        )
-        print(res_l.report())
-        print(res_i.report())
-
-        # ---- Scenario D: low-concurrency regression check ------------------
-        # The case where interleave is suspected to be pessimal: one
-        # consumer thread reading a large store. With pages spread, that
-        # one thread does mostly-remote loads. Expect interleave slightly
-        # slower or within noise; this is what justifies the "local"
-        # opt-out documented in set_numa_policy.
-        banner("LOW-CONCURRENCY: workers=1, 1 GB / 50-col  ds.dict()")
-        previous_workers = config.get_max_workers()
-        previous_cap = config.get_gather_thread_cap()
+        # ---- Low-concurrency regression check. With only one consumer
+        # thread, "interleave" forces 7/8 remote loads on an 8-node host;
+        # writer-side and reader-side both can hurt slightly here. The
+        # "local" opt-out documented in set_numa_policy exists for this case.
+        banner("LOW-CONCURRENCY regression check (workers=1, 1 GB / 50-col)")
+        prev_workers = config.get_max_workers()
+        prev_cap = config.get_gather_thread_cap()
         try:
             config.set_max_workers(1)
             config.set_gather_thread_cap(1)
-            res_l, res_i = bench_interleaved_policies(
-                "policy=local      workers=1",
-                "policy=interleave workers=1",
-                builder_many_dict,
-            )
-            print(res_l.report())
-            print(res_i.report())
+            ds_local = colstore.open(str(local_path))
+            ds_inter = colstore.open(str(interleave_path))
+            try:
+                with policy_scope("local"):
+                    r_local = labeled(
+                        "workers=1  writer=local      reader=local",
+                        bench(lambda: ds_local.dict()),
+                    )
+                    r_inter = labeled(
+                        "workers=1  writer=interleave reader=local",
+                        bench(lambda: ds_inter.dict()),
+                    )
+                print(r_local.report())
+                print(r_inter.report())
+            finally:
+                ds_local.close()
+                ds_inter.close()
         finally:
-            config.set_max_workers(previous_workers)
-            config.set_gather_thread_cap(previous_cap)
+            config.set_max_workers(prev_workers)
+            config.set_gather_thread_cap(prev_cap)
 
 
 if __name__ == "__main__":
