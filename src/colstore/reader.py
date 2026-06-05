@@ -42,6 +42,23 @@ _MADVISE_FLAGS: dict[str, int] = {
 
 _USE_DEFAULT_MADVISE = "__default__"
 
+
+def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
+    """Return whether ``dtype`` is in the host's native byte order.
+
+    Single-byte and string-of-bytes kinds carry byteorder ``"|"`` (not
+    applicable) and are always safe for a raw byte copy. Multi-byte numeric
+    dtypes are native when their byteorder is ``"="`` or matches the host.
+    The native-only paths (raw memcpy range copy, the typed gather kernels)
+    use this to decide whether a byte-level copy preserves values; non-native
+    dtypes fall back to NumPy, which byteswaps during the copy.
+    """
+    byteorder = dtype.byteorder
+    if byteorder in ("=", "|"):
+        return True
+    return (byteorder == "<") == bool(np.little_endian)
+
+
 # ---- Parallel contiguous copy ------------------------------------------
 #
 # A contiguous column read is fundamentally one memcpy from the memmap into
@@ -705,18 +722,58 @@ class ColStoreReader:
 
         Replaces the gather kernel for contiguous-range reads. A range
         spanning R' records is served by R' contiguous memory copies from
-        the file mmap, plus two O(log R) searchsorted calls to locate the
-        first/last overlapping records. No per-element work.
+        the file mmap, plus an O(log R) search to locate the first
+        overlapping record. No per-element work.
 
-        The output is always native byte order; if the disk dtype is
-        non-native the per-record view from ``np.frombuffer`` is byteswapped
-        during the assignment into ``output``.
+        When the C++ extension is available and the on-disk dtype is in native
+        byte order, the per-record copy loop runs entirely in C++
+        (:func:`_gather.copy_multirecord_range`): one ``memcpy`` per record,
+        record membership found by binary search in the kernel, zero per-record
+        Python/NumPy overhead. Non-native dtypes (which need a byteswap during
+        the copy) and the no-extension case fall back to the NumPy loop in
+        :meth:`_copy_multirecord_range_python`.
         """
         n = stop - start
-        output = np.empty(n, dtype=native_dtype)
+        output: NDArray[Any] = np.empty(n, dtype=native_dtype)
         if n == 0:
             return output
 
+        if kernels.cpp_available() and _dtype_is_native(disk_dtype):
+            from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+            _cpp_module.copy_multirecord_range(
+                self._file_mmap,
+                output,
+                int(start),
+                int(stop),
+                self._record_starts_rows,
+                self._record_starts_bytes,
+                self._n_rows_per_record,
+                int(col_prefix),
+                int(itemsize),
+            )
+            return output
+
+        return self._copy_multirecord_range_python(
+            start, stop, disk_dtype, col_prefix, itemsize, output
+        )
+
+    def _copy_multirecord_range_python(
+        self,
+        start: int,
+        stop: int,
+        disk_dtype: np.dtype[Any],
+        col_prefix: int,
+        itemsize: int,
+        output: NDArray[Any],
+    ) -> NDArray[Any]:
+        """NumPy fallback for :meth:`_read_contiguous_range_multi_record`.
+
+        Used when the C++ extension is unavailable, or when the on-disk dtype
+        is non-native (the per-record ``np.frombuffer`` view is byteswapped
+        during assignment into the native-order ``output``). ``output`` is
+        preallocated by the caller with length ``stop - start``.
+        """
         record_starts_rows = self._record_starts_rows
         first_record = int(np.searchsorted(record_starts_rows, start, side="right") - 1)
         # stop-1 is the last row index actually read; same searchsorted finds

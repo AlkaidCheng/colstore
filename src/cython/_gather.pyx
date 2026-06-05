@@ -48,6 +48,11 @@ cdef extern from "colstore/gather.hpp" nogil:
                                  ptrdiff_t, int)
     void colstore_gather_bytes_8(const uint8_t*, const int64_t*, uint8_t*,
                                  ptrdiff_t, int)
+    void colstore_copy_multirecord_range(const uint8_t*, uint8_t*,
+                                         int64_t, int64_t,
+                                         const int64_t*, const int64_t*,
+                                         const int64_t*, int64_t,
+                                         int64_t, int64_t)
     int colstore_max_threads()
 
 
@@ -227,3 +232,72 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
         )
+
+
+def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
+                           long long start, long long stop,
+                           cnp.ndarray record_starts_rows,
+                           cnp.ndarray record_starts_bytes,
+                           cnp.ndarray n_rows_per_record,
+                           long long col_prefix_bytes, long long itemsize):
+    """Copy global rows ``[start, stop)`` of one column from a multi-record file.
+
+    The output is filled with the packed, contiguous rows of the range. Each
+    overlapping record contributes one ``memcpy``; record membership is found
+    by binary search inside the kernel, so no per-record Python work happens.
+
+    Parameters
+    ----------
+    source : numpy.ndarray
+        Whole-file ``uint8`` mmap; treated as the raw byte base pointer.
+    output : numpy.ndarray
+        1D destination array of length ``stop - start`` and the column's dtype.
+        Filled in-place. Its dtype must be the on-disk dtype in *native* byte
+        order -- this is a raw byte copy and does not byteswap.
+    start, stop : int
+        Half-open global row range. ``stop > start`` is required by the caller;
+        an empty range is a no-op.
+    record_starts_rows : numpy.ndarray
+        1D ``int64`` cumulative row counts, length ``n_records + 1``.
+    record_starts_bytes : numpy.ndarray
+        1D ``int64`` per-record body byte offsets, length ``n_records``.
+    n_rows_per_record : numpy.ndarray
+        1D ``int64`` per-record row counts, length ``n_records``.
+    col_prefix_bytes : int
+        Sum of itemsizes of the columns preceding this one in a record body.
+    itemsize : int
+        Bytes per element of the column.
+
+    Raises
+    ------
+    TypeError
+        If any index array is not ``int64``.
+    ValueError
+        If the index arrays are not 1D or have inconsistent lengths.
+    """
+    if (record_starts_rows.ndim != 1 or record_starts_bytes.ndim != 1
+            or n_rows_per_record.ndim != 1 or output.ndim != 1):
+        raise ValueError("Index arrays and output must be 1D.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+    if stop <= start:
+        return
+
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+
+    with nogil:
+        colstore_copy_multirecord_range(base, output_ptr, start, stop,
+                                        rsr, rsb, nrr, n_records,
+                                        col_prefix_bytes, itemsize)
