@@ -15,6 +15,7 @@ tests pin the platform-agnostic invariants:
 
 from __future__ import annotations
 
+import contextlib
 import platform
 import sys
 
@@ -226,3 +227,124 @@ def test_reader_open_under_local_policy_skips_numa_call(tmp_path, monkeypatch):
         config.set_numa_policy(previous)
 
     assert calls == [], "local policy must not call the NUMA helper"
+
+
+# ---- Writer-side integration ------------------------------------------------
+
+
+def test_interleave_thread_policy_yields_bool_on_every_platform():
+    """The context manager returns a boolean indicating actual application.
+
+    On a single-node sandbox the manager yields False; on multi-node
+    Linux it yields True after the syscall succeeds. Either way the
+    body runs and the context unwinds cleanly.
+    """
+    with _numa.interleave_thread_policy() as applied:
+        assert isinstance(applied, bool)
+        # On unavailable hosts we MUST report False, not silently apply.
+        if not _numa.is_available():
+            assert applied is False
+
+
+def test_interleave_thread_policy_is_reentrant():
+    """Nesting the scope must work even if the outer policy was applied.
+
+    Inner scopes capture the policy that's active on entry (which may
+    be MPOL_INTERLEAVE from an outer scope) and restore it on exit.
+    Without the capture-and-restore design, nesting would silently
+    drop us to MPOL_DEFAULT after the inner exits.
+    """
+    with _numa.interleave_thread_policy() as outer, _numa.interleave_thread_policy() as inner:
+        assert outer == inner  # both no-op or both applied
+
+
+def test_writer_under_auto_enters_interleave_scope(tmp_path, monkeypatch):
+    """`auto` policy wraps writer body in interleave_thread_policy.
+
+    Patches the shared ``_numa.writer_policy_scope`` dispatcher --
+    both ``ColStoreWriter.write`` and ``format.write_dataset`` go
+    through it, so this catches a regression in either path.
+    """
+    entered: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy():
+        entered.append(True)
+        yield True
+
+    # Patch BOTH the canonical location (used by ColStoreWriter via
+    # `_numa.writer_policy_scope`) and the re-export through `format`
+    # (used by `colstore.store` -> `format.write_dataset`). The two
+    # callers reach the dispatcher through different binding paths.
+    monkeypatch.setattr(_numa, "writer_policy_scope", spy)
+    from colstore import format as fmt_mod
+
+    monkeypatch.setattr(fmt_mod._numa, "writer_policy_scope", spy)
+
+    previous = config.get_numa_policy()
+    try:
+        config.set_numa_policy("auto")
+        store_path = tmp_path / "writer_auto.cstore"
+        colstore.store(
+            {"x": np.arange(16, dtype=np.float64)}, store_path, show_progress=False
+        ).close()
+    finally:
+        config.set_numa_policy(previous)
+
+    assert entered, "auto policy must enter the writer-side interleave scope"
+
+
+def test_writer_under_local_skips_interleave_call(tmp_path, monkeypatch):
+    """`local` policy must NOT enter the interleave scope on the writer.
+
+    The dispatcher returns a ``nullcontext`` for "local" or non-
+    applicable hosts; ``interleave_thread_policy`` itself must not be
+    invoked. Patches ``interleave_thread_policy`` to detect any call.
+    """
+    invoked: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy():
+        invoked.append(True)
+        yield True
+
+    monkeypatch.setattr(_numa, "interleave_thread_policy", spy)
+
+    previous = config.get_numa_policy()
+    try:
+        config.set_numa_policy("local")
+        store_path = tmp_path / "writer_local.cstore"
+        colstore.store(
+            {"x": np.arange(16, dtype=np.float64)}, store_path, show_progress=False
+        ).close()
+    finally:
+        config.set_numa_policy(previous)
+
+    assert invoked == [], "local policy must not invoke interleave_thread_policy"
+
+
+def test_writer_writes_correct_data_under_each_policy(tmp_path):
+    """The actual file contents are independent of NUMA policy.
+
+    The optimization changes WHERE pages live, not WHAT they contain.
+    Pin that the round-trip is byte-equivalent under every policy.
+    """
+    expected_x = np.arange(1024, dtype=np.float64)
+    expected_y = np.arange(1024, dtype=np.int32)
+
+    previous = config.get_numa_policy()
+    try:
+        for policy in ("auto", "interleave", "local"):
+            config.set_numa_policy(policy)
+            store_path = tmp_path / f"under_{policy}.cstore"
+            colstore.store(
+                {"x": expected_x, "y": expected_y}, store_path, show_progress=False
+            ).close()
+            store = colstore.open(store_path)
+            try:
+                np.testing.assert_array_equal(store["x"].array(), expected_x)
+                np.testing.assert_array_equal(store["y"].array(), expected_y)
+            finally:
+                store.close()
+    finally:
+        config.set_numa_policy(previous)

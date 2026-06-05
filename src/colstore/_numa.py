@@ -38,12 +38,14 @@ back to no-op on anything else.
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import os
 import platform
 import warnings
+from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 if TYPE_CHECKING:
     import numpy as np
@@ -51,17 +53,33 @@ if TYPE_CHECKING:
 
 # ---- Syscall constants -----------------------------------------------------
 
-# mbind(2) syscall numbers, by uname machine. From the Linux kernel's
-# arch/<arch>/include/uapi/asm/unistd*.h tables; stable across kernel
-# versions for each arch.
-_MBIND_SYSCALL_NRS: dict[str, int] = {
-    "x86_64": 237,
-    "aarch64": 235,
-    "ppc64le": 259,
-    "s390x": 268,
+
+class _NumaSyscalls(NamedTuple):
+    """Per-arch syscall numbers for the three NUMA syscalls we use.
+
+    Looked up from ``arch/<arch>/.../syscall*.tbl`` in the kernel
+    source. Stable across kernel versions for each architecture.
+    """
+
+    mbind: int
+    set_mempolicy: int
+    get_mempolicy: int
+
+
+# x86_64:  mbind, set_mempolicy, get_mempolicy in that order.
+# aarch64: uses asm-generic/unistd.h; mbind=235, get=236, set=237.
+# ppc64le: get and set are swapped relative to x86_64 (get=260, set=261).
+# s390x:   similarly out of order (get=269, set=270).
+_NUMA_SYSCALLS: dict[str, _NumaSyscalls] = {
+    "x86_64": _NumaSyscalls(mbind=237, set_mempolicy=238, get_mempolicy=239),
+    "aarch64": _NumaSyscalls(mbind=235, set_mempolicy=237, get_mempolicy=236),
+    "ppc64le": _NumaSyscalls(mbind=259, set_mempolicy=261, get_mempolicy=260),
+    "s390x": _NumaSyscalls(mbind=268, set_mempolicy=270, get_mempolicy=269),
 }
 
+
 # Policy modes from <linux/mempolicy.h>.
+_MPOL_DEFAULT = 0
 _MPOL_INTERLEAVE = 3
 
 
@@ -115,7 +133,7 @@ def _detect_allowed_nodes() -> list[int]:
 
 
 _PLATFORM_IS_LINUX = platform.system() == "Linux"
-_MBIND_SYSCALL_NR = _MBIND_SYSCALL_NRS.get(platform.machine(), -1)
+_SYSCALLS: _NumaSyscalls | None = _NUMA_SYSCALLS.get(platform.machine())
 _ALLOWED_NODES: list[int] = _detect_allowed_nodes() if _PLATFORM_IS_LINUX else []
 
 # Treat the host as "NUMA-capable for our purposes" only when there's
@@ -123,7 +141,7 @@ _ALLOWED_NODES: list[int] = _detect_allowed_nodes() if _PLATFORM_IS_LINUX else [
 # either a no-op or a slight pessimization (the kernel has to do
 # extra bookkeeping for a policy that picks the only available node
 # every time), so we skip the syscall entirely.
-_AVAILABLE: bool = _PLATFORM_IS_LINUX and _MBIND_SYSCALL_NR > 0 and len(_ALLOWED_NODES) > 1
+_AVAILABLE: bool = _PLATFORM_IS_LINUX and _SYSCALLS is not None and len(_ALLOWED_NODES) > 1
 
 
 # Page size for mbind alignment. POSIX guarantees ``SC_PAGESIZE`` on Linux;
@@ -245,7 +263,28 @@ def _page_align_range(addr: int, length: int) -> tuple[int, int]:
     return aligned_start, aligned_end - aligned_start
 
 
-_WARNED_FAILURE = False
+_WARNED_FAILURES: set[str] = set()
+
+
+def _warn_once(syscall_name: str, errno: int) -> None:
+    """Emit a once-per-process warning for a failed NUMA syscall.
+
+    Different syscalls warn independently so the operator gets one
+    message for each kind of failure; repeated failures of the same
+    syscall stay silent. The warning identifies which syscall failed
+    so the diagnosis (cgroup restriction vs. seccomp filter vs. old
+    kernel) is immediate.
+    """
+    if syscall_name in _WARNED_FAILURES:
+        return
+    _WARNED_FAILURES.add(syscall_name)
+    warnings.warn(
+        f"{syscall_name} failed (errno={errno}); NUMA placement was not "
+        f"applied. The store will still work correctly but may run slower "
+        f"on multi-node hosts. Further failures of this syscall will not "
+        f"be reported.",
+        stacklevel=3,
+    )
 
 
 def apply_interleave_to_memmap(memmap: np.ndarray) -> bool:
@@ -255,29 +294,26 @@ def apply_interleave_to_memmap(memmap: np.ndarray) -> bool:
     (non-applicable host, zero-length region, syscall failure).
 
     Page-cache pages backing the underlying file region will be
-    allocated round-robin across the allowed NUMA nodes on first
-    fault, instead of all on whichever node serviced the I/O.
-
-    Must be called BEFORE the memmap is accessed in any way that
-    faults pages in. Pages already faulted in with a different
-    policy are not migrated by this call -- ``MPOL_MF_MOVE`` would
-    do that but is expensive and seldom needed in the open ->
-    apply -> gather flow we target.
+    allocated round-robin across the allowed NUMA nodes **on first
+    fault** -- pages already in the page cache are not migrated by
+    this call. For files we write ourselves, see
+    :func:`interleave_thread_policy`, which controls placement at
+    write time and is the lever that actually changes warm-cache
+    behavior; reader-side ``mbind`` is the cold-cache complement.
 
     On the first syscall failure in this process, emits a
     ``UserWarning`` so the operator can investigate (cgroup
     restriction, seccomp filter, old kernel). Subsequent failures
     are silent to avoid log spam.
     """
-    global _WARNED_FAILURE
-    if not _AVAILABLE or _libc is None or _INTERLEAVE_MASK is None:
+    if not _AVAILABLE or _libc is None or _INTERLEAVE_MASK is None or _SYSCALLS is None:
         return False
     length = int(memmap.nbytes)
     if length == 0:
         return False
     aligned_addr, aligned_length = _page_align_range(int(memmap.ctypes.data), length)
     rc = _libc.syscall(
-        ctypes.c_long(_MBIND_SYSCALL_NR),
+        ctypes.c_long(_SYSCALLS.mbind),
         ctypes.c_void_p(aligned_addr),
         ctypes.c_ulong(aligned_length),
         ctypes.c_int(_MPOL_INTERLEAVE),
@@ -286,15 +322,117 @@ def apply_interleave_to_memmap(memmap: np.ndarray) -> bool:
         ctypes.c_uint(0),
     )
     if rc != 0:
-        errno = ctypes.get_errno()
-        if not _WARNED_FAILURE:
-            warnings.warn(
-                f"mbind(MPOL_INTERLEAVE) failed (errno={errno}); NUMA "
-                f"interleaving was not applied. The store will still "
-                f"work correctly but may run slower on multi-node hosts. "
-                f"Further failures will not be reported.",
-                stacklevel=2,
-            )
-            _WARNED_FAILURE = True
+        _warn_once("mbind(MPOL_INTERLEAVE)", ctypes.get_errno())
         return False
     return True
+
+
+# ---- Thread-local mempolicy (writer-side) ----------------------------------
+
+
+@contextlib.contextmanager
+def interleave_thread_policy() -> Iterator[bool]:
+    """Set ``MPOL_INTERLEAVE`` on the calling thread for the scope.
+
+    Yields ``True`` if the policy was actually applied, ``False`` if
+    the helper degraded to no-op (non-applicable host, syscall
+    failure). The boolean lets callers branch on whether the
+    optimization is active without re-querying the module.
+
+    ``set_mempolicy(2)`` affects the calling thread's default
+    mempolicy, which is what the kernel uses for page-cache
+    allocations during ``write(2)`` syscalls on this thread. Wrapping
+    :meth:`ColStoreWriter.write` in this scope causes the page-cache
+    pages backing the file to be allocated round-robin across the
+    allowed NUMA nodes at write time. Every subsequent reader of the
+    file -- this process or any other, now or weeks later -- sees the
+    distributed placement without needing any reader-side work.
+
+    This is the lever that actually delivers the NUMA win.
+    Reader-side ``apply_interleave_to_memmap`` only affects pages
+    not yet in the page cache (cold reads); for warm reads of files
+    we wrote ourselves under default policy, page placement is
+    already locked and reader-side ``mbind`` can't move it.
+
+    The previous policy is captured via ``get_mempolicy(2)`` and
+    restored on exit, so processes running under ``numactl
+    --interleave=all`` (which sets a non-default thread policy on
+    startup) get exactly what they had before the scope.
+
+    No-op on non-applicable hosts.
+    """
+    if not _AVAILABLE or _libc is None or _INTERLEAVE_MASK is None or _SYSCALLS is None:
+        yield False
+        return
+
+    # Capture the previous policy so the exit can restore it exactly.
+    # On a thread with default policy this returns mode=MPOL_DEFAULT
+    # and an empty mask; the restore then sets MPOL_DEFAULT again,
+    # which is a no-op but harmless.
+    prev_mode = ctypes.c_int(0)
+    prev_mask = (ctypes.c_ulong * _n_words)()
+    rc = _libc.syscall(
+        ctypes.c_long(_SYSCALLS.get_mempolicy),
+        ctypes.byref(prev_mode),
+        ctypes.cast(prev_mask, ctypes.c_void_p),
+        ctypes.c_ulong(_MAXNODE),
+        ctypes.c_void_p(0),  # addr=NULL: query the thread default, not a VMA
+        ctypes.c_ulong(0),  # flags=0
+    )
+    if rc != 0:
+        _warn_once("get_mempolicy", ctypes.get_errno())
+        yield False
+        return
+
+    # Set MPOL_INTERLEAVE.
+    rc = _libc.syscall(
+        ctypes.c_long(_SYSCALLS.set_mempolicy),
+        ctypes.c_int(_MPOL_INTERLEAVE),
+        ctypes.cast(_INTERLEAVE_MASK, ctypes.c_void_p),
+        ctypes.c_ulong(_MAXNODE),
+    )
+    if rc != 0:
+        _warn_once("set_mempolicy(MPOL_INTERLEAVE)", ctypes.get_errno())
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        # Restore. For MPOL_DEFAULT the kernel rejects a non-empty
+        # mask, but get_mempolicy returns an empty mask when the
+        # current policy is MPOL_DEFAULT, so the captured pair is
+        # always self-consistent.
+        _libc.syscall(
+            ctypes.c_long(_SYSCALLS.set_mempolicy),
+            ctypes.c_int(prev_mode.value),
+            ctypes.cast(prev_mask, ctypes.c_void_p),
+            ctypes.c_ulong(_MAXNODE),
+        )
+
+
+def writer_policy_scope() -> contextlib.AbstractContextManager[bool]:
+    """Return the NUMA context manager wrapping writer body writes.
+
+    Single source of truth for "should this writer enter
+    ``MPOL_INTERLEAVE`` for its scope?". Both
+    :class:`colstore.writer.ColStoreWriter` (streaming writes) and
+    :func:`colstore.format.write_dataset` (one-shot
+    :func:`colstore.store` path) call this so the two write paths
+    have identical NUMA semantics.
+
+    Resolves :func:`colstore.config.get_numa_policy`:
+
+    * ``"local"`` -> :class:`contextlib.nullcontext` (no-op)
+    * non-applicable host -> :class:`contextlib.nullcontext`
+    * ``"auto"`` / ``"interleave"`` on multi-node Linux ->
+      :func:`interleave_thread_policy`
+
+    Importing :mod:`colstore.config` is deferred to call time to keep
+    this module free of intra-package import cycles at load.
+    """
+    from . import config  # local import: _numa is imported by reader/writer
+
+    if config.get_numa_policy() == "local" or not is_available():
+        return contextlib.nullcontext(False)
+    return interleave_thread_policy()

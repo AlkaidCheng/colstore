@@ -61,6 +61,7 @@ from typing import IO, Any
 
 import numpy as np
 
+from . import _numa
 from .progress import progress_bar
 
 FILE_EXTENSION = ".cstore"
@@ -775,6 +776,15 @@ def write_dataset(
             unit_scale=True,
             enabled=show_progress,
         ) as progress,
+        # Wrap body writes in MPOL_INTERLEAVE on multi-node Linux so the
+        # kernel distributes page-cache pages across NUMA nodes at write
+        # time. Identical semantics to ColStoreWriter.write -- the policy
+        # gate lives in _numa.writer_policy_scope so this path and the
+        # streaming path agree. The one-shot colstore.store() (which is
+        # what most callers use) routes through here, so this is the
+        # call site that actually fixes the warm-cache NUMA placement
+        # the original benchmark identified.
+        _numa.writer_policy_scope(),
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
         # Single record at index 0 wrapping the entire dataset. Reads of this

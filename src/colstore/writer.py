@@ -56,7 +56,7 @@ from typing import Any
 
 import numpy as np
 
-from . import _lock
+from . import _lock, _numa
 from . import format as fmt
 
 
@@ -254,19 +254,31 @@ class ColStoreWriter:
         if not self._has_header:
             self._write_header_from_first_write(columns_meta)
 
-        # Append a record at the current file position (which is end-of-file
-        # in update mode after the constructor seek, or right past the
-        # header padding in create/recreate after the header write).
-        record_index = self._n_records
-        fmt.write_record_header(self._file, record_index, n_rows)
-        body_bytes = 0
-        for col_meta in self._schema or columns_meta:
-            array = le_columns[col_meta["name"]]
-            array.tofile(self._file)
-            body_bytes += array.nbytes
-        pad = fmt.align_up(body_bytes, fmt._RECORD_BODY_ALIGNMENT) - body_bytes
-        if pad:
-            self._file.write(b"\x00" * pad)
+        # Wrap the body writes in MPOL_INTERLEAVE on multi-node Linux so
+        # the kernel distributes page-cache pages across NUMA nodes as
+        # they're allocated by write(). On the default
+        # config.set_numa_policy("auto") this delivers the actual NUMA
+        # win: pages are placed correctly at write time, and every
+        # subsequent reader of the file (this process or any other) sees
+        # the distributed layout without any reader-side migration --
+        # which mbind on a MAP_SHARED read mapping cannot do. No-op on
+        # single-node hosts, non-Linux, "local" policy, or when the
+        # syscall fails.
+        with _numa.writer_policy_scope():
+            # Append a record at the current file position (end-of-file
+            # in update mode after the constructor seek, or right past
+            # the header padding in create/recreate after the header
+            # write).
+            record_index = self._n_records
+            fmt.write_record_header(self._file, record_index, n_rows)
+            body_bytes = 0
+            for col_meta in self._schema or columns_meta:
+                array = le_columns[col_meta["name"]]
+                array.tofile(self._file)
+                body_bytes += array.nbytes
+            pad = fmt.align_up(body_bytes, fmt._RECORD_BODY_ALIGNMENT) - body_bytes
+            if pad:
+                self._file.write(b"\x00" * pad)
 
         self._n_records += 1
         self._committed_rows += n_rows
