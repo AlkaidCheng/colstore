@@ -8,7 +8,6 @@ the no-op batching behaviour of ``batch_size``.
 
 from __future__ import annotations
 
-import itertools
 import json
 import struct
 import warnings
@@ -490,16 +489,6 @@ def test_resolve_rows_per_step_zero_rows_returns_single_pass():
     assert rows_per_step == [0, 0, 0]
 
 
-def test_format_bytes_per_sec_auto_scales():
-    assert fmt._format_bytes_per_sec(0) == "0 B/s"
-    assert fmt._format_bytes_per_sec(512) == "512 B/s"
-    assert fmt._format_bytes_per_sec(2048) == "2.00 KB/s"
-    assert fmt._format_bytes_per_sec(1.5 * 1024**2) == "1.50 MB/s"
-    assert fmt._format_bytes_per_sec(2.5 * 1024**3) == "2.50 GB/s"
-    # Very large bandwidth stays in GB/s (no TB/s tier yet -- not needed).
-    assert fmt._format_bytes_per_sec(1024**4).endswith("GB/s")
-
-
 def test_format_rows_per_sec_auto_scales():
     assert fmt._format_rows_per_sec(0) == "0 rows/s"
     assert fmt._format_rows_per_sec(500) == "500 rows/s"
@@ -533,100 +522,54 @@ def test_auto_adaptive_constants_form_a_sensible_ramp():
     assert next_size <= initial * 2  # bounded ramp-up
 
 
-def test_estimate_total_batches_zero_remaining_returns_done():
-    assert fmt._estimate_total_batches(batches_done=5, remaining_bytes=0, bytes_per_batch=1024) == 5
-    assert (
-        fmt._estimate_total_batches(batches_done=5, remaining_bytes=-100, bytes_per_batch=1024) == 5
-    )
+def test_auto_progress_bar_is_byte_counted(tmp_path, monkeypatch):
+    """Regression guard: the adaptive progress bar uses bytes, not batches.
 
+    The earlier batch-counted design needed a moving estimate of the
+    eventual batch count; that estimate fluctuated whenever bandwidth
+    drifted (OS cache filling, slower disk region, contention), so the
+    displayed total kept changing and the n/total ratio stayed tiny --
+    a write that was 90% done by bytes still showed a barely-filled bar.
 
-def test_estimate_total_batches_ceil_division():
-    # 10 batches remaining at exactly 1 MiB each
-    one_mib = 1024 * 1024
-    assert (
-        fmt._estimate_total_batches(
-            batches_done=3, remaining_bytes=10 * one_mib, bytes_per_batch=one_mib
-        )
-        == 13
-    )
-    # 10.5 MiB / 1 MiB per batch -> 11 more batches (ceiling), not 10
-    assert (
-        fmt._estimate_total_batches(
-            batches_done=3, remaining_bytes=10 * one_mib + 1, bytes_per_batch=one_mib
-        )
-        == 14
-    )
-
-
-def test_estimate_total_batches_zero_bytes_per_batch_falls_back_to_plus_one():
-    # Degenerate input: report at least one more batch rather than 0/inf.
-    assert fmt._estimate_total_batches(batches_done=7, remaining_bytes=1024, bytes_per_batch=0) == 8
-
-
-def test_estimate_total_batches_converges_as_batch_size_grows():
-    """The whole point: as bytes_per_batch converges to steady-state size,
-    the total estimate converges. During ramp-up, the estimate gets
-    smaller (because future batches will be bigger than past ones).
-    """
-    total_bytes = 80 * 1024 * 1024  # 80 MiB
-    # Simulated ramp: 1 MiB, 2 MiB, 4 MiB, 8 MiB, 16 MiB, then steady at ~16 MiB.
-    one_mib = 1024 * 1024
-    ramp = [1, 2, 4, 8, 16, 16, 16]
-    body_bytes = 0
-    estimates = []
-    for batch_idx, mib in enumerate(ramp):
-        body_bytes += mib * one_mib
-        if body_bytes >= total_bytes:
-            break
-        next_bytes = mib * 2 * one_mib if mib < 16 else 16 * one_mib
-        estimates.append(
-            fmt._estimate_total_batches(
-                batches_done=batch_idx + 1,
-                remaining_bytes=total_bytes - body_bytes,
-                bytes_per_batch=next_bytes,
-            )
-        )
-    # Each successive estimate should be <= the previous one as batch
-    # size grows (or equal once steady state is reached).
-    for a, b in itertools.pairwise(estimates):
-        assert b <= a, f"estimate should not grow during ramp: {estimates}"
-    # Once batch size stabilizes (last three ramp entries are all 16 MiB),
-    # the estimate stabilizes too: the last few values must agree.
-    assert (
-        estimates[-3:] == [estimates[-1]] * 3
-    ), f"estimate should freeze in steady state: {estimates}"
-
-
-def test_auto_progress_total_is_defined_throughout(tmp_path, monkeypatch):
-    """Regression guard: adaptive writes must give tqdm a non-None total.
-
-    The earlier version of adaptive mode passed ``total=None`` to tqdm,
-    which rendered as ``204/?`` -- no ETA, no progress fraction. The fix
-    seeds the total with a coarse estimate and refines it after each
-    batch during the ramp.
+    The fix: use total_bytes as the progress total directly. Each batch
+    advances by chunk_bytes. The total is known up front, monotonically
+    fills, and the bar fraction always matches actual byte progress.
     """
     from contextlib import contextmanager
 
-    from colstore.progress import NullProgressBar
+    captured: dict[str, object] = {}
 
-    captured_totals: list[int | None] = []
+    class _Stub:
+        n: int = 0
+
+        def update(self, n: int = 1) -> None:
+            self.n += n
+
+        def set_postfix(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def set_description(self, *args: object, **kwargs: object) -> None:
+            pass
 
     @contextmanager
-    def recording_progress_bar(total, **kwargs):
-        captured_totals.append(total)
-        # Yield a NullProgressBar so the write loop's progress.total =
-        # ... assignments land somewhere harmless. We only care about
-        # the initial total passed in.
-        yield NullProgressBar()
+    def stub_progress_bar(total: int | None, **kwargs: object):
+        captured["total"] = total
+        captured["unit"] = kwargs.get("unit")
+        captured["unit_scale"] = kwargs.get("unit_scale")
+        stub = _Stub()
+        yield stub
+        captured["final_n"] = stub.n
 
-    monkeypatch.setattr("colstore.format.progress_bar", recording_progress_bar)
+    monkeypatch.setattr("colstore.format.progress_bar", stub_progress_bar)
 
     # 20 MiB float64 -> above the 16 MiB adaptive threshold.
     n_rows = 20 * 1024 * 1024 // 8
     columns = {"x": np.arange(n_rows, dtype=np.float64)}
     write_dataset(columns, tmp_path / "x.cstore", batch_size="auto", show_progress=True)
 
-    assert captured_totals, "progress_bar was never invoked"
-    initial = captured_totals[0]
-    assert initial is not None, "adaptive mode passed total=None to progress_bar"
-    assert initial > 0, f"adaptive initial total should be positive, got {initial}"
+    # progress_bar must be invoked with total=total_bytes, byte-unit display.
+    assert captured["total"] == n_rows * 8
+    assert captured["unit"] == "B"
+    assert captured["unit_scale"] is True
+    # All bytes must be accounted for via update() calls.
+    assert captured["final_n"] == n_rows * 8

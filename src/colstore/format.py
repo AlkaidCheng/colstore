@@ -676,19 +676,9 @@ def _resolve_rows_per_step(
 
 # ---- Throughput formatting -----------------------------------------------
 #
-# Used by ``write_dataset`` to attach a human-readable rows/s and bytes/s
-# to the progress bar postfix.
-
-
-def _format_bytes_per_sec(bytes_per_sec: float) -> str:
-    """Auto-scaled bytes/s: '47.5 MB/s', '1.23 GB/s', '850 KB/s', etc."""
-    if bytes_per_sec >= 1024**3:
-        return f"{bytes_per_sec / 1024**3:.2f} GB/s"
-    if bytes_per_sec >= 1024**2:
-        return f"{bytes_per_sec / 1024**2:.2f} MB/s"
-    if bytes_per_sec >= 1024:
-        return f"{bytes_per_sec / 1024:.2f} KB/s"
-    return f"{bytes_per_sec:.0f} B/s"
+# Used by ``write_dataset`` to attach a human-readable rows/s line to the
+# progress bar postfix. (Bytes/s is rendered natively by tqdm because the
+# bar is byte-counted, with ``unit="B"`` and ``unit_scale=True``.)
 
 
 def _format_rows_per_sec(rows_per_sec: float) -> str:
@@ -706,27 +696,6 @@ def _format_rows_per_sec(rows_per_sec: float) -> str:
     if rows_per_sec >= 1_000:
         return f"{rows_per_sec / 1_000:.2f} Krows/s"
     return f"{rows_per_sec:.0f} rows/s"
-
-
-def _estimate_total_batches(batches_done: int, remaining_bytes: int, bytes_per_batch: int) -> int:
-    """Project the total batch count from the current adaptive batch size.
-
-    Used during adaptive ramp-up to give the progress bar a meaningful
-    target instead of an open-ended ``?``. The estimate converges as
-    ``bytes_per_batch`` converges to its steady-state value.
-
-    ``batches_done`` is the number already written (``progress.n``);
-    ``remaining_bytes`` is the byte volume still to be written across
-    all remaining columns; ``bytes_per_batch`` is the projected size
-    of the next batch (``current_bytes_per_batch``).
-    """
-    if remaining_bytes <= 0:
-        return batches_done
-    if bytes_per_batch <= 0:
-        return batches_done + 1
-    # Ceiling division: any leftover bytes need at least one more batch.
-    batches_remaining = -(-remaining_bytes // bytes_per_batch)
-    return batches_done + batches_remaining
 
 
 def write_dataset(
@@ -788,24 +757,23 @@ def write_dataset(
             column_itemsizes=column_itemsizes,
         )
 
-    # Adaptive mode starts with a coarse over-estimate (assume every batch
-    # stays at the 1 MiB probe size) and refines after each batch using
-    # the current bandwidth-derived batch size. The estimate freezes once
-    # the growth-rate cap stops binding (we're at steady state). Fixed
-    # modes know their batch count exactly up-front.
-    total_units: int
-    if use_adaptive:
-        total_units = max(1, total_bytes // _AUTO_INITIAL_BYTES)
-    elif n_rows == 0:
-        total_units = n_columns
-    else:
-        assert fixed_rows_per_step is not None
-        total_units = sum(1 if rps >= n_rows else -(-n_rows // rps) for rps in fixed_rows_per_step)
+    # Progress bar is byte-counted: total = total_bytes, each batch updates
+    # by chunk_bytes. tqdm's native unit_scale renders this as e.g.
+    # "47.5MB/200MB [00:01<00:03, 50.2MB/s]" -- the bar fill, percentage,
+    # and rate all derive directly from bytes written / total bytes, so
+    # there is no estimation phase, no "?" total, and the bar fill always
+    # matches the displayed percentage. The adaptive batch sizing (below)
+    # is unchanged; it just affects HOW MANY tofile() calls happen, not
+    # WHAT is shown to the user.
 
     with (
         open(path, "wb") as output_file,
         progress_bar(
-            total_units, desc="Writing colstore", unit=" batch", enabled=show_progress
+            total_bytes,
+            desc="Writing colstore",
+            unit="B",
+            unit_scale=True,
+            enabled=show_progress,
         ) as progress,
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
@@ -814,26 +782,22 @@ def write_dataset(
         write_record_header(output_file, record_index=0, n_rows=n_rows)
         body_bytes = 0
         cum_rows = 0
+        cum_batches = 0
         start_time = time.monotonic()
         # Adaptive-mode state: only used when use_adaptive is True. The
-        # EMA bandwidth starts None (initialized from the first measurement),
-        # and the per-batch byte target ramps via the growth-rate cap.
-        # total_frozen flips to True the first time the growth-rate cap
-        # stops binding (= we've reached EMA-driven steady state), after
-        # which the progress total stops being recomputed.
+        # EMA bandwidth starts None (initialized from the first measurement);
+        # current_bytes_per_batch ramps via the growth-rate cap.
         current_bytes_per_batch = _AUTO_INITIAL_BYTES
         bandwidth_ema: float | None = None
-        total_frozen = False
 
         for col_idx, name in enumerate(column_names):
             array = little_endian_columns[name]
             itemsize = column_itemsizes[col_idx]
 
             if n_rows == 0:
-                # Zero-row column: emit a single zero-byte write so the
-                # progress accounting matches the total computed above.
+                # Zero-row column: emit a single zero-byte write. Nothing
+                # to add to the byte-counted progress bar.
                 array.tofile(output_file)
-                progress.update(1)
                 continue
 
             offset = 0
@@ -854,19 +818,8 @@ def write_dataset(
                 chunk_bytes = chunk.nbytes
                 body_bytes += chunk_bytes
                 cum_rows += chunk_rows
+                cum_batches += 1
                 offset += chunk_rows
-
-                # Update postfix with cumulative throughput. The order
-                # (rows first, then data) matches the request format
-                # "batch/s, row/s, memory/s" -- batch/s comes from tqdm's
-                # own unit handling, the rest from this postfix.
-                elapsed = t_batch_end - start_time
-                if elapsed > 0:
-                    progress.set_postfix(
-                        rows=_format_rows_per_sec(cum_rows / elapsed),
-                        data=_format_bytes_per_sec(body_bytes / elapsed),
-                    )
-                progress.update(1)
 
                 # Update adaptive state for the next batch. Two-stage smoothing:
                 #
@@ -898,20 +851,15 @@ def write_dataset(
                             min(target_bytes, growth_cap),
                         )
 
-                        # Refine the projected total batch count while we're
-                        # still ramping. Once the growth-rate cap stops
-                        # binding (target_bytes <= growth_cap), batch sizes
-                        # are EMA-driven and roughly stable, so we freeze
-                        # the total to avoid jitter in the displayed ETA.
-                        if not total_frozen:
-                            progress.total = _estimate_total_batches(
-                                progress.n,
-                                total_bytes - body_bytes,
-                                current_bytes_per_batch,
-                            )
-                            progress.refresh()
-                            if target_bytes <= growth_cap:
-                                total_frozen = True
+                # Postfix shows rows/s and the batch count. Bytes/s and the
+                # bar fill come from tqdm itself via unit="B"/unit_scale=True.
+                elapsed = t_batch_end - start_time
+                if elapsed > 0:
+                    progress.set_postfix(
+                        batches=str(cum_batches),
+                        rows=_format_rows_per_sec(cum_rows / elapsed),
+                    )
+                progress.update(chunk_bytes)
 
         # Pad the record body up to _RECORD_BODY_ALIGNMENT so any future
         # record (if this file were later opened for append) would start at
