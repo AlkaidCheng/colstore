@@ -62,6 +62,50 @@ def test_is_available_consistency_with_platform():
             assert _numa.is_available() is True
 
 
+# ---- maxnode computation (regression) ---------------------------------------
+
+
+def test_maxnode_for_bitmap_uses_full_word_width():
+    """Regression: maxnode is "bitmap bits, plus one", not "max id, plus one".
+
+    The bug this pins: ``_MAXNODE = max(allowed_nodes) + 1`` looks
+    superficially right but the kernel internally decrements maxnode
+    and ANDs the last word against
+    ``(1 << (maxnode % BITS_PER_LONG)) - 1``, silently dropping the
+    highest bit. On an 8-node host with bug-version maxnode=8,
+    ``/proc/self/numa_maps`` reported ``interleave:0-6`` for what was
+    intended as ``interleave:0-7`` -- node 7 was being dropped.
+
+    The fix: ``maxnode = n_words * BITS_PER_LONG + 1`` (libnuma's
+    convention). With ``n_words=1`` that's 65, which after the
+    kernel's ``--maxnode`` lands on exactly ``BITS_PER_LONG``, making
+    the endmask be ``~0UL`` -- every bit of the bitmap honored.
+    """
+    # 1 unsigned long = 64 bits → maxnode = 65
+    assert _numa._maxnode_for_bitmap(1) == 65
+    # 2 unsigned longs = 128 bits → maxnode = 129
+    assert _numa._maxnode_for_bitmap(2) == 129
+    # The buggy value for 8 nodes was 8 (== max_id + 1). The corrected
+    # value for an 8-node bitmap (one ulong) is 65, NOT 9 or 8.
+    assert _numa._maxnode_for_bitmap(1) != 8
+    assert _numa._maxnode_for_bitmap(1) != 9
+
+
+def test_module_maxnode_matches_bitmap_width():
+    """On capable hosts, the module-level _MAXNODE must match the bitmap width."""
+    if not _numa.is_available():
+        # The constant is initialized to 0 on inapplicable hosts; that's correct.
+        assert _numa._MAXNODE == 0
+        return
+    # On capable hosts, it should be n_words * BITS_PER_LONG + 1. Both
+    # sides are bound to locals so ruff's SIM300 yoda-condition heuristic
+    # doesn't see the right-hand side's attribute-access chain as the
+    # "constant" side; the assertion reads naturally either way.
+    actual_maxnode = _numa._MAXNODE
+    expected_maxnode = _numa._n_words * _numa._BITS_PER_LONG + 1
+    assert actual_maxnode == expected_maxnode
+
+
 # ---- Page-alignment helper --------------------------------------------------
 
 

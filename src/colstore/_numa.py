@@ -139,6 +139,43 @@ def _detect_page_size() -> int:
 
 _PAGE_SIZE: int = _detect_page_size()
 
+# Bits per ``unsigned long`` on this build. 64 on every supported arch
+# we ship for, but spelled out so the bitmap-size math reads correctly
+# anywhere ctypes is configured differently.
+_BITS_PER_LONG: int = ctypes.sizeof(ctypes.c_ulong) * 8
+
+
+def _maxnode_for_bitmap(n_words: int) -> int:
+    """Compute the ``maxnode`` argument for ``mbind`` / ``set_mempolicy``.
+
+    The syscall's userspace convention -- documented in ``mbind(2)`` and
+    matched by ``libnuma`` -- is "the size of the nodes bitmap in bits,
+    plus one". For an ``n_words``-word bitmap that is
+    ``n_words * BITS_PER_LONG + 1``.
+
+    The bug this replaces was ``max_node_id + 1``, which looks
+    superficially right ("highest valid index plus one") but doesn't
+    match what the kernel does. Tracing through ``mm/mempolicy.c``::
+
+        --maxnode;                              # kernel decrements
+        endmask = (maxnode % BITS_PER_LONG == 0)
+                    ? ~0UL
+                    : (1UL << (maxnode % BITS_PER_LONG)) - 1;
+        nodes_addr[nlongs - 1] &= endmask;      # mask the last word
+
+    With ``maxnode = max_id + 1`` and ``max_id = 7`` (an 8-node host),
+    the kernel computes ``endmask = (1 << 7) - 1 = 0x7f`` and ANDs that
+    into the last word -- silently dropping bit 7 (i.e. node 7). The
+    user-visible symptom is ``/proc/self/numa_maps`` reporting
+    ``interleave:0-6`` for what was intended as ``interleave:0-7``.
+
+    Returning ``n_words * BITS_PER_LONG + 1`` gives the kernel a
+    ``maxnode`` that's exactly a multiple of ``BITS_PER_LONG`` after
+    its ``--maxnode``, which makes ``endmask = ~0UL`` and preserves
+    every bit of the user's bitmap. Equivalent to what libnuma uses.
+    """
+    return n_words * _BITS_PER_LONG + 1
+
 
 # ---- ctypes setup, only on capable hosts -----------------------------------
 
@@ -157,13 +194,12 @@ if _AVAILABLE:
         # but cap it correctly so high-node-id machines (large 4-socket
         # AMD parts, multi-rack POWER systems) still work.
         _max_allowed = max(_ALLOWED_NODES)
-        _n_words = (_max_allowed // 64) + 1
+        _n_words = (_max_allowed // _BITS_PER_LONG) + 1
         _NodemaskType = ctypes.c_ulong * _n_words
         _INTERLEAVE_MASK = _NodemaskType()
         for _node in _ALLOWED_NODES:
-            _INTERLEAVE_MASK[_node // 64] |= 1 << (_node % 64)
-        # ``maxnode`` in mbind is the maximum-permitted node id PLUS ONE.
-        _MAXNODE = _max_allowed + 1
+            _INTERLEAVE_MASK[_node // _BITS_PER_LONG] |= 1 << (_node % _BITS_PER_LONG)
+        _MAXNODE = _maxnode_for_bitmap(_n_words)
     except OSError:
         # libc.so.6 not found -- bizarre on Linux but possible in
         # minimal containers. Demote to no-op rather than fail open.
