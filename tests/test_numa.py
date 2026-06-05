@@ -78,18 +78,24 @@ def test_maxnode_for_bitmap_uses_full_word_width():
     intended as ``interleave:0-7`` -- node 7 was being dropped.
 
     The fix: ``maxnode = n_words * BITS_PER_LONG + 1`` (libnuma's
-    convention). With ``n_words=1`` that's 65, which after the
-    kernel's ``--maxnode`` lands on exactly ``BITS_PER_LONG``, making
-    the endmask be ``~0UL`` -- every bit of the bitmap honored.
+    convention). After the kernel's ``--maxnode`` this lands on exactly
+    ``BITS_PER_LONG``, making the endmask be ``~0UL`` -- every bit of
+    the bitmap honored.
+
+    The assertion is in terms of ``_BITS_PER_LONG`` so it stays correct
+    on both LP64 (Linux/macOS, 64-bit ulong) and LLP64 (Windows, 32-bit
+    ulong). The helper is dead code on platforms without NUMA syscalls,
+    but the formula's invariant is platform-independent and worth
+    pinning anyway.
     """
-    # 1 unsigned long = 64 bits → maxnode = 65
-    assert _numa._maxnode_for_bitmap(1) == 65
-    # 2 unsigned longs = 128 bits → maxnode = 129
-    assert _numa._maxnode_for_bitmap(2) == 129
-    # The buggy value for 8 nodes was 8 (== max_id + 1). The corrected
-    # value for an 8-node bitmap (one ulong) is 65, NOT 9 or 8.
-    assert _numa._maxnode_for_bitmap(1) != 8
-    assert _numa._maxnode_for_bitmap(1) != 9
+    bits = _numa._BITS_PER_LONG
+    # An n-word bitmap gets maxnode = n * BITS_PER_LONG + 1.
+    assert _numa._maxnode_for_bitmap(1) == bits + 1
+    assert _numa._maxnode_for_bitmap(2) == 2 * bits + 1
+    # The buggy value for an 8-node host was 8 (== max_id + 1). The
+    # correct value for any nonzero-word bitmap is significantly larger,
+    # regardless of word width.
+    assert _numa._maxnode_for_bitmap(1) > 9
 
 
 def test_module_maxnode_matches_bitmap_width():
