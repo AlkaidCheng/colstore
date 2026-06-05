@@ -104,6 +104,32 @@ void copy_multirecord_range(const std::uint8_t* base,
                             std::int64_t col_prefix_bytes,
                             std::int64_t itemsize);
 
+// Fused multi-record fancy gather. ``output[i] = column_value(indices[i])``
+// for an arbitrary (unsorted) integer index array. For each index the record
+// is located by a branchless binary search over ``record_starts_rows`` (the
+// R+1 cumulative row boundaries, tiny and cache-resident), the byte address is
+// computed in registers, and the element is loaded -- all in one pass. This
+// replaces the NumPy pipeline (searchsorted -> record_id -> within_record ->
+// byte_offsets -> gather), whose dominant cost is the searchsorted; here the
+// binning is fused into the load and parallelized across indices.
+//
+// Templated on element size only (1/2/4/8 bytes); ``sizeof(T)`` is the column
+// itemsize. Caller guarantees native byte order and that every index is in
+// ``[0, record_starts_rows[n_records])``. ``col_prefix_bytes`` is the summed
+// itemsize of the columns preceding this one in a record body.
+template <typename T>
+void gather_multirecord_typed(const std::uint8_t* base,
+                              const std::int64_t* indices,
+                              std::uint8_t* output,
+                              std::ptrdiff_t n_indices,
+                              const std::int64_t* record_starts_rows,
+                              const std::int64_t* record_starts_bytes,
+                              const std::int64_t* n_rows_per_record,
+                              std::int64_t n_records,
+                              std::int64_t col_prefix_bytes,
+                              int thread_cap = 0,
+                              std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -158,6 +184,41 @@ void colstore_copy_multirecord_range(const std::uint8_t* base,
                                      std::int64_t n_records,
                                      std::int64_t col_prefix_bytes,
                                      std::int64_t itemsize);
+
+// Fused multi-record fancy gather, one per element size (1/2/4/8 bytes).
+// See colstore::gather_multirecord_typed for the addressing contract.
+void colstore_gather_multirecord_1(const std::uint8_t* base,
+                                   const std::int64_t* indices,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   const std::int64_t* record_starts_rows,
+                                   const std::int64_t* record_starts_bytes,
+                                   const std::int64_t* n_rows_per_record,
+                                   std::int64_t n_records,
+                                   std::int64_t col_prefix_bytes, int thread_cap);
+void colstore_gather_multirecord_2(const std::uint8_t* base,
+                                   const std::int64_t* indices,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   const std::int64_t* record_starts_rows,
+                                   const std::int64_t* record_starts_bytes,
+                                   const std::int64_t* n_rows_per_record,
+                                   std::int64_t n_records,
+                                   std::int64_t col_prefix_bytes, int thread_cap);
+void colstore_gather_multirecord_4(const std::uint8_t* base,
+                                   const std::int64_t* indices,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   const std::int64_t* record_starts_rows,
+                                   const std::int64_t* record_starts_bytes,
+                                   const std::int64_t* n_rows_per_record,
+                                   std::int64_t n_records,
+                                   std::int64_t col_prefix_bytes, int thread_cap);
+void colstore_gather_multirecord_8(const std::uint8_t* base,
+                                   const std::int64_t* indices,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   const std::int64_t* record_starts_rows,
+                                   const std::int64_t* record_starts_bytes,
+                                   const std::int64_t* n_rows_per_record,
+                                   std::int64_t n_records,
+                                   std::int64_t col_prefix_bytes, int thread_cap);
 
 // Returns the OpenMP thread cap that gathers will use, or 1 if OpenMP is
 // not compiled in. Exposed for diagnostics.
