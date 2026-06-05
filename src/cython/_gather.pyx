@@ -53,6 +53,18 @@ cdef extern from "colstore/gather.hpp" nogil:
                                          const int64_t*, const int64_t*,
                                          const int64_t*, int64_t,
                                          int64_t, int64_t)
+    void colstore_gather_multirecord_1(const uint8_t*, const int64_t*, uint8_t*,
+                                       ptrdiff_t, const int64_t*, const int64_t*,
+                                       const int64_t*, int64_t, int64_t, int)
+    void colstore_gather_multirecord_2(const uint8_t*, const int64_t*, uint8_t*,
+                                       ptrdiff_t, const int64_t*, const int64_t*,
+                                       const int64_t*, int64_t, int64_t, int)
+    void colstore_gather_multirecord_4(const uint8_t*, const int64_t*, uint8_t*,
+                                       ptrdiff_t, const int64_t*, const int64_t*,
+                                       const int64_t*, int64_t, int64_t, int)
+    void colstore_gather_multirecord_8(const uint8_t*, const int64_t*, uint8_t*,
+                                       ptrdiff_t, const int64_t*, const int64_t*,
+                                       const int64_t*, int64_t, int64_t, int)
     int colstore_max_threads()
 
 
@@ -301,3 +313,107 @@ def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
         colstore_copy_multirecord_range(base, output_ptr, start, stop,
                                         rsr, rsb, nrr, n_records,
                                         col_prefix_bytes, itemsize)
+
+
+def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
+                       cnp.ndarray output,
+                       cnp.ndarray record_starts_rows,
+                       cnp.ndarray record_starts_bytes,
+                       cnp.ndarray n_rows_per_record,
+                       long long col_prefix_bytes, int thread_cap=0):
+    """Fused multi-record fancy gather: ``output[i] = column_value(indices[i])``.
+
+    For each (arbitrary, unsorted) index the record is located by a branchless
+    binary search over ``record_starts_rows`` inside the kernel, the byte
+    address is computed in registers, and the element is loaded -- one pass, no
+    ``byte_offsets`` array, no per-index NumPy temporaries. Replaces the NumPy
+    searchsorted pipeline for the unsorted multi-record path.
+
+    Parameters
+    ----------
+    source : numpy.ndarray
+        Whole-file ``uint8`` mmap; the raw byte base pointer.
+    indices : numpy.ndarray
+        1D ``int64`` element indices into the logical (global) row space. Each
+        must lie in ``[0, total_rows)``; the caller (view layer) guarantees
+        this. Need not be sorted.
+    output : numpy.ndarray
+        1D destination of length ``len(indices)`` and the column's dtype, in
+        *native* byte order (the kernel does a raw typed load and cannot
+        byteswap). Filled in-place.
+    record_starts_rows : numpy.ndarray
+        1D ``int64`` cumulative row counts, length ``n_records + 1``.
+    record_starts_bytes : numpy.ndarray
+        1D ``int64`` per-record body byte offsets, length ``n_records``.
+    n_rows_per_record : numpy.ndarray
+        1D ``int64`` per-record row counts, length ``n_records``.
+    col_prefix_bytes : int
+        Summed itemsize of the columns preceding this one in a record body.
+    thread_cap : int, optional
+        Maximum OpenMP threads; ``0`` means the OpenMP maximum. The kernel
+        runs serially below its internal parallel threshold.
+
+    Raises
+    ------
+    TypeError
+        If ``indices`` or any index array is not ``int64``, or the element
+        size is unsupported.
+    ValueError
+        If shapes are 1D-inconsistent or lengths disagree.
+    """
+    if (indices.ndim != 1 or output.ndim != 1 or record_starts_rows.ndim != 1
+            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
+        raise ValueError("indices, output, and index arrays must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match indices length {n}."
+        )
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_multirecord_1(base, indices_ptr, output_ptr, n,
+                                          rsr, rsb, nrr, n_records,
+                                          col_prefix_bytes, thread_cap)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_multirecord_2(base, indices_ptr, output_ptr, n,
+                                          rsr, rsb, nrr, n_records,
+                                          col_prefix_bytes, thread_cap)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_multirecord_4(base, indices_ptr, output_ptr, n,
+                                          rsr, rsb, nrr, n_records,
+                                          col_prefix_bytes, thread_cap)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_multirecord_8(base, indices_ptr, output_ptr, n,
+                                          rsr, rsb, nrr, n_records,
+                                          col_prefix_bytes, thread_cap)
+    else:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )

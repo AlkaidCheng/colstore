@@ -650,6 +650,8 @@ class ColStoreReader:
         record_starts_rows = self._record_starts_rows
         record_starts_bytes = self._record_starts_bytes
         n_rows_per_record = self._n_rows_per_record
+        output = np.empty(n, dtype=native_dtype)
+        effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
         # Sortedness check is O(K) but ~100x faster than a searchsorted at
         # K=200K, so the early exit is essentially free in the unsorted case.
         if n > 1 and bool(np.all(indices[1:] >= indices[:-1])):
@@ -676,6 +678,10 @@ class ColStoreReader:
             #     (record_id, within_record, two intermediate gathers). At
             #     K=1M the generic form costs ~11ms in allocator/cache
             #     traffic alone; the per-record loop costs ~1ms.
+            #
+            # This path already avoids the big temporaries and runs ~4-11x
+            # faster than the unsorted path (measured), so it is left as-is;
+            # the fused native kernel below targets the unsorted case.
             crossings = np.searchsorted(indices, record_starts_rows, side="left")
             byte_offsets = np.empty(n, dtype=np.int64)
             for r in range(crossings.shape[0] - 1):
@@ -690,12 +696,29 @@ class ColStoreReader:
                 )
                 np.multiply(indices[lo:hi], itemsize, out=byte_offsets[lo:hi])
                 np.add(byte_offsets[lo:hi], base, out=byte_offsets[lo:hi])
+            _cpp_module.gather_bytes(self._file_mmap, byte_offsets, output, effective_cap)
+        elif _dtype_is_native(disk_dtype):
+            # Unsorted (or n == 1), native byte order: fused native gather.
+            # The kernel bins each index to its record with a branchless
+            # binary search and loads in one pass -- no searchsorted, no
+            # byte_offsets array. The searchsorted-based binning was measured
+            # at ~75-85% of this path's cost; folding it into the kernel (and
+            # parallelizing it, which searchsorted cannot be) is the win.
+            _cpp_module.gather_multirecord(
+                self._file_mmap,
+                indices,
+                output,
+                record_starts_rows,
+                record_starts_bytes,
+                n_rows_per_record,
+                int(col_prefix),
+                effective_cap,
+            )
         else:
-            # Unsorted (or n == 1). The generic searchsorted is O(K log R)
-            # and the byte_offset materialization allocates several K-sized
-            # int64 temporaries -- both are significant at large K, and
-            # we've measured no cheaper alternative (argsort + sorted-path
-            # is strictly worse because argsort dominates).
+            # Unsorted, non-native byte order (big-endian host). The fused
+            # kernel does a raw typed load and cannot byteswap, so fall back to
+            # the NumPy searchsorted pipeline feeding the raw gather_bytes
+            # kernel -- identical to the pre-Stage-2 behavior on this host.
             record_id = np.searchsorted(record_starts_rows, indices, side="right") - 1
             within_record = indices - record_starts_rows[record_id]
             byte_offsets = (
@@ -703,10 +726,8 @@ class ColStoreReader:
                 + col_prefix * n_rows_per_record[record_id]
                 + within_record * itemsize
             )
+            _cpp_module.gather_bytes(self._file_mmap, byte_offsets, output, effective_cap)
 
-        output = np.empty(n, dtype=native_dtype)
-        effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
-        _cpp_module.gather_bytes(self._file_mmap, byte_offsets, output, effective_cap)
         return output
 
     def _read_contiguous_range_multi_record(
