@@ -650,7 +650,15 @@ class ColStoreReader:
         record_starts_rows = self._record_starts_rows
         record_starts_bytes = self._record_starts_bytes
         n_rows_per_record = self._n_rows_per_record
-        output = np.empty(n, dtype=native_dtype)
+        # The raw byte-offset kernel (gather_bytes) copies on-disk bytes
+        # verbatim, and the disk is always little-endian -- so its
+        # destination must be typed with the DISK dtype, not the native one,
+        # or a big-endian host would misinterpret every value. The
+        # ``astype(native, copy=False)`` at the return is a no-op on
+        # little-endian hosts (the dtypes compare equal) and a byteswapping
+        # copy on big-endian ones. The fused native kernel branch is only
+        # taken when disk == native, where the distinction vanishes.
+        output = np.empty(n, dtype=disk_dtype)
         effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
 
         # Sortedness check is O(K) but ~100x faster than a searchsorted at
@@ -742,7 +750,7 @@ class ColStoreReader:
                 config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
             )
 
-        return output
+        return output.astype(native_dtype, copy=False)
 
     def _read_contiguous_range_multi_record(
         self,
