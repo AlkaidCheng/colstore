@@ -59,6 +59,48 @@ import numpy as np
 from . import _lock, _numa
 from . import format as fmt
 
+# ---- vectored record emission ---------------------------------------------
+
+# A whole record (32-byte header + column bodies + alignment padding) is
+# written with a single writev() per record where the platform provides it,
+# instead of one buffered write per piece -- each numpy tofile() also forces
+# a flush of the buffered layer, so the sequential path costs one syscall
+# plus a flush per column. For many-small-record streams that machinery, not
+# the data movement, dominates the write cost. Output bytes are identical on
+# both paths.
+_HAS_WRITEV = hasattr(os, "writev")
+
+# Upper bound on iovec segments per writev() call; longer records are split
+# into successive calls. sysconf is the authoritative source where exposed;
+# 1024 is the universal POSIX floor.
+_IOV_MAX: int = 1024
+with contextlib.suppress(AttributeError, ValueError, OSError):
+    _sysconf_iov = os.sysconf("SC_IOV_MAX")
+    if _sysconf_iov > 0:
+        _IOV_MAX = int(_sysconf_iov)
+
+
+def _writev_full(fd: int, buffers: list[Any]) -> None:
+    """writev() the buffers to ``fd`` completely, in order.
+
+    Handles the two POSIX permissions writev reserves for itself: writing
+    fewer bytes than requested (resume mid-buffer; views are cast to byte
+    granularity so a write may split anywhere) and rejecting more than
+    IOV_MAX segments (chunk). Zero-length buffers are legal and skipped by
+    the bookkeeping naturally.
+    """
+    views = [memoryview(b).cast("B") for b in buffers]
+    index = 0
+    while index < len(views):
+        written = os.writev(fd, views[index : index + _IOV_MAX])
+        if written < 0:  # pragma: no cover - os.writev raises instead
+            raise OSError("writev returned a negative count")
+        while index < len(views) and written >= views[index].nbytes:
+            written -= views[index].nbytes
+            index += 1
+        if index < len(views) and written:
+            views[index] = views[index][written:]
+
 
 class ColStoreWriter:
     """Append-only writer for a colstore file. See module docstring.
@@ -269,20 +311,59 @@ class ColStoreWriter:
             # in update mode after the constructor seek, or right past
             # the header padding in create/recreate after the header
             # write).
-            record_index = self._n_records
-            fmt.write_record_header(self._file, record_index, n_rows)
-            body_bytes = 0
-            for col_meta in self._schema or columns_meta:
-                array = le_columns[col_meta["name"]]
-                array.tofile(self._file)
-                body_bytes += array.nbytes
-            pad = fmt.align_up(body_bytes, fmt._RECORD_BODY_ALIGNMENT) - body_bytes
-            if pad:
-                self._file.write(b"\x00" * pad)
+            self._emit_record(self._n_records, n_rows, le_columns, columns_meta)
 
         self._n_records += 1
         self._committed_rows += n_rows
         self._wrote_anything = True
+
+    def _emit_record(
+        self,
+        record_index: int,
+        n_rows: int,
+        le_columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
+        columns_meta: list[dict[str, Any]],
+    ) -> None:
+        """Write one record: 32-byte header + column bodies + padding.
+
+        Vectored on POSIX: the record is assembled as an iovec (header
+        bytes, one entry per column buffer, padding) and emitted with a
+        single ``writev`` per record, bypassing the buffered layer -- which
+        is flushed first so the raw fd sits at the logical append position.
+        All other file operations seek absolutely, so the buffered file's
+        stale position after the raw write is never observed. Falls back to
+        the per-piece buffered path where ``os.writev`` is unavailable;
+        both paths produce identical bytes.
+        """
+        header = fmt.record_header_bytes(record_index, n_rows)
+        arrays = [le_columns[m["name"]] for m in (self._schema or columns_meta)]
+        body_bytes = sum(array.nbytes for array in arrays)
+        pad = fmt.align_up(body_bytes, fmt._RECORD_BODY_ALIGNMENT) - body_bytes
+        if not _HAS_WRITEV:
+            self._emit_record_sequential(header, arrays, pad)
+            return
+        buffers: list[Any] = [header]
+        # normalize_columns lets contiguous arrays through untouched but can
+        # return strided views; writev needs real buffers, so copy only the
+        # strided case (the same data movement tofile() would do internally).
+        buffers.extend(np.ascontiguousarray(array) for array in arrays)
+        if pad:
+            buffers.append(b"\x00" * pad)
+        self._file.flush()
+        _writev_full(self._file.fileno(), buffers)
+
+    def _emit_record_sequential(
+        self,
+        header: bytes,
+        arrays: list[np.ndarray[Any, np.dtype[Any]]],
+        pad: int,
+    ) -> None:
+        """Buffered per-piece fallback for platforms without ``os.writev``."""
+        self._file.write(header)
+        for array in arrays:
+            array.tofile(self._file)
+        if pad:
+            self._file.write(b"\x00" * pad)
 
     def close(self) -> None:
         """Commit counters, fsync, release the lock, close the file.
