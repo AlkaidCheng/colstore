@@ -120,6 +120,19 @@ def test_iov_max_chunking(tmp_path, monkeypatch):
     dataset.close()
 
 
+def test_writev_zero_progress_raises_instead_of_spinning(monkeypatch):
+    # POSIX permits writev to return 0; a write-full loop must surface that
+    # as an error rather than retrying forever.
+    monkeypatch.setattr(os, "writev", lambda fd, buffers: 0)
+    read_fd, write_fd = os.pipe()
+    try:
+        with pytest.raises(OSError, match="no progress"):
+            writer_mod._writev_full(write_fd, [b"abcd"])
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def test_writev_full_zero_length_buffers():
     read_fd, write_fd = os.pipe()
     try:
