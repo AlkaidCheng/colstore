@@ -37,6 +37,9 @@ dependencies = [
     "psutil>=5.9",
 ]
 
+[project.scripts]
+colstore = "colstore.cli:main"
+
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
 progress = ["tqdm>=4.60"]

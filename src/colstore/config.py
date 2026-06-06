@@ -28,6 +28,20 @@ NumaPolicy = Literal["auto", "interleave", "local"]
 # between 8 and 244 threads was measured at ~40x slower).
 _GATHER_THREAD_CEILING = 8
 
+# Default software-prefetch look-ahead for the gather kernels, in elements.
+# Mirrors ``DEFAULT_PREFETCH_DISTANCE`` in ``include/colstore/gather.hpp``,
+# which is the single authoritative value -- a test pins the two against each
+# other via ``_gather.default_prefetch_distance()``. The right distance is
+# hardware-dependent (it must cover the memory latency the prefetch is hiding,
+# divided by the loop-iteration cost); use
+# ``benchmark/sweep_prefetch_distance.py`` to measure on a target host.
+_DEFAULT_PREFETCH_DISTANCE = 8
+
+# Sanity ceiling for the prefetch distance: beyond a few thousand elements the
+# prefetched lines are evicted again before use on any realistic cache, so a
+# larger value is almost certainly a typo (e.g. bytes instead of elements).
+_PREFETCH_DISTANCE_CEILING = 1 << 14
+
 
 def _default_gather_thread_cap() -> int:
     """Derive a near-optimal default gather thread cap from the hardware.
@@ -50,6 +64,14 @@ _default_madvise: MadviseOption | None = "sequential"
 _default_backend: GatherBackend = "cpp"
 _gather_thread_cap: int = _default_gather_thread_cap()
 _numa_policy: NumaPolicy = "auto"
+_prefetch_distance: int | Literal["auto"] = "auto"
+
+# Lazily-loaded per-regime distance table for "auto" mode, populated either
+# from the autotune cache (first resolution) or directly by
+# ``autotune.calibrate_prefetch``. ``None`` + loaded=True means "no
+# calibration available; use the compiled default".
+_auto_prefetch_table: dict[str, int] | None = None
+_auto_prefetch_table_loaded: bool = False
 
 
 def get_max_workers() -> int:
@@ -90,6 +112,87 @@ def set_gather_thread_cap(n: int) -> None:
     if n < 1:
         raise ValueError(f"gather_thread_cap must be >= 1, got {n}.")
     _gather_thread_cap = int(n)
+
+
+def get_prefetch_distance() -> int | Literal["auto"]:
+    """Return the prefetch-distance setting for the gather kernels.
+
+    Either an explicit look-ahead in elements (``0`` means prefetching is
+    disabled) or ``"auto"`` (the default), in which case each gather resolves
+    its distance per call via :func:`resolve_prefetch_distance`.
+    """
+    return _prefetch_distance
+
+
+def set_prefetch_distance(distance: int | Literal["auto"]) -> None:
+    """Set the software-prefetch look-ahead for the gather kernels.
+
+    ``"auto"`` (the default) resolves the distance per call from two cheap
+    signals -- source size vs last-level-cache size, and index sortedness --
+    using the per-regime table measured by
+    :func:`colstore.autotune.calibrate_prefetch`. Without a calibration cache
+    ``"auto"`` falls back to the compiled default, so it is always safe.
+
+    An explicit ``distance > 0`` prefetches that many iterations ahead for
+    every gather; ``0`` disables prefetching, which can win when the gathered
+    source is cache-resident and the prefetch instructions are pure overhead.
+    Larger distances help when the source lives in DRAM: the prefetch must be
+    issued early enough to cover the miss latency. Sweep with
+    ``benchmark/sweep_prefetch_distance.py`` on the target host.
+    """
+    global _prefetch_distance
+    if distance == "auto":
+        _prefetch_distance = "auto"
+        return
+    if not isinstance(distance, int) or distance < 0 or distance > _PREFETCH_DISTANCE_CEILING:
+        raise ValueError(
+            f"prefetch_distance must be 'auto' or an int in "
+            f"[0, {_PREFETCH_DISTANCE_CEILING}], got {distance!r}."
+        )
+    _prefetch_distance = int(distance)
+
+
+def _set_auto_prefetch_table(table: dict[str, int] | None) -> None:
+    """Install (or clear) the per-regime distance table used by ``"auto"``.
+
+    Called by :func:`colstore.autotune.calibrate_prefetch` so a fresh
+    calibration takes effect in-process without re-reading the cache file.
+    Passing ``None`` resets to the not-yet-loaded state (used by tests).
+    """
+    global _auto_prefetch_table, _auto_prefetch_table_loaded
+    _auto_prefetch_table = table
+    _auto_prefetch_table_loaded = table is not None
+
+
+def resolve_prefetch_distance(source_nbytes: int, indices_sorted: bool) -> int:
+    """Return the effective prefetch distance for one gather call.
+
+    With an explicit setting this is a passthrough, so call sites can use it
+    unconditionally. With ``"auto"`` the access regime is classified from the
+    caller's two signals -- the gathered source's size against the
+    last-level-cache size (resident vs DRAM-bound) and whether the index
+    array is monotonically non-decreasing -- and looked up in the calibrated
+    table. No table (calibration never run, or a different machine) falls
+    back to the compiled default distance.
+    """
+    setting = _prefetch_distance
+    if setting != "auto":
+        return setting
+
+    global _auto_prefetch_table, _auto_prefetch_table_loaded
+    if not _auto_prefetch_table_loaded:
+        from . import autotune  # deferred: autotune imports config at module level
+
+        _auto_prefetch_table = autotune.load_cached_prefetch()
+        _auto_prefetch_table_loaded = True
+    if _auto_prefetch_table is None:
+        return _DEFAULT_PREFETCH_DISTANCE
+
+    from . import autotune
+
+    size_name = "resident" if source_nbytes <= autotune.llc_bytes() else "dram"
+    order_name = "sorted" if indices_sorted else "unsorted"
+    return _auto_prefetch_table[f"{size_name}_{order_name}"]
 
 
 def get_default_madvise() -> MadviseOption | None:

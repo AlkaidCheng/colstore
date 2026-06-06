@@ -113,7 +113,15 @@ def gather(
             # own resolve_thread_count picks the right number of threads
             # (1 below the parallel threshold, scaling up from there).
             output = np.empty(indices.shape[0], dtype=dtype)
-            _cpp_module.gather_into(source, indices, output, effective_cap)
+            # The O(K) sortedness check is only paid in "auto" mode, where it
+            # is one of the two signals classifying the access regime; an
+            # explicit setting skips it (resolve is a passthrough then).
+            if config.get_prefetch_distance() == "auto":
+                indices_sorted = indices.shape[0] > 1 and bool(np.all(indices[1:] >= indices[:-1]))
+            else:
+                indices_sorted = False
+            prefetch = config.resolve_prefetch_distance(source.nbytes, indices_sorted)
+            _cpp_module.gather_into(source, indices, output, effective_cap, prefetch)
             return output
         if not _CPP_AVAILABLE:
             warnings.warn(

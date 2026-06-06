@@ -33,21 +33,21 @@ cnp.import_array()
 
 cdef extern from "colstore/gather.hpp" nogil:
     void colstore_gather_indexed_1(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int)
+                                   ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_indexed_2(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int)
+                                   ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_indexed_4(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int)
+                                   ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_indexed_8(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int)
+                                   ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_bytes_1(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int)
+                                 ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_bytes_2(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int)
+                                 ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_bytes_4(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int)
+                                 ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_bytes_8(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int)
+                                 ptrdiff_t, int, ptrdiff_t)
     void colstore_copy_multirecord_range(const uint8_t*, uint8_t*,
                                          int64_t, int64_t,
                                          const int64_t*, const int64_t*,
@@ -55,21 +55,22 @@ cdef extern from "colstore/gather.hpp" nogil:
                                          int64_t, int64_t)
     void colstore_gather_multirecord_1(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int)
+                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
     void colstore_gather_multirecord_2(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int)
+                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
     void colstore_gather_multirecord_4(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int)
+                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
     void colstore_gather_multirecord_8(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int)
+                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
     int colstore_max_threads()
 
 
 cdef extern from "colstore/gather.hpp" namespace "colstore" nogil:
     ptrdiff_t resolve_thread_count(ptrdiff_t n_indices, int cap)
+    const ptrdiff_t DEFAULT_PREFETCH_DISTANCE
 
 
 def max_threads() -> int:
@@ -85,8 +86,17 @@ def thread_count_for(Py_ssize_t n_indices, int cap) -> int:
     return resolve_thread_count(n_indices, cap)
 
 
+def default_prefetch_distance() -> int:
+    """Return the compiled-in default prefetch distance (gather.hpp).
+
+    Exposed so the Python config layer and tests can pin against the single
+    authoritative constant instead of duplicating the value.
+    """
+    return DEFAULT_PREFETCH_DISTANCE
+
+
 def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
-           int thread_cap=0):
+           int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Element-indexed gather: ``output[i] = source[indices[i]]``.
 
     Parameters
@@ -102,6 +112,11 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         Maximum OpenMP threads. ``0`` (default) means the OpenMP maximum;
         the kernel still drops to a single thread for small inputs and
         scales up to this cap for large ones.
+    prefetch_distance : int, optional
+        Software-prefetch look-ahead in elements. ``> 0`` prefetches that
+        many iterations ahead; ``0`` disables prefetching (useful when the
+        source is cache-resident); negative (default) uses the compiled
+        default, :func:`default_prefetch_distance`.
 
     Raises
     ------
@@ -135,22 +150,25 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
 
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
     if itemsize == 1:
         with nogil:
             colstore_gather_indexed_1(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap)
+                                      n_indices, thread_cap, pd)
     elif itemsize == 2:
         with nogil:
             colstore_gather_indexed_2(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap)
+                                      n_indices, thread_cap, pd)
     elif itemsize == 4:
         with nogil:
             colstore_gather_indexed_4(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap)
+                                      n_indices, thread_cap, pd)
     elif itemsize == 8:
         with nogil:
             colstore_gather_indexed_8(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap)
+                                      n_indices, thread_cap, pd)
     else:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
@@ -159,18 +177,18 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
 
 
 def gather_into(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
-                int thread_cap=0):
+                int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Alias for :func:`gather`.
 
     The name is used by :mod:`colstore.kernels` to make the no-allocation
     contract explicit at the call site -- the kernel never allocates the
     output buffer; the caller does. Functionally identical to :func:`gather`.
     """
-    gather(source, indices, output, thread_cap)
+    gather(source, indices, output, thread_cap, prefetch_distance)
 
 
 def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
-                 cnp.ndarray output, int thread_cap=0):
+                 cnp.ndarray output, int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Byte-offset gather: copy ``itemsize`` bytes from ``source + byte_offsets[i]``.
 
     Parameters
@@ -187,6 +205,11 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
         1D array determining both the element size and the output dtype.
     thread_cap : int, optional
         Maximum OpenMP threads. ``0`` means the OpenMP maximum.
+    prefetch_distance : int, optional
+        Software-prefetch look-ahead in elements. ``> 0`` prefetches that
+        many iterations ahead; ``0`` disables prefetching (useful when the
+        source is cache-resident); negative (default) uses the compiled
+        default, :func:`default_prefetch_distance`.
 
     Notes
     -----
@@ -223,22 +246,25 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
     cdef const int64_t* offsets_ptr = <const int64_t*>cnp.PyArray_DATA(byte_offsets)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
 
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
     if itemsize == 1:
         with nogil:
             colstore_gather_bytes_1(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap)
+                                    n_indices, thread_cap, pd)
     elif itemsize == 2:
         with nogil:
             colstore_gather_bytes_2(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap)
+                                    n_indices, thread_cap, pd)
     elif itemsize == 4:
         with nogil:
             colstore_gather_bytes_4(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap)
+                                    n_indices, thread_cap, pd)
     elif itemsize == 8:
         with nogil:
             colstore_gather_bytes_8(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap)
+                                    n_indices, thread_cap, pd)
     else:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
@@ -320,7 +346,8 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
                        cnp.ndarray record_starts_rows,
                        cnp.ndarray record_starts_bytes,
                        cnp.ndarray n_rows_per_record,
-                       long long col_prefix_bytes, int thread_cap=0):
+                       long long col_prefix_bytes, int thread_cap=0,
+                       Py_ssize_t prefetch_distance=-1):
     """Fused multi-record fancy gather: ``output[i] = column_value(indices[i])``.
 
     For each (arbitrary, unsorted) index the record is located by a branchless
@@ -352,6 +379,11 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
     thread_cap : int, optional
         Maximum OpenMP threads; ``0`` means the OpenMP maximum. The kernel
         runs serially below its internal parallel threshold.
+    prefetch_distance : int, optional
+        Software-prefetch look-ahead in elements. ``> 0`` prefetches that
+        many iterations ahead; ``0`` disables prefetching (useful when the
+        source is cache-resident); negative (default) uses the compiled
+        default, :func:`default_prefetch_distance`.
 
     Raises
     ------
@@ -392,26 +424,29 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
     cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
     cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
 
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
     if itemsize == 1:
         with nogil:
             colstore_gather_multirecord_1(base, indices_ptr, output_ptr, n,
                                           rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap)
+                                          col_prefix_bytes, thread_cap, pd)
     elif itemsize == 2:
         with nogil:
             colstore_gather_multirecord_2(base, indices_ptr, output_ptr, n,
                                           rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap)
+                                          col_prefix_bytes, thread_cap, pd)
     elif itemsize == 4:
         with nogil:
             colstore_gather_multirecord_4(base, indices_ptr, output_ptr, n,
                                           rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap)
+                                          col_prefix_bytes, thread_cap, pd)
     elif itemsize == 8:
         with nogil:
             colstore_gather_multirecord_8(base, indices_ptr, output_ptr, n,
                                           rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap)
+                                          col_prefix_bytes, thread_cap, pd)
     else:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
