@@ -218,11 +218,18 @@ def test_reader_open_under_local_policy_skips_numa_call(tmp_path, monkeypatch):
         calls.append(view)
         return True
 
-    monkeypatch.setattr(_numa, "apply_interleave_to_memmap", spy)
-
     store_path = tmp_path / "skip.cstore"
     columns = {"x": np.arange(16, dtype=np.float64)}
     colstore.store(columns, store_path, show_progress=False).close()
+
+    # The spy is installed only AFTER store() completes: store() returns an
+    # *open* reader, and that open runs under whatever policy is current
+    # (normally "auto"). On a NUMA-capable host it legitimately calls the
+    # helper once, which is not what this test asserts -- the assertion is
+    # about the open performed under "local" below. Installing the spy
+    # before store() made the test fail on multi-node hosts only, while
+    # passing on hosts where is_available() is false.
+    monkeypatch.setattr(_numa, "apply_interleave_to_memmap", spy)
 
     previous = config.get_numa_policy()
     try:
