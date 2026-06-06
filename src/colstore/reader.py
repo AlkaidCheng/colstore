@@ -223,7 +223,11 @@ class ColStoreReader:
         emit a warning rather than raising. Defaults to ``False``.
     backend : str or None, optional
         Gather backend used for fancy-index reads (``"cpp"``, ``"numpy"``,
-        or ``"numba"``). ``None`` uses the package-wide default.
+        or ``"numba"``). ``None`` uses the package-wide default. Applies to
+        single-record stores; multi-record stores require the compiled C++
+        extension and always use it for fancy-index reads (this has been the
+        case since multi-record support landed -- there is no pure-NumPy
+        multi-record gather).
     max_workers : int or None, optional
         Override the package-wide thread-pool size for multi-column reads.
         ``None`` uses the global setting (physical core count by default).
@@ -355,7 +359,11 @@ class ColStoreReader:
 
     @property
     def backend(self) -> str:
-        """Effective gather backend on this instance."""
+        """Effective gather backend on this instance.
+
+        Governs single-record fancy-index reads; multi-record fancy reads
+        always use the C++ extension (see the ``backend`` parameter note).
+        """
         return self._backend
 
     @property
