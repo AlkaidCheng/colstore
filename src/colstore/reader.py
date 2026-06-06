@@ -223,7 +223,11 @@ class ColStoreReader:
         emit a warning rather than raising. Defaults to ``False``.
     backend : str or None, optional
         Gather backend used for fancy-index reads (``"cpp"``, ``"numpy"``,
-        or ``"numba"``). ``None`` uses the package-wide default.
+        or ``"numba"``). ``None`` uses the package-wide default. Applies to
+        single-record stores; multi-record stores require the compiled C++
+        extension and always use it for fancy-index reads (this has been the
+        case since multi-record support landed -- there is no pure-NumPy
+        multi-record gather).
     max_workers : int or None, optional
         Override the package-wide thread-pool size for multi-column reads.
         ``None`` uses the global setting (physical core count by default).
@@ -355,7 +359,11 @@ class ColStoreReader:
 
     @property
     def backend(self) -> str:
-        """Effective gather backend on this instance."""
+        """Effective gather backend on this instance.
+
+        Governs single-record fancy-index reads; multi-record fancy reads
+        always use the C++ extension (see the ``backend`` parameter note).
+        """
         return self._backend
 
     @property
@@ -650,15 +658,7 @@ class ColStoreReader:
         record_starts_rows = self._record_starts_rows
         record_starts_bytes = self._record_starts_bytes
         n_rows_per_record = self._n_rows_per_record
-        # The raw byte-offset kernel (gather_bytes) copies on-disk bytes
-        # verbatim, and the disk is always little-endian -- so its
-        # destination must be typed with the DISK dtype, not the native one,
-        # or a big-endian host would misinterpret every value. The
-        # ``astype(native, copy=False)`` at the return is a no-op on
-        # little-endian hosts (the dtypes compare equal) and a byteswapping
-        # copy on big-endian ones. The fused native kernel branch is only
-        # taken when disk == native, where the distinction vanishes.
-        output = np.empty(n, dtype=disk_dtype)
+        output = np.empty(n, dtype=native_dtype)
         effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
 
         # Sortedness check is O(K) but ~100x faster than a searchsorted at
@@ -750,7 +750,7 @@ class ColStoreReader:
                 config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
             )
 
-        return output.astype(native_dtype, copy=False)
+        return output
 
     def _read_contiguous_range_multi_record(
         self,
