@@ -286,6 +286,28 @@ void gather_multirecord_uniform_withbins_typed(const std::uint8_t* base,
                                                int thread_cap = 0,
                                                std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Record-base variant of gather_multirecord_withbins_typed for irregular
+// files: the caller precomputes, per column,
+//   record_base[r] = record_starts_bytes[r]
+//                  + col_prefix_bytes * n_rows_per_record[r]
+//                  - record_starts_rows[r] * itemsize
+// (an O(R) vectorized pass), and the per-element address collapses to
+//   off = record_base[bins[i]] + indices[i] * itemsize
+// -- one metadata load instead of three, one multiply-add instead of two
+// multiplies and three adds. ``bins`` comes from
+// gather_multirecord_bins_typed on the same indices; ``record_base`` has
+// one entry per record and must be built with this column's prefix and
+// itemsize.
+template <typename T>
+void gather_multirecord_withbins_rbase_typed(const std::uint8_t* base,
+                                             const std::int64_t* indices,
+                                             std::uint8_t* output,
+                                             const std::int32_t* bins,
+                                             std::ptrdiff_t n_indices,
+                                             const std::int64_t* record_base,
+                                             int thread_cap = 0,
+                                             std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -564,6 +586,25 @@ void colstore_gather_multirecord_withbins_8(
 
 // Returns the OpenMP thread cap that gathers will use, or 1 if OpenMP is
 // not compiled in. Exposed for diagnostics.
+
+// Record-base withbins variant; see gather_multirecord_withbins_rbase_typed.
+void colstore_gather_multirecord_withbins_rbase_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_rbase_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_rbase_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_rbase_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance);
+
 int colstore_max_threads();
 
 }  // extern "C"

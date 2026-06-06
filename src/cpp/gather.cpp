@@ -916,6 +916,52 @@ template void gather_multirecord_uniform_withbins_typed<std::uint64_t>(
     std::ptrdiff_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t,
     std::int64_t, std::int64_t, int, std::ptrdiff_t);
 
+// Record-base withbins variant: the per-element steady state is the
+// sequential int32 bin read, one record_base load, one multiply-add, and
+// the data load -- against the generic withbins kernel's three metadata
+// loads and two multiplies. The record_base array is built by the caller
+// per column (O(R), vectorized) and folds the column prefix and the
+// row-to-byte conversion into a single per-record scalar.
+template <typename T>
+void gather_multirecord_withbins_rbase_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                                             const std::int64_t* COLSTORE_RESTRICT indices,
+                                             std::uint8_t* COLSTORE_RESTRICT output,
+                                             const std::int32_t* COLSTORE_RESTRICT bins,
+                                             std::ptrdiff_t n_indices,
+                                             const std::int64_t* COLSTORE_RESTRICT record_base,
+                                             int thread_cap,
+                                             std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      const std::ptrdiff_t j = i + prefetch_distance;
+      COLSTORE_PREFETCH(base + record_base[bins[j]] + indices[j] * itemsize);
+    }
+    dst[i] = load_unaligned<T>(base + record_base[bins[i]] + indices[i] * itemsize);
+  }
+}
+
+template void gather_multirecord_withbins_rbase_typed<std::uint8_t>(
+    const std::uint8_t*, const std::int64_t*, std::uint8_t*, const std::int32_t*,
+    std::ptrdiff_t, const std::int64_t*, int, std::ptrdiff_t);
+template void gather_multirecord_withbins_rbase_typed<std::uint16_t>(
+    const std::uint8_t*, const std::int64_t*, std::uint8_t*, const std::int32_t*,
+    std::ptrdiff_t, const std::int64_t*, int, std::ptrdiff_t);
+template void gather_multirecord_withbins_rbase_typed<std::uint32_t>(
+    const std::uint8_t*, const std::int64_t*, std::uint8_t*, const std::int32_t*,
+    std::ptrdiff_t, const std::int64_t*, int, std::ptrdiff_t);
+template void gather_multirecord_withbins_rbase_typed<std::uint64_t>(
+    const std::uint8_t*, const std::int64_t*, std::uint8_t*, const std::int32_t*,
+    std::ptrdiff_t, const std::int64_t*, int, std::ptrdiff_t);
+
 }  // namespace colstore
 
 extern "C" {
@@ -1368,6 +1414,39 @@ void colstore_gather_multirecord_uniform_withbins_8(
       base, indices, output, bins, n, rows_per_record, record_stride_bytes,
       first_body_offset, n_records, last_record_rows, col_prefix_bytes,
       thread_cap, prefetch_distance);
+}
+
+
+void colstore_gather_multirecord_withbins_rbase_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance) {
+  colstore::gather_multirecord_withbins_rbase_typed<std::uint8_t>(
+      base, indices, output, bins, n, record_base, thread_cap, prefetch_distance);
+}
+
+void colstore_gather_multirecord_withbins_rbase_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance) {
+  colstore::gather_multirecord_withbins_rbase_typed<std::uint16_t>(
+      base, indices, output, bins, n, record_base, thread_cap, prefetch_distance);
+}
+
+void colstore_gather_multirecord_withbins_rbase_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance) {
+  colstore::gather_multirecord_withbins_rbase_typed<std::uint32_t>(
+      base, indices, output, bins, n, record_base, thread_cap, prefetch_distance);
+}
+
+void colstore_gather_multirecord_withbins_rbase_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int thread_cap, std::ptrdiff_t prefetch_distance) {
+  colstore::gather_multirecord_withbins_rbase_typed<std::uint64_t>(
+      base, indices, output, bins, n, record_base, thread_cap, prefetch_distance);
 }
 
 int colstore_max_threads() {
