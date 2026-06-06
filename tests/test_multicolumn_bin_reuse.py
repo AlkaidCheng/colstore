@@ -11,6 +11,8 @@ order -- including when non-native columns are mixed in and fall back.
 
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 import pytest
 
@@ -83,9 +85,14 @@ def mixed_store(tmp_path):
         "i2": rng.integers(-1000, 1000, 40_000).astype(np.int16),
     }
     path = tmp_path / "m.cstore"
+    # Irregular record sizes (one record split unevenly): these tests pin the
+    # GENERIC bins route, which uniform-record files no longer take (they
+    # route to the arithmetic-binning kernels, covered by
+    # tests/test_uniform_multirecord.py).
+    boundaries = [0, 500, *range(800, 40_001, 800)]
     with colstore.create(path) as writer:
-        for offset in range(0, 40_000, 800):  # 50 records
-            writer.write({name: col[offset : offset + 800] for name, col in full.items()})
+        for lo, hi in itertools.pairwise(boundaries):
+            writer.write({name: col[lo:hi] for name, col in full.items()})
     return path, full
 
 

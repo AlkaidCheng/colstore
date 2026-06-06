@@ -333,6 +333,11 @@ class ColStoreReader:
             self._record_starts_rows = record_starts_rows
             self._record_starts_bytes = record_starts_bytes
             self._n_rows_per_record = n_rows_per_record
+            # Uniform-record layout (all records the same row count, constant
+            # body stride, final record possibly partial), detected lazily on
+            # first fancy read and cached -- see _uniform_record_layout.
+            self._uniform_layout_cache: tuple[int, int, int, int] | None = None
+            self._uniform_layout_known = False
             self._column_prefix_bytes: dict[str, np.int64] = {}
             prefix = 0
             for col, size in zip(columns_meta, itemsizes, strict=True):
@@ -631,6 +636,41 @@ class ColStoreReader:
 
     # ---- Multi-record read path -----------------------------------------
 
+    def _detect_uniform_record_layout(self) -> tuple[int, int, int, int] | None:
+        """Detect a uniform multi-record layout, or ``None``.
+
+        Uniform means: every record except possibly the last has the same
+        row count, the last record is no larger, and the record bodies sit
+        at a constant byte stride (which the packed format implies for equal
+        row counts, but is verified numerically rather than derived from
+        format internals). Returns ``(rows_per_record, record_stride_bytes,
+        first_body_offset, last_record_rows)`` for the arithmetic-binning
+        kernel, whose record bin is ``idx // rows_per_record`` -- exact for
+        every index precisely under these conditions. O(R) numpy passes,
+        run once per reader (see :meth:`_uniform_record_layout`).
+        """
+        nrr = self._n_rows_per_record
+        rsb = self._record_starts_bytes
+        rows = int(nrr[0])
+        if rows <= 0:
+            return None
+        if not bool(np.all(nrr[:-1] == rows)):
+            return None
+        last_rows = int(nrr[-1])
+        if last_rows > rows or last_rows <= 0:
+            return None
+        stride = int(rsb[1] - rsb[0])
+        if not bool(np.all(np.diff(rsb) == stride)):
+            return None
+        return rows, stride, int(rsb[0]), last_rows
+
+    def _uniform_record_layout(self) -> tuple[int, int, int, int] | None:
+        """Cached :meth:`_detect_uniform_record_layout`."""
+        if not self._uniform_layout_known:
+            self._uniform_layout_cache = self._detect_uniform_record_layout()
+            self._uniform_layout_known = True
+        return self._uniform_layout_cache
+
     def _gather_one_multi_record(
         self, column_name: str, row_indexer: Any, thread_cap: int | None
     ) -> NDArray[Any]:
@@ -814,17 +854,37 @@ class ColStoreReader:
             # byte_offsets array. The searchsorted-based binning was measured
             # at ~75-85% of this path's cost; folding it into the kernel (and
             # parallelizing it, which searchsorted cannot be) is the win.
-            _cpp_module.gather_multirecord(
-                self._file_mmap,
-                indices,
-                output,
-                record_starts_rows,
-                record_starts_bytes,
-                n_rows_per_record,
-                int(col_prefix),
-                effective_cap,
-                config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
-            )
+            # On uniform-record files the search itself goes away: the bin is
+            # one integer division and the address one affine formula
+            # (gather_multirecord_uniform).
+            uniform = self._uniform_record_layout()
+            if uniform is not None:
+                rows_per_record, record_stride, first_body, last_rows = uniform
+                _cpp_module.gather_multirecord_uniform(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    rows_per_record,
+                    record_stride,
+                    first_body,
+                    int(self._record_starts_bytes.shape[0]),
+                    last_rows,
+                    int(col_prefix),
+                    effective_cap,
+                    config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
+                )
+            else:
+                _cpp_module.gather_multirecord(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    record_starts_rows,
+                    record_starts_bytes,
+                    n_rows_per_record,
+                    int(col_prefix),
+                    effective_cap,
+                    config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
+                )
         else:
             # Unsorted, non-native byte order (big-endian host). The fused
             # kernel does a raw typed load and cannot byteswap, so fall back to
@@ -1080,8 +1140,46 @@ class ColStoreReader:
 
         effective_cap = config.get_gather_thread_cap()
         prefetch = config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False)
-        bins = np.empty(n, dtype=np.int32)
         gathered: dict[str, NDArray[Any]] = {}
+        uniform = self._uniform_record_layout()
+        if uniform is not None:
+            # Uniform-record file: same shape as the generic bins route
+            # (first column fills bins, the rest read them; columns
+            # sequential, each OpenMP-parallel at the full cap), but the
+            # first column's binning is one division instead of a binary
+            # search, and subsequent columns form addresses with the affine
+            # formula instead of three per-record metadata loads. Division
+            # once per element beats division per column: with C columns
+            # the bins read is cheaper than re-dividing.
+            rows_per_record, record_stride, first_body, last_rows = uniform
+            bins = np.empty(n, dtype=np.int32)
+            for position, name in enumerate(native_names):
+                output = np.empty(n, dtype=self._column_dtypes[name].newbyteorder("="))
+                uniform_kernel = (
+                    _cpp_module.gather_multirecord_uniform_bins
+                    if position == 0
+                    else _cpp_module.gather_multirecord_uniform_withbins
+                )
+                uniform_kernel(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    bins,
+                    rows_per_record,
+                    record_stride,
+                    first_body,
+                    n_records,
+                    last_rows,
+                    int(self._column_prefix_bytes[name]),
+                    effective_cap,
+                    prefetch,
+                )
+                gathered[name] = output
+            return {
+                name: gathered[name] if name in gathered else self._gather_one(name, row_indexer)
+                for name in column_names
+            }
+        bins = np.empty(n, dtype=np.int32)
         for position, name in enumerate(native_names):
             output = np.empty(n, dtype=self._column_dtypes[name].newbyteorder("="))
             kernel = (

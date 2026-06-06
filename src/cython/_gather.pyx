@@ -125,6 +125,54 @@ cdef extern from "colstore/gather.hpp" nogil:
         const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
         int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_1(
+        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_2(
+        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_4(
+        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_8(
+        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_bins_1(
+        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_bins_2(
+        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_bins_4(
+        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_bins_8(
+        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_withbins_1(
+        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_withbins_2(
+        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_withbins_4(
+        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_uniform_withbins_8(
+        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int, ptrdiff_t)
     int colstore_max_threads()
 
 
@@ -675,6 +723,235 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
             colstore_gather_multirecord_strided_8(base, output_ptr, start, step, n,
                                                   rsr, rsb, nrr, n_records,
                                                   col_prefix_bytes, thread_cap, pd)
+    else:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
+                               cnp.ndarray output,
+                               long long rows_per_record,
+                               long long record_stride_bytes,
+                               long long first_body_offset,
+                               long long n_records,
+                               long long last_record_rows,
+                               long long col_prefix_bytes, int thread_cap=0,
+                               Py_ssize_t prefetch_distance=-1):
+    """Unsorted fancy gather over a uniform-record file: arithmetic binning.
+
+    Specialization of :func:`gather_multirecord` for files whose records all
+    have ``rows_per_record`` rows (the final record may be partial, with
+    ``last_record_rows`` rows) and whose record bodies sit at a constant
+    byte stride. The record bin is one integer division and the address one
+    affine formula -- no binary search, no per-record metadata loads. The
+    caller detects the layout and guarantees its invariants (see the C++
+    header) plus native byte order; this entry validates only the scalar
+    sanity conditions and the array contracts shared by every kernel.
+    """
+    if indices.ndim != 1 or output.ndim != 1:
+        raise ValueError("indices and output must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if rows_per_record <= 0:
+        raise ValueError("rows_per_record must be positive.")
+    if n_records <= 0:
+        raise ValueError("n_records must be positive.")
+    if last_record_rows <= 0 or last_record_rows > rows_per_record:
+        raise ValueError("last_record_rows must be in [1, rows_per_record].")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match indices length {n}."
+        )
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_multirecord_uniform_1(base, indices_ptr, output_ptr, n,
+                                                  rows_per_record, record_stride_bytes,
+                                                  first_body_offset, n_records,
+                                                  last_record_rows, col_prefix_bytes,
+                                                  thread_cap, pd)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_multirecord_uniform_2(base, indices_ptr, output_ptr, n,
+                                                  rows_per_record, record_stride_bytes,
+                                                  first_body_offset, n_records,
+                                                  last_record_rows, col_prefix_bytes,
+                                                  thread_cap, pd)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_multirecord_uniform_4(base, indices_ptr, output_ptr, n,
+                                                  rows_per_record, record_stride_bytes,
+                                                  first_body_offset, n_records,
+                                                  last_record_rows, col_prefix_bytes,
+                                                  thread_cap, pd)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_multirecord_uniform_8(base, indices_ptr, output_ptr, n,
+                                                  rows_per_record, record_stride_bytes,
+                                                  first_body_offset, n_records,
+                                                  last_record_rows, col_prefix_bytes,
+                                                  thread_cap, pd)
+    else:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_uniform_bins(cnp.ndarray source, cnp.ndarray indices,
+                                    cnp.ndarray output, cnp.ndarray bins,
+                                    long long rows_per_record,
+                                    long long record_stride_bytes,
+                                    long long first_body_offset,
+                                    long long n_records,
+                                    long long last_record_rows,
+                                    long long col_prefix_bytes, int thread_cap=0,
+                                    Py_ssize_t prefetch_distance=-1):
+    """Uniform-record gather that also records each index's record bin.
+
+    First-column kernel of the uniform multi-column route: the record is
+    computed arithmetically (one division, partial-tail guard) and written
+    to ``bins`` (int32) so subsequent columns can read it instead of
+    re-dividing. Requires ``n_records <= INT32_MAX`` (the caller guards).
+    Layout invariants and other parameters match
+    :func:`gather_multirecord_uniform`.
+    """
+    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1:
+        raise ValueError("indices, output, and bins must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if bins.dtype != np.int32:
+        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    if rows_per_record <= 0:
+        raise ValueError("rows_per_record must be positive.")
+    if n_records <= 0:
+        raise ValueError("n_records must be positive.")
+    if last_record_rows <= 0 or last_record_rows > rows_per_record:
+        raise ValueError("last_record_rows must be in [1, rows_per_record].")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError("output and bins lengths must match indices length.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef int32_t* bins_ptr = <int32_t*>cnp.PyArray_DATA(bins)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_multirecord_uniform_bins_1(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_multirecord_uniform_bins_2(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_multirecord_uniform_bins_4(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_multirecord_uniform_bins_8(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    else:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
+                                        cnp.ndarray output, cnp.ndarray bins,
+                                        long long rows_per_record,
+                                        long long record_stride_bytes,
+                                        long long first_body_offset,
+                                        long long n_records,
+                                        long long last_record_rows,
+                                        long long col_prefix_bytes, int thread_cap=0,
+                                        Py_ssize_t prefetch_distance=-1):
+    """Uniform-record gather using bins from :func:`gather_multirecord_uniform_bins`.
+
+    Per element: a sequential int32 bin read, the partial-tail compare, one
+    multiply-add, and the load -- no division, no search, no per-record
+    metadata. ``bins`` must come from the bins kernel run on the same
+    ``indices`` and layout; behavior is undefined otherwise. Other
+    parameters and errors match :func:`gather_multirecord_uniform_bins`.
+    """
+    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1:
+        raise ValueError("indices, output, and bins must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if bins.dtype != np.int32:
+        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    if rows_per_record <= 0:
+        raise ValueError("rows_per_record must be positive.")
+    if n_records <= 0:
+        raise ValueError("n_records must be positive.")
+    if last_record_rows <= 0 or last_record_rows > rows_per_record:
+        raise ValueError("last_record_rows must be in [1, rows_per_record].")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError("output and bins lengths must match indices length.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int32_t* bins_ptr = <const int32_t*>cnp.PyArray_DATA(bins)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_multirecord_uniform_withbins_1(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_multirecord_uniform_withbins_2(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_multirecord_uniform_withbins_4(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_multirecord_uniform_withbins_8(
+                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
+                record_stride_bytes, first_body_offset, n_records,
+                last_record_rows, col_prefix_bytes, thread_cap, pd)
     else:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
