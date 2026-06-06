@@ -601,11 +601,12 @@ class ColStoreReader:
           than the generic path on a slice spanning 10 records (0.07 ms vs
           3.4 ms).
 
-        * **Sorted fancy index**: boundary-based partition. ``np.searchsorted``
-          on the *record-row boundaries* against the indices array (O(R log K))
-          replaces searchsorted on the *indices* against the boundaries
-          (O(K log R)). For K=200K, R=100 this saves ~1.3 ms on the
-          ~4.5 ms sorted path. Same kernel work afterward.
+        * **Sorted fancy index**: native linear-walk kernel
+          (``gather_multirecord_sorted``) -- each thread binary-searches its
+          chunk's first record, then advances the record cursor
+          monotonically; O(K + R), offsets in registers, no byte_offsets
+          array. The NumPy boundary-partition pipeline survives only as the
+          non-native (big-endian host) fallback.
 
         * **Unsorted fancy index**: searchsorted + byte-offset gather. This
           is the generic path; the searchsorted is unavoidable when indices
@@ -647,8 +648,11 @@ class ColStoreReader:
                 )
             indices = np.arange(start, stop, step, dtype=np.int64)
         else:
-            # int ndarray -- already validated and made int64 by the view layer.
-            indices = np.asarray(row_indexer, dtype=np.int64)
+            # int ndarray -- already validated, made int64, and made
+            # C-contiguous by the view layer; ascontiguousarray here is a
+            # free no-op backstop for internal callers (the kernels require
+            # contiguity and validate it).
+            indices = np.ascontiguousarray(row_indexer, dtype=np.int64)
 
         n = indices.shape[0]
         if n == 0:
@@ -672,7 +676,10 @@ class ColStoreReader:
         # Sortedness check is O(K) but ~100x faster than a searchsorted at
         # K=200K, so the early exit is essentially free in the unsorted case.
         if n > 1 and bool(np.all(indices[1:] >= indices[:-1])):
-            # Sorted path. Two-part optimization:
+            # Sorted path. The native walk kernel handles native dtypes; the
+            # NumPy boundary-partition pipeline below it survives only as
+            # the non-native (big-endian host) fallback. Its design, kept
+            # for that fallback:
             #
             # (1) Boundary-based partition. ``np.searchsorted`` on the
             #     *record-row boundaries* against the indices array
@@ -695,10 +702,6 @@ class ColStoreReader:
             #     (record_id, within_record, two intermediate gathers). At
             #     K=1M the generic form costs ~11ms in allocator/cache
             #     traffic alone; the per-record loop costs ~1ms.
-            #
-            # This path already avoids the big temporaries and runs ~4-11x
-            # faster than the unsorted path (measured), so it is left as-is;
-            # the fused native kernel below targets the unsorted case.
             if _dtype_is_native(disk_dtype):
                 # Native byte order: linear-walk kernel. Each thread
                 # binary-searches the record of its chunk's first index, then
@@ -948,7 +951,7 @@ class ColStoreReader:
             return None
         if not isinstance(row_indexer, np.ndarray):
             return None
-        indices = np.asarray(row_indexer, dtype=np.int64)
+        indices = np.ascontiguousarray(row_indexer, dtype=np.int64)
         n = indices.shape[0]
         if n <= 1:
             return None

@@ -139,6 +139,24 @@ def default_prefetch_distance() -> int:
     return DEFAULT_PREFETCH_DISTANCE
 
 
+
+def _require_c_contiguous(pairs):
+    """Raise if any (name, array) pair is not C-contiguous.
+
+    Every entry point in this module hands ``PyArray_DATA`` pointers to C++
+    kernels that index them as dense arrays. A strided view (``a[::2]``,
+    ``a[::-1]``) would be read at the wrong positions -- silently wrong
+    values for positive strides, out-of-bounds reads for negative ones --
+    so contiguity is a hard requirement, validated here. Callers that may
+    hold strided arrays should normalize with ``np.ascontiguousarray``.
+    """
+    for name, array in pairs:
+        if not array.flags.c_contiguous:
+            raise ValueError(
+                f"{name} must be C-contiguous; pass np.ascontiguousarray({name})."
+            )
+
+
 def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
            int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Element-indexed gather: ``output[i] = source[indices[i]]``.
@@ -190,6 +208,7 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         return
 
     cdef int itemsize = source.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
@@ -286,6 +305,7 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
         return
 
     cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("byte_offsets", byte_offsets), ("output", output)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef const int64_t* offsets_ptr = <const int64_t*>cnp.PyArray_DATA(byte_offsets)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
@@ -366,6 +386,7 @@ def gather_multirecord_bins(cnp.ndarray source, cnp.ndarray indices,
         return
 
     cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
@@ -450,6 +471,7 @@ def gather_multirecord_withbins(cnp.ndarray source, cnp.ndarray indices,
         return
 
     cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
@@ -528,6 +550,7 @@ def gather_multirecord_sorted(cnp.ndarray source, cnp.ndarray indices,
         return
 
     cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
@@ -619,6 +642,7 @@ def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
     if stop <= start:
         return
 
+    _require_c_contiguous((("source", source), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
     cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
@@ -707,6 +731,7 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
         return
 
     cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
     cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
     cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
     cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)

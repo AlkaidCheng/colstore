@@ -78,7 +78,13 @@ class _BaseView:
             raise IndexError(
                 f"Row index array must be integer or boolean; got dtype {row_array.dtype}."
             )
-        return self._validate_fancy_index(row_array.astype(np.int64, copy=False))
+        # ascontiguousarray, not astype(copy=False): the latter preserves
+        # strides when the dtype is already int64, and a strided index view
+        # (e.g. ``rows[::2]`` or ``rows[::-1]``) would reach the C++ kernels,
+        # which interpret the array as a contiguous int64 pointer -- wrong
+        # values for positive strides, out-of-bounds reads for negative
+        # ones. No-op (no copy) for arrays that are already contiguous.
+        return self._validate_fancy_index(np.ascontiguousarray(row_array, dtype=np.int64))
 
     def _normalize_scalar(self, position: int) -> int:
         """Fold a negative scalar row index and bounds-check it."""
