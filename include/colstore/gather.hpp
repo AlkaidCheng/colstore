@@ -221,6 +221,71 @@ void gather_multirecord_strided_typed(const std::uint8_t* base,
                                       int thread_cap = 0,
                                       std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Uniform-record fancy gather: the unsorted fused gather specialized for
+// files whose records all have the same row count (the final record may be
+// partial) and a constant record byte stride. The record bin is computed
+// arithmetically -- ``r = idx / rows_per_record`` -- instead of the
+// branchless binary search, and the byte address needs no per-record
+// metadata loads at all: full records share one affine formula and the
+// (possibly partial) final record gets a single guarded base. The caller
+// detects the layout (``reader._detect_uniform_record_layout``) and
+// guarantees: ``rows_per_record > 0``, every record except possibly the
+// last has exactly ``rows_per_record`` rows, ``record_starts_bytes`` is an
+// arithmetic sequence with stride ``record_stride_bytes`` starting at
+// ``first_body_offset``, ``0 < last_record_rows <= rows_per_record``,
+// every index is in range, and the dtype is native byte order.
+template <typename T>
+void gather_multirecord_uniform_typed(const std::uint8_t* base,
+                                      const std::int64_t* indices,
+                                      std::uint8_t* output,
+                                      std::ptrdiff_t n_indices,
+                                      std::int64_t rows_per_record,
+                                      std::int64_t record_stride_bytes,
+                                      std::int64_t first_body_offset,
+                                      std::int64_t n_records,
+                                      std::int64_t last_record_rows,
+                                      std::int64_t col_prefix_bytes,
+                                      int thread_cap = 0,
+                                      std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
+// Multi-column companions of gather_multirecord_uniform_typed, mirroring
+// the bins/withbins pair: the first column computes each index's record
+// arithmetically (one division, plus the partial-tail guard) and records
+// it in ``bins``; subsequent columns read the bin -- a sequential int32
+// load, cheaper than re-dividing -- and form the address with the same
+// affine formula, touching no per-record metadata at all. Same layout
+// invariants as the single-column kernel; ``n_records <= INT32_MAX``
+// (the caller guards, as for the generic bins pair).
+template <typename T>
+void gather_multirecord_uniform_bins_typed(const std::uint8_t* base,
+                                           const std::int64_t* indices,
+                                           std::uint8_t* output,
+                                           std::int32_t* bins,
+                                           std::ptrdiff_t n_indices,
+                                           std::int64_t rows_per_record,
+                                           std::int64_t record_stride_bytes,
+                                           std::int64_t first_body_offset,
+                                           std::int64_t n_records,
+                                           std::int64_t last_record_rows,
+                                           std::int64_t col_prefix_bytes,
+                                           int thread_cap = 0,
+                                           std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
+template <typename T>
+void gather_multirecord_uniform_withbins_typed(const std::uint8_t* base,
+                                               const std::int64_t* indices,
+                                               std::uint8_t* output,
+                                               const std::int32_t* bins,
+                                               std::ptrdiff_t n_indices,
+                                               std::int64_t rows_per_record,
+                                               std::int64_t record_stride_bytes,
+                                               std::int64_t first_body_offset,
+                                               std::int64_t n_records,
+                                               std::int64_t last_record_rows,
+                                               std::int64_t col_prefix_bytes,
+                                               int thread_cap = 0,
+                                               std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -378,6 +443,78 @@ void colstore_gather_multirecord_strided_8(
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
     std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
     std::ptrdiff_t prefetch_distance);
+
+// Uniform-record arithmetic-bin gather; see gather_multirecord_uniform_typed.
+void colstore_gather_multirecord_uniform_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
+    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
+    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
+    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
+    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+
+// Uniform bins/withbins pair; see the *_typed declarations.
+void colstore_gather_multirecord_uniform_bins_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_bins_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_bins_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_bins_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_withbins_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_withbins_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_withbins_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_uniform_withbins_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
+    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
+    std::int64_t n_records, std::int64_t last_record_rows,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Bin-reuse pair; see gather_multirecord_bins_typed.
 void colstore_gather_multirecord_bins_1(

@@ -78,16 +78,23 @@ def test_sorted_above_threshold_returns_true():
 @pytest.fixture()
 def multi_record_store(tmp_path):
     rng = np.random.default_rng(21)
-    n_records, rows = 40, 4_000  # total 160_000 rows: selectors can exceed THRESHOLD
-    total = n_records * rows
+    # Irregular record sizes (first record split unevenly): these tests pin
+    # the GENERIC kernels' routing, which uniform-record files no longer
+    # take (they route to the arithmetic-binning kernels, covered by
+    # tests/test_uniform_multirecord.py). Total 160_000 rows so selectors
+    # can exceed THRESHOLD.
+    rows_per_record = [1_500, 2_500] + [4_000] * 39
+    total = sum(rows_per_record)
     full = {
         "f8": rng.standard_normal(total),
         "i4": rng.integers(-(2**20), 2**20, total).astype(np.int32),
     }
     path = tmp_path / "sortedness.cstore"
+    offset = 0
     with colstore.create(path) as writer:
-        for r in range(n_records):
-            writer.write({k: v[r * rows : (r + 1) * rows] for k, v in full.items()})
+        for rows in rows_per_record:
+            writer.write({k: v[offset : offset + rows] for k, v in full.items()})
+            offset += rows
     return path, full, total
 
 
