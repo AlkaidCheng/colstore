@@ -601,6 +601,13 @@ class ColStoreReader:
           than the generic path on a slice spanning 10 records (0.07 ms vs
           3.4 ms).
 
+        * **Strided slice** (``step != 1``, native dtype): native strided
+          walk kernel (``gather_multirecord_strided``) -- the row stream is
+          synthesized arithmetically inside the kernel, which advances the
+          record cursor monotonically in the step's direction. No index
+          array is materialized and no sortedness check runs. Non-native
+          dtypes fall back to ``np.arange`` + the fancy path below.
+
         * **Sorted fancy index**: native linear-walk kernel
           (``gather_multirecord_sorted``) -- each thread binary-searches its
           chunk's first record, then advances the record cursor
@@ -640,12 +647,23 @@ class ColStoreReader:
         if isinstance(row_indexer, slice):
             start, stop, step = row_indexer.indices(self._n_rows)
             if step == 1:
-                # The hot case. step != 1 falls through to the fancy-index
-                # path; non-unit-step slices are rare and not worth special-
-                # casing further (they'd need per-record arange-style picks).
+                # The hot case: one memcpy per overlapping record.
                 return self._read_contiguous_range_multi_record(
                     start, stop, disk_dtype, native_dtype, col_prefix, itemsize
                 )
+            if _dtype_is_native(disk_dtype):
+                # Non-unit step, native byte order: strided walk kernel. The
+                # row stream is arithmetic, so no index array is built at all
+                # -- this skips the np.arange materialization, the O(K)
+                # sortedness pass, and the index-array bandwidth the fancy
+                # path below would pay. Negative steps (a descending stream,
+                # which the sortedness check would send to the per-element
+                # binary-search kernel) become an O(K + R) backward walk.
+                return self._read_strided_range_multi_record(
+                    start, stop, step, disk_dtype, native_dtype, col_prefix, thread_cap
+                )
+            # Non-native (big-endian host) fallback: materialize the indices
+            # and take the generic fancy path below, exactly as before.
             indices = np.arange(start, stop, step, dtype=np.int64)
         else:
             # int ndarray -- already validated, made int64, and made
@@ -889,6 +907,53 @@ class ColStoreReader:
             output[write_starts_list[i] : write_starts_list[i] + count] = view
 
         return output
+
+    def _read_strided_range_multi_record(
+        self,
+        start: int,
+        stop: int,
+        step: int,
+        disk_dtype: np.dtype[Any],
+        native_dtype: np.dtype[Any],
+        col_prefix: int,
+        thread_cap: int | None,
+    ) -> NDArray[Any]:
+        """Read rows ``start, start+step, ...`` (slice semantics) for one column.
+
+        Serves multi-record slices with ``step != 1`` via the native strided
+        walk kernel. The kernel synthesizes each row arithmetically, so this
+        path never allocates an index array, never runs the sortedness check,
+        and never reads index bytes -- the three costs the previous
+        ``np.arange`` + fancy-gather route paid. Requires a native-byte-order
+        disk dtype (the caller gates; the kernel does raw typed loads).
+
+        Prefetch is resolved with ``indices_sorted=True`` for both step
+        directions: the calibrated regimes classify the *access stream*, and a
+        strided walk is monotone (ascending or descending) with the same
+        record-local linearity the sorted gather has. The per-thread-count
+        axis caveat from the calibration work applies here unchanged.
+        """
+        from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+        n = len(range(start, stop, step))
+        output = np.empty(n, dtype=disk_dtype)
+        if n == 0:
+            return output.astype(native_dtype, copy=False)
+        effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+        _cpp_module.gather_multirecord_strided(
+            self._file_mmap,
+            output,
+            start,
+            stop,
+            step,
+            self._record_starts_rows,
+            self._record_starts_bytes,
+            self._n_rows_per_record,
+            int(col_prefix),
+            effective_cap,
+            config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=True),
+        )
+        return output.astype(native_dtype, copy=False)
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         """Read multiple columns in parallel; return ordered dict of owning arrays.
