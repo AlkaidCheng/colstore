@@ -92,9 +92,14 @@ def _writev_full(fd: int, buffers: list[Any]) -> None:
     views = [memoryview(b).cast("B") for b in buffers]
     index = 0
     while index < len(views):
-        written = os.writev(fd, views[index : index + _IOV_MAX])
-        if written < 0:  # pragma: no cover - os.writev raises instead
-            raise OSError("writev returned a negative count")
+        chunk = views[index : index + _IOV_MAX]
+        written = os.writev(fd, chunk)
+        if written == 0 and any(view.nbytes for view in chunk):
+            # POSIX permits a zero return; for a regular file it should never
+            # happen, but looping on it would spin forever, so surface it as
+            # the I/O failure it is. (A zero return for an all-empty chunk is
+            # not an error -- there was nothing to write.)
+            raise OSError(f"writev made no progress with {len(views) - index} buffer(s) remaining")
         while index < len(views) and written >= views[index].nbytes:
             written -= views[index].nbytes
             index += 1
