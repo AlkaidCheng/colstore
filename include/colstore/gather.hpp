@@ -175,6 +175,27 @@ void gather_multirecord_withbins_typed(const std::uint8_t* base,
                                        int thread_cap = 0,
                                        std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Sorted multi-record fancy gather: a linear record walk instead of a
+// per-element binary search. Requires ``indices`` to be non-decreasing
+// (the caller checks; behavior is undefined otherwise). Each OpenMP thread
+// binary-searches the record of the first index in its chunk, then advances
+// the record cursor monotonically -- O(K + R) total work, no byte_offsets
+// array, no per-record host-language loop. Replaces the NumPy
+// boundary-partition pipeline whose per-record Python loop measures 79-97%
+// of the sorted path at R >= 10^4 records.
+template <typename T>
+void gather_multirecord_sorted_typed(const std::uint8_t* base,
+                                     const std::int64_t* indices,
+                                     std::uint8_t* output,
+                                     std::ptrdiff_t n_indices,
+                                     const std::int64_t* record_starts_rows,
+                                     const std::int64_t* record_starts_bytes,
+                                     const std::int64_t* n_rows_per_record,
+                                     std::int64_t n_records,
+                                     std::int64_t col_prefix_bytes,
+                                     int thread_cap = 0,
+                                     std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -276,6 +297,32 @@ void colstore_gather_multirecord_8(const std::uint8_t* base,
                                    std::int64_t n_records,
                                    std::int64_t col_prefix_bytes, int thread_cap,
                                std::ptrdiff_t prefetch_distance);
+
+// Sorted walk; see gather_multirecord_sorted_typed.
+void colstore_gather_multirecord_sorted_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_sorted_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_sorted_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_sorted_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
 
 // Bin-reuse pair; see gather_multirecord_bins_typed.
 void colstore_gather_multirecord_bins_1(
