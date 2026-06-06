@@ -59,6 +59,49 @@ def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
     return (byteorder == "<") == bool(np.little_endian)
 
 
+# Sampled-rejection sortedness test. The sampler probes this many evenly
+# spaced adjacent pairs (fractional positions precomputed; the per-call work
+# is one 16-element multiply/astype and two 16-element gathers) before
+# committing to the full O(K) pass. Sampling is skipped below the size
+# threshold, where the full pass is cheaper than the sampler's fixed
+# overhead (measured crossover ~23K elements on the dev container; the
+# constant is set conservatively above it -- at the threshold the sampler
+# can cost at most ~its own fixed overhead, ~15us, relative to the check
+# it replaces).
+_SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
+_SORTEDNESS_SAMPLE_MIN_SIZE = 32768
+
+
+def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
+    """Non-decreasing test with a cheap sampled rejection pass first.
+
+    Semantics are identical to ``bool(np.all(indices[1:] >= indices[:-1]))``,
+    including ``True`` for lengths 0 and 1. The sampling pass is used only to
+    *reject* sortedness, never to prove it -- any sampled descent makes the
+    array definitely unsorted, while an all-ascending sample still falls
+    through to the full pass. Correctness is therefore unconditional; the
+    sampling only changes who pays what:
+
+    * a random unsorted selector fails the sample with probability
+      ``1 - 2**-16`` (each adjacent pair descends with probability ~1/2) and
+      skips the full O(K) pass plus its K-1-byte comparison temporary;
+    * a genuinely sorted selector pays the sampler's ~15us once on top of a
+      full pass it was going to run anyway (0.4ms at K=10^6, 8ms at K=10^7
+      on the dev container -- sub-percent overhead);
+    * adversarial nearly-sorted selectors whose only descents fall between
+      probe positions behave exactly as before: sample passes, full pass
+      decides.
+    """
+    n = indices.shape[0]
+    if n <= 1:
+        return True
+    if n >= _SORTEDNESS_SAMPLE_MIN_SIZE:
+        positions = (_SORTEDNESS_SAMPLE_FRACTIONS * (n - 2)).astype(np.int64)
+        if bool(np.any(indices[positions + 1] < indices[positions])):
+            return False
+    return bool(np.all(indices[1:] >= indices[:-1]))
+
+
 # ---- Parallel contiguous copy ------------------------------------------
 #
 # A contiguous column read is fundamentally one memcpy from the memmap into
@@ -691,9 +734,11 @@ class ColStoreReader:
         output = np.empty(n, dtype=disk_dtype)
         effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
 
-        # Sortedness check is O(K) but ~100x faster than a searchsorted at
-        # K=200K, so the early exit is essentially free in the unsorted case.
-        if n > 1 and bool(np.all(indices[1:] >= indices[:-1])):
+        # Sortedness gate: sampled rejection short-circuits the full O(K)
+        # pass for random unsorted selectors; sorted selectors still get the
+        # full proof (see _indices_are_sorted). The check stays serial, so
+        # its share of the read grows with the kernel's thread count.
+        if n > 1 and _indices_are_sorted(indices):
             # Sorted path. The native walk kernel handles native dtypes; the
             # NumPy boundary-partition pipeline below it survives only as
             # the non-native (big-endian host) fallback. Its design, kept
@@ -1020,7 +1065,7 @@ class ColStoreReader:
         n = indices.shape[0]
         if n <= 1:
             return None
-        if bool(np.all(indices[1:] >= indices[:-1])):
+        if _indices_are_sorted(indices):
             return None  # sorted: per-column path is already load-bound
         n_records = int(self._record_starts_bytes.shape[0])
         if n_records > np.iinfo(np.int32).max:
