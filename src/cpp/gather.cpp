@@ -95,6 +95,26 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
 // and produces the same vectorized loop as a direct ``T* output[i] =
 // T* source[i]`` body. T is one of the unsigned integer types (uint8_t/16_t/
 // 32_t/64_t); the bytes copied are agnostic to the user-facing dtype kind.
+namespace {
+
+// Alignment-safe typed load from the file mmap. Record bodies are packed
+// with no inter-column padding, so a column's start is naturally aligned
+// only if every preceding column's byte count happens to be a multiple of
+// its alignment -- e.g. an odd-length int8 column followed by a float64
+// column produces 8-byte loads at odd addresses. Dereferencing a misaligned
+// T* is undefined behavior in C++ (even though x86 tolerates it); a
+// fixed-size memcpy is the standards-correct unaligned load and compiles to
+// the identical mov on x86. Outputs are library-allocated NumPy arrays and
+// therefore aligned; only source loads need this.
+template <typename T>
+inline T load_unaligned(const std::uint8_t* address) {
+  T value;
+  std::memcpy(&value, address, sizeof(T));
+  return value;
+}
+
+}  // namespace
+
 template <typename T>
 void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                           const std::int64_t* COLSTORE_RESTRICT indices,
@@ -102,7 +122,8 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                           std::ptrdiff_t n_indices,
                           int thread_cap,
                           std::ptrdiff_t prefetch_distance) {
-  const T* src = reinterpret_cast<const T*>(base);
+  // Byte-based addressing: ``base`` may not be aligned for T (see
+  // load_unaligned). The prefetch below only forms addresses, never loads.
   T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -113,9 +134,9 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      COLSTORE_PREFETCH(&src[indices[i + prefetch_distance]]);
+      COLSTORE_PREFETCH(base + indices[i + prefetch_distance] * static_cast<std::ptrdiff_t>(sizeof(T)));
     }
-    dst[i] = src[indices[i]];
+    dst[i] = load_unaligned<T>(base + indices[i] * static_cast<std::ptrdiff_t>(sizeof(T)));
   }
 }
 
@@ -144,7 +165,7 @@ void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
       COLSTORE_PREFETCH(base + byte_offsets[i + prefetch_distance]);
     }
-    dst[i] = *reinterpret_cast<const T*>(base + byte_offsets[i]);
+    dst[i] = load_unaligned<T>(base + byte_offsets[i]);
   }
 }
 
@@ -328,7 +349,7 @@ void gather_multirecord_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     const std::int64_t off = record_starts_bytes[r] +
                              col_prefix_bytes * n_rows_per_record[r] +
                              (idx - record_starts_rows[r]) * itemsize;
-    dst[i] = *reinterpret_cast<const T*>(base + off);
+    dst[i] = load_unaligned<T>(base + off);
   }
 }
 
@@ -391,7 +412,7 @@ void gather_multirecord_bins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     const std::int64_t off = record_starts_bytes[r] +
                              col_prefix_bytes * n_rows_per_record[r] +
                              (idx - record_starts_rows[r]) * itemsize;
-    dst[i] = *reinterpret_cast<const T*>(base + off);
+    dst[i] = load_unaligned<T>(base + off);
   }
 }
 
@@ -450,7 +471,7 @@ void gather_multirecord_withbins_typed(const std::uint8_t* COLSTORE_RESTRICT bas
     const std::int64_t off = record_starts_bytes[r] +
                              col_prefix_bytes * n_rows_per_record[r] +
                              (idx - record_starts_rows[r]) * itemsize;
-    dst[i] = *reinterpret_cast<const T*>(base + off);
+    dst[i] = load_unaligned<T>(base + off);
   }
 }
 
