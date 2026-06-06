@@ -310,13 +310,14 @@ def write_counters(file: IO[bytes], n_records: int, committed_rows: int) -> None
     file.write(_pack_counters(n_records, committed_rows))
 
 
-def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None:
-    """Write a 32-byte record header to ``file`` at its current position.
+def record_header_bytes(record_index: int, n_rows: int) -> bytes:
+    """Serialize one 32-byte record header.
 
     The header CRC32 covers the first 28 bytes (everything but the CRC slot);
     a corrupt header is detected on read even if only the in-place fields
-    were tampered with. Used by :func:`write_dataset` for the single-record
-    write path and by :class:`ColStoreWriter` for the multi-record case.
+    were tampered with. Exposed separately from :func:`write_record_header`
+    so the streaming writer can place the header into a vectored write
+    alongside the record body instead of issuing a separate ``write()``.
     """
     header_prefix = struct.pack(
         "<4sqqq",
@@ -326,8 +327,17 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
         0,  # reserved
     )
     crc = zlib.crc32(header_prefix) & 0xFFFFFFFF
-    file.write(header_prefix)
-    file.write(struct.pack("<I", crc))
+    return header_prefix + struct.pack("<I", crc)
+
+
+def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None:
+    """Write a 32-byte record header to ``file`` at its current position.
+
+    Used by :func:`write_dataset` for the single-record write path and as
+    the no-``writev`` fallback in :class:`ColStoreWriter`. See
+    :func:`record_header_bytes` for the layout.
+    """
+    file.write(record_header_bytes(record_index, n_rows))
 
 
 def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
