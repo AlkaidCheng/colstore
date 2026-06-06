@@ -49,6 +49,13 @@ namespace colstore {
 // the sweet spot on current x86 hardware for scattered memory loads.
 constexpr std::ptrdiff_t DEFAULT_PREFETCH_DISTANCE = 8;
 
+// Prefetch-distance semantics, shared by all gather kernels: values > 0
+// prefetch that many iterations ahead; 0 (or negative) disables software
+// prefetching entirely, which can win when the source is cache-resident
+// and the prefetch instructions are pure overhead. The extern "C" wrappers
+// forward the caller's value unchanged; "use the default" is resolved at
+// the Cython layer so this constant has exactly one authoritative home.
+
 // Below this many indices, the OpenMP fork/join cost outweighs the gather
 // work, so the kernel runs serially regardless of cap.
 constexpr std::ptrdiff_t PARALLEL_THRESHOLD = 1 << 18;  // 262144
@@ -141,36 +148,44 @@ extern "C" {
 void colstore_gather_indexed_1(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap);
+                               std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_indexed_2(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap);
+                               std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_indexed_4(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap);
+                               std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_indexed_8(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap);
+                               std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 
 void colstore_gather_bytes_1(const std::uint8_t* base,
                              const std::int64_t* byte_offsets,
                              std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap);
+                             std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_bytes_2(const std::uint8_t* base,
                              const std::int64_t* byte_offsets,
                              std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap);
+                             std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_bytes_4(const std::uint8_t* base,
                              const std::int64_t* byte_offsets,
                              std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap);
+                             std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_bytes_8(const std::uint8_t* base,
                              const std::int64_t* byte_offsets,
                              std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap);
+                             std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 
 // Contiguous multi-record range copy (size-agnostic; one memcpy per record).
 // See colstore::copy_multirecord_range for the addressing contract.
@@ -194,7 +209,8 @@ void colstore_gather_multirecord_1(const std::uint8_t* base,
                                    const std::int64_t* record_starts_bytes,
                                    const std::int64_t* n_rows_per_record,
                                    std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap);
+                                   std::int64_t col_prefix_bytes, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_multirecord_2(const std::uint8_t* base,
                                    const std::int64_t* indices,
                                    std::uint8_t* output, std::ptrdiff_t n,
@@ -202,7 +218,8 @@ void colstore_gather_multirecord_2(const std::uint8_t* base,
                                    const std::int64_t* record_starts_bytes,
                                    const std::int64_t* n_rows_per_record,
                                    std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap);
+                                   std::int64_t col_prefix_bytes, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_multirecord_4(const std::uint8_t* base,
                                    const std::int64_t* indices,
                                    std::uint8_t* output, std::ptrdiff_t n,
@@ -210,7 +227,8 @@ void colstore_gather_multirecord_4(const std::uint8_t* base,
                                    const std::int64_t* record_starts_bytes,
                                    const std::int64_t* n_rows_per_record,
                                    std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap);
+                                   std::int64_t col_prefix_bytes, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 void colstore_gather_multirecord_8(const std::uint8_t* base,
                                    const std::int64_t* indices,
                                    std::uint8_t* output, std::ptrdiff_t n,
@@ -218,7 +236,8 @@ void colstore_gather_multirecord_8(const std::uint8_t* base,
                                    const std::int64_t* record_starts_bytes,
                                    const std::int64_t* n_rows_per_record,
                                    std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap);
+                                   std::int64_t col_prefix_bytes, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
 
 // Returns the OpenMP thread cap that gathers will use, or 1 if OpenMP is
 // not compiled in. Exposed for diagnostics.

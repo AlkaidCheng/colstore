@@ -268,9 +268,9 @@ def test_dispatcher_always_uses_cpp_kernel_when_compatible(monkeypatch):
     cpp_calls: list[int] = []
     real_gather_into = _gather.gather_into
 
-    def spy(source, indices, output, thread_cap):
+    def spy(source, indices, output, thread_cap, prefetch_distance=-1):
         cpp_calls.append(len(indices))
-        return real_gather_into(source, indices, output, thread_cap)
+        return real_gather_into(source, indices, output, thread_cap, prefetch_distance)
 
     monkeypatch.setattr(_gather, "gather_into", spy)
 

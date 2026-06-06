@@ -652,6 +652,7 @@ class ColStoreReader:
         n_rows_per_record = self._n_rows_per_record
         output = np.empty(n, dtype=native_dtype)
         effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+
         # Sortedness check is O(K) but ~100x faster than a searchsorted at
         # K=200K, so the early exit is essentially free in the unsorted case.
         if n > 1 and bool(np.all(indices[1:] >= indices[:-1])):
@@ -696,7 +697,13 @@ class ColStoreReader:
                 )
                 np.multiply(indices[lo:hi], itemsize, out=byte_offsets[lo:hi])
                 np.add(byte_offsets[lo:hi], base, out=byte_offsets[lo:hi])
-            _cpp_module.gather_bytes(self._file_mmap, byte_offsets, output, effective_cap)
+            _cpp_module.gather_bytes(
+                self._file_mmap,
+                byte_offsets,
+                output,
+                effective_cap,
+                config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=True),
+            )
         elif _dtype_is_native(disk_dtype):
             # Unsorted (or n == 1), native byte order: fused native gather.
             # The kernel bins each index to its record with a branchless
@@ -713,6 +720,7 @@ class ColStoreReader:
                 n_rows_per_record,
                 int(col_prefix),
                 effective_cap,
+                config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
             )
         else:
             # Unsorted, non-native byte order (big-endian host). The fused
@@ -726,7 +734,13 @@ class ColStoreReader:
                 + col_prefix * n_rows_per_record[record_id]
                 + within_record * itemsize
             )
-            _cpp_module.gather_bytes(self._file_mmap, byte_offsets, output, effective_cap)
+            _cpp_module.gather_bytes(
+                self._file_mmap,
+                byte_offsets,
+                output,
+                effective_cap,
+                config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
+            )
 
         return output
 
