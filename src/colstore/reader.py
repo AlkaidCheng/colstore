@@ -699,6 +699,27 @@ class ColStoreReader:
             # This path already avoids the big temporaries and runs ~4-11x
             # faster than the unsorted path (measured), so it is left as-is;
             # the fused native kernel below targets the unsorted case.
+            if _dtype_is_native(disk_dtype):
+                # Native byte order: linear-walk kernel. Each thread
+                # binary-searches the record of its chunk's first index, then
+                # advances the record cursor monotonically -- O(K + R) total,
+                # offsets in registers, OpenMP across index chunks. The
+                # boundary-partition pipeline below is kept only for
+                # non-native hosts: its per-record Python loop measures
+                # 79-97% of the sorted path at R >= 10^4 records, and the
+                # partition, loop, and byte_offsets array all disappear here.
+                _cpp_module.gather_multirecord_sorted(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    record_starts_rows,
+                    record_starts_bytes,
+                    n_rows_per_record,
+                    int(col_prefix),
+                    effective_cap,
+                    config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=True),
+                )
+                return output.astype(native_dtype, copy=False)
             crossings = np.searchsorted(indices, record_starts_rows, side="left")
             byte_offsets = np.empty(n, dtype=np.int64)
             for r in range(crossings.shape[0] - 1):
