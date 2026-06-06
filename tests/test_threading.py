@@ -124,6 +124,34 @@ def test_cache_roundtrip_and_fingerprint_invalidation(tmp_path, monkeypatch):
     assert autotune.load_cached_cap() is None
 
 
+def test_clear_cached_cap_removes_file_and_resets_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    original = config.get_gather_thread_cap()
+    try:
+        autotune._write_cache(5, {1: 1.0, 5: 2.0})
+        config.set_gather_thread_cap(5)
+        assert autotune.clear_cached_cap() is True
+        assert autotune.load_cached_cap() is None
+        # In-process cap returns to the static hardware default.
+        assert config.get_gather_thread_cap() == config._default_gather_thread_cap()
+        # Idempotent.
+        assert autotune.clear_cached_cap() is False
+    finally:
+        config.set_gather_thread_cap(original)
+
+
+def test_clear_cached_cap_can_keep_in_process_value(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    original = config.get_gather_thread_cap()
+    try:
+        autotune._write_cache(3, {1: 1.0, 3: 2.0})
+        config.set_gather_thread_cap(3)
+        assert autotune.clear_cached_cap(reset_in_process=False) is True
+        assert config.get_gather_thread_cap() == 3
+    finally:
+        config.set_gather_thread_cap(original)
+
+
 def test_apply_cached_cap_if_present(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     original = config.get_gather_thread_cap()

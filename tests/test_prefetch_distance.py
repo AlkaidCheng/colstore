@@ -207,3 +207,43 @@ def test_calibrate_prefetch_picks_persists_and_applies(_clean_auto_state, monkey
     config.set_prefetch_distance("auto")
     resolved = config.resolve_prefetch_distance(1, indices_sorted=False)
     assert resolved == table["resident_unsorted"]
+
+
+# ---- Cache clearing -------------------------------------------------------
+
+
+def test_clear_cached_prefetch_removes_file_and_resets_auto(_clean_auto_state):
+    table = {r: 8 for r in autotune._PREFETCH_REGIMES}
+    autotune._write_prefetch_cache(table, {r: {8: 1.0} for r in table})
+    config._set_auto_prefetch_table(table)
+    config.set_prefetch_distance("auto")
+    assert autotune._prefetch_cache_path().exists()
+
+    assert autotune.clear_cached_prefetch() is True
+    assert not autotune._prefetch_cache_path().exists()
+    # In-process effect: "auto" immediately falls back to the compiled default.
+    resolved = config.resolve_prefetch_distance(1, indices_sorted=False)
+    assert resolved == config._DEFAULT_PREFETCH_DISTANCE
+    # Idempotent: clearing again reports nothing removed and stays quiet.
+    assert autotune.clear_cached_prefetch() is False
+
+
+def test_clear_cached_prefetch_can_keep_in_process_table(_clean_auto_state):
+    table = {r: 16 for r in autotune._PREFETCH_REGIMES}
+    autotune._write_prefetch_cache(table, {})
+    config._set_auto_prefetch_table(table)
+    config.set_prefetch_distance("auto")
+
+    assert autotune.clear_cached_prefetch(reset_in_process=False) is True
+    # The live table survives until the process restarts.
+    assert config.resolve_prefetch_distance(1, indices_sorted=False) == 16
+
+
+def test_clear_calibration_reports_both_caches(_clean_auto_state):
+    autotune._write_prefetch_cache({r: 8 for r in autotune._PREFETCH_REGIMES}, {})
+    autotune._write_cache(4, {1: 1.0, 4: 2.0})
+    result = autotune.clear_calibration()
+    assert result == {"threads": True, "prefetch": True}
+    assert autotune.load_cached_cap() is None
+    assert autotune.load_cached_prefetch() is None
+    assert autotune.clear_calibration() == {"threads": False, "prefetch": False}

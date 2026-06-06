@@ -452,3 +452,63 @@ def calibrate_prefetch(
     if persist:
         _write_prefetch_cache(table, timings)
     return table
+
+
+# ---- Calibration cache management ----------------------------------------
+def _remove_cache_file(path: Path) -> bool:
+    """Delete one cache file; return whether it existed.
+
+    A missing file is the success case for "clear" (idempotent), so it
+    returns ``False`` rather than raising. Real failures (e.g. permissions)
+    propagate -- silently failing to clear would leave the user believing
+    stale calibration is gone when it is not.
+    """
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def clear_cached_cap(*, reset_in_process: bool = True) -> bool:
+    """Remove this machine's cached thread-cap calibration.
+
+    Deletes ``threads.json`` if present. With ``reset_in_process`` (the
+    default) the live cap is also reset to the static hardware default, so
+    the running process behaves as if calibration had never happened; pass
+    ``False`` to clear only the persisted cache and keep the current cap
+    (e.g. when it was set manually after calibrating). Returns whether a
+    cache file was removed. Idempotent.
+    """
+    removed = _remove_cache_file(_cache_path())
+    if reset_in_process:
+        config.set_gather_thread_cap(config._default_gather_thread_cap())
+    return removed
+
+
+def clear_cached_prefetch(*, reset_in_process: bool = True) -> bool:
+    """Remove this machine's cached prefetch-distance calibration.
+
+    Deletes ``prefetch.json`` if present. With ``reset_in_process`` (the
+    default) the in-process ``"auto"`` table is also dropped, so subsequent
+    gathers fall back to the compiled default distance immediately rather
+    than at the next interpreter start. Returns whether a cache file was
+    removed. Idempotent.
+    """
+    removed = _remove_cache_file(_prefetch_cache_path())
+    if reset_in_process:
+        config._set_auto_prefetch_table(None)
+    return removed
+
+
+def clear_calibration(*, reset_in_process: bool = True) -> dict[str, bool]:
+    """Remove all cached calibration for this machine (cap and prefetch).
+
+    Returns ``{"threads": removed, "prefetch": removed}`` indicating which
+    cache files existed. See :func:`clear_cached_cap` and
+    :func:`clear_cached_prefetch` for the ``reset_in_process`` semantics.
+    """
+    return {
+        "threads": clear_cached_cap(reset_in_process=reset_in_process),
+        "prefetch": clear_cached_prefetch(reset_in_process=reset_in_process),
+    }
