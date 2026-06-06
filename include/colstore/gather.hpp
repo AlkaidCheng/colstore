@@ -196,6 +196,31 @@ void gather_multirecord_sorted_typed(const std::uint8_t* base,
                                      int thread_cap = 0,
                                      std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Strided multi-record range gather: ``output[i] = column_value(start + i*step)``
+// for ``i`` in ``[0, n_out)``. The row stream is arithmetic, so no index array
+// exists at all -- the kernel synthesizes each row in a register. Like the
+// sorted kernel, each OpenMP thread binary-searches the record of its chunk's
+// first row, then advances the record cursor monotonically (forward for
+// ``step > 0``, backward for ``step < 0``) -- O(n_out + R) total work, no
+// ``np.arange`` materialization, no sortedness check, no index-array memory
+// traffic. ``step`` must be non-zero (the Cython entry validates); the caller
+// guarantees every visited row ``start + i*step`` is in
+// ``[0, record_starts_rows[n_records])`` (the reader derives ``start``/``stop``
+// from ``slice.indices``, which clamps). Caller guarantees native byte order.
+template <typename T>
+void gather_multirecord_strided_typed(const std::uint8_t* base,
+                                      std::uint8_t* output,
+                                      std::int64_t start,
+                                      std::int64_t step,
+                                      std::ptrdiff_t n_out,
+                                      const std::int64_t* record_starts_rows,
+                                      const std::int64_t* record_starts_bytes,
+                                      const std::int64_t* n_rows_per_record,
+                                      std::int64_t n_records,
+                                      std::int64_t col_prefix_bytes,
+                                      int thread_cap = 0,
+                                      std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -320,6 +345,36 @@ void colstore_gather_multirecord_sorted_4(
 void colstore_gather_multirecord_sorted_8(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+
+// Strided range walk; see gather_multirecord_strided_typed.
+void colstore_gather_multirecord_strided_1(
+    const std::uint8_t* base, std::uint8_t* output,
+    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
+    const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_strided_2(
+    const std::uint8_t* base, std::uint8_t* output,
+    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
+    const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_strided_4(
+    const std::uint8_t* base, std::uint8_t* output,
+    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
+    const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_strided_8(
+    const std::uint8_t* base, std::uint8_t* output,
+    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
+    const std::int64_t* record_starts_rows,
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
     std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
     std::ptrdiff_t prefetch_distance);

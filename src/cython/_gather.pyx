@@ -109,6 +109,22 @@ cdef extern from "colstore/gather.hpp" nogil:
         const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
         int, ptrdiff_t)
+    void colstore_gather_multirecord_strided_1(
+        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_strided_2(
+        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_strided_4(
+        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
+    void colstore_gather_multirecord_strided_8(
+        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
     int colstore_max_threads()
 
 
@@ -581,6 +597,84 @@ def gather_multirecord_sorted(cnp.ndarray source, cnp.ndarray indices,
             colstore_gather_multirecord_sorted_8(base, indices_ptr, output_ptr, n,
                                                  rsr, rsb, nrr, n_records,
                                                  col_prefix_bytes, thread_cap, pd)
+    else:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
+                               long long start, long long stop, long long step,
+                               cnp.ndarray record_starts_rows,
+                               cnp.ndarray record_starts_bytes,
+                               cnp.ndarray n_rows_per_record,
+                               long long col_prefix_bytes, int thread_cap=0,
+                               Py_ssize_t prefetch_distance=-1):
+    """Strided multi-record range gather: rows ``start, start+step, ...``.
+
+    Reads the rows of Python ``slice(start, stop, step)`` semantics for one
+    column without ever materializing an index array -- the row stream is
+    synthesized arithmetically inside the kernel, which walks the record
+    cursor monotonically (forward for ``step > 0``, backward for
+    ``step < 0``). ``step`` must be non-zero and ``output`` must have exactly
+    ``len(range(start, stop, step))`` elements. The caller guarantees every
+    visited row is in range (the reader derives the triple from
+    ``slice.indices``, which clamps) and that the dtype is in native byte
+    order (raw typed loads cannot byteswap). Other parameters and errors
+    match :func:`gather_multirecord`.
+    """
+    if (output.ndim != 1 or record_starts_rows.ndim != 1
+            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
+        raise ValueError("output and index arrays must be 1D.")
+    if step == 0:
+        raise ValueError("step must be non-zero.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+    cdef ptrdiff_t n = len(range(start, stop, step))
+    if output.shape[0] != n:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match the slice length {n}."
+        )
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    if itemsize == 1:
+        with nogil:
+            colstore_gather_multirecord_strided_1(base, output_ptr, start, step, n,
+                                                  rsr, rsb, nrr, n_records,
+                                                  col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 2:
+        with nogil:
+            colstore_gather_multirecord_strided_2(base, output_ptr, start, step, n,
+                                                  rsr, rsb, nrr, n_records,
+                                                  col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 4:
+        with nogil:
+            colstore_gather_multirecord_strided_4(base, output_ptr, start, step, n,
+                                                  rsr, rsb, nrr, n_records,
+                                                  col_prefix_bytes, thread_cap, pd)
+    elif itemsize == 8:
+        with nogil:
+            colstore_gather_multirecord_strided_8(base, output_ptr, start, step, n,
+                                                  rsr, rsb, nrr, n_records,
+                                                  col_prefix_bytes, thread_cap, pd)
     else:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
