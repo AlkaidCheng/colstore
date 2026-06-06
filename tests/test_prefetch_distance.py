@@ -190,7 +190,7 @@ def test_calibrate_prefetch_picks_persists_and_applies(_clean_auto_state, monkey
     monkeypatch.setattr(autotune, "llc_bytes", lambda: 4 * 1024 * 1024)
     monkeypatch.setattr(autotune, "_PREFETCH_CANDIDATES", (0, 8, 32))
     monkeypatch.setattr(autotune, "_PREFETCH_CALIB_N_INDICES", 100_000)
-    monkeypatch.setattr(autotune, "_PREFETCH_CALIB_WARMUP_ROUNDS", 0)
+    monkeypatch.setattr(autotune, "_CALIB_WARMUP_ROUNDS", 0)
 
     import warnings
 

@@ -171,10 +171,10 @@ def test_calibrate_picks_and_caches_a_cap(tmp_path, monkeypatch):
     # Shrink the synthetic workload so the test is fast.
     monkeypatch.setattr(autotune, "_CALIB_SOURCE_ROWS", 1_000_000)
     monkeypatch.setattr(autotune, "_CALIB_N_INDICES", 200_000)
-    monkeypatch.setattr(autotune, "_CALIB_REPEATS", 2)
+    monkeypatch.setattr(autotune, "_CALIB_WARMUP_ROUNDS", 0)
     original = config.get_gather_thread_cap()
     try:
-        chosen = autotune.calibrate(persist=True)
+        chosen = autotune.calibrate(persist=True, rounds=2)
         assert chosen >= 1
         assert config.get_gather_thread_cap() == chosen
         assert autotune.load_cached_cap() == chosen

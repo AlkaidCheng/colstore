@@ -30,6 +30,7 @@ import json
 import os
 import platform
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,17 @@ _CANDIDATE_THREADS = (1, 2, 4, 8, 16)
 # (above the kernel's serial threshold) and to exercise memory bandwidth.
 _CALIB_SOURCE_ROWS = 50_000_000
 _CALIB_N_INDICES = 4_000_000
-_CALIB_REPEATS = 5
+
+# Timing rounds shared by every calibration target. Each round measures every
+# candidate once (interleaved), so slow drift in background load -- the
+# dominant noise source on shared nodes -- biases all candidates equally
+# instead of penalizing whichever candidate happened to be measured during a
+# spike. The per-candidate statistic is the median over rounds, which stays
+# honest when no quiet window ever occurs. The first rounds are warmup and
+# discarded. Individual targets may override the count via their ``rounds``
+# parameter.
+_CALIB_ROUNDS = 10
+_CALIB_WARMUP_ROUNDS = 2
 
 # A thread count counts as "good enough" if it reaches this fraction of the
 # best observed throughput. We then pick the *smallest* such count, since
@@ -125,31 +136,88 @@ def _write_cache(thread_cap: int, measurements: dict[int, float]) -> None:
         pass
 
 
-def _measure_cap(
-    source: np.ndarray,
-    indices: np.ndarray,
-    output: np.ndarray,
-    cap: int,
-    repeats: int,
-) -> float:
-    """Return best-of-N throughput in GB/s of output for a given thread cap."""
-    from . import _gather  # type: ignore[attr-defined]
+def _interleaved_samples_ms(
+    candidates: Sequence[int],
+    time_once: Callable[[int], float],
+    rounds: int,
+) -> dict[int, list[float]]:
+    """Time every candidate once per round; return kept samples in ms.
 
-    best_wall = float("inf")
-    for _ in range(repeats):
-        start = time.perf_counter()
-        _gather.gather(source, indices, output, cap)
-        best_wall = min(best_wall, time.perf_counter() - start)
-    output_bytes = output.nbytes
-    return output_bytes / max(best_wall, 1e-12) / 1e9
+    ``time_once(candidate)`` runs one measurement and returns seconds. The
+    first :data:`_CALIB_WARMUP_ROUNDS` rounds are discarded. Shared by all
+    calibration targets so they inherit the same drift-resistant methodology;
+    see the note on :data:`_CALIB_ROUNDS`.
+    """
+    kept: dict[int, list[float]] = {c: [] for c in candidates}
+    for round_index in range(_CALIB_WARMUP_ROUNDS + rounds):
+        for candidate in candidates:
+            elapsed = time_once(candidate)
+            if round_index >= _CALIB_WARMUP_ROUNDS:
+                kept[candidate].append(elapsed * 1e3)
+    return kept
 
 
-def calibrate(*, persist: bool = True, verbose: bool = False) -> int:
+def _median_ms(samples: dict[int, list[float]]) -> dict[int, float]:
+    return {c: float(np.median(ts)) for c, ts in samples.items()}
+
+
+def _pick_knee(times_ms: dict[int, float]) -> int:
+    """Smallest candidate within the knee tolerance of the best time.
+
+    Used for thread caps (smallest cap within 95% of best throughput --
+    equivalent in the time domain) and for prefetch distances (smallest
+    distance, letting 0 = disabled win ties). Fewer threads and fewer
+    outstanding prefetches both mean less pressure on the shared memory
+    subsystem at equal speed.
+    """
+    best = min(times_ms.values())
+    return min(c for c, t in times_ms.items() if best / t >= _KNEE_TOLERANCE)
+
+
+def _half_picks(samples: dict[int, list[float]]) -> tuple[int, int] | None:
+    """Knee picks recomputed from the two halves of the rounds, or ``None``.
+
+    A disagreement between the halves is the stability diagnostic shared by
+    all calibration targets: it usually means the machine is busy. ``None``
+    when there are too few rounds to split.
+    """
+    n_rounds = len(next(iter(samples.values())))
+    half = n_rounds // 2
+    if half == 0:
+        return None
+    pick_a = _pick_knee({c: float(np.median(ts[:half])) for c, ts in samples.items()})
+    pick_b = _pick_knee({c: float(np.median(ts[half:])) for c, ts in samples.items()})
+    return pick_a, pick_b
+
+
+def _warn_if_unstable(
+    label: str, samples: dict[int, list[float]], times_ms: dict[int, float]
+) -> None:
+    halves = _half_picks(samples)
+    if halves is None or halves[0] == halves[1]:
+        return
+    pick_a, pick_b = halves
+    spread = abs(times_ms[pick_a] - times_ms[pick_b]) / min(times_ms[pick_a], times_ms[pick_b])
+    if spread > 1.0 - _KNEE_TOLERANCE:
+        import warnings
+
+        warnings.warn(
+            f"calibration for '{label}' is unstable (half-picks {pick_a} vs "
+            f"{pick_b}); the machine may be busy -- prefer a dedicated compute "
+            f"node or raise rounds=.",
+            stacklevel=3,
+        )
+
+
+def calibrate(*, persist: bool = True, verbose: bool = False, rounds: int = _CALIB_ROUNDS) -> int:
     """Measure and select a near-optimal gather thread cap for this machine.
 
-    Sweeps a range of thread counts on a synthetic scatter, picks the smallest
-    count within :data:`_KNEE_TOLERANCE` of the best throughput, applies it via
+    Sweeps a range of thread counts on a synthetic scatter -- every candidate
+    timed once per round, interleaved, with the median over ``rounds`` rounds
+    as the statistic (see :data:`_CALIB_ROUNDS`) -- picks the smallest count
+    within :data:`_KNEE_TOLERANCE` of the best throughput, applies it via
     :func:`colstore.config.set_gather_thread_cap`, and (by default) caches it.
+    A half-vs-half pick disagreement emits a stability warning.
 
     Requires the compiled C++ extension; raises :class:`RuntimeError` if it is
     unavailable. Returns the chosen cap.
@@ -176,22 +244,29 @@ def calibrate(*, persist: bool = True, verbose: bool = False) -> int:
 
     _gather.gather(source, indices, output, 1)
 
-    measurements: dict[int, float] = {}
-    for cap in candidates:
-        gbps = _measure_cap(source, indices, output, cap, _CALIB_REPEATS)
-        measurements[cap] = gbps
-        if verbose:
-            print(f"  cap={cap:>3}: {gbps:6.2f} GB/s")
+    def _time_once(cap: int) -> float:
+        start = time.perf_counter()
+        _gather.gather(source, indices, output, cap)
+        return time.perf_counter() - start
 
-    best_gbps = max(measurements.values())
-    threshold = best_gbps * _KNEE_TOLERANCE
-    chosen = min(cap for cap, gbps in measurements.items() if gbps >= threshold)
+    samples = _interleaved_samples_ms(candidates, _time_once, rounds)
+    times_ms = _median_ms(samples)
+    measurements = {cap: output.nbytes / (t / 1e3) / 1e9 for cap, t in times_ms.items()}
+    chosen = _pick_knee(times_ms)
+    if verbose:
+        for cap in candidates:
+            print(f"  cap={cap:>3}: {measurements[cap]:6.2f} GB/s")
+        halves = _half_picks(samples)
+        suffix = f" (halves: {halves[0]} / {halves[1]})" if halves else ""
+        print(
+            f"Selected gather thread cap: {chosen} "
+            f"(best {max(measurements.values()):.2f} GB/s){suffix}"
+        )
+    _warn_if_unstable("threads", samples, times_ms)
 
     config.set_gather_thread_cap(chosen)
     if persist:
         _write_cache(chosen, measurements)
-    if verbose:
-        print(f"Selected gather thread cap: {chosen} (best {best_gbps:.2f} GB/s)")
     return chosen
 
 
@@ -246,21 +321,6 @@ _PREFETCH_CALIB_RESIDENT_FRACTION = 0.5
 _PREFETCH_CALIB_DRAM_MULTIPLE = 4
 _PREFETCH_CALIB_DRAM_CAP_BYTES = 1 << 30
 _PREFETCH_CALIB_N_INDICES = 1_000_000
-
-# Timing rounds per regime. Each round measures every candidate distance once
-# (interleaved), so slow drift in background load -- the dominant noise source
-# on shared nodes -- biases all candidates equally instead of penalizing
-# whichever distance happened to be measured during a spike. The per-distance
-# statistic is the median over rounds, which stays honest when no quiet
-# window ever occurs. The first rounds are warmup and discarded.
-_PREFETCH_CALIB_ROUNDS = 7
-_PREFETCH_CALIB_WARMUP_ROUNDS = 2
-
-# Same knee rule as the thread cap, but over distances: prefer the *smallest*
-# distance within tolerance of the best throughput. Fewer outstanding
-# prefetches means less pressure on the shared memory subsystem, and it lets
-# 0 (disabled) win whenever prefetching buys nothing.
-_PREFETCH_KNEE_TOLERANCE = 0.95
 
 _LLC_FALLBACK_BYTES = 32 * 1024 * 1024
 
@@ -340,55 +400,19 @@ def _write_prefetch_cache(table: dict[str, int], timings_ms: dict[str, dict[int,
         pass
 
 
-def _pick_knee(times_ms: dict[int, float]) -> int:
-    """Smallest distance within the knee tolerance of the best time."""
-    best = min(times_ms.values())
-    return min(d for d, t in times_ms.items() if best / t >= _PREFETCH_KNEE_TOLERANCE)
-
-
-def _sweep_regime_interleaved(
-    source: np.ndarray,
-    indices: np.ndarray,
-    output: np.ndarray,
-    cap: int,
-    rounds: int,
-) -> dict[int, list[float]]:
-    """Time every candidate distance once per round, ``rounds`` kept rounds.
-
-    Interleaving is the point: consecutive per-distance repeats would let a
-    background-load spike penalize one distance specifically; round-robin
-    spreads drift evenly across all candidates.
-    """
-    from . import _gather  # type: ignore[attr-defined]
-
-    kept: dict[int, list[float]] = {d: [] for d in _PREFETCH_CANDIDATES}
-    for round_index in range(_PREFETCH_CALIB_WARMUP_ROUNDS + rounds):
-        for distance in _PREFETCH_CANDIDATES:
-            start = time.perf_counter()
-            _gather.gather(source, indices, output, cap, distance)
-            elapsed = time.perf_counter() - start
-            if round_index >= _PREFETCH_CALIB_WARMUP_ROUNDS:
-                kept[distance].append(elapsed * 1e3)
-    return kept
-
-
 def calibrate_prefetch(
-    *, persist: bool = True, verbose: bool = False, rounds: int = _PREFETCH_CALIB_ROUNDS
+    *, persist: bool = True, verbose: bool = False, rounds: int = _CALIB_ROUNDS
 ) -> dict[str, int]:
     """Measure per-regime prefetch distances for this machine.
 
     For each of the four regimes, sweeps :data:`_PREFETCH_CANDIDATES` on a
     synthetic gather at the *configured* thread cap (run :func:`calibrate`
-    first so the cap reflects this host). Every distance is timed once per
-    round, interleaved; the per-distance statistic is the median over
-    ``rounds`` rounds, and the pick is the smallest distance within
-    :data:`_PREFETCH_KNEE_TOLERANCE` of the best. Applies the table to
-    ``"auto"`` resolution in-process, optionally persists it, and returns it.
-
-    As a stability diagnostic, the pick is recomputed from the first and
-    second halves of the rounds separately; a disagreement is reported via
-    :mod:`warnings` (and printed when ``verbose``), which usually means the
-    machine is busy -- prefer a dedicated compute node, or raise ``rounds``.
+    first so the cap reflects this host), using the shared interleaved-median
+    methodology and stability diagnostic (see :data:`_CALIB_ROUNDS`). The
+    pick is the smallest distance within :data:`_KNEE_TOLERANCE` of the best,
+    letting 0 (disabled) win whenever prefetching buys nothing. Applies the
+    table to ``"auto"`` resolution in-process, optionally persists it, and
+    returns it.
 
     Requires the compiled C++ extension; raises :class:`RuntimeError` if it
     is unavailable.
@@ -400,6 +424,7 @@ def calibrate_prefetch(
             "Prefetch calibration requires the compiled C++ gather extension, "
             "which is not available in this build."
         )
+    from . import _gather  # type: ignore[attr-defined]
 
     llc = llc_bytes()
     resident_rows = max(1 << 20, int(llc * _PREFETCH_CALIB_RESIDENT_FRACTION) // 8)
@@ -420,30 +445,27 @@ def calibrate_prefetch(
         ):
             regime = f"{size_name}_{order_name}"
             output = np.empty(n_idx, dtype=np.float64)
-            samples = _sweep_regime_interleaved(source, indices, output, cap, rounds)
-            regime_times = {d: float(np.median(ts)) for d, ts in samples.items()}
+
+            def _time_once(
+                distance: int,
+                src: np.ndarray = source,
+                idx: np.ndarray = indices,
+                out: np.ndarray = output,
+            ) -> float:
+                start = time.perf_counter()
+                _gather.gather(src, idx, out, cap, distance)
+                return time.perf_counter() - start
+
+            samples = _interleaved_samples_ms(_PREFETCH_CANDIDATES, _time_once, rounds)
+            regime_times = _median_ms(samples)
             chosen = _pick_knee(regime_times)
-            # Stability diagnostic: picks from the two halves of the rounds.
-            half = rounds // 2
-            pick_a = _pick_knee({d: float(np.median(ts[:half])) for d, ts in samples.items()})
-            pick_b = _pick_knee({d: float(np.median(ts[half:])) for d, ts in samples.items()})
             if verbose:
                 for distance in _PREFETCH_CANDIDATES:
                     print(f"  {regime:<18} d={distance:>3}: {regime_times[distance]:8.3f} ms")
-                print(f"  {regime:<18} -> d={chosen} (halves: d={pick_a} / d={pick_b})")
-            if pick_a != pick_b:
-                time_a = regime_times[pick_a]
-                time_b = regime_times[pick_b]
-                spread = abs(time_a - time_b) / min(time_a, time_b)
-                if spread > 1.0 - _PREFETCH_KNEE_TOLERANCE:
-                    import warnings
-
-                    warnings.warn(
-                        f"prefetch calibration for regime '{regime}' is unstable "
-                        f"(half-picks d={pick_a} vs d={pick_b}); the machine may be "
-                        f"busy -- prefer a dedicated compute node or raise rounds=.",
-                        stacklevel=2,
-                    )
+                halves = _half_picks(samples)
+                suffix = f" (halves: d={halves[0]} / d={halves[1]})" if halves else ""
+                print(f"  {regime:<18} -> d={chosen}{suffix}")
+            _warn_if_unstable(f"prefetch:{regime}", samples, regime_times)
             table[regime] = chosen
             timings[regime] = regime_times
         del source
