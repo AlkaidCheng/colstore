@@ -137,6 +137,44 @@ void gather_multirecord_typed(const std::uint8_t* base,
                               int thread_cap = 0,
                               std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Variant of gather_multirecord_typed that additionally records each index's
+// record bin (int32) so subsequent columns sharing the same index set can
+// skip the binary search entirely. The binning is 87-93% of the fused
+// kernel's cost on the deployment hardware, and it is identical across
+// columns of one read -- computing it once and reusing it is the
+// multi-column win. ``bins`` must have length ``n_indices``; requires
+// ``n_records <= INT32_MAX`` (the caller guards).
+template <typename T>
+void gather_multirecord_bins_typed(const std::uint8_t* base,
+                                   const std::int64_t* indices,
+                                   std::uint8_t* output,
+                                   std::int32_t* bins,
+                                   std::ptrdiff_t n_indices,
+                                   const std::int64_t* record_starts_rows,
+                                   const std::int64_t* record_starts_bytes,
+                                   const std::int64_t* n_rows_per_record,
+                                   std::int64_t n_records,
+                                   std::int64_t col_prefix_bytes,
+                                   int thread_cap = 0,
+                                   std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
+// Companion: gather one column using record bins computed by
+// gather_multirecord_bins_typed for the same ``indices``. No search per
+// element -- the bin is a sequential int32 read -- and the prefetch
+// look-ahead also reads its bin instead of re-searching.
+template <typename T>
+void gather_multirecord_withbins_typed(const std::uint8_t* base,
+                                       const std::int64_t* indices,
+                                       std::uint8_t* output,
+                                       const std::int32_t* bins,
+                                       std::ptrdiff_t n_indices,
+                                       const std::int64_t* record_starts_rows,
+                                       const std::int64_t* record_starts_bytes,
+                                       const std::int64_t* n_rows_per_record,
+                                       std::int64_t col_prefix_bytes,
+                                       int thread_cap = 0,
+                                       std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -238,6 +276,52 @@ void colstore_gather_multirecord_8(const std::uint8_t* base,
                                    std::int64_t n_records,
                                    std::int64_t col_prefix_bytes, int thread_cap,
                                std::ptrdiff_t prefetch_distance);
+
+// Bin-reuse pair; see gather_multirecord_bins_typed.
+void colstore_gather_multirecord_bins_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_1(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_bins_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_2(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_bins_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_4(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_bins_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+void colstore_gather_multirecord_withbins_8(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Returns the OpenMP thread cap that gathers will use, or 1 if OpenMP is
 // not compiled in. Exposed for diagnostics.
