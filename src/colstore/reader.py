@@ -71,6 +71,14 @@ def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
 _SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
 _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 
+# Record-base precompute gate for the irregular multi-column route: build a
+# per-column record_base array (an O(R) vectorized pass plus an R-element
+# allocation) only when the read is large enough to amortize it -- the
+# kernel-side saving is per element, so the ratio of indices to records is
+# the deciding quantity. Below the gate the generic withbins kernel runs
+# unchanged. The constant doubles as the benchmark's baseline seam.
+_RBASE_MIN_INDICES_PER_RECORD = 1.0
+
 
 def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     """Non-decreasing test with a cheap sampled rejection pass first.
@@ -1180,25 +1188,60 @@ class ColStoreReader:
                 for name in column_names
             }
         bins = np.empty(n, dtype=np.int32)
+        # Record-base precompute (irregular files): after the first column
+        # fills the bins, the generic withbins kernel still pays three
+        # per-record metadata loads per element. When the read is large
+        # enough to amortize the O(R) build (see the gate constant),
+        # subsequent columns instead get a per-column record_base array
+        # folding all three plus the prefix arithmetic into one scalar per
+        # record, and the per-element address becomes
+        # record_base[bins[i]] + indices[i] * itemsize.
+        use_record_base = n >= n_records * _RBASE_MIN_INDICES_PER_RECORD
+        rsr_records = self._record_starts_rows[:-1]
         for position, name in enumerate(native_names):
             output = np.empty(n, dtype=self._column_dtypes[name].newbyteorder("="))
-            kernel = (
-                _cpp_module.gather_multirecord_bins
-                if position == 0
-                else _cpp_module.gather_multirecord_withbins
-            )
-            kernel(
-                self._file_mmap,
-                indices,
-                output,
-                bins,
-                self._record_starts_rows,
-                self._record_starts_bytes,
-                self._n_rows_per_record,
-                int(self._column_prefix_bytes[name]),
-                effective_cap,
-                prefetch,
-            )
+            if position == 0:
+                _cpp_module.gather_multirecord_bins(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    bins,
+                    self._record_starts_rows,
+                    self._record_starts_bytes,
+                    self._n_rows_per_record,
+                    int(self._column_prefix_bytes[name]),
+                    effective_cap,
+                    prefetch,
+                )
+            elif use_record_base:
+                itemsize = output.dtype.itemsize
+                record_base = (
+                    self._record_starts_bytes
+                    + int(self._column_prefix_bytes[name]) * self._n_rows_per_record
+                    - rsr_records * itemsize
+                )
+                _cpp_module.gather_multirecord_withbins_rbase(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    bins,
+                    record_base,
+                    effective_cap,
+                    prefetch,
+                )
+            else:
+                _cpp_module.gather_multirecord_withbins(
+                    self._file_mmap,
+                    indices,
+                    output,
+                    bins,
+                    self._record_starts_rows,
+                    self._record_starts_bytes,
+                    self._n_rows_per_record,
+                    int(self._column_prefix_bytes[name]),
+                    effective_cap,
+                    prefetch,
+                )
             gathered[name] = output
         return {
             name: gathered[name] if name in gathered else self._gather_one(name, row_indexer)

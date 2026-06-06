@@ -299,13 +299,21 @@ def test_irregular_store_keeps_bins_route(tmp_path, monkeypatch):
     path, full, total = _write_store(tmp_path, [500, 400, 500, 500, 500])
     calls = _spy(
         monkeypatch,
-        ["gather_multirecord_uniform", "gather_multirecord_bins", "gather_multirecord_withbins"],
+        [
+            "gather_multirecord_uniform",
+            "gather_multirecord_bins",
+            "gather_multirecord_withbins",
+            "gather_multirecord_withbins_rbase",
+        ],
     )
     indices = np.random.default_rng(14).integers(0, total, 900).astype(np.int64)
     dataset = colstore.open(path)
     try:
         result = dataset[indices, ["f8", "i2"]].dict()
-        assert calls == ["gather_multirecord_bins", "gather_multirecord_withbins"]
+        # Generic bins route (not the uniform pair); the trailing column is
+        # served from the bins by the record-base variant, since the read
+        # is above the rbase size gate.
+        assert calls == ["gather_multirecord_bins", "gather_multirecord_withbins_rbase"]
         assert np.array_equal(result["f8"], full["f8"][indices])
     finally:
         dataset.close()

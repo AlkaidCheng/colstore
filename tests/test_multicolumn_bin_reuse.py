@@ -97,14 +97,21 @@ def mixed_store(tmp_path):
 
 
 def _spy_withbins(monkeypatch):
+    """Count bins-reuse kernel calls: either withbins variant qualifies.
+
+    Large reads take the record-base variant (withbins_rbase); small reads
+    keep the generic withbins kernel. The route contract these tests pin --
+    first column binned, the rest served from the bins -- holds for both.
+    """
     calls: list[int] = []
-    real = _gather.gather_multirecord_withbins
+    for name in ("gather_multirecord_withbins", "gather_multirecord_withbins_rbase"):
+        real = getattr(_gather, name)
 
-    def spy(*args, **kwargs):
-        calls.append(1)
-        return real(*args, **kwargs)
+        def spy(*args, _real=real, **kwargs):
+            calls.append(1)
+            return _real(*args, **kwargs)
 
-    monkeypatch.setattr(_gather, "gather_multirecord_withbins", spy)
+        monkeypatch.setattr(_gather, name, spy)
     return calls
 
 
