@@ -149,16 +149,32 @@ class ColumnView(_BaseView):
         """NumPy dtype of the selected column."""
         return self._store.dtypes[self._column_name]
 
-    def array(self) -> np.ndarray:
-        """Materialize as a 1D owning ndarray.
+    def array(self, copy: bool = True) -> np.ndarray:
+        """Materialize as a 1D ndarray.
+
+        Parameters
+        ----------
+        copy : bool, optional
+            ``True`` (default): an owning array, as always -- safe to mutate
+            and to use after the store is closed. ``False``: a READ-ONLY
+            zero-copy view backed by the store's open memmap. Zero-copy is
+            supported exactly when the store is single-record (e.g. produced
+            by ``colstore.compact``), the column's dtype is in native byte
+            order, and the row selector is ``None``, an int, or a slice;
+            anything else raises ``ValueError`` rather than silently
+            copying. The view holds a reference to the mapping, so it stays
+            valid even after the store is closed -- at the cost of keeping
+            the file mapped until the view is garbage-collected.
 
         Returns
         -------
         numpy.ndarray
-            Owning 1D array of the selected rows in the column's stored
-            dtype. Safe to use after the source store is closed.
+            1D array of the selected rows in the column's stored dtype.
         """
-        return self._store._gather_one(self._column_name, self._resolve_row_indexer())
+        row_indexer = self._resolve_row_indexer()
+        if not copy:
+            return self._store._view_one(self._column_name, row_indexer)
+        return self._store._gather_one(self._column_name, row_indexer)
 
 
 class TableView(_BaseView):
@@ -202,16 +218,28 @@ class TableView(_BaseView):
         """Per-column NumPy dtypes."""
         return {name: self._store.dtypes[name] for name in self._column_names}
 
-    def dict(self) -> dict[str, np.ndarray]:
+    def dict(self, copy: bool = True) -> dict[str, np.ndarray]:
         """Materialize as a dict mapping column name to 1D ndarray.
+
+        Parameters
+        ----------
+        copy : bool, optional
+            ``True`` (default): owning arrays. ``False``: READ-ONLY
+            zero-copy views backed by the store's open memmaps,
+            all-or-nothing -- see :meth:`ColumnView.array` for the exact
+            support conditions and lifetime semantics. ``recarray`` and
+            ``frame`` have no zero-copy form (both repack by construction).
 
         Returns
         -------
         dict[str, numpy.ndarray]
-            Owning arrays in selection order; each column's stored dtype is
+            Arrays in selection order; each column's stored dtype is
             preserved.
         """
-        return self._store._gather_many(self._column_names, self._resolve_row_indexer())
+        row_indexer = self._resolve_row_indexer()
+        if not copy:
+            return self._store._view_many(self._column_names, row_indexer)
+        return self._store._gather_many(self._column_names, row_indexer)
 
     def recarray(self) -> np.ndarray:
         """Materialize as a structured (record) ndarray with one field per column.
