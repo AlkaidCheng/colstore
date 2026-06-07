@@ -79,6 +79,17 @@ _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 # unchanged. The constant doubles as the benchmark's baseline seam.
 _RBASE_MIN_INDICES_PER_RECORD = 1.0
 
+# Mask-native route gate: minimum selected fraction (count_nonzero / n_rows)
+# for boolean masks to take the mask kernel on multi-record native-dtype
+# reads. Below it, the mask is lowered to indices (np.flatnonzero) and the
+# existing fancy paths run unchanged -- for sparse masks, per-column index
+# traffic (8 bytes per SELECTED element) undercuts re-reading the
+# 1-byte-per-ROW mask, and the measured crossover sits between densities
+# 0.05 (single column 1.09x, two columns 0.75x) and 0.2 (1.47-2.2x). The
+# constant doubles as the benchmark's baseline seam (set above 1.0 to
+# disable the route).
+_MASK_NATIVE_MIN_DENSITY = 0.15
+
 
 def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     """Non-decreasing test with a cheap sampled rejection pass first.
@@ -613,6 +624,15 @@ class ColStoreReader:
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
+        if (
+            isinstance(row_indexer, np.ndarray)
+            and row_indexer.dtype == np.bool_
+            and not self._is_multi_record
+        ):
+            # Single-record stores keep the flatnonzero -> fancy path: the
+            # backend parameter's documented contract governs single-record
+            # fancy reads, and lowering here preserves it exactly.
+            row_indexer = np.flatnonzero(row_indexer)
         if self._is_multi_record:
             return self._gather_one_multi_record(column_name, row_indexer, thread_cap)
         # Single-record fast path: one per-column memmap; the read is a
@@ -782,6 +802,40 @@ class ColStoreReader:
         native_dtype = disk_dtype.newbyteorder("=")
         itemsize = disk_dtype.itemsize
         col_prefix = int(self._column_prefix_bytes[column_name])
+
+        # ---- Boolean mask: mask-native kernel where it pays, else lower to
+        # indices and continue into the fancy paths below. The kernel reads
+        # the 1-byte/row mask linearly (no flatnonzero materialization, no
+        # sortedness pass, no 8-byte/element index traffic) and gets run
+        # coalescing for free from the mask bytes it scans anyway.
+        if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
+            mask = row_indexer
+            selected = int(np.count_nonzero(mask))
+            if (
+                _dtype_is_native(disk_dtype)
+                and self._n_rows > 0
+                and selected / self._n_rows >= _MASK_NATIVE_MIN_DENSITY
+            ):
+                output = np.empty(selected, dtype=disk_dtype)
+                if selected:
+                    effective_cap = (
+                        config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+                    )
+                    _cpp_module.gather_multirecord_mask(
+                        self._file_mmap,
+                        mask,
+                        output,
+                        self._record_starts_rows,
+                        self._record_starts_bytes,
+                        self._n_rows_per_record,
+                        col_prefix,
+                        effective_cap,
+                        config.resolve_prefetch_distance(
+                            self._file_mmap.nbytes, indices_sorted=True
+                        ),
+                    )
+                return output.astype(native_dtype, copy=False)
+            row_indexer = np.flatnonzero(mask)
 
         # ---- Slice / None / scalar ints all map to a contiguous row range.
         # Handle them with one path that avoids the gather kernel entirely.
@@ -1146,6 +1200,13 @@ class ColStoreReader:
         comes from the column pool (the regime where that is most efficient);
         with few columns each kernel still gets a meaningful share of the cap.
         """
+        mask_route = self._gather_many_mask(column_names, row_indexer)
+        if mask_route is not None:
+            return mask_route
+        if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
+            # Mask route declined (single-record store, sparse mask, or
+            # too few native columns): lower once and use the fancy paths.
+            row_indexer = np.flatnonzero(row_indexer)
         bin_reuse = self._gather_many_bin_reuse(column_names, row_indexer)
         if bin_reuse is not None:
             return bin_reuse
@@ -1160,6 +1221,61 @@ class ColStoreReader:
                 for name in column_names
             }
             return {name: futures[name].result() for name in column_names}
+
+    def _gather_many_mask(
+        self, column_names: list[str], row_indexer: Any
+    ) -> dict[str, NDArray[Any]] | None:
+        """Mask-native route for multi-column boolean-mask reads, or ``None``.
+
+        Taken when the store is multi-record, the selector is a boolean
+        mask at or above the density gate (``_MASK_NATIVE_MIN_DENSITY``),
+        and at least two requested columns are native-byte-order. Each
+        native column runs the mask kernel (sequential columns at the full
+        OMP cap, like the bins route) -- the selected count is computed
+        once, no int64 index array exists for the native columns, and the
+        kernel coalesces mask runs into memcpys. Non-native columns (and
+        the decline cases) fall back to lowered indices in the caller.
+        """
+        if not (isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_):
+            return None
+        if not self._is_multi_record or self._n_rows == 0:
+            return None
+        mask = row_indexer
+        selected = int(np.count_nonzero(mask))
+        if selected / self._n_rows < _MASK_NATIVE_MIN_DENSITY:
+            return None
+        native_names = [
+            name for name in column_names if _dtype_is_native(self._column_dtypes[name])
+        ]
+        if len(native_names) < 2:
+            return None
+        from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+        effective_cap = config.get_gather_thread_cap()
+        prefetch = config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=True)
+        gathered: dict[str, NDArray[Any]] = {}
+        for name in native_names:
+            disk_dtype = self._column_dtypes[name]
+            output = np.empty(selected, dtype=disk_dtype)
+            if selected:
+                _cpp_module.gather_multirecord_mask(
+                    self._file_mmap,
+                    mask,
+                    output,
+                    self._record_starts_rows,
+                    self._record_starts_bytes,
+                    self._n_rows_per_record,
+                    int(self._column_prefix_bytes[name]),
+                    effective_cap,
+                    prefetch,
+                )
+            gathered[name] = output.astype(disk_dtype.newbyteorder("="), copy=False)
+        if len(gathered) < len(column_names):
+            indices = np.flatnonzero(mask)
+            for name in column_names:
+                if name not in gathered:
+                    gathered[name] = self._gather_one(name, indices)
+        return {name: gathered[name] for name in column_names}
 
     def _gather_many_bin_reuse(
         self, column_names: list[str], row_indexer: Any
