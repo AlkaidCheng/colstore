@@ -14,7 +14,9 @@ future calibration is one ``_Target`` entry -- no command logic changes.
 
 Registry order is execution order and encodes dependencies: the thread cap is
 calibrated before the prefetch distances because the prefetch sweep is
-measured at the configured cap. Selecting a subset never reorders execution.
+measured at the configured cap, and the mask-density gate runs last because
+its sweep reads through routes whose timing depends on both. Selecting a
+subset never reorders execution.
 Rerunning simply remeasures and overwrites the caches. Calibration should run
 on the hardware the jobs run on; on a cluster, prefer a dedicated compute
 node over a shared login node.
@@ -74,6 +76,17 @@ _TARGETS: tuple[_Target, ...] = (
         load=lambda: autotune.load_cached_prefetch(),
         default_rounds=lambda: autotune._CALIB_ROUNDS,
     ),
+    _Target(
+        name="mask-density",
+        summary="boolean-mask density gate",
+        run=lambda rounds, persist: autotune.calibrate_mask_density(
+            rounds=rounds, persist=persist, verbose=True
+        ),
+        clear=lambda: autotune.clear_cached_mask_density(),
+        cache_path=lambda: autotune._mask_density_cache_path(),
+        load=lambda: autotune.load_cached_mask_density(),
+        default_rounds=lambda: autotune._CALIB_ROUNDS,
+    ),
 )
 
 
@@ -124,7 +137,8 @@ def _configure_run_parser(parser: argparse.ArgumentParser) -> None:
 
 
 def _rounds_for(target: _Target, args: argparse.Namespace) -> int:
-    per_target = getattr(args, f"{target.name}_rounds")
+    # argparse normalizes hyphens in option names to underscores.
+    per_target = getattr(args, f"{target.name.replace('-', '_')}_rounds")
     if per_target is not None:
         return int(per_target)
     if args.rounds is not None:

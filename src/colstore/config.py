@@ -195,6 +195,89 @@ def resolve_prefetch_distance(source_nbytes: int, indices_sorted: bool) -> int:
     return _auto_prefetch_table[f"{size_name}_{order_name}"]
 
 
+_MASK_DENSITY_GATE_DEFAULT = 0.0
+_mask_density_gate: float | Literal["auto"] = "auto"
+_auto_mask_density: float | None = None
+_auto_mask_density_loaded = False
+
+
+def get_mask_density_gate() -> float | Literal["auto"]:
+    """Return the boolean-mask-native density-gate setting.
+
+    Either an explicit selected-fraction threshold or ``"auto"`` (the
+    default), in which case mask reads resolve the gate per call via
+    :func:`resolve_mask_density_gate`.
+    """
+    return _mask_density_gate
+
+
+def set_mask_density_gate(gate: float | Literal["auto"]) -> None:
+    """Set the density gate for the boolean-mask-native read route.
+
+    Multi-record boolean-mask reads with native dtypes take the mask-native
+    kernel when the mask's selected fraction (``count_nonzero / n_rows``)
+    is at or above the gate; below it they lower to ``np.flatnonzero`` and
+    the fancy paths, because for sparse masks per-column index traffic
+    (8 bytes per *selected* element) undercuts re-reading the
+    1-byte-per-*row* mask. The crossover is hardware-dependent.
+
+    ``"auto"`` (the default) uses the per-host gate measured by
+    :func:`colstore.autotune.calibrate_mask_density` (the ``mask-density``
+    target of ``colstore calibrate``), falling back to the compiled default
+    of 0.0 -- route on at every density -- without a calibration cache:
+    on multi-threaded hosts the lowered route's serial flatnonzero loses
+    at every measured density, so the route is on by default and
+    calibration exists to *raise* (or disable) the gate on hosts where
+    sparse masks lose, e.g. single-core environments. An explicit float
+    >= 0 overrides both; values above 1.0 disable the route entirely (no
+    selected fraction can reach them), which is also the benchmark
+    baseline toggle.
+    """
+    global _mask_density_gate
+    if gate == "auto":
+        _mask_density_gate = "auto"
+        return
+    if isinstance(gate, bool) or not isinstance(gate, (int, float)) or gate < 0.0:
+        raise ValueError(f"mask_density_gate must be 'auto' or a float >= 0, got {gate!r}.")
+    _mask_density_gate = float(gate)
+
+
+def _set_auto_mask_density(gate: float | None) -> None:
+    """Install (or clear) the calibrated gate used by ``"auto"``.
+
+    Called by :func:`colstore.autotune.calibrate_mask_density` so a fresh
+    calibration takes effect in-process without re-reading the cache file.
+    Passing ``None`` resets to the not-yet-loaded state (used by cache
+    clearing and tests).
+    """
+    global _auto_mask_density, _auto_mask_density_loaded
+    _auto_mask_density = gate
+    _auto_mask_density_loaded = gate is not None
+
+
+def resolve_mask_density_gate() -> float:
+    """Return the effective mask-density gate for one read.
+
+    With an explicit setting this is a passthrough. With ``"auto"`` the
+    calibrated per-host gate is used when its cache exists and its hardware
+    fingerprint matches this machine (loaded lazily once per process);
+    otherwise the compiled default applies.
+    """
+    setting = _mask_density_gate
+    if setting != "auto":
+        return setting
+
+    global _auto_mask_density, _auto_mask_density_loaded
+    if not _auto_mask_density_loaded:
+        from . import autotune  # deferred: autotune imports config at module level
+
+        _auto_mask_density = autotune.load_cached_mask_density()
+        _auto_mask_density_loaded = True
+    if _auto_mask_density is None:
+        return _MASK_DENSITY_GATE_DEFAULT
+    return _auto_mask_density
+
+
 def get_default_madvise() -> MadviseOption | None:
     """Return the default ``madvise`` hint applied to new ``ColStoreReader`` opens."""
     return _default_madvise

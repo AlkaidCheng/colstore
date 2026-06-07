@@ -589,7 +589,9 @@ Below-gate rows measure the fallback against itself (the route declines
 there by design), confirming the parity floor; the gate's placement rests
 on dev-container data showing the forced kernel at 0.4–0.6x at density
 0.01. The whole-record-cut win peaks at R=10⁵ (8.6–9.1x), where runs span
-entire records.
+entire records. (Superseded by per-host calibration: the node sweep later
+measured the mask route winning at every grid density, and the compiled
+default gate is now 0.0 — see the open-items register.)
 
 ---
 
@@ -664,10 +666,17 @@ caches.
 * **Single-record mask-native route** — single-record masks deliberately
   keep the flatnonzero + fancy path to preserve the `backend` parameter's
   contract; numpy's own boolean indexing leaves little headroom there.
-* **Mask-density gate refinement** — the 0.15 gate is set from dev-container
-  crossover data with a node-confirmed parity floor below it; a node sweep
-  with the gate forced open would establish whether 0.05–0.1 can be
-  claimed.
+* **Mask-density gate refinement** — closed twice over: the gate is a
+  per-host calibration target (`colstore calibrate mask-density`) that
+  sweeps the density grid through both routes and places the gate at the
+  measured crossover (1.05x win margin, monotonicity required; no win
+  disables the route), and the deployment-node calibration found the mask
+  route winning at every grid density (1.35–3.2x, gate 0.01,
+  halves-stable) — the lowered route's serial flatnonzero loses to the
+  kernel's parallel passes even sparse. The compiled default is therefore
+  0.0 (route on at every density); calibration exists to raise or disable
+  the gate on hosts where sparse masks lose, e.g. single-core
+  environments.
 * **NUMA follow-ups** — benchmark `auto` vs `local` policies for
   single-threaded readers; writer-side interleave scope on real Lustre
   paths.
