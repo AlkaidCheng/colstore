@@ -1296,8 +1296,11 @@ class ColStoreReader:
         thread counts). The sortedness check and prefetch resolution are also
         amortized across the read instead of per column.
 
-        Sorted selectors stay on the per-column boundary-partition path
-        (already load-bound; nothing to amortize), and non-native columns of
+        Sorted selectors decline the route and run the native sorted walk
+        kernel per column (``gather_multirecord_sorted``): the walk is
+        already load-bound at every record count, and its record binning is
+        an O(K + R) cursor advance rather than a per-element search, so
+        there is nothing to amortize across columns. Non-native columns of
         a mixed read fall back to :meth:`_gather_one` individually.
         """
         if not self._is_multi_record or len(column_names) <= 1:
