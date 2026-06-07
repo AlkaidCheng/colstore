@@ -19,12 +19,15 @@ import pytest
 
 import colstore
 from colstore import _gather
-from colstore import reader as reader_mod
+from colstore import config as config_mod
 from colstore.kernels import cpp_available
 
 pytestmark = pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
 
-GATE = reader_mod._MASK_NATIVE_MIN_DENSITY
+# Routing tests pin an explicit nonzero gate so both sides of the route
+# are exercised regardless of the compiled default (0.0: always native)
+# or any calibration cache on the dev machine.
+GATE = 0.15
 
 
 def _layout(n_rows_per_record, dtype, col_prefix_rows=0, seed=0):
@@ -157,6 +160,7 @@ SPIED = ["gather_multirecord_mask", "gather_multirecord_sorted", "gather_multire
 
 def test_dense_mask_routes_to_mask_kernel(irregular_store, monkeypatch):
     path, full, total = irregular_store
+    monkeypatch.setattr(config_mod, "_mask_density_gate", GATE)
     calls = _spy(monkeypatch, SPIED)
     mask = np.random.default_rng(62).random(total) < 0.5
     dataset = colstore.open(path)
@@ -174,6 +178,7 @@ def test_dense_mask_routes_to_mask_kernel(irregular_store, monkeypatch):
 
 def test_sparse_mask_lowers_to_indices(irregular_store, monkeypatch):
     path, full, total = irregular_store
+    monkeypatch.setattr(config_mod, "_mask_density_gate", GATE)
     calls = _spy(monkeypatch, SPIED)
     mask = np.zeros(total, dtype=bool)
     mask[:: int(2 / GATE)] = True  # density well below the gate
@@ -192,7 +197,7 @@ def test_gate_seam_parity(irregular_store, monkeypatch):
     dataset = colstore.open(path)
     try:
         via_mask = dataset[mask, ["f8", "i2"]].dict()
-        monkeypatch.setattr(reader_mod, "_MASK_NATIVE_MIN_DENSITY", 2.0)
+        monkeypatch.setattr(config_mod, "_mask_density_gate", 2.0)
         via_indices = dataset[mask, ["f8", "i2"]].dict()
     finally:
         dataset.close()

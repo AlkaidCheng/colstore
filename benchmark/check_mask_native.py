@@ -21,8 +21,9 @@ Run on the deployment hardware (quiet compute node), both thread regimes:
     python benchmark/check_mask_native.py
     OMP_NUM_THREADS=8 python benchmark/check_mask_native.py
 
-The density sweep brackets the gate (0.15, set from the measured
-crossover) so node data can confirm or move it.
+The density sweep brackets the gate so host data can confirm or move it;
+the gate is per-host calibrated (`colstore calibrate mask-density`), with a
+compiled default of 0.0 (route on at every density) when uncalibrated.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
-from colstore import reader as reader_mod
+from colstore import config
 
 LAYOUTS = ((1_000, 20_000), (10_000, 2_000), (100_000, 200))
 DENSITIES = (0.9, 0.5, 0.2, 0.1, 0.05, 0.01)
@@ -47,12 +48,12 @@ RECORD_CUT_FRACTION = 0.3
 
 class _force_lowered:
     def __enter__(self):
-        self._original = reader_mod._MASK_NATIVE_MIN_DENSITY
-        reader_mod._MASK_NATIVE_MIN_DENSITY = 2.0
+        self._original = config.get_mask_density_gate()
+        config.set_mask_density_gate(2.0)  # no selected fraction reaches it
         return self
 
     def __exit__(self, *exc):
-        reader_mod._MASK_NATIVE_MIN_DENSITY = self._original
+        config.set_mask_density_gate(self._original)
         return False
 
 

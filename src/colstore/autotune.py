@@ -476,6 +476,204 @@ def calibrate_prefetch(
     return table
 
 
+# ---- Mask-density gate calibration ----------------------------------------
+# The boolean-mask-native route's density gate (see
+# config.set_mask_density_gate) sits at a hardware-dependent crossover:
+# below it, per-column int64 index traffic (8 bytes per SELECTED element)
+# undercuts re-reading the 1-byte-per-ROW mask. The compiled default (0.15)
+# is conservative; this calibration measures the crossover where jobs run.
+_MASK_DENSITY_GRID = (0.02, 0.05, 0.08, 0.12, 0.15, 0.2, 0.3)
+_MASK_DENSITY_WIN_RATIO = 1.05
+_MASK_CALIB_N_RECORDS = 2_000
+_MASK_CALIB_ROWS_PER_RECORD = 2_500
+_MASK_CALIB_N_COLUMNS = 2  # the binding (multi-column) shape; single-column
+#                            reads then run slightly conservative
+
+
+def _mask_density_cache_path() -> Path:
+    return _cache_dir() / "mask_density.json"
+
+
+def _pick_mask_density_gate(ratios: dict[float, float]) -> float:
+    """Crossover rule for the mask-density gate.
+
+    ``ratios[d]`` is lowered-time / mask-route-time at grid density ``d``
+    (>1 means the mask route wins). The gate is placed at the midpoint
+    between the smallest grid density that wins by
+    :data:`_MASK_DENSITY_WIN_RATIO` *at itself and every denser grid point*
+    and the previous grid point (0 for the first) -- the monotonicity
+    requirement keeps one noisy near-parity cell from dragging the gate
+    into a regime the data does not support. If no density qualifies, the
+    gate is 1.0: only all-true masks (a pure run-coalesced copy) take the
+    route, effectively disabling it on hosts where it never pays.
+    """
+    grid = sorted(ratios)
+    for position, density in enumerate(grid):
+        if all(ratios[d] >= _MASK_DENSITY_WIN_RATIO for d in grid[position:]):
+            lower = grid[position - 1] if position > 0 else 0.0
+            return (lower + density) / 2.0
+    return 1.0
+
+
+def load_cached_mask_density() -> float | None:
+    """Return the cached mask-density gate, or ``None`` if absent.
+
+    Never raises; a missing, unreadable, foreign-fingerprint, or malformed
+    cache returns ``None`` so resolution falls back to the compiled
+    default gate.
+    """
+    try:
+        with open(_mask_density_cache_path(), encoding="utf-8") as handle:
+            payload: dict[str, Any] = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if payload.get("fingerprint") != _hardware_fingerprint():
+        return None
+    gate = payload.get("gate")
+    if not isinstance(gate, (int, float)) or isinstance(gate, bool) or not 0.0 <= gate <= 1.0:
+        return None
+    return float(gate)
+
+
+def _write_mask_density_cache(
+    gate: float,
+    ratios: dict[float, float],
+    timings_ms: dict[float, dict[str, float]],
+) -> None:
+    payload = {
+        "fingerprint": _hardware_fingerprint(),
+        "gate": gate,
+        "ratios": {str(d): r for d, r in ratios.items()},
+        "timings_ms": {str(d): t for d, t in timings_ms.items()},
+        "thread_cap_used": config.get_gather_thread_cap(),
+        "calibration_version": _CALIBRATION_VERSION,
+        "timestamp": time.time(),
+    }
+    path = _mask_density_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def calibrate_mask_density(
+    *, persist: bool = True, verbose: bool = False, rounds: int = _CALIB_ROUNDS
+) -> float:
+    """Measure this machine's mask-density gate; apply, persist, return it.
+
+    Builds a synthetic multi-record store (two f8 columns -- the binding
+    multi-column shape; single-column reads then run slightly
+    conservative), and for each grid density times the mask-native route
+    against the lowered (flatnonzero) route through the public read API at
+    the *configured* thread cap, toggling via the gate setting itself.
+    Cells are interleaved round-robin per the shared methodology (see
+    :data:`_CALIB_ROUNDS`), with medians as the statistic; the gate is
+    placed by :func:`_pick_mask_density_gate` and a half-vs-half pick
+    disagreement warns, mirroring the other targets' stability diagnostic.
+
+    Requires the compiled C++ extension; raises :class:`RuntimeError` if it
+    is unavailable.
+    """
+    import tempfile
+
+    from .kernels import cpp_available
+
+    if not cpp_available():
+        raise RuntimeError(
+            "Mask-density calibration requires the compiled C++ gather "
+            "extension, which is not available in this build."
+        )
+    from .api import create as _create
+    from .api import open as _open
+
+    rng = np.random.default_rng(0)
+    rows = _MASK_CALIB_ROWS_PER_RECORD
+    total = _MASK_CALIB_N_RECORDS * rows
+    columns = [f"c{i}" for i in range(_MASK_CALIB_N_COLUMNS)]
+    densities = list(_MASK_DENSITY_GRID)
+    masks = {d: rng.random(total) < d for d in densities}
+    # Cell encoding for the shared integer-keyed helpers: cell 2*i is the
+    # mask route at densities[i], cell 2*i + 1 the lowered route.
+    cells = list(range(2 * len(densities)))
+
+    saved_gate = config.get_mask_density_gate()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "mask_density_calib.cstore"
+        data = {name: rng.standard_normal(total) for name in columns}
+        with _create(path) as writer:
+            for r in range(_MASK_CALIB_N_RECORDS):
+                writer.write({k: v[r * rows : (r + 1) * rows] for k, v in data.items()})
+        del data
+        dataset = _open(path)
+        try:
+
+            def _time_once(cell: int) -> float:
+                density = densities[cell // 2]
+                config.set_mask_density_gate(0.0 if cell % 2 == 0 else 2.0)
+                start = time.perf_counter()
+                dataset[masks[density], columns].dict()
+                return time.perf_counter() - start
+
+            samples = _interleaved_samples_ms(cells, _time_once, rounds)
+        finally:
+            config.set_mask_density_gate(saved_gate)
+            dataset.close()
+
+    times = _median_ms(samples)
+
+    def _ratios_from(times_ms: dict[int, float]) -> dict[float, float]:
+        return {d: times_ms[2 * i + 1] / times_ms[2 * i] for i, d in enumerate(densities)}
+
+    ratios = _ratios_from(times)
+    gate = _pick_mask_density_gate(ratios)
+
+    n_rounds = len(next(iter(samples.values())))
+    half = n_rounds // 2
+    halves: tuple[float, float] | None = None
+    if half:
+        gate_a = _pick_mask_density_gate(
+            _ratios_from({c: float(np.median(ts[:half])) for c, ts in samples.items()})
+        )
+        gate_b = _pick_mask_density_gate(
+            _ratios_from({c: float(np.median(ts[half:])) for c, ts in samples.items()})
+        )
+        halves = (gate_a, gate_b)
+        if gate_a != gate_b:
+            import warnings
+
+            warnings.warn(
+                f"calibration for 'mask-density' is unstable (half-picks "
+                f"{gate_a} vs {gate_b}); the machine may be busy -- prefer a "
+                f"dedicated compute node or raise rounds=.",
+                stacklevel=2,
+            )
+    if verbose:
+        for i, density in enumerate(densities):
+            print(
+                f"  density {density:<5} mask {times[2 * i]:8.2f} ms   "
+                f"lowered {times[2 * i + 1]:8.2f} ms   ratio {ratios[density]:5.2f}"
+            )
+        suffix = f" (halves: {halves[0]} / {halves[1]})" if halves else ""
+        state = "route disabled on this host" if gate == 1.0 else "gate"
+        print(f"  -> {state} = {gate}{suffix}")
+
+    config._set_auto_mask_density(gate)
+    if persist:
+        _write_mask_density_cache(
+            gate,
+            ratios,
+            {
+                d: {"mask": times[2 * i], "lowered": times[2 * i + 1]}
+                for i, d in enumerate(densities)
+            },
+        )
+    return gate
+
+
 # ---- Calibration cache management ----------------------------------------
 def _remove_cache_file(path: Path) -> bool:
     """Delete one cache file; return whether it existed.
@@ -523,14 +721,29 @@ def clear_cached_prefetch(*, reset_in_process: bool = True) -> bool:
     return removed
 
 
-def clear_calibration(*, reset_in_process: bool = True) -> dict[str, bool]:
-    """Remove all cached calibration for this machine (cap and prefetch).
+def clear_cached_mask_density(*, reset_in_process: bool = True) -> bool:
+    """Remove this machine's cached mask-density-gate calibration.
 
-    Returns ``{"threads": removed, "prefetch": removed}`` indicating which
-    cache files existed. See :func:`clear_cached_cap` and
-    :func:`clear_cached_prefetch` for the ``reset_in_process`` semantics.
+    Deletes ``mask_density.json`` if present. With ``reset_in_process`` (the
+    default) the in-process calibrated gate is also dropped, so subsequent
+    mask reads fall back to the compiled default gate immediately. Returns
+    whether a cache file was removed. Idempotent.
+    """
+    removed = _remove_cache_file(_mask_density_cache_path())
+    if reset_in_process:
+        config._set_auto_mask_density(None)
+    return removed
+
+
+def clear_calibration(*, reset_in_process: bool = True) -> dict[str, bool]:
+    """Remove all cached calibration for this machine.
+
+    Returns ``{"threads": removed, "prefetch": removed, "mask-density":
+    removed}`` indicating which cache files existed. See the per-target
+    ``clear_cached_*`` functions for the ``reset_in_process`` semantics.
     """
     return {
         "threads": clear_cached_cap(reset_in_process=reset_in_process),
         "prefetch": clear_cached_prefetch(reset_in_process=reset_in_process),
+        "mask-density": clear_cached_mask_density(reset_in_process=reset_in_process),
     }

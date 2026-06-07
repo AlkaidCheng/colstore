@@ -31,8 +31,13 @@ def _recorded_runs(monkeypatch):
         calls.append(("prefetch", kwargs))
         return {r: 0 for r in autotune._PREFETCH_REGIMES}
 
+    def fake_mask_density(**kwargs):
+        calls.append(("mask-density", kwargs))
+        return 0.085
+
     monkeypatch.setattr(autotune, "calibrate", fake_threads)
     monkeypatch.setattr(autotune, "calibrate_prefetch", fake_prefetch)
+    monkeypatch.setattr(autotune, "calibrate_mask_density", fake_mask_density)
     return calls
 
 
@@ -45,14 +50,19 @@ def test_run_default_runs_all_targets_in_dependency_order(
 ):
     assert cli.main(argv_prefix) == 0
     # Registry order: the prefetch sweep runs at the configured cap, so the
-    # cap must be calibrated first.
-    assert [name for name, _ in _recorded_runs] == ["threads", "prefetch"]
+    # cap must be calibrated first; the mask-density sweep reads through
+    # routes whose timing depends on both, so it runs last.
+    assert [name for name, _ in _recorded_runs] == ["threads", "prefetch", "mask-density"]
     assert "-> 4" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(
     ("targets", "expected"),
-    [(["threads"], ["threads"]), (["prefetch"], ["prefetch"])],
+    [
+        (["threads"], ["threads"]),
+        (["prefetch"], ["prefetch"]),
+        (["mask-density"], ["mask-density"]),
+    ],
 )
 def test_run_target_selection(_isolated_cache, _recorded_runs, targets, expected):
     assert cli.main(["calibration", "run", *targets]) == 0
@@ -62,8 +72,8 @@ def test_run_target_selection(_isolated_cache, _recorded_runs, targets, expected
 def test_run_subset_never_reorders_execution(_isolated_cache, _recorded_runs):
     # Targets given out of order on the command line still execute in
     # registry (dependency) order.
-    assert cli.main(["calibration", "run", "prefetch", "threads"]) == 0
-    assert [name for name, _ in _recorded_runs] == ["threads", "prefetch"]
+    assert cli.main(["calibration", "run", "mask-density", "prefetch", "threads"]) == 0
+    assert [name for name, _ in _recorded_runs] == ["threads", "prefetch", "mask-density"]
 
 
 def test_run_rejects_unknown_target(_isolated_cache):
@@ -78,10 +88,19 @@ def test_run_global_rounds_applies_to_all_targets(_isolated_cache, _recorded_run
 
 
 def test_run_per_target_rounds_overrides_global(_isolated_cache, _recorded_runs):
-    argv = ["calibration", "run", "--rounds", "11", "--prefetch-rounds", "13"]
+    argv = [
+        "calibration",
+        "run",
+        "--rounds",
+        "11",
+        "--prefetch-rounds",
+        "13",
+        "--mask-density-rounds",
+        "7",
+    ]
     assert cli.main(argv) == 0
     rounds = {name: kwargs["rounds"] for name, kwargs in _recorded_runs}
-    assert rounds == {"threads": 11, "prefetch": 13}
+    assert rounds == {"threads": 11, "prefetch": 13, "mask-density": 7}
 
 
 def test_run_default_rounds_come_from_autotune(_isolated_cache, _recorded_runs):
@@ -97,21 +116,25 @@ def test_run_no_persist_forwarded(_isolated_cache, _recorded_runs):
 # ---- calibration clear ----------------------------------------------------
 
 
-def test_clear_removes_both_caches_and_is_idempotent(_isolated_cache, capsys):
+def test_clear_removes_all_caches_and_is_idempotent(_isolated_cache, capsys):
     autotune._write_cache(4, {1: 1.0, 4: 2.0})
     autotune._write_prefetch_cache({r: 8 for r in autotune._PREFETCH_REGIMES}, {})
+    autotune._write_mask_density_cache(0.1, {}, {})
 
     assert cli.main(["calibration", "clear"]) == 0
     out = capsys.readouterr().out
     assert "threads: removed" in out
     assert "prefetch: removed" in out
+    assert "mask-density: removed" in out
     assert autotune.load_cached_cap() is None
     assert autotune.load_cached_prefetch() is None
+    assert autotune.load_cached_mask_density() is None
 
     assert cli.main(["calibration", "clear"]) == 0
     out = capsys.readouterr().out
     assert "threads: no cache present" in out
     assert "prefetch: no cache present" in out
+    assert "mask-density: no cache present" in out
 
 
 def test_clear_target_selection(_isolated_cache, capsys):
@@ -164,7 +187,7 @@ def test_registry_covers_all_subcommand_surface():
     # the full interface the subcommands render from.
     from colstore.cli import calibration
 
-    assert [t.name for t in calibration._TARGETS] == ["threads", "prefetch"]
+    assert [t.name for t in calibration._TARGETS] == ["threads", "prefetch", "mask-density"]
     for target in calibration._TARGETS:
         assert callable(target.run)
         assert callable(target.clear)

@@ -239,11 +239,17 @@ def test_clear_cached_prefetch_can_keep_in_process_table(_clean_auto_state):
     assert config.resolve_prefetch_distance(1, indices_sorted=False) == 16
 
 
-def test_clear_calibration_reports_both_caches(_clean_auto_state):
+def test_clear_calibration_reports_all_caches(_clean_auto_state):
     autotune._write_prefetch_cache({r: 8 for r in autotune._PREFETCH_REGIMES}, {})
     autotune._write_cache(4, {1: 1.0, 4: 2.0})
+    autotune._write_mask_density_cache(0.1, {}, {})
     result = autotune.clear_calibration()
-    assert result == {"threads": True, "prefetch": True}
+    assert result == {"threads": True, "prefetch": True, "mask-density": True}
     assert autotune.load_cached_cap() is None
     assert autotune.load_cached_prefetch() is None
-    assert autotune.clear_calibration() == {"threads": False, "prefetch": False}
+    assert autotune.load_cached_mask_density() is None
+    assert autotune.clear_calibration() == {
+        "threads": False,
+        "prefetch": False,
+        "mask-density": False,
+    }

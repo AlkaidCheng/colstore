@@ -79,17 +79,6 @@ _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 # unchanged. The constant doubles as the benchmark's baseline seam.
 _RBASE_MIN_INDICES_PER_RECORD = 1.0
 
-# Mask-native route gate: minimum selected fraction (count_nonzero / n_rows)
-# for boolean masks to take the mask kernel on multi-record native-dtype
-# reads. Below it, the mask is lowered to indices (np.flatnonzero) and the
-# existing fancy paths run unchanged -- for sparse masks, per-column index
-# traffic (8 bytes per SELECTED element) undercuts re-reading the
-# 1-byte-per-ROW mask, and the measured crossover sits between densities
-# 0.05 (single column 1.09x, two columns 0.75x) and 0.2 (1.47-2.2x). The
-# constant doubles as the benchmark's baseline seam (set above 1.0 to
-# disable the route).
-_MASK_NATIVE_MIN_DENSITY = 0.15
-
 
 def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     """Non-decreasing test with a cheap sampled rejection pass first.
@@ -814,7 +803,7 @@ class ColStoreReader:
             if (
                 _dtype_is_native(disk_dtype)
                 and self._n_rows > 0
-                and selected / self._n_rows >= _MASK_NATIVE_MIN_DENSITY
+                and selected / self._n_rows >= config.resolve_mask_density_gate()
             ):
                 output = np.empty(selected, dtype=disk_dtype)
                 if selected:
@@ -1228,7 +1217,8 @@ class ColStoreReader:
         """Mask-native route for multi-column boolean-mask reads, or ``None``.
 
         Taken when the store is multi-record, the selector is a boolean
-        mask at or above the density gate (``_MASK_NATIVE_MIN_DENSITY``),
+        mask at or above the density gate (``config.resolve_mask_density_gate``:
+        per-host calibrated, or the compiled default),
         and at least two requested columns are native-byte-order. Each
         native column runs the mask kernel (sequential columns at the full
         OMP cap, like the bins route) -- the selected count is computed
@@ -1242,7 +1232,7 @@ class ColStoreReader:
             return None
         mask = row_indexer
         selected = int(np.count_nonzero(mask))
-        if selected / self._n_rows < _MASK_NATIVE_MIN_DENSITY:
+        if selected / self._n_rows < config.resolve_mask_density_gate():
             return None
         native_names = [
             name for name in column_names if _dtype_is_native(self._column_dtypes[name])
