@@ -642,6 +642,65 @@ class ColStoreReader:
             source, row_indexer, native_dtype, backend=self._backend, thread_cap=thread_cap
         )
 
+    # ---- Zero-copy read path --------------------------------------------
+
+    def _view_one(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
+        """Zero-copy read of one column, or raise if a copy is unavoidable.
+
+        Returns a READ-ONLY ndarray view backed by the column's open memmap
+        -- no bytes are copied and no memory is allocated beyond the array
+        header. Supported exactly when the store is single-record (one
+        contiguous on-disk region per column; ``colstore.compact`` produces
+        these), the dtype is in native byte order (a view cannot byteswap),
+        and the selector is sliceable (``None``, an int, or a slice of any
+        step). Fancy/boolean selectors require a gather and therefore a
+        copy; multi-record logical columns are interleaved on disk and
+        cannot be viewed contiguously.
+
+        Lifetime: the view holds a reference to the underlying mapping (via
+        ``.base``), so it remains valid even after :meth:`close` -- the OS
+        releases the mapping when the last view is garbage-collected. The
+        cost of that safety is that open views keep the file mapped.
+        """
+        if self._closed:
+            raise ValueError("ColStoreReader is closed.")
+        if self._is_multi_record:
+            raise ValueError(
+                "Zero-copy reads require a single-record store: multi-record logical "
+                "columns are interleaved on disk. Collapse the store with "
+                "colstore.compact() first, or use copy=True."
+            )
+        disk_dtype = self._layout[column_name][1]
+        if not _dtype_is_native(disk_dtype):
+            raise ValueError(
+                f"Zero-copy reads require native byte order; column {column_name!r} "
+                f"has dtype {disk_dtype} (a view cannot byteswap). Use copy=True."
+            )
+        if isinstance(row_indexer, np.ndarray):
+            raise ValueError(
+                "Zero-copy reads support only contiguous/strided selectors (None, int, "
+                "or slice); fancy and boolean selectors require a gather, which copies. "
+                "Use copy=True."
+            )
+        source = self._memmaps[column_name]
+        if row_indexer is None:
+            selected = source[:]
+        elif isinstance(row_indexer, int):
+            # Length-1 view, matching the copying path's atleast_1d shape.
+            selected = source[row_indexer : row_indexer + 1]
+        elif isinstance(row_indexer, slice):
+            selected = source[row_indexer]
+        else:  # pragma: no cover - the view layer normalizes to the above
+            raise TypeError(f"Unsupported row indexer for zero-copy read: {row_indexer!r}")
+        # Re-class the np.memmap slice as a plain ndarray view: same buffer,
+        # same read-only flags (the memmap is mode="r"), but without the
+        # memmap subclass surface; ``.base`` keeps the mapping alive.
+        return selected.view(np.ndarray)
+
+    def _view_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
+        """Zero-copy :meth:`_view_one` over multiple columns (all-or-nothing)."""
+        return {name: self._view_one(name, row_indexer) for name in column_names}
+
     # ---- Multi-record read path -----------------------------------------
 
     def _detect_uniform_record_layout(self) -> tuple[int, int, int, int] | None:
@@ -1259,17 +1318,29 @@ class ColStoreReader:
     # annotation scope of earlier methods (mypy resolves annotations in
     # declaration order against the class namespace).
 
-    def dict(self) -> dict[str, NDArray[Any]]:
+    def dict(self, copy: bool = True) -> dict[str, NDArray[Any]]:
         """Materialize the whole store as a dict mapping column name to ndarray.
+
+        Parameters
+        ----------
+        copy : bool, optional
+            ``True`` (default): owning arrays. ``False``: READ-ONLY
+            zero-copy views backed by the open memmaps; supported only on
+            single-record stores (e.g. produced by :func:`colstore.compact`)
+            with native-byte-order dtypes, raising ``ValueError`` otherwise.
+            Views stay valid after :meth:`close` (they pin the mapping until
+            garbage-collected).
 
         Returns
         -------
         dict[str, numpy.ndarray]
-            Owning arrays in on-disk column order; each column's stored
-            dtype is preserved (native byte order).
+            Arrays in on-disk column order; each column's stored dtype is
+            preserved (native byte order).
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
+        if not copy:
+            return self._view_many(list(self._column_dtypes), None)
         return self._gather_many(list(self._column_dtypes), None)
 
     def recarray(self) -> NDArray[Any]:
