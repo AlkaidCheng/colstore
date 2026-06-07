@@ -185,6 +185,22 @@ cdef extern from "colstore/gather.hpp" nogil:
     void colstore_gather_multirecord_withbins_rbase_8(
         const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
         const int64_t*, int, ptrdiff_t)
+    int colstore_gather_multirecord_mask_1(
+        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
+    int colstore_gather_multirecord_mask_2(
+        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
+    int colstore_gather_multirecord_mask_4(
+        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
+    int colstore_gather_multirecord_mask_8(
+        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, ptrdiff_t)
     int colstore_max_threads()
 
 
@@ -1030,6 +1046,91 @@ def gather_multirecord_withbins_rbase(cnp.ndarray source, cnp.ndarray indices,
                                                          bins_ptr, n, rbase, thread_cap, pd)
     else:
         raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_mask(cnp.ndarray source, cnp.ndarray mask,
+                            cnp.ndarray output,
+                            cnp.ndarray record_starts_rows,
+                            cnp.ndarray record_starts_bytes,
+                            cnp.ndarray n_rows_per_record,
+                            long long col_prefix_bytes, int thread_cap=0,
+                            Py_ssize_t prefetch_distance=-1):
+    """Boolean-mask-native multi-record gather: no index materialization.
+
+    ``mask`` is a numpy bool array with one entry per row of the store
+    (length must equal ``record_starts_rows[-1]``); selected rows are
+    gathered in row order. ``output`` must be sized to exactly
+    ``np.count_nonzero(mask)`` -- the kernel re-counts internally to fix
+    per-thread offsets and raises if the caller's size disagrees, writing
+    nothing in that case. Native byte order required; other parameters and
+    errors match :func:`gather_multirecord_sorted`.
+    """
+    if mask.ndim != 1 or output.ndim != 1:
+        raise ValueError("mask and output must be 1D.")
+    if mask.dtype != np.bool_:
+        raise TypeError(f"mask must be bool; got {mask.dtype}.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+
+    _require_c_contiguous((("source", source), ("mask", mask), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+    cdef int64_t n_rows = rsr[n_records]
+    if mask.shape[0] != n_rows:
+        raise ValueError(
+            f"mask length {mask.shape[0]} does not match the store's row count {n_rows}."
+        )
+    cdef ptrdiff_t n_out = output.shape[0]
+    if n_rows == 0 or n_out == 0:
+        # Nothing to write; still verify the contract for nonzero masks.
+        if n_out == 0 and mask.shape[0] != 0 and bool(np.any(mask)):
+            raise ValueError("output length does not match the mask's selected count.")
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const uint8_t* mask_ptr = <const uint8_t*>cnp.PyArray_DATA(mask)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status = -1
+    if itemsize == 1:
+        with nogil:
+            status = colstore_gather_multirecord_mask_1(base, mask_ptr, output_ptr,
+                                                        n_rows, n_out, rsr, rsb, nrr,
+                                                        n_records, col_prefix_bytes,
+                                                        thread_cap, pd)
+    elif itemsize == 2:
+        with nogil:
+            status = colstore_gather_multirecord_mask_2(base, mask_ptr, output_ptr,
+                                                        n_rows, n_out, rsr, rsb, nrr,
+                                                        n_records, col_prefix_bytes,
+                                                        thread_cap, pd)
+    elif itemsize == 4:
+        with nogil:
+            status = colstore_gather_multirecord_mask_4(base, mask_ptr, output_ptr,
+                                                        n_rows, n_out, rsr, rsb, nrr,
+                                                        n_records, col_prefix_bytes,
+                                                        thread_cap, pd)
+    elif itemsize == 8:
+        with nogil:
+            status = colstore_gather_multirecord_mask_8(base, mask_ptr, output_ptr,
+                                                        n_rows, n_out, rsr, rsb, nrr,
+                                                        n_records, col_prefix_bytes,
+                                                        thread_cap, pd)
+    else:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+    if status != 0:
+        raise ValueError("output length does not match the mask's selected count.")
 
 
 def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,

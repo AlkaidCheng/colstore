@@ -308,6 +308,35 @@ void gather_multirecord_withbins_rbase_typed(const std::uint8_t* base,
                                              int thread_cap = 0,
                                              std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
+// Boolean-mask-native gather: reads the (uint8 0/1) mask directly instead
+// of materializing int64 indices via flatnonzero. Selector traffic drops
+// from 8 bytes per selected element (plus the flatnonzero write and the
+// sortedness pass) to 1 byte per ROW, read linearly; row order is sorted
+// by construction, so the record cursor advances monotonically like the
+// sorted walk. Runs of set bits are visible in the mask at no extra cost
+// and are served by memcpy (clipped at record boundaries); sparse spans
+// are skipped 8 mask bytes at a time. Two internal passes: a parallel
+// per-chunk popcount fixes each thread's output offset, then each thread
+// gathers its row range. Returns 0 on success, 1 if the mask's selected
+// count does not equal ``n_out`` (nothing is written in that case) --
+// the caller sizes ``output`` with np.count_nonzero and the kernel
+// verifies rather than trusting. ``mask`` has one byte per row
+// (``n_rows`` total, normalized 0/1 as numpy bool guarantees); other
+// arguments match the sorted kernel. Native byte order required.
+template <typename T>
+int gather_multirecord_mask_typed(const std::uint8_t* base,
+                                  const std::uint8_t* mask,
+                                  std::uint8_t* output,
+                                  std::int64_t n_rows,
+                                  std::ptrdiff_t n_out,
+                                  const std::int64_t* record_starts_rows,
+                                  const std::int64_t* record_starts_bytes,
+                                  const std::int64_t* n_rows_per_record,
+                                  std::int64_t n_records,
+                                  std::int64_t col_prefix_bytes,
+                                  int thread_cap = 0,
+                                  std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
+
 }  // namespace colstore
 
 // C-callable wrappers used by the Cython binding. Two families:
@@ -606,5 +635,32 @@ void colstore_gather_multirecord_withbins_rbase_8(
     int thread_cap, std::ptrdiff_t prefetch_distance);
 
 int colstore_max_threads();
+
+
+// Boolean-mask-native gather; see gather_multirecord_mask_typed.
+int colstore_gather_multirecord_mask_1(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_mask_2(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_mask_4(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_mask_8(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
 
 }  // extern "C"

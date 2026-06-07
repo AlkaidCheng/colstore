@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace colstore {
 
@@ -962,6 +963,171 @@ template void gather_multirecord_withbins_rbase_typed<std::uint64_t>(
     const std::uint8_t*, const std::int64_t*, std::uint8_t*, const std::int32_t*,
     std::ptrdiff_t, const std::int64_t*, int, std::ptrdiff_t);
 
+// Boolean-mask-native gather. Pass 1 counts each thread chunk's selected
+// rows (a vectorizable byte sum) so output offsets are exact without
+// synchronization; pass 2 walks each chunk's rows with the sorted walk's
+// record-cursor machinery, skipping unselected spans 8 mask bytes at a
+// time (a uint64 of zeros), extending runs of set bits 8 bytes at a time
+// (a uint64 of 0x01s), and serving runs of >= 32 bytes with one memcpy --
+// run detection costs nothing extra here because the mask byte is the
+// datum being scanned anyway, which is what made run coalescing
+// unprofitable on materialized int64 indices.
+namespace {
+constexpr std::int64_t MASK_RUN_COPY_MIN_BYTES = 32;
+constexpr std::uint64_t MASK_ALL_ONES = 0x0101010101010101ULL;
+
+inline std::int64_t count_mask_range(const std::uint8_t* mask, std::int64_t lo,
+                                     std::int64_t hi) {
+  std::int64_t total = 0;
+  for (std::int64_t i = lo; i < hi; ++i) {
+    total += mask[i];
+  }
+  return total;
+}
+}  // namespace
+
+template <typename T>
+int gather_multirecord_mask_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                                  const std::uint8_t* COLSTORE_RESTRICT mask,
+                                  std::uint8_t* COLSTORE_RESTRICT output,
+                                  std::int64_t n_rows,
+                                  std::ptrdiff_t n_out,
+                                  const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
+                                  const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
+                                  const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
+                                  std::int64_t n_records,
+                                  std::int64_t col_prefix_bytes,
+                                  int thread_cap,
+                                  std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  const std::int64_t len = n_records + 1;
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_rows, thread_cap);
+  const std::int64_t chunk = (n_rows + n_threads - 1) / n_threads;
+
+  // Pass 1: per-chunk selected-row counts -> exclusive prefix offsets.
+  std::vector<std::int64_t> offsets(static_cast<std::size_t>(n_threads) + 1, 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#endif
+  for (std::ptrdiff_t t = 0; t < n_threads; ++t) {
+    const std::int64_t lo = static_cast<std::int64_t>(t) * chunk;
+    const std::int64_t hi = std::min(n_rows, lo + chunk);
+    offsets[static_cast<std::size_t>(t) + 1] = (lo < hi) ? count_mask_range(mask, lo, hi) : 0;
+  }
+  for (std::ptrdiff_t t = 0; t < n_threads; ++t) {
+    offsets[static_cast<std::size_t>(t) + 1] += offsets[static_cast<std::size_t>(t)];
+  }
+  if (offsets[static_cast<std::size_t>(n_threads)] != static_cast<std::int64_t>(n_out)) {
+    return 1;  // caller-sized output disagrees with the mask; write nothing
+  }
+
+  // Pass 2, word-at-a-time. The per-element mask test is a coin flip at
+  // mid densities and mispredicts catastrophically; classifying 8 mask
+  // bytes at once makes the branches predictable in every density regime:
+  // all-zero words skip, runs of all-ones words become one memcpy, and
+  // mixed words compact branchlessly -- eight unconditional loads/stores
+  // with ``out += mask[i]``, which over-stores into slots that later
+  // selected elements overwrite. The over-store is bounded inside the
+  // thread's own output region by the quota guard: the branchless form
+  // runs only while out + 8 <= quota, and the last few words of a
+  // thread's quota take the branchy scalar form (a handful of
+  // mispredicts per THREAD, not per element).
+  const auto walk_range = [&](std::int64_t lo, std::int64_t hi, std::int64_t out,
+                              std::int64_t quota) {
+    if (lo >= hi) {
+      return;
+    }
+    std::int64_t r = bin_record(record_starts_rows, len, lo);
+    std::int64_t i = lo;
+    while (i < hi) {
+      while (i >= record_starts_rows[r + 1]) {
+        ++r;
+      }
+      const std::int64_t seg_end = std::min(hi, record_starts_rows[r + 1]);
+      const std::int64_t record_base = record_starts_bytes[r] +
+                                       col_prefix_bytes * n_rows_per_record[r] -
+                                       record_starts_rows[r] * itemsize;
+      while (i < seg_end) {
+        if (i + 8 <= seg_end) {
+          const std::uint64_t word = load_unaligned<std::uint64_t>(mask + i);
+          if (word == 0) {
+            i += 8;
+            continue;
+          }
+          if (word == MASK_ALL_ONES) {
+            std::int64_t j = i + 8;
+            while (j + 8 <= seg_end &&
+                   load_unaligned<std::uint64_t>(mask + j) == MASK_ALL_ONES) {
+              j += 8;
+            }
+            std::memcpy(dst + out, base + record_base + i * itemsize,
+                        static_cast<std::size_t>((j - i) * itemsize));
+            out += j - i;
+            i = j;
+            continue;
+          }
+          if (out + 8 <= quota) {
+            // Mixed word, branchless compaction: unconditional load/store,
+            // advance by the mask byte. Reads up to 8 in-record elements
+            // regardless of selection; transiently stores garbage into
+            // slots later overwritten by the true occupants.
+            for (int b = 0; b < 8; ++b) {
+              dst[out] = load_unaligned<T>(base + record_base + (i + b) * itemsize);
+              out += mask[i + b];
+            }
+            i += 8;
+            continue;
+          }
+        }
+        // Branchy scalar form: segment tails shorter than a word, and the
+        // final words of this thread's quota (where branchless over-store
+        // could cross into the next thread's region).
+        if (mask[i]) {
+          dst[out] = load_unaligned<T>(base + record_base + i * itemsize);
+          ++out;
+        }
+        ++i;
+      }
+    }
+    (void)prefetch_distance;  // linear walk: hardware prefetch covers it
+  };
+
+#ifdef _OPENMP
+  if (n_threads > 1) {
+#pragma omp parallel num_threads(static_cast<int>(n_threads))
+    {
+      const std::ptrdiff_t t = omp_get_thread_num();
+      const std::int64_t lo = static_cast<std::int64_t>(t) * chunk;
+      const std::int64_t hi = std::min(n_rows, lo + chunk);
+      walk_range(lo, hi, offsets[static_cast<std::size_t>(t)],
+                 offsets[static_cast<std::size_t>(t) + 1]);
+    }
+    return 0;
+  }
+#endif
+  walk_range(0, n_rows, 0, static_cast<std::int64_t>(n_out));
+  return 0;
+}
+
+template int gather_multirecord_mask_typed<std::uint8_t>(
+    const std::uint8_t*, const std::uint8_t*, std::uint8_t*, std::int64_t,
+    std::ptrdiff_t, const std::int64_t*, const std::int64_t*,
+    const std::int64_t*, std::int64_t, std::int64_t, int, std::ptrdiff_t);
+template int gather_multirecord_mask_typed<std::uint16_t>(
+    const std::uint8_t*, const std::uint8_t*, std::uint8_t*, std::int64_t,
+    std::ptrdiff_t, const std::int64_t*, const std::int64_t*,
+    const std::int64_t*, std::int64_t, std::int64_t, int, std::ptrdiff_t);
+template int gather_multirecord_mask_typed<std::uint32_t>(
+    const std::uint8_t*, const std::uint8_t*, std::uint8_t*, std::int64_t,
+    std::ptrdiff_t, const std::int64_t*, const std::int64_t*,
+    const std::int64_t*, std::int64_t, std::int64_t, int, std::ptrdiff_t);
+template int gather_multirecord_mask_typed<std::uint64_t>(
+    const std::uint8_t*, const std::uint8_t*, std::uint8_t*, std::int64_t,
+    std::ptrdiff_t, const std::int64_t*, const std::int64_t*,
+    const std::int64_t*, std::int64_t, std::int64_t, int, std::ptrdiff_t);
+
 }  // namespace colstore
 
 extern "C" {
@@ -1447,6 +1613,51 @@ void colstore_gather_multirecord_withbins_rbase_8(
     int thread_cap, std::ptrdiff_t prefetch_distance) {
   colstore::gather_multirecord_withbins_rbase_typed<std::uint64_t>(
       base, indices, output, bins, n, record_base, thread_cap, prefetch_distance);
+}
+
+
+int colstore_gather_multirecord_mask_1(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance) {
+  return colstore::gather_multirecord_mask_typed<std::uint8_t>(
+      base, mask, output, n_rows, n_out, record_starts_rows, record_starts_bytes,
+      n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
+}
+
+int colstore_gather_multirecord_mask_2(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance) {
+  return colstore::gather_multirecord_mask_typed<std::uint16_t>(
+      base, mask, output, n_rows, n_out, record_starts_rows, record_starts_bytes,
+      n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
+}
+
+int colstore_gather_multirecord_mask_4(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance) {
+  return colstore::gather_multirecord_mask_typed<std::uint32_t>(
+      base, mask, output, n_rows, n_out, record_starts_rows, record_starts_bytes,
+      n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
+}
+
+int colstore_gather_multirecord_mask_8(
+    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
+    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::ptrdiff_t prefetch_distance) {
+  return colstore::gather_multirecord_mask_typed<std::uint64_t>(
+      base, mask, output, n_rows, n_out, record_starts_rows, record_starts_bytes,
+      n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
 }
 
 int colstore_max_threads() {

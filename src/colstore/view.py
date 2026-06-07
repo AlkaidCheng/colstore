@@ -73,7 +73,13 @@ class _BaseView:
                     f"Boolean mask length {row_array.shape[0]} does not match "
                     f"n_rows {self._store.n_rows}."
                 )
-            return np.flatnonzero(row_array)
+            # Pass the mask through as-is: the reader routes multi-record
+            # native-dtype reads to the mask-native kernel (1 byte/row of
+            # selector traffic instead of materializing 8-byte indices) and
+            # falls back to np.flatnonzero + the fancy paths everywhere
+            # else, including all single-record reads (where the backend
+            # parameter's contract applies to the resulting fancy read).
+            return np.ascontiguousarray(row_array)
         if row_array.dtype.kind not in ("i", "u"):
             raise IndexError(
                 f"Row index array must be integer or boolean; got dtype {row_array.dtype}."
