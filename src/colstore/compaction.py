@@ -1,28 +1,23 @@
 """File compaction: collapse a multi-record file into a single-record file.
 
 The public entry point is :func:`colstore.compact`; this module holds the
-implementation. The work splits into two halves:
+implementation. The work splits into a *header re-emit* (magic, counters,
+manifest, padding, record header -- tens to hundreds of bytes, negligible)
+and a *byte splice* of each column's payload from every input record into
+one contiguous run in the output, which is bandwidth-bound and dominates.
 
-* A *header re-emit* that writes the output's magic, counters block, manifest,
-  padding, and record header. These are tens to hundreds of bytes total --
-  cost is negligible.
-* A *byte splice* of each column's payload from every input record into one
-  contiguous run in the output. This is bandwidth-bound and dominates the
-  runtime. We use :func:`os.sendfile` on Linux (kernel-space copy, no
-  Python-side surfacing) and :func:`shutil.copyfileobj` on other platforms.
-  macOS has ``os.sendfile`` but it requires a socket destination and so is
-  unusable for file-to-file copies; Windows has no ``os.sendfile``. The
-  platform gate is therefore ``sys.platform == "linux"``.
+The splice uses :func:`os.sendfile` on Linux (kernel-space copy) and
+:func:`shutil.copyfileobj` elsewhere: macOS's ``os.sendfile`` requires a
+socket destination and Windows has none, so the gate is
+``sys.platform == "linux"``. Memory footprint is bounded by the kernel's
+sendfile buffer on Linux and by ``shutil.COPY_BUFSIZE`` (64 KB)
+elsewhere, independent of file size.
 
-Memory footprint is bounded by the kernel's sendfile buffer on Linux and
-by ``shutil.COPY_BUFSIZE`` (64 KB) elsewhere, independent of file size.
-The output file can be many times larger than RAM.
-
-Atomicity (in-place mode): the output is written to a sibling temp file and
-moved into place with :func:`os.replace`. On any error the temp file is
-removed and the source is untouched. Concurrent writers are blocked for the
-duration via an advisory lock on the source (``fcntl.flock`` on POSIX,
-``msvcrt.locking`` on Windows; see :mod:`colstore._lock`).
+Atomicity (in-place mode): the output is written to a sibling temp file
+and moved into place with :func:`os.replace`; on any error the temp file
+is removed and the source is untouched. Concurrent writers are blocked
+for the duration via an advisory lock on the source (see
+:mod:`colstore._lock`).
 """
 
 from __future__ import annotations

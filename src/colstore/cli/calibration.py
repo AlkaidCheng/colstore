@@ -8,18 +8,15 @@ Commands::
     colstore calibrate [TARGET ...]          top-level alias for ``run``
 
 Calibration targets are declared once in :data:`_TARGETS` below; ``run``,
-``show``, and ``clear`` (including their target choices and the per-target
-``--<name>-rounds`` options) are all rendered from that registry. Adding a
-future calibration is one ``_Target`` entry -- no command logic changes.
-
-Registry order is execution order and encodes dependencies: the thread cap is
-calibrated before the prefetch distances because the prefetch sweep is
-measured at the configured cap, and the mask-density gate runs last because
-its sweep reads through routes whose timing depends on both. Selecting a
-subset never reorders execution.
-Rerunning simply remeasures and overwrites the caches. Calibration should run
-on the hardware the jobs run on; on a cluster, prefer a dedicated compute
-node over a shared login node.
+``show``, and ``clear`` (with their target choices and per-target
+``--<name>-rounds`` options) are all rendered from that registry, so a
+future calibration is one ``_Target`` entry. Registry order is execution
+order and encodes dependencies: thread cap before prefetch (the prefetch
+sweep is measured at the configured cap), mask-density gate last (its
+sweep reads through routes that depend on both); selecting a subset never
+reorders execution. Rerunning remeasures and overwrites the caches.
+Calibrate on the hardware the jobs run on; on a cluster, prefer a
+dedicated compute node over a shared login node.
 """
 
 from __future__ import annotations

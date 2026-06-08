@@ -2,7 +2,7 @@
 
 File layout::
 
-    [magic 8B]
+    [magic 8B: b"CSTORE\\x00\\x01" -- constant for the life of the format]
     [counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
     [manifest_len 8B (u64 little-endian)]
     [manifest_json: format_version + columns + manifest_crc32]
@@ -11,23 +11,21 @@ File layout::
     [record_1 header 32B][record_1 body, padded to 8B]
     ...
 
-The 8-byte magic is followed by a 32-byte counters block at fixed offset 8
-holding the mutable ``n_records`` and ``committed_rows`` (with its own
-CRC32). The JSON manifest holds the immutable schema (``format_version``
-and per-column ``{name, dtype, encoding, nullable}``). Splitting mutable
-counters from the immutable manifest is what lets the writer commit a
-session atomically -- it can rewrite the 32-byte counters block in place
-without shifting any record byte offsets. The canonical file extension is
+The mutable counters (``n_records``, ``committed_rows``, own CRC32) sit at
+fixed offset 8, separate from the immutable JSON manifest
+(``format_version`` and per-column ``{name, dtype, encoding, nullable}``).
+This split lets the writer commit a session atomically: the 32-byte
+counters block is rewritten in place without shifting any record byte
+offsets. Format evolution is tracked via ``format_version`` in the
+manifest, not by changing the magic. The canonical file extension is
 ``.cstore``.
 
-A file is a sequence of one or more records. Each record carries a 32-byte
-header followed by a column-major body (columns laid out back-to-back in
-schema declaration order, no inter-column padding) padded up to 8 bytes so
-the next record's header is naturally aligned. Files written in one shot
-(via :func:`colstore.store`) produce a single-record file;
-:class:`ColStoreWriter` produces multi-record files.
-
-Each record header is::
+A file is a sequence of one or more records, each a 32-byte header plus a
+column-major body (columns back-to-back in schema declaration order, no
+inter-column padding) padded to 8 bytes so the next header is naturally
+aligned. One-shot writes (:func:`colstore.store`) produce a single-record
+file; :class:`ColStoreWriter` produces multi-record files. Each record
+header is::
 
     4B  magic b"REC\\x01"
     8B  record_index (i64, sequential from 0)
@@ -38,16 +36,9 @@ Each record header is::
 Supported column dtypes are the fixed-size NumPy kinds: floating point,
 signed/unsigned integers, booleans, ``datetime64``/``timedelta64``, and
 fixed-width strings (``S`` bytes and ``U`` unicode). Object/variable-length
-columns are rejected.
-
-Byte order: column bytes are always written **little-endian** so files are
-portable across hosts. On a big-endian host the data is byte-swapped on
-write and again on read, so callers always see native-order arrays.
-
-The 8-byte magic ``b"CSTORE\\x00\\x01"`` spells the format name (6 ASCII
-bytes) followed by two reserved bytes; the bytes are constant for the life
-of the format. Per-instance evolution is tracked via ``format_version``
-inside the manifest, not by changing the magic.
+columns are rejected. Column bytes are always written **little-endian** for
+cross-host portability; big-endian hosts byte-swap on write and read, so
+callers always see native-order arrays.
 """
 
 import json
@@ -177,20 +168,16 @@ def read_record_index(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Walk record headers to build the per-record index used by the reader.
 
-    Returns three small int64 arrays:
+    Returns three small int64 arrays (24 bytes per record total; built from
+    ``R`` 32-byte reads):
 
-    * ``record_starts_rows`` shape ``(R+1,)`` -- cumulative row counts. The
-      reader's hot path uses this with ``np.searchsorted`` to bin indices to
-      records.
+    * ``record_starts_rows`` shape ``(R+1,)`` -- cumulative row counts,
+      used to bin row indices to records.
     * ``record_starts_bytes`` shape ``(R,)`` -- file byte offset of each
-      record's body (post-32B header). The base address for any byte-offset
-      computation against that record.
-    * ``n_rows_per_record`` shape ``(R,)`` -- needed at read time to compute
-      per-column offsets within a record without materializing a 2D table:
-      ``column_prefix_bytes[j] * n_rows_per_record[record_id]``.
-
-    Total storage: 24 bytes per record. Cost to build: ``R`` * 32B reads,
-    typically microseconds even for thousands of records.
+      record's body (past the 32B header).
+    * ``n_rows_per_record`` shape ``(R,)`` -- per-record row counts, used
+      to compute per-column offsets within a record
+      (``column_prefix_bytes[j] * n_rows_per_record[record_id]``).
 
     Raises
     ------
@@ -343,21 +330,16 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
 def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
     """Read and validate the file header; return ``(header_dict, data_start_offset)``.
 
-    The header_dict contains both the immutable manifest fields
-    (``format_version``, ``columns``, ``manifest_crc32``) and the mutable
-    counters (``n_records``, ``committed_rows``) read from the fixed
-    32-byte counters block. Callers don't need to know they live in
-    separate on-disk regions.
-
-    Validates the file header only -- magic, counters CRC, format version,
-    and manifest CRC. Per-record headers (and any truncation past the file
-    header) are validated by :func:`read_record_index`, which the caller
-    runs immediately after this to build the per-record index.
-
-    For callers that already hold an open file handle (notably the writer
-    in update mode and the compactor while holding its lock), use
-    :func:`read_header_from_file` instead so we don't open a second
-    handle. Saves a syscall and matches the caller's lifecycle.
+    The header_dict merges the immutable manifest fields
+    (``format_version``, ``columns``, ``manifest_crc32``) with the mutable
+    counters (``n_records``, ``committed_rows``); callers need not know
+    they live in separate on-disk regions. Only the file header is
+    validated (magic, counters CRC, format version, manifest CRC);
+    per-record headers and truncation past the file header are validated
+    by :func:`read_record_index`, which the caller runs next. Callers that
+    already hold an open handle (the update-mode writer, the compactor
+    under its lock) should use :func:`read_header_from_file` instead of
+    opening a second one.
 
     Raises
     ------
@@ -417,24 +399,18 @@ def read_header_from_file(input_file: IO[bytes]) -> tuple[dict[str, Any], int]:
 def build_column_layout(manifest: dict[str, Any], body_offset: int, n_rows: int) -> ColumnLayout:
     """Compute per-column ``(byte_offset, dtype)`` within a single record.
 
-    ``body_offset`` is the file offset of the record body's first byte --
-    i.e. past the 32-byte record header. The reader's caller obtains this
-    from :func:`read_record_index` so that the layout sits on top of an
-    already-validated record.
+    ``body_offset`` is the file offset of the record body's first byte
+    (past the 32-byte record header), obtained from
+    :func:`read_record_index` so the layout sits on an already-validated
+    record. Columns are laid out back-to-back in schema declaration order
+    with no inter-column padding; the reader builds one ``np.memmap`` per
+    column from the result.
 
-    For a record with ``n_rows`` rows, each column's data is laid out
-    back-to-back in schema declaration order with no inter-column padding.
-    The reader uses the returned layout to build one ``np.memmap`` per
-    column.
-
-    Valid only for the single-record fast path. Multi-record files have no
-    meaningful per-column layout (each column's bytes are scattered across
-    records); the reader computes byte addresses on the fly instead.
-
-    The dtype returned is the on-disk dtype, which is little-endian for
-    multi-byte kinds. Memory-maps must use this dtype to interpret the
-    bytes correctly; the store presents native-order arrays to callers via
-    the gather path.
+    Valid only for the single-record fast path: multi-record files have no
+    contiguous per-column layout, and the reader computes byte addresses
+    on the fly instead. The returned dtype is the on-disk dtype
+    (little-endian for multi-byte kinds); memmaps must use it to interpret
+    the bytes, and the gather path presents native-order arrays to callers.
     """
     layout: ColumnLayout = {}
     current_offset = body_offset
@@ -730,18 +706,8 @@ def write_dataset(
     path : str or os.PathLike
         Destination path.
     batch_size : int, str, or None
-        Controls how the column write is chunked for the progress bar. Has
-        no effect on the bytes written.
-
-        * ``None`` -- single pass per column.
-        * ``int N`` -- ``N`` cells (rows x columns) per logical batch.
-        * ``str`` like ``"100 MB"`` / ``"1.5 GiB"`` -- bytes per batch
-          (binary multipliers; ``MB`` ≡ ``MiB``).
-        * ``str "auto"`` -- adaptive: probe with a 1 MiB initial batch,
-          then size subsequent batches based on EMA-smoothed measured
-          bandwidth with a 2x growth-rate cap per batch. No upper bound
-          on steady-state batch size -- the medium decides. Datasets
-          under 16 MiB single-pass.
+        Write chunking for the progress bar; no effect on the bytes
+        written. Semantics are documented on :func:`colstore.store`.
     show_progress : bool
         Whether to display a tqdm progress bar. The bar's postfix shows
         cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.

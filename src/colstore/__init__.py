@@ -3,19 +3,18 @@
 ``colstore`` provides a compact on-disk container for tabular, fixed-size
 numeric data. A ``.cstore`` file stores each column as a contiguous block of
 raw bytes; reads use ``numpy.memmap`` plus a parallel C++ gather kernel, so
-process memory stays bounded by the size of the materialized output even
-when the file on disk is much larger.
+process memory stays bounded by the materialized output even when the file
+is much larger.
 
-The public surface centers on:
+Public surface:
 
 * :func:`open` / :func:`store` / :func:`create` / :func:`recreate` /
   :func:`update` -- module-level entry points for reading and writing.
 * :func:`compact` -- collapse a multi-record file into a single-record file.
 * :func:`info` / :func:`schema` -- introspect a file without reading bodies.
-* :class:`ColStoreReader` -- the underlying reader class; indexes return
-  lazy views (:class:`ColumnView` for a single column,
-  :class:`TableView` for multi-column).
-* :class:`ColStoreWriter` -- the underlying streaming writer class.
+* :class:`ColStoreReader` / :class:`ColStoreWriter` -- the underlying
+  classes; reader indexing returns lazy views (:class:`ColumnView`,
+  :class:`TableView`).
 
 Package-wide defaults (thread count, ``madvise`` hint, gather backend) live
 in :mod:`colstore.config` and can be changed at runtime.
@@ -27,22 +26,17 @@ import os as _os
 def use_passive_openmp_wait() -> bool:
     """Opt in to ``OMP_WAIT_POLICY=passive`` for OpenMP threads. Returns success.
 
-    The gather kernel runs short, bursty parallel regions interleaved with
-    Python. OpenMP's default *active* wait makes idle threads busy-spin between
-    regions, which can burn cores. ``passive`` makes them sleep instead.
+    The gather kernel runs short, bursty parallel regions; OpenMP's
+    default *active* wait makes idle threads busy-spin between them.
+    ``passive`` makes them sleep instead. This is **opt-in and not called
+    automatically** because ``OMP_WAIT_POLICY`` is process-global (it
+    affects every OpenMP runtime: NumPy, numba, PyTorch, ...), and the
+    per-call thread cap already bounds colstore's own spinning.
 
-    This is **opt-in and not called automatically**, because ``OMP_WAIT_POLICY``
-    is process-global: it affects every OpenMP runtime in the process (NumPy,
-    numba, PyTorch, SciPy, ...), not just colstore. With the per-call thread cap
-    in place, colstore's own spinning is already bounded to a handful of
-    threads, so most users will not need this.
-
-    Like all OpenMP/BLAS environment variables, it only takes effect if set
-    **before** the OpenMP runtime initializes (i.e. before the first import of
-    NumPy or the compiled extension). Call it at the very top of your program,
-    before importing colstore or NumPy, for it to apply. Returns ``True`` if the
-    variable was set, ``False`` if it was already set (and therefore left
-    untouched).
+    Takes effect only if set **before** the OpenMP runtime initializes:
+    call it at the very top of the program, before importing colstore or
+    NumPy. Returns ``True`` if the variable was set, ``False`` if it was
+    already set (and left untouched).
     """
     if "OMP_WAIT_POLICY" in _os.environ:
         return False

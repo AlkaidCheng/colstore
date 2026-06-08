@@ -161,16 +161,15 @@ class ColumnView(_BaseView):
         Parameters
         ----------
         copy : bool, optional
-            ``True`` (default): an owning array, as always -- safe to mutate
-            and to use after the store is closed. ``False``: a READ-ONLY
-            zero-copy view backed by the store's open memmap. Zero-copy is
-            supported exactly when the store is single-record (e.g. produced
-            by ``colstore.compact``), the column's dtype is in native byte
-            order, and the row selector is ``None``, an int, or a slice;
-            anything else raises ``ValueError`` rather than silently
-            copying. The view holds a reference to the mapping, so it stays
-            valid even after the store is closed -- at the cost of keeping
-            the file mapped until the view is garbage-collected.
+            ``True`` (default): an owning array, safe to mutate and to use
+            after the store is closed. ``False``: a READ-ONLY zero-copy
+            view backed by the store's open memmap, supported exactly when
+            the store is single-record, the column's dtype is in native
+            byte order, and the row selector is ``None``, an int, or a
+            slice; anything else raises ``ValueError`` rather than
+            silently copying. The view holds a reference to the mapping,
+            so it stays valid after the store is closed -- at the cost of
+            keeping the file mapped until the view is garbage-collected.
 
         Returns
         -------

@@ -216,22 +216,18 @@ def set_mask_density_gate(gate: float | Literal["auto"]) -> None:
 
     Multi-record boolean-mask reads with native dtypes take the mask-native
     kernel when the mask's selected fraction (``count_nonzero / n_rows``)
-    is at or above the gate; below it they lower to ``np.flatnonzero`` and
-    the fancy paths, because for sparse masks per-column index traffic
-    (8 bytes per *selected* element) undercuts re-reading the
-    1-byte-per-*row* mask. The crossover is hardware-dependent.
+    is at or above the gate, and lower to ``np.flatnonzero`` + the fancy
+    paths below it; the crossover is hardware-dependent.
 
     ``"auto"`` (the default) uses the per-host gate measured by
     :func:`colstore.autotune.calibrate_mask_density` (the ``mask-density``
-    target of ``colstore calibrate``), falling back to the compiled default
-    of 0.0 -- route on at every density -- without a calibration cache:
-    on multi-threaded hosts the lowered route's serial flatnonzero loses
-    at every measured density, so the route is on by default and
-    calibration exists to *raise* (or disable) the gate on hosts where
-    sparse masks lose, e.g. single-core environments. An explicit float
-    >= 0 overrides both; values above 1.0 disable the route entirely (no
-    selected fraction can reach them), which is also the benchmark
-    baseline toggle.
+    target of ``colstore calibrate``), falling back to the compiled
+    default of 0.0 (route on at every density) when no calibration cache
+    exists -- on multi-threaded hosts the lowered route loses at every
+    measured density, so calibration exists to *raise* or disable the gate
+    on hosts where sparse masks lose (e.g. single-core environments). An
+    explicit float >= 0 overrides both; values above 1.0 disable the route
+    entirely, which is also the benchmark baseline toggle.
     """
     global _mask_density_gate
     if gate == "auto":
@@ -315,20 +311,16 @@ def set_numa_policy(policy: NumaPolicy) -> None:
 
     Policies:
 
-    * ``"auto"`` (default) -- apply ``MPOL_INTERLEAVE`` on multi-node Linux
-      hosts so that page-cache pages distribute across NUMA nodes as they
-      fault in, instead of concentrating on whichever node serviced the
-      I/O. No-op on single-node Linux, on macOS, on Windows, and on any
-      host where the syscall is blocked or unsupported. Significant win
-      on multi-socket / multi-NPS server hardware (measured ~1.8x on
-      ``ds.dict()`` on a dual EPYC 7763, 8 NUMA nodes).
+    * ``"auto"`` (default) -- ``MPOL_INTERLEAVE`` on multi-node Linux so
+      page-cache pages distribute across nodes as they fault in; no-op
+      everywhere else (single-node Linux, macOS, Windows, blocked
+      syscall). Significant win on multi-socket / multi-NPS hardware
+      (see :mod:`colstore._numa` for measurements).
     * ``"interleave"`` -- force interleave even where ``"auto"`` would
-      skip. Mainly useful for testing; in practice ``"auto"`` already
-      enables interleave whenever it would help.
-    * ``"local"`` -- no-op. Pages fall under the kernel's default
-      first-touch policy. Set this if you have a low-concurrency
-      workload (e.g. ``max_workers=1``) where forced interleaving
-      causes more remote-memory hops than it saves.
+      skip; mainly for testing.
+    * ``"local"`` -- no-op; the kernel's default first-touch policy. Use
+      for low-concurrency workloads (e.g. ``max_workers=1``) where forced
+      interleaving costs more remote-memory hops than it saves.
     """
     if policy not in ("auto", "interleave", "local"):
         raise ValueError(f"numa policy must be 'auto', 'interleave', or 'local'; got {policy!r}.")

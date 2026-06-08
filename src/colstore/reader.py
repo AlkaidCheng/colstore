@@ -162,33 +162,23 @@ def _parallel_contiguous_copy(
 def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataFrame:
     """Build a pandas DataFrame from a column dict without dtype-block consolidation.
 
-    The returned DataFrame is "fragmented" relative to one built by
-    ``pd.DataFrame(columns)``: it has one ``Block`` per column rather
-    than one ``Block`` per dtype group. The two are functionally
-    identical through the public DataFrame API; pandas consolidates on
-    demand for operations that benefit from it. For the
-    read-once-and-pass-along workload this method targets, paying the
-    consolidation cost eagerly is wasted work.
+    The result is "fragmented" relative to ``pd.DataFrame(columns)``: one
+    ``Block`` per column rather than per dtype group. The two are
+    functionally identical through the public DataFrame API (pandas
+    consolidates on demand); for the read-once-and-pass-along workload
+    this targets, eager consolidation is wasted work.
 
     Uses the pandas private API ``create_block_manager_from_column_arrays``
-    plus ``DataFrame._from_mgr`` (both stable in pandas 2.0+). On any of:
-
-      * ``ImportError`` -- a symbol is gone (e.g. ``_from_mgr`` not
-        present on pandas 1.x, or the ``managers`` submodule moved);
-      * ``AttributeError`` -- a classmethod or attribute is gone; or
-      * ``TypeError`` -- the call signature has shifted (a keyword was
-        renamed or removed, ``refs`` semantics changed, etc.);
-
-    the helper falls back to ``pd.DataFrame(columns)`` and emits a
-    one-shot ``UserWarning`` so the regression is visible without
-    breaking user code. The fallback is functionally identical but
-    pays the consolidation copy, so on whole-store materialization
-    it's roughly an order of magnitude slower.
-
-    ``ValueError`` is intentionally NOT caught: it almost certainly
-    signals a data-validation problem (mismatched shapes, etc.) that
-    the fallback path would surface in the same way, and catching it
-    would mask the original error.
+    plus ``DataFrame._from_mgr`` (both stable in pandas 2.0+). On
+    ``ImportError`` (symbol gone or moved), ``AttributeError`` (classmethod
+    or attribute gone), or ``TypeError`` (call signature shifted), the
+    helper falls back to ``pd.DataFrame(columns)`` -- functionally
+    identical but roughly an order of magnitude slower on whole-store
+    materialization -- and emits a one-shot ``UserWarning`` so the
+    regression is visible without breaking user code. ``ValueError`` is
+    intentionally NOT caught: it almost certainly signals a
+    data-validation problem the fallback would surface identically, and
+    catching it would mask the original error.
     """
     import pandas as pd
 
@@ -248,9 +238,7 @@ class ColStoreReader:
         Gather backend used for fancy-index reads (``"cpp"``, ``"numpy"``,
         or ``"numba"``). ``None`` uses the package-wide default. Applies to
         single-record stores; multi-record stores require the compiled C++
-        extension and always use it for fancy-index reads (this has been the
-        case since multi-record support landed -- there is no pure-NumPy
-        multi-record gather).
+        extension and always use it for fancy-index reads.
     max_workers : int or None, optional
         Override the package-wide thread-pool size for multi-column reads.
         ``None`` uses the global setting (physical core count by default).
@@ -573,15 +561,13 @@ class ColStoreReader:
     ) -> NDArray[Any]:
         """Read one column with the given row selector; return owning ndarray.
 
-        Output arrays are always native byte order, even though the on-disk
-        column is stored little-endian. On a little-endian host this is a
-        no-op; on a big-endian host NumPy converts during the copy/gather.
-
-        ``thread_cap`` overrides the per-call thread cap used by both the
-        fancy-index gather (OpenMP) and the contiguous parallel copy
-        (Python threadpool). ``None`` uses the package default.
-        :meth:`_gather_many` passes a divided budget here so concurrent
-        column reads do not oversubscribe.
+        Output arrays are always native byte order (the on-disk column is
+        little-endian; big-endian hosts convert during the copy/gather).
+        ``thread_cap`` overrides the per-call cap for both the fancy-index
+        gather (OpenMP) and the contiguous parallel copy (Python
+        threadpool); ``None`` uses the package default, and
+        :meth:`_gather_many` passes a divided budget so concurrent column
+        reads do not oversubscribe.
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
@@ -628,20 +614,18 @@ class ColStoreReader:
     def _view_one(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
         """Zero-copy read of one column, or raise if a copy is unavoidable.
 
-        Returns a READ-ONLY ndarray view backed by the column's open memmap
-        -- no bytes are copied and no memory is allocated beyond the array
-        header. Supported exactly when the store is single-record (one
-        contiguous on-disk region per column; ``colstore.compact`` produces
-        these), the dtype is in native byte order (a view cannot byteswap),
-        and the selector is sliceable (``None``, an int, or a slice of any
-        step). Fancy/boolean selectors require a gather and therefore a
-        copy; multi-record logical columns are interleaved on disk and
-        cannot be viewed contiguously.
+        Returns a READ-ONLY ndarray view backed by the column's open
+        memmap; no bytes are copied. Supported exactly when the store is
+        single-record (``colstore.compact`` produces these), the dtype is
+        in native byte order (a view cannot byteswap), and the selector is
+        ``None``, an int, or a slice of any step. Fancy/boolean selectors
+        require a gather and therefore a copy; multi-record logical
+        columns are interleaved on disk and cannot be viewed contiguously.
 
-        Lifetime: the view holds a reference to the underlying mapping (via
-        ``.base``), so it remains valid even after :meth:`close` -- the OS
-        releases the mapping when the last view is garbage-collected. The
-        cost of that safety is that open views keep the file mapped.
+        Lifetime: the view holds a reference to the underlying mapping
+        (via ``.base``), so it remains valid after :meth:`close` -- at the
+        cost of keeping the file mapped until the last view is
+        garbage-collected.
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
@@ -1352,16 +1336,15 @@ class ColStoreReader:
         copy : bool, optional
             ``True`` (default): owning arrays. ``False``: READ-ONLY
             zero-copy views backed by the open memmaps; supported only on
-            single-record stores (e.g. produced by :func:`colstore.compact`)
-            with native-byte-order dtypes, raising ``ValueError`` otherwise.
-            Views stay valid after :meth:`close` (they pin the mapping until
-            garbage-collected).
+            single-record stores with native-byte-order dtypes, raising
+            ``ValueError`` otherwise. Views stay valid after :meth:`close`
+            (they pin the mapping until garbage-collected).
 
         Returns
         -------
         dict[str, numpy.ndarray]
-            Arrays in on-disk column order; each column's stored dtype is
-            preserved (native byte order).
+            Arrays in on-disk column order, stored dtypes preserved
+            (native byte order).
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
