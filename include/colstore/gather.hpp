@@ -68,9 +68,11 @@ constexpr std::ptrdiff_t ELEMENTS_PER_THREAD = 1 << 20;  // 1048576
 // (<= 0 means OpenMP maximum). Exposed for tests.
 std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap);
 
-// Element-indexed gather. ``base`` is reinterpreted as ``T*`` and indexed
-// directly. Caller guarantees natural T alignment of ``base``. The byte-
-// pointer surface keeps the C wrappers uniform; the inner loop is typed.
+// Element-indexed gather: ``output[i]`` is the T at
+// ``base + indices[i] * sizeof(T)``. ``base`` need not be T-aligned --
+// source loads are alignment-safe (packed record bodies make misaligned
+// columns legal). The byte-pointer surface keeps the C wrappers uniform;
+// the inner loop is typed.
 template <typename T>
 void gather_indexed_typed(const std::uint8_t* base,
                           const std::int64_t* indices,
@@ -79,8 +81,8 @@ void gather_indexed_typed(const std::uint8_t* base,
                           int thread_cap = 0,
                           std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
-// Byte-offset gather. ``output[i] = *(T*)(base + byte_offsets[i])``. Caller
-// guarantees byte_offsets[i] points at a T-aligned address inside ``base``.
+// Byte-offset gather: ``output[i]`` is the T at ``base + byte_offsets[i]``.
+// Offsets need not be T-aligned; source loads are alignment-safe.
 template <typename T>
 void gather_bytes_typed(const std::uint8_t* base,
                         const std::int64_t* byte_offsets,
@@ -613,9 +615,6 @@ void colstore_gather_multirecord_withbins_8(
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
     std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
 
-// Returns the OpenMP thread cap that gathers will use, or 1 if OpenMP is
-// not compiled in. Exposed for diagnostics.
-
 // Record-base withbins variant; see gather_multirecord_withbins_rbase_typed.
 void colstore_gather_multirecord_withbins_rbase_1(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
@@ -634,6 +633,8 @@ void colstore_gather_multirecord_withbins_rbase_8(
     const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
     int thread_cap, std::ptrdiff_t prefetch_distance);
 
+// Returns OpenMP's maximum thread count, or 1 if OpenMP is not compiled in.
+// Exposed for diagnostics.
 int colstore_max_threads();
 
 

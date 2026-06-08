@@ -32,9 +32,11 @@
 //    GCC/Clang, ``__restrict`` on MSVC). Compiler can assume base,
 //    indices, and output do not alias, enabling vectorization of the
 //    store stream.
-//  * Typed dereferences inside the templated loop. ``*(T*)(base + ...)`` is
-//    treated by the compiler as a natural-alignment load and emits the same
-//    instructions as ``source[i]`` would in the old per-dtype kernel.
+//  * Typed loads/stores inside the templated loop. Source loads go through
+//    ``load_unaligned`` -- a fixed-size memcpy, the standards-correct
+//    unaligned load, compiling to a plain mov on x86 -- and output stores
+//    are direct ``T`` stores into the library-allocated, aligned NumPy
+//    buffer.
 
 #include "colstore/gather.hpp"
 
@@ -91,11 +93,11 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
 
 // Element-indexed gather: ``output[i] = base_as_T[indices[i]]``.
 //
-// The caller passes byte pointers but the kernel reinterprets them as T*
-// for the load/store -- this gives the compiler typed-alignment information
-// and produces the same vectorized loop as a direct ``T* output[i] =
-// T* source[i]`` body. T is one of the unsigned integer types (uint8_t/16_t/
-// 32_t/64_t); the bytes copied are agnostic to the user-facing dtype kind.
+// The caller passes byte pointers; the kernel types the inner loop itself:
+// the output is reinterpreted as T* (library-allocated, aligned), while
+// source loads go through load_unaligned. T is one of the unsigned integer
+// types (uint8_t/16_t/32_t/64_t); the bytes copied are agnostic to the
+// user-facing dtype kind.
 namespace {
 
 // Alignment-safe typed load from the file mmap. Record bodies are packed
@@ -141,12 +143,11 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
   }
 }
 
-// Byte-offset gather: ``output[i] = *(T*)(base + byte_offsets[i])``.
+// Byte-offset gather: ``output[i]`` is the T at ``base + byte_offsets[i]``.
 //
 // For the multi-record reader: addresses are non-uniform and pre-computed at
-// the Python level (record-header skips, per-record column offsets). The
-// kernel reinterprets the loaded bytes as T to give the compiler the same
-// typed-alignment information; caller guarantees offsets are T-aligned.
+// the Python level (record-header skips, per-record column offsets). Offsets
+// need not be T-aligned; source loads go through load_unaligned.
 template <typename T>
 void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                         const std::int64_t* COLSTORE_RESTRICT byte_offsets,
