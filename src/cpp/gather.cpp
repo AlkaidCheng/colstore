@@ -68,17 +68,14 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
   if (effective_cap < 1) {
     effective_cap = 1;
   }
-  // Work-proportional thread count, ~one thread per ELEMENTS_PER_THREAD
-  // elements. The previous form ``n / ELEMENTS_PER_THREAD + 1`` floored every
-  // n below ELEMENTS_PER_THREAD (1<<20) to a single thread, silently
-  // overriding PARALLEL_THRESHOLD (1<<18): a gather of 256K-1M elements is
-  // past the fork/join floor and measured a clean 2x at 2 threads, but the
-  // floor division forced it serial. Round up instead, and grant at least 2
-  // threads once we are past PARALLEL_THRESHOLD (already guaranteed by the
-  // early return above). Anything below PARALLEL_THRESHOLD never reaches here,
-  // so small-input behavior is unchanged. Above it, the ramp matches the
-  // measured knee (~1 thread per 1<<20 elements; scaling stays near-linear to
-  // the cap on the bandwidth-limited gather).
+  // Work-proportional thread count: ~one thread per ELEMENTS_PER_THREAD
+  // elements, rounded up, with a floor of 2 threads. Everything reaching
+  // this point is past PARALLEL_THRESHOLD (the early return above), so it
+  // benefits from at least two threads; floor division would silently
+  // force mid-sized gathers back to serial and dead-code the threshold.
+  // The ramp matches the measured scaling knee (~1 thread per 1<<20
+  // elements; scaling stays near-linear to the cap on the
+  // bandwidth-limited gather).
   std::ptrdiff_t by_work =
       (n_indices + ELEMENTS_PER_THREAD - 1) / ELEMENTS_PER_THREAD;
   std::ptrdiff_t threads =
@@ -222,10 +219,10 @@ template void gather_bytes_typed<std::uint64_t>(const std::uint8_t*,
 // global row space. ``write_pos`` tracks the packed output position in rows.
 //
 // This is deliberately serial: the work is a sequence of memcpys, and a single
-// core saturates memory bandwidth on a large contiguous copy. The win over the
-// former Python loop is the elimination of per-record interpreter overhead
-// (one np.frombuffer construction and one slice assignment per record), which
-// dominates when the range spans many small records.
+// core saturates memory bandwidth on a large contiguous copy. The kernel
+// exists to eliminate per-record host overhead (one np.frombuffer
+// construction and one slice assignment per record in the Python fallback),
+// which dominates when the range spans many small records.
 void copy_multirecord_range(const std::uint8_t* COLSTORE_RESTRICT base,
                             std::uint8_t* COLSTORE_RESTRICT output,
                             std::int64_t start,
@@ -283,9 +280,9 @@ namespace {
 // but the conditional pointer advance compiles to a cmov, so it has no
 // data-dependent branch to mispredict. That matters because the gather calls
 // this once per element with unpredictable ``idx``; a branchy binary search
-// mispredicts ~50% of comparisons and is several times slower in practice
-// (measured ~5x at R=1000). ``rsr`` is tiny (8*(R+1) bytes) and stays cache-
-// resident, so the search is a handful of L1 loads plus cmovs.
+// mispredicts ~50% of comparisons and is several times slower in practice.
+// ``rsr`` is tiny (8*(R+1) bytes) and stays cache-resident, so the search is
+// a handful of L1 loads plus cmovs.
 inline std::int64_t bin_record(const std::int64_t* rsr, std::int64_t len,
                                std::int64_t idx) {
   const std::int64_t* basep = rsr;
@@ -304,13 +301,8 @@ inline std::int64_t bin_record(const std::int64_t* rsr, std::int64_t len,
 // Fused multi-record fancy gather. See header for the addressing contract.
 //
 // One pass over ``indices``: per element, bin to a record with the branchless
-// search above, compute the byte address in registers, and load. This replaces
-// the NumPy pipeline whose dominant cost is the searchsorted record-binning
-// (measured ~75-85% of the unsorted path) plus several K-sized int64
-// temporaries. Here the binning is fused into the load and the loop is
-// OpenMP-parallel across indices -- searchsorted cannot be threaded, so on a
-// multi-core host the binning speeds up with the thread count on top of the
-// per-element branchless win.
+// search above, compute the byte address in registers, and load. The binning
+// is fused into the load and the loop is OpenMP-parallel across indices.
 //
 // The software prefetch recomputes the record bin for the look-ahead index;
 // the search is cheap relative to the DRAM latency it hides for the scattered
@@ -374,8 +366,8 @@ template void gather_multirecord_typed<std::uint64_t>(
 
 // Bin-recording variant: identical addressing to gather_multirecord_typed,
 // plus ``bins[i] = r`` so subsequent columns of the same read reuse the
-// binning (87-93% of this kernel's cost on the deployment hardware) instead
-// of recomputing it per column.
+// binning (the dominant cost of this kernel) instead of recomputing it per
+// column.
 template <typename T>
 void gather_multirecord_bins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                    const std::int64_t* COLSTORE_RESTRICT indices,
@@ -498,10 +490,8 @@ template void gather_multirecord_withbins_typed<std::uint64_t>(
 // (caller-checked). Each thread locates the record of the first index in
 // its chunk with one branchless binary search, then walks the record cursor
 // forward monotonically -- the walk does O(K + R) total comparisons across
-// the whole call, versus O(K log R) searches for the unsorted kernel and
-// versus the NumPy boundary-partition pipeline this replaces (whose
-// per-record host loop is 79-97% of the sorted path at R >= 10^4). Offsets
-// are computed in registers; there is no byte_offsets array.
+// the whole call, versus O(K log R) searches for the unsorted kernel.
+// Offsets are computed in registers; there is no byte_offsets array.
 //
 // Prefetching: the look-ahead element's record is only known after walking,
 // so the prefetch is issued only when the look-ahead index still lies in
@@ -531,9 +521,7 @@ void gather_multirecord_sorted_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     }
     std::int64_t r = bin_record(record_starts_rows, len, indices[lo]);
     // Per-record state, recomputed only at record boundaries: the inner
-    // loop's steady state is one compare, one multiply-add, one load --
-    // strictly less per-element work than the byte-offset kernel this
-    // replaces (which reads a precomputed offset from memory instead).
+    // loop's steady state is one compare, one multiply-add, one load.
     std::int64_t next_boundary = record_starts_rows[r + 1];
     std::int64_t record_base = record_starts_bytes[r] +
                                col_prefix_bytes * n_rows_per_record[r] -
@@ -597,16 +585,11 @@ template void gather_multirecord_sorted_typed<std::uint64_t>(
 // ``start + i*step``. Structurally the sorted kernel with the index-array
 // loads deleted -- the row is synthesized in a register, so the per-element
 // steady state is one or two compares, one multiply-add, and the data load.
-// Relative to the ``np.arange`` + fancy-gather route this replaces, the
-// savings are the n_out*8-byte index materialization, the O(n_out)
-// sortedness pass, and the index-array read bandwidth inside the kernel; for
-// ``step < 0`` (a descending stream, which the sortedness check sends to the
-// per-element binary-search kernel) it additionally converts O(n_out log R)
-// binning into an O(n_out + R) backward walk. The record cursor moves
-// monotonically -- forward for ``step > 0``, backward for ``step < 0`` -- so
-// each thread's total cursor movement is bounded by R regardless of step
-// size. The same-record prefetch gate mirrors the sorted kernel's, with the
-// look-ahead row formed arithmetically instead of loaded.
+// The record cursor moves monotonically -- forward for ``step > 0``,
+// backward for ``step < 0`` -- so each thread's total cursor movement is
+// bounded by R regardless of step size. The same-record prefetch gate
+// mirrors the sorted kernel's, with the look-ahead row formed
+// arithmetically instead of loaded.
 template <typename T>
 void gather_multirecord_strided_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                       std::uint8_t* COLSTORE_RESTRICT output,
@@ -971,8 +954,7 @@ template void gather_multirecord_withbins_rbase_typed<std::uint64_t>(
 // time (a uint64 of zeros), extending runs of set bits 8 bytes at a time
 // (a uint64 of 0x01s), and serving runs of >= 32 bytes with one memcpy --
 // run detection costs nothing extra here because the mask byte is the
-// datum being scanned anyway, which is what made run coalescing
-// unprofitable on materialized int64 indices.
+// datum being scanned anyway.
 namespace {
 constexpr std::int64_t MASK_RUN_COPY_MIN_BYTES = 32;
 constexpr std::uint64_t MASK_ALL_ONES = 0x0101010101010101ULL;

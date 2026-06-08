@@ -622,6 +622,9 @@ caches.
 * **Fused C-column gather kernel** — wins serially (2.5–4.5x) but collapses
   at 8 threads on the deployment node (1.35–1.57x at C=8); per-thread
   stream counts saturate miss handling. (Stage 5)
+* **Argsort + sorted walk + reindex for unsorted selectors** — argsort on K
+  int64 costs more than the binning it would replace; measured slower than
+  binning the unsorted indices directly. (Stage 2)
 * **Small-K threshold for the bin-reuse route** — bin-reuse wins at every K
   from 4 to 131072 (1.44–1.62x); a threshold would add a regression.
 * **Fixed software prefetch / prefetch for unsorted gathers on Zen 3** —

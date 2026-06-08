@@ -1,26 +1,34 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False
 # distutils: language = c++
-"""Cython binding for the size-dispatched C++ gather kernel.
+"""Cython bindings for the size-dispatched C++ gather kernels.
 
-The underlying C++ kernel is templated on element size (1/2/4/8 bytes), not
-on NumPy dtype kind. A single set of four templates per entry point covers
-every fixed-width numeric dtype, plus fixed-width bytes/unicode strings,
+The C++ kernels are templated on element size (1/2/4/8 bytes), not on NumPy
+dtype kind: one set of four instantiations per kernel covers every
+fixed-width numeric dtype, plus fixed-width bytes/unicode strings,
 datetime64, and timedelta64 -- anything whose itemsize is one of those four
-sizes "just works."
+sizes.
 
-Three Python entry points:
+Each ``def`` below wraps one kernel: the single-record pair
+(:func:`gather` / :func:`gather_bytes`), the multi-record range, strided,
+sorted, and unsorted kernels, the bin-reuse and uniform-layout families,
+and the boolean-mask kernel. Docstrings state the caller contract;
+kernel design lives in ``include/colstore/gather.hpp`` and the
+measurements behind each kernel in ``docs/optimization_series.md``.
 
-* :func:`gather` -- element-indexed (hot path). Caller passes int64 element
-  indices; the kernel computes byte addresses internally. No Python-side
-  allocation per call.
+Contracts shared by every entry point:
 
-* :func:`gather_into` -- alias for :func:`gather` retained for callers that
-  reach the binding directly (the colstore.kernels dispatcher uses this
-  name to make the no-allocation contract explicit at the call site).
-
-* :func:`gather_bytes` -- byte-offset. Caller passes int64 byte offsets
-  directly. Used by the multi-record reader (PR 2) where byte addresses
-  cross record boundaries.
+* Arrays handed to the kernels as pointers must be C-contiguous
+  (validated here; the view layer normalizes fancy selectors with
+  ``np.ascontiguousarray``).
+* Output buffers are caller-allocated and filled in-place; no entry
+  point allocates.
+* ``thread_cap`` (int, default 0): maximum OpenMP threads; ``0`` means
+  the OpenMP maximum. Kernels run serially below their internal
+  parallel threshold.
+* ``prefetch_distance`` (int, default -1): software-prefetch look-ahead
+  in elements. ``> 0`` prefetches that many iterations ahead; ``0``
+  disables prefetching (useful when the source is cache-resident);
+  negative uses the compiled default, :func:`default_prefetch_distance`.
 """
 
 import numpy as np
@@ -262,15 +270,8 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     output : numpy.ndarray
         1D array with the same dtype as ``source`` and length matching
         ``indices``. Filled in-place; allocation is the caller's job.
-    thread_cap : int, optional
-        Maximum OpenMP threads. ``0`` (default) means the OpenMP maximum;
-        the kernel still drops to a single thread for small inputs and
-        scales up to this cap for large ones.
-    prefetch_distance : int, optional
-        Software-prefetch look-ahead in elements. ``> 0`` prefetches that
-        many iterations ahead; ``0`` disables prefetching (useful when the
-        source is cache-resident); negative (default) uses the compiled
-        default, :func:`default_prefetch_distance`.
+    thread_cap, prefetch_distance : int, optional
+        Shared kernel parameters; see the module docstring.
 
     Raises
     ------
@@ -359,21 +360,15 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
         legal).
     output : numpy.ndarray
         1D array determining both the element size and the output dtype.
-    thread_cap : int, optional
-        Maximum OpenMP threads. ``0`` means the OpenMP maximum.
-    prefetch_distance : int, optional
-        Software-prefetch look-ahead in elements. ``> 0`` prefetches that
-        many iterations ahead; ``0`` disables prefetching (useful when the
-        source is cache-resident); negative (default) uses the compiled
-        default, :func:`default_prefetch_distance`.
+    thread_cap, prefetch_distance : int, optional
+        Shared kernel parameters; see the module docstring.
 
     Notes
     -----
-    Used by the multi-record reader (PR 2): byte offsets there encode
-    record-header skips and per-record column offsets and cannot be reduced
-    to a simple ``index * itemsize``. For the contiguous hot path,
-    :func:`gather` is faster because it skips the byte-offset array
-    materialization.
+    Used by the multi-record reader where byte offsets encode record-header
+    skips and per-record column offsets and cannot be reduced to a simple
+    ``index * itemsize``. For the contiguous hot path, :func:`gather` is
+    faster because it skips the byte-offset array materialization.
 
     Raises
     ------
@@ -441,11 +436,10 @@ def gather_multirecord_bins(cnp.ndarray source, cnp.ndarray indices,
 
     Identical addressing and output to :func:`gather_multirecord`, plus
     ``bins[i]`` is filled with the record index (``int32``) that
-    ``indices[i]`` binned to. The binning -- a branchless binary search per
-    element -- measures 87-93% of the fused kernel's cost on the target
-    hardware and is identical for every column of a multi-column read, so a
-    caller reading C columns computes it once here and reuses it C-1 times
-    via :func:`gather_multirecord_withbins`.
+    ``indices[i]`` binned to. The binning dominates the fused kernel's cost
+    and is identical for every column of a multi-column read, so a caller
+    reading C columns computes it once here and reuses it C-1 times via
+    :func:`gather_multirecord_withbins`.
 
     ``bins`` must be 1D ``int32`` of the same length as ``indices``; the
     caller guarantees ``n_records <= 2**31 - 1``. All other parameters and
@@ -529,10 +523,8 @@ def gather_multirecord_withbins(cnp.ndarray source, cnp.ndarray indices,
     """Multi-record gather using record bins from :func:`gather_multirecord_bins`.
 
     ``bins`` must be the array filled by :func:`gather_multirecord_bins` for
-    the *same* ``indices`` against the same record layout; each element's
-    record is then a sequential ``int32`` read instead of a binary search
-    (including for the prefetch look-ahead). Output is identical to
-    :func:`gather_multirecord` for the column selected by
+    the *same* ``indices`` against the same record layout. Output is
+    identical to :func:`gather_multirecord` for the column selected by
     ``col_prefix_bytes``. Other parameters and errors match
     :func:`gather_multirecord`.
     """
@@ -612,12 +604,8 @@ def gather_multirecord_sorted(cnp.ndarray source, cnp.ndarray indices,
 
     ``indices`` MUST be non-decreasing; the caller is responsible for the
     check (the reader's sortedness test gates the route) and behavior is
-    undefined otherwise. Each thread binary-searches the record of the first
-    index in its chunk, then advances the record cursor monotonically --
-    O(K + R) total, no ``byte_offsets`` array, no per-record host loop.
-    Replaces the NumPy boundary-partition pipeline for the sorted
-    multi-record path. Parameters and errors otherwise match
-    :func:`gather_multirecord`.
+    undefined otherwise. Parameters and errors match
+    :func:`gather_multirecord`; see ``gather.hpp`` for the walk design.
     """
     if (indices.ndim != 1 or output.ndim != 1 or record_starts_rows.ndim != 1
             or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
@@ -688,15 +676,12 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
     """Strided multi-record range gather: rows ``start, start+step, ...``.
 
     Reads the rows of Python ``slice(start, stop, step)`` semantics for one
-    column without ever materializing an index array -- the row stream is
-    synthesized arithmetically inside the kernel, which walks the record
-    cursor monotonically (forward for ``step > 0``, backward for
-    ``step < 0``). ``step`` must be non-zero and ``output`` must have exactly
-    ``len(range(start, stop, step))`` elements. The caller guarantees every
-    visited row is in range (the reader derives the triple from
-    ``slice.indices``, which clamps) and that the dtype is in native byte
-    order (raw typed loads cannot byteswap). Other parameters and errors
-    match :func:`gather_multirecord`.
+    column without materializing an index array. ``step`` must be non-zero
+    and ``output`` must have exactly ``len(range(start, stop, step))``
+    elements. The caller guarantees every visited row is in range (the
+    reader derives the triple from ``slice.indices``, which clamps) and
+    that the dtype is in native byte order (raw typed loads cannot
+    byteswap). Other parameters and errors match :func:`gather_multirecord`.
     """
     if (output.ndim != 1 or record_starts_rows.ndim != 1
             or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
@@ -770,11 +755,10 @@ def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
     Specialization of :func:`gather_multirecord` for files whose records all
     have ``rows_per_record`` rows (the final record may be partial, with
     ``last_record_rows`` rows) and whose record bodies sit at a constant
-    byte stride. The record bin is one integer division and the address one
-    affine formula -- no binary search, no per-record metadata loads. The
-    caller detects the layout and guarantees its invariants (see the C++
-    header) plus native byte order; this entry validates only the scalar
-    sanity conditions and the array contracts shared by every kernel.
+    byte stride. The caller detects the layout and guarantees its
+    invariants (see ``gather.hpp``) plus native byte order; this entry
+    validates only the scalar sanity conditions and the array contracts
+    shared by every kernel.
     """
     if indices.ndim != 1 or output.ndim != 1:
         raise ValueError("indices and output must be 1D.")
@@ -922,10 +906,8 @@ def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
                                         Py_ssize_t prefetch_distance=-1):
     """Uniform-record gather using bins from :func:`gather_multirecord_uniform_bins`.
 
-    Per element: a sequential int32 bin read, the partial-tail compare, one
-    multiply-add, and the load -- no division, no search, no per-record
-    metadata. ``bins`` must come from the bins kernel run on the same
-    ``indices`` and layout; behavior is undefined otherwise. Other
+    ``bins`` must come from :func:`gather_multirecord_uniform_bins` run on
+    the same ``indices`` and layout; behavior is undefined otherwise. Other
     parameters and errors match :func:`gather_multirecord_uniform_bins`.
     """
     if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1:
@@ -994,12 +976,11 @@ def gather_multirecord_withbins_rbase(cnp.ndarray source, cnp.ndarray indices,
     ``record_base[r] = record_starts_bytes[r] + col_prefix * n_rows_per_record[r]
     - record_starts_rows[r] * itemsize`` for THIS column's prefix and
     itemsize, one entry per record; the per-element address is then
-    ``record_base[bins[i]] + indices[i] * itemsize`` -- one metadata load
-    instead of the three the generic withbins kernel pays. ``bins`` must
-    come from :func:`gather_multirecord_bins` (or the uniform bins kernel)
-    on the same ``indices``; record membership and base correctness are the
-    caller's contract and are not re-validated. Other parameters and errors
-    match :func:`gather_multirecord_withbins`.
+    ``record_base[bins[i]] + indices[i] * itemsize``. ``bins`` must come
+    from :func:`gather_multirecord_bins` (or the uniform bins kernel) on
+    the same ``indices``; record membership and base correctness are the
+    caller's contract and are not re-validated. Other parameters and
+    errors match :func:`gather_multirecord_withbins`.
     """
     if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1 or record_base.ndim != 1:
         raise ValueError("indices, output, bins, and record_base must be 1D.")
@@ -1213,11 +1194,10 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
                        Py_ssize_t prefetch_distance=-1):
     """Fused multi-record fancy gather: ``output[i] = column_value(indices[i])``.
 
-    For each (arbitrary, unsorted) index the record is located by a branchless
-    binary search over ``record_starts_rows`` inside the kernel, the byte
-    address is computed in registers, and the element is loaded -- one pass, no
-    ``byte_offsets`` array, no per-index NumPy temporaries. Replaces the NumPy
-    searchsorted pipeline for the unsorted multi-record path.
+    Unsorted-selector kernel: each index is binned to its record inside the
+    kernel (see ``gather.hpp`` for the design). The metadata parameters
+    below define the record layout contract shared by every irregular
+    multi-record kernel in this module.
 
     Parameters
     ----------
@@ -1239,14 +1219,8 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
         1D ``int64`` per-record row counts, length ``n_records``.
     col_prefix_bytes : int
         Summed itemsize of the columns preceding this one in a record body.
-    thread_cap : int, optional
-        Maximum OpenMP threads; ``0`` means the OpenMP maximum. The kernel
-        runs serially below its internal parallel threshold.
-    prefetch_distance : int, optional
-        Software-prefetch look-ahead in elements. ``> 0`` prefetches that
-        many iterations ahead; ``0`` disables prefetching (useful when the
-        source is cache-resident); negative (default) uses the compiled
-        default, :func:`default_prefetch_distance`.
+    thread_cap, prefetch_distance : int, optional
+        Shared kernel parameters; see the module docstring.
 
     Raises
     ------

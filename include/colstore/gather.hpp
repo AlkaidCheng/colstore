@@ -1,19 +1,23 @@
-// Public header for the colstore gather kernel.
+// Public header for the colstore gather kernels.
 //
-// Two entry points sharing one size-templated machinery:
+// Two single-record entry points share one size-templated machinery:
 //
 //   gather_indexed: caller passes element indices; kernel computes byte
 //   addresses internally as ``base + indices[i] * sizeof(T)``. This is the
-//   hot path for any contiguous gather; matches the cost of the original
-//   per-dtype kernel because the inner loop is identical after compilation
-//   (T is compile-time known via the size-keyed templates).
+//   hot path for any contiguous gather.
 //
 //   gather_bytes: caller passes pre-computed byte offsets. Used by the
 //   multi-record reader where addresses are non-uniform.
 //
-// Both are templated on element size only -- a single set of four
-// instantiations (sizes 1/2/4/8) covers every fixed-width numeric dtype plus
-// fixed-width strings, datetime64, and timedelta64.
+// The multi-record kernels below them serve range, strided, sorted,
+// unsorted, bin-reuse, uniform-layout, and boolean-mask reads. All are
+// templated on element size only -- a single set of four instantiations
+// (sizes 1/2/4/8) covers every fixed-width numeric dtype plus fixed-width
+// strings, datetime64, and timedelta64.
+//
+// Measurements and the history behind each kernel are recorded in
+// docs/optimization_series.md; comments here state the contracts and the
+// present design.
 
 #pragma once
 
@@ -117,10 +121,8 @@ void copy_multirecord_range(const std::uint8_t* base,
 // for an arbitrary (unsorted) integer index array. For each index the record
 // is located by a branchless binary search over ``record_starts_rows`` (the
 // R+1 cumulative row boundaries, tiny and cache-resident), the byte address is
-// computed in registers, and the element is loaded -- all in one pass. This
-// replaces the NumPy pipeline (searchsorted -> record_id -> within_record ->
-// byte_offsets -> gather), whose dominant cost is the searchsorted; here the
-// binning is fused into the load and parallelized across indices.
+// computed in registers, and the element is loaded -- all in one pass,
+// OpenMP-parallel across indices.
 //
 // Templated on element size only (1/2/4/8 bytes); ``sizeof(T)`` is the column
 // itemsize. Caller guarantees native byte order and that every index is in
@@ -141,11 +143,10 @@ void gather_multirecord_typed(const std::uint8_t* base,
 
 // Variant of gather_multirecord_typed that additionally records each index's
 // record bin (int32) so subsequent columns sharing the same index set can
-// skip the binary search entirely. The binning is 87-93% of the fused
-// kernel's cost on the deployment hardware, and it is identical across
-// columns of one read -- computing it once and reusing it is the
-// multi-column win. ``bins`` must have length ``n_indices``; requires
-// ``n_records <= INT32_MAX`` (the caller guards).
+// skip the binary search entirely. The binning dominates the fused kernel's
+// cost and is identical across columns of one read -- computing it once and
+// reusing it is the multi-column win. ``bins`` must have length
+// ``n_indices``; requires ``n_records <= INT32_MAX`` (the caller guards).
 template <typename T>
 void gather_multirecord_bins_typed(const std::uint8_t* base,
                                    const std::int64_t* indices,
@@ -182,9 +183,7 @@ void gather_multirecord_withbins_typed(const std::uint8_t* base,
 // (the caller checks; behavior is undefined otherwise). Each OpenMP thread
 // binary-searches the record of the first index in its chunk, then advances
 // the record cursor monotonically -- O(K + R) total work, no byte_offsets
-// array, no per-record host-language loop. Replaces the NumPy
-// boundary-partition pipeline whose per-record Python loop measures 79-97%
-// of the sorted path at R >= 10^4 records.
+// array, no per-record host-language loop.
 template <typename T>
 void gather_multirecord_sorted_typed(const std::uint8_t* base,
                                      const std::int64_t* indices,
@@ -203,9 +202,8 @@ void gather_multirecord_sorted_typed(const std::uint8_t* base,
 // exists at all -- the kernel synthesizes each row in a register. Like the
 // sorted kernel, each OpenMP thread binary-searches the record of its chunk's
 // first row, then advances the record cursor monotonically (forward for
-// ``step > 0``, backward for ``step < 0``) -- O(n_out + R) total work, no
-// ``np.arange`` materialization, no sortedness check, no index-array memory
-// traffic. ``step`` must be non-zero (the Cython entry validates); the caller
+// ``step > 0``, backward for ``step < 0``) -- O(n_out + R) total work.
+// ``step`` must be non-zero (the Cython entry validates); the caller
 // guarantees every visited row ``start + i*step`` is in
 // ``[0, record_starts_rows[n_records])`` (the reader derives ``start``/``stop``
 // from ``slice.indices``, which clamps). Caller guarantees native byte order.
@@ -310,19 +308,16 @@ void gather_multirecord_withbins_rbase_typed(const std::uint8_t* base,
                                              int thread_cap = 0,
                                              std::ptrdiff_t prefetch_distance = DEFAULT_PREFETCH_DISTANCE);
 
-// Boolean-mask-native gather: reads the (uint8 0/1) mask directly instead
-// of materializing int64 indices via flatnonzero. Selector traffic drops
-// from 8 bytes per selected element (plus the flatnonzero write and the
-// sortedness pass) to 1 byte per ROW, read linearly; row order is sorted
-// by construction, so the record cursor advances monotonically like the
-// sorted walk. Runs of set bits are visible in the mask at no extra cost
-// and are served by memcpy (clipped at record boundaries); sparse spans
-// are skipped 8 mask bytes at a time. Two internal passes: a parallel
-// per-chunk popcount fixes each thread's output offset, then each thread
-// gathers its row range. Returns 0 on success, 1 if the mask's selected
-// count does not equal ``n_out`` (nothing is written in that case) --
-// the caller sizes ``output`` with np.count_nonzero and the kernel
-// verifies rather than trusting. ``mask`` has one byte per row
+// Boolean-mask-native gather: reads the (uint8 0/1) mask directly -- 1 byte
+// per row, linearly; row order is sorted by construction, so the record
+// cursor advances monotonically like the sorted walk. Runs of set bits are
+// visible in the mask at no extra cost and are served by memcpy (clipped at
+// record boundaries); sparse spans are skipped 8 mask bytes at a time. Two
+// internal passes: a parallel per-chunk popcount fixes each thread's output
+// offset, then each thread gathers its row range. Returns 0 on success, 1 if
+// the mask's selected count does not equal ``n_out`` (nothing is written in
+// that case) -- the caller sizes ``output`` with np.count_nonzero and the
+// kernel verifies rather than trusting. ``mask`` has one byte per row
 // (``n_rows`` total, normalized 0/1 as numpy bool guarantees); other
 // arguments match the sorted kernel. Native byte order required.
 template <typename T>
