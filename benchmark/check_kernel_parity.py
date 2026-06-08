@@ -24,8 +24,8 @@ contiguous reads, ``gather_bytes`` only when offsets are non-uniform.
 from __future__ import annotations
 
 import argparse
-import time
 
+import _common as _c
 import numpy as np
 
 from colstore import _gather  # type: ignore[attr-defined]
@@ -33,13 +33,7 @@ from colstore.kernels import cpp_available
 
 
 def _best(fn, repeats: int) -> float:
-    fn()
-    b = float("inf")
-    for _ in range(repeats):
-        t = time.perf_counter()
-        fn()
-        b = min(b, time.perf_counter() - t)
-    return b
+    return _c.best_time(fn, repeat=repeats, warmup=1)
 
 
 def main() -> None:

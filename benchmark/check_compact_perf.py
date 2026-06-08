@@ -14,25 +14,17 @@ Two questions:
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from pathlib import Path
 
+import _common as _c
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
 
 
 def _best(fn, repeats: int) -> float:
-    fn()
-    best = float("inf")
-    for _ in range(repeats):
-        t = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t)
-    return best
+    return _c.best_time(fn, repeat=repeats, warmup=1)
 
 
 def main() -> None:

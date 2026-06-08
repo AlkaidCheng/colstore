@@ -33,15 +33,14 @@ from __future__ import annotations
 
 import argparse
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
 
 # Allow running this script directly without installing the package:
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import _common as _c
 from _format_fixture import write_record_file
 
 from colstore import ColStoreReader
@@ -67,13 +66,7 @@ def _make_file(path: Path, n_rows: int, n_records: int, dtype: np.dtype) -> None
 
 
 def _best(fn, repeats: int) -> float:
-    fn()  # warmup discarded
-    best = float("inf")
-    for _ in range(repeats):
-        t = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t)
-    return best
+    return _c.best_time(fn, repeat=repeats, warmup=1)
 
 
 def main() -> None:
