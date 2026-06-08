@@ -59,15 +59,11 @@ def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
     return (byteorder == "<") == bool(np.little_endian)
 
 
-# Sampled-rejection sortedness test. The sampler probes this many evenly
-# spaced adjacent pairs (fractional positions precomputed; the per-call work
-# is one 16-element multiply/astype and two 16-element gathers) before
-# committing to the full O(K) pass. Sampling is skipped below the size
-# threshold, where the full pass is cheaper than the sampler's fixed
-# overhead (measured crossover ~23K elements on the dev container; the
-# constant is set conservatively above it -- at the threshold the sampler
-# can cost at most ~its own fixed overhead, ~15us, relative to the check
-# it replaces).
+# Sampled-rejection sortedness test: probe this many evenly spaced adjacent
+# pairs before committing to the full O(K) pass. Sampling is skipped below
+# the size threshold, where the full pass is cheaper than the sampler's
+# fixed overhead (threshold set conservatively above the measured
+# crossover; see docs/optimization_series.md).
 _SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
 _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 
@@ -88,17 +84,8 @@ def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     *reject* sortedness, never to prove it -- any sampled descent makes the
     array definitely unsorted, while an all-ascending sample still falls
     through to the full pass. Correctness is therefore unconditional; the
-    sampling only changes who pays what:
-
-    * a random unsorted selector fails the sample with probability
-      ``1 - 2**-16`` (each adjacent pair descends with probability ~1/2) and
-      skips the full O(K) pass plus its K-1-byte comparison temporary;
-    * a genuinely sorted selector pays the sampler's ~15us once on top of a
-      full pass it was going to run anyway (0.4ms at K=10^6, 8ms at K=10^7
-      on the dev container -- sub-percent overhead);
-    * adversarial nearly-sorted selectors whose only descents fall between
-      probe positions behave exactly as before: sample passes, full pass
-      decides.
+    sampling only changes the cost split between sorted and unsorted
+    selectors (see docs/optimization_series.md).
     """
     n = indices.shape[0]
     if n <= 1:
@@ -112,18 +99,13 @@ def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
 
 # ---- Parallel contiguous copy ------------------------------------------
 #
-# A contiguous column read is fundamentally one memcpy from the memmap into
-# an owning ndarray. NumPy's copy is single-threaded; on modern multi-core
-# systems with multi-channel memory, one core can't saturate the bus, so
-# splitting the copy across threads is 2-3x faster on a big read. On a
-# memory-bandwidth-bound machine where one core already saturates, the
-# threadpool overhead is wasted and the constants below keep us on the
-# single-thread path.
-#
-# These thresholds are intentionally conservative: any read below
-# _PARALLEL_COPY_MIN_BYTES (~16 MiB) goes single-threaded, and each
-# threadpool worker gets at least _PARALLEL_COPY_BYTES_PER_THREAD of work
-# so the ~1 ms threadpool fork cost is amortized over a few ms of memcpy.
+# A contiguous column read is one memcpy from the memmap into an owning
+# ndarray. NumPy's copy is single-threaded; where one core cannot saturate
+# the memory bus, splitting the copy across threads wins on big reads. The
+# conservative thresholds below keep small reads single-threaded: any read
+# below _PARALLEL_COPY_MIN_BYTES goes single-threaded, and each worker gets
+# at least _PARALLEL_COPY_BYTES_PER_THREAD of work so the threadpool fork
+# cost is amortized.
 
 _PARALLEL_COPY_MIN_BYTES = 16 * 1024 * 1024
 _PARALLEL_COPY_BYTES_PER_THREAD = 16 * 1024 * 1024
@@ -175,16 +157,6 @@ def _parallel_contiguous_copy(
 
 
 # ---- DataFrame construction --------------------------------------------
-#
-# ``pd.DataFrame(dict_of_arrays)`` groups columns by dtype and copies
-# them into one 2D ``Block`` per dtype group ("consolidation"). On a 1 GB
-# / 50-column store of all-float64 data, that's a 1 GB extra allocation
-# plus memcpy on top of the dict already owning a 1 GB copy of the data
-# -- it dominates ``frame()`` (~700 ms vs ~70 ms for ``dict()`` on the
-# same data, measured on 256-core hardware). The optimized path
-# constructs the ``BlockManager`` with one ``Block`` per column instead,
-# sharing memory with the input arrays and skipping the consolidation
-# copy.
 
 
 def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataFrame:
@@ -752,35 +724,32 @@ class ColStoreReader:
     ) -> NDArray[Any]:
         """Read one column from a file with multiple records.
 
-        Per-pattern dispatch:
+        Per-pattern dispatch (measurements and rejected alternatives in
+        docs/optimization_series.md):
+
+        * **Boolean mask** at/above the density gate, native dtype:
+          mask-native kernel (``gather_multirecord_mask``). Below the gate
+          or non-native: lower to ``np.flatnonzero`` and continue below.
 
         * **Slice** (``None`` / ``slice`` / contiguous range): per-record
-          contiguous memcpy via ``np.frombuffer``. Avoids the gather kernel
-          and the byte-offset materialization entirely. Measured ~48x faster
-          than the generic path on a slice spanning 10 records (0.07 ms vs
-          3.4 ms).
+          contiguous memcpy; no gather kernel, no byte-offset
+          materialization.
 
         * **Strided slice** (``step != 1``, native dtype): native strided
-          walk kernel (``gather_multirecord_strided``) -- the row stream is
-          synthesized arithmetically inside the kernel, which advances the
-          record cursor monotonically in the step's direction. No index
-          array is materialized and no sortedness check runs. Non-native
-          dtypes fall back to ``np.arange`` + the fancy path below.
+          walk kernel (``gather_multirecord_strided``). Non-native dtypes
+          fall back to ``np.arange`` + the fancy path below.
 
         * **Sorted fancy index**: native linear-walk kernel
-          (``gather_multirecord_sorted``) -- each thread binary-searches its
-          chunk's first record, then advances the record cursor
-          monotonically; O(K + R), offsets in registers, no byte_offsets
-          array. The NumPy boundary-partition pipeline survives only as the
-          non-native (big-endian host) fallback.
+          (``gather_multirecord_sorted``); the NumPy boundary-partition
+          pipeline survives only as the non-native (big-endian host)
+          fallback.
 
-        * **Unsorted fancy index**: searchsorted + byte-offset gather. This
-          is the generic path; the searchsorted is unavoidable when indices
-          can land anywhere across records, and it dominates the cost.
-          Argsort + sorted-path + reindex is *slower* than this (measured)
-          because argsort on K int64 costs more than searchsorted does. The
-          escape valve is :func:`colstore.compact` -- collapse to a single
-          record and the fast path kicks in.
+        * **Unsorted fancy index**: fused native kernel (arithmetic binning
+          on uniform layouts, branchless search otherwise); the
+          searchsorted + ``gather_bytes`` pipeline survives only as the
+          non-native fallback. The escape valve for unsorted reads is
+          :func:`colstore.compact` -- collapse to a single record and the
+          single-record fast path applies.
 
         For an integer scalar selector, the result is a length-1 ndarray
         matching the contiguous path's ``atleast_1d`` semantics.
@@ -793,10 +762,7 @@ class ColStoreReader:
         col_prefix = int(self._column_prefix_bytes[column_name])
 
         # ---- Boolean mask: mask-native kernel where it pays, else lower to
-        # indices and continue into the fancy paths below. The kernel reads
-        # the 1-byte/row mask linearly (no flatnonzero materialization, no
-        # sortedness pass, no 8-byte/element index traffic) and gets run
-        # coalescing for free from the mask bytes it scans anyway.
+        # indices and continue into the fancy paths below.
         if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
             mask = row_indexer
             selected = int(np.count_nonzero(mask))
@@ -845,18 +811,13 @@ class ColStoreReader:
                     start, stop, disk_dtype, native_dtype, col_prefix, itemsize
                 )
             if _dtype_is_native(disk_dtype):
-                # Non-unit step, native byte order: strided walk kernel. The
-                # row stream is arithmetic, so no index array is built at all
-                # -- this skips the np.arange materialization, the O(K)
-                # sortedness pass, and the index-array bandwidth the fancy
-                # path below would pay. Negative steps (a descending stream,
-                # which the sortedness check would send to the per-element
-                # binary-search kernel) become an O(K + R) backward walk.
+                # Non-unit step, native byte order: strided walk kernel; no
+                # index array, no sortedness pass (negative steps included).
                 return self._read_strided_range_multi_record(
                     start, stop, step, disk_dtype, native_dtype, col_prefix, thread_cap
                 )
             # Non-native (big-endian host) fallback: materialize the indices
-            # and take the generic fancy path below, exactly as before.
+            # and take the generic fancy path below.
             indices = np.arange(start, stop, step, dtype=np.int64)
         else:
             # int ndarray -- already validated, made int64, and made
@@ -889,41 +850,8 @@ class ColStoreReader:
         # full proof (see _indices_are_sorted). The check stays serial, so
         # its share of the read grows with the kernel's thread count.
         if n > 1 and _indices_are_sorted(indices):
-            # Sorted path. The native walk kernel handles native dtypes; the
-            # NumPy boundary-partition pipeline below it survives only as
-            # the non-native (big-endian host) fallback. Its design, kept
-            # for that fallback:
-            #
-            # (1) Boundary-based partition. ``np.searchsorted`` on the
-            #     *record-row boundaries* against the indices array
-            #     (O(R log K)) replaces searchsorted on the *indices* against
-            #     the boundaries (O(K log R)).
-            #
-            # (2) Per-record byte_offset arithmetic. For each record-bucket
-            #     [lo, hi), all entries share the same record body offset,
-            #     so:
-            #
-            #         byte_offsets[i] = rsb[r] + col_prefix * nrr[r]
-            #                                  + (indices[i] - rsr[r]) * itemsize
-            #                         = base_for_record_r + indices[i] * itemsize
-            #
-            #     where base_for_record_r = rsb[r] + col_prefix*nrr[r]
-            #                               - rsr[r]*itemsize is a scalar.
-            #
-            #     This is much cheaper than the generic vectorized form,
-            #     which would allocate four K-sized int64 temporaries
-            #     (record_id, within_record, two intermediate gathers). At
-            #     K=1M the generic form costs ~11ms in allocator/cache
-            #     traffic alone; the per-record loop costs ~1ms.
             if _dtype_is_native(disk_dtype):
-                # Native byte order: linear-walk kernel. Each thread
-                # binary-searches the record of its chunk's first index, then
-                # advances the record cursor monotonically -- O(K + R) total,
-                # offsets in registers, OpenMP across index chunks. The
-                # boundary-partition pipeline below is kept only for
-                # non-native hosts: its per-record Python loop measures
-                # 79-97% of the sorted path at R >= 10^4 records, and the
-                # partition, loop, and byte_offsets array all disappear here.
+                # Native byte order: linear-walk kernel (see gather.hpp).
                 _cpp_module.gather_multirecord_sorted(
                     self._file_mmap,
                     indices,
@@ -936,6 +864,18 @@ class ColStoreReader:
                     config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=True),
                 )
                 return output.astype(native_dtype, copy=False)
+            # Non-native (big-endian host) fallback: NumPy boundary-partition
+            # pipeline. ``np.searchsorted`` partitions on the *record-row
+            # boundaries* against the indices (O(R log K), not O(K log R));
+            # within each record-bucket [lo, hi) all entries share one
+            # record body, so
+            #
+            #     byte_offsets[i] = rsb[r] + col_prefix * nrr[r]
+            #                              + (indices[i] - rsr[r]) * itemsize
+            #                     = base_for_record_r + indices[i] * itemsize
+            #
+            # with base_for_record_r = rsb[r] + col_prefix*nrr[r]
+            # - rsr[r]*itemsize a scalar, avoiding K-sized int64 temporaries.
             crossings = np.searchsorted(indices, record_starts_rows, side="left")
             byte_offsets = np.empty(n, dtype=np.int64)
             for r in range(crossings.shape[0] - 1):
@@ -959,14 +899,9 @@ class ColStoreReader:
             )
         elif _dtype_is_native(disk_dtype):
             # Unsorted (or n == 1), native byte order: fused native gather.
-            # The kernel bins each index to its record with a branchless
-            # binary search and loads in one pass -- no searchsorted, no
-            # byte_offsets array. The searchsorted-based binning was measured
-            # at ~75-85% of this path's cost; folding it into the kernel (and
-            # parallelizing it, which searchsorted cannot be) is the win.
-            # On uniform-record files the search itself goes away: the bin is
-            # one integer division and the address one affine formula
-            # (gather_multirecord_uniform).
+            # Uniform-record layouts get arithmetic binning
+            # (gather_multirecord_uniform); irregular layouts get the
+            # branchless-search kernel (see gather.hpp).
             uniform = self._uniform_record_layout()
             if uniform is not None:
                 rows_per_record, record_stride, first_body, last_rows = uniform
@@ -997,9 +932,9 @@ class ColStoreReader:
                 )
         else:
             # Unsorted, non-native byte order (big-endian host). The fused
-            # kernel does a raw typed load and cannot byteswap, so fall back to
-            # the NumPy searchsorted pipeline feeding the raw gather_bytes
-            # kernel -- identical to the pre-Stage-2 behavior on this host.
+            # kernel does a raw typed load and cannot byteswap, so fall back
+            # to the NumPy searchsorted pipeline feeding the raw gather_bytes
+            # kernel.
             record_id = np.searchsorted(record_starts_rows, indices, side="right") - 1
             within_record = indices - record_starts_rows[record_id]
             byte_offsets = (
@@ -1136,17 +1071,14 @@ class ColStoreReader:
         """Read rows ``start, start+step, ...`` (slice semantics) for one column.
 
         Serves multi-record slices with ``step != 1`` via the native strided
-        walk kernel. The kernel synthesizes each row arithmetically, so this
-        path never allocates an index array, never runs the sortedness check,
-        and never reads index bytes -- the three costs the previous
-        ``np.arange`` + fancy-gather route paid. Requires a native-byte-order
-        disk dtype (the caller gates; the kernel does raw typed loads).
+        walk kernel, with no index array and no sortedness check. Requires a
+        native-byte-order disk dtype (the caller gates; the kernel does raw
+        typed loads).
 
         Prefetch is resolved with ``indices_sorted=True`` for both step
         directions: the calibrated regimes classify the *access stream*, and a
         strided walk is monotone (ascending or descending) with the same
-        record-local linearity the sorted gather has. The per-thread-count
-        axis caveat from the calibration work applies here unchanged.
+        record-local linearity the sorted gather has.
         """
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
@@ -1173,13 +1105,11 @@ class ColStoreReader:
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         """Read multiple columns in parallel; return ordered dict of owning arrays.
 
-        Multi-column **unsorted fancy** reads of a multi-record store take the
-        bin-reuse route first (see :meth:`_gather_many_bin_reuse`): the
-        per-index record binning is 87-93% of the fused gather kernel's cost
-        on the target hardware and is identical for every column of the read,
-        so it is computed once and reused -- measured 1.9-2.5x at realistic
-        thread counts, growing with the column count, and it also cuts total
-        CPU work (one binning pass instead of C).
+        Multi-column **boolean-mask** reads try the mask-native route first
+        (:meth:`_gather_many_mask`); multi-column **unsorted fancy** reads
+        of a multi-record store take the bin-reuse route
+        (:meth:`_gather_many_bin_reuse`), which computes the per-index
+        record binning once and reuses it for every column.
 
         Otherwise, columns are read concurrently on a thread pool, and each
         column's C++ gather may itself use OpenMP threads. To keep the product
@@ -1217,14 +1147,14 @@ class ColStoreReader:
         """Mask-native route for multi-column boolean-mask reads, or ``None``.
 
         Taken when the store is multi-record, the selector is a boolean
-        mask at or above the density gate (``config.resolve_mask_density_gate``:
-        per-host calibrated, or the compiled default),
-        and at least two requested columns are native-byte-order. Each
-        native column runs the mask kernel (sequential columns at the full
-        OMP cap, like the bins route) -- the selected count is computed
-        once, no int64 index array exists for the native columns, and the
-        kernel coalesces mask runs into memcpys. Non-native columns (and
-        the decline cases) fall back to lowered indices in the caller.
+        mask at or above the density gate
+        (``config.resolve_mask_density_gate``: per-host calibrated, or the
+        compiled default), and at least two requested columns are
+        native-byte-order. Each native column runs the mask kernel
+        (sequential columns at the full OMP cap, like the bins route); the
+        selected count is computed once and no index array is built for the
+        native columns. Non-native columns (and the decline cases) fall
+        back to lowered indices in the caller.
         """
         if not (isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_):
             return None
@@ -1275,23 +1205,19 @@ class ColStoreReader:
         Taken when the store is multi-record, the selector is a fancy index
         array that is unsorted, and at least two requested columns are
         native-byte-order (the bins kernels do raw typed loads). The first
-        native column runs ``gather_multirecord_bins`` (the Stage-2 kernel
-        plus an ``int32`` bins output); the rest run
-        ``gather_multirecord_withbins``, where the per-element record is a
-        sequential bins read instead of a branchless binary search. Columns
-        run sequentially, each at the full thread cap, OpenMP-parallel over
-        indices: measured on the target hardware this beats both the
-        column-pool shape and a fully fused C-column kernel (whose per-thread
-        C concurrent load streams collapse aggregate throughput at realistic
-        thread counts). The sortedness check and prefetch resolution are also
-        amortized across the read instead of per column.
+        native column runs ``gather_multirecord_bins``; the rest reuse the
+        bins via the withbins kernels. Columns run sequentially, each at the
+        full thread cap, OpenMP-parallel over indices -- the shape that won
+        on the deployment hardware over both the column-pool shape and a
+        fully fused C-column kernel (see docs/optimization_series.md). The
+        sortedness check and prefetch resolution are amortized across the
+        read instead of per column.
 
         Sorted selectors decline the route and run the native sorted walk
-        kernel per column (``gather_multirecord_sorted``): the walk is
-        already load-bound at every record count, and its record binning is
-        an O(K + R) cursor advance rather than a per-element search, so
-        there is nothing to amortize across columns. Non-native columns of
-        a mixed read fall back to :meth:`_gather_one` individually.
+        kernel per column: the walk's record binning is a cursor advance
+        rather than a per-element search, so there is nothing to amortize
+        across columns. Non-native columns of a mixed read fall back to
+        :meth:`_gather_one` individually.
         """
         if not self._is_multi_record or len(column_names) <= 1:
             return None
@@ -1320,13 +1246,8 @@ class ColStoreReader:
         uniform = self._uniform_record_layout()
         if uniform is not None:
             # Uniform-record file: same shape as the generic bins route
-            # (first column fills bins, the rest read them; columns
-            # sequential, each OpenMP-parallel at the full cap), but the
-            # first column's binning is one division instead of a binary
-            # search, and subsequent columns form addresses with the affine
-            # formula instead of three per-record metadata loads. Division
-            # once per element beats division per column: with C columns
-            # the bins read is cheaper than re-dividing.
+            # (first column fills bins, the rest read them), with arithmetic
+            # binning in place of the binary search.
             rows_per_record, record_stride, first_body, last_rows = uniform
             bins = np.empty(n, dtype=np.int32)
             for position, name in enumerate(native_names):
@@ -1356,14 +1277,10 @@ class ColStoreReader:
                 for name in column_names
             }
         bins = np.empty(n, dtype=np.int32)
-        # Record-base precompute (irregular files): after the first column
-        # fills the bins, the generic withbins kernel still pays three
-        # per-record metadata loads per element. When the read is large
-        # enough to amortize the O(R) build (see the gate constant),
-        # subsequent columns instead get a per-column record_base array
-        # folding all three plus the prefix arithmetic into one scalar per
-        # record, and the per-element address becomes
-        # record_base[bins[i]] + indices[i] * itemsize.
+        # Record-base precompute (irregular files): when the read is large
+        # enough to amortize the O(R) per-column record_base build (see the
+        # gate constant), columns after the first use the rbase kernel;
+        # below the gate the generic withbins kernel runs unchanged.
         use_record_base = n >= n_records * _RBASE_MIN_INDICES_PER_RECORD
         rsr_records = self._record_starts_rows[:-1]
         for position, name in enumerate(native_names):
