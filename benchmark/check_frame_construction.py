@@ -27,133 +27,20 @@ Run with PYTHONPATH=src and an extension built into src/colstore/.
 
 from __future__ import annotations
 
-import ctypes
 import os
-import resource
-import statistics
 import tempfile
-import threading
-import time
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 
+import _common as _c
 import numpy as np
 import pandas as pd
 
 import colstore
 from colstore.reader import _make_dataframe_no_consolidate
 
-
-@dataclass
-class Run:
-    wall_ms: float
-    cpu_ms: float
-    peak_threads: int
-    major_pf: int
-    minor_pf: int
-
-
-@dataclass
-class Result:
-    label: str
-    runs: list[Run] = field(default_factory=list)
-
-    def report(self) -> str:
-        if not self.runs:
-            return f"  {self.label:<60}  (no runs)"
-        best = min(self.runs, key=lambda r: r.wall_ms)
-        med_threads = statistics.median(r.peak_threads for r in self.runs)
-        med_major = statistics.median(r.major_pf for r in self.runs)
-        med_minor = statistics.median(r.minor_pf for r in self.runs)
-        ratio = best.cpu_ms / best.wall_ms if best.wall_ms > 0 else float("nan")
-        return (
-            f"  {self.label:<60} "
-            f"wall={best.wall_ms:8.2f}ms  cpu={best.cpu_ms:7.1f}ms  "
-            f"ratio={ratio:5.2f}x  threads={int(med_threads):2d}  "
-            f"pf={int(med_major)}/{int(med_minor)}"
-        )
-
-
-def drop_pagecache_softly(paths: list[Path]) -> None:
-    """Evict file pages via posix_fadvise(DONTNEED) (no root needed)."""
-    POSIX_FADV_DONTNEED = 4
-    libc = ctypes.CDLL("libc.so.6")
-    for path in paths:
-        if path.is_dir():
-            for sub in path.iterdir():
-                if sub.is_file():
-                    fd = os.open(str(sub), os.O_RDONLY)
-                    try:
-                        libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-        else:
-            fd = os.open(str(path), os.O_RDONLY)
-            try:
-                libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
-            finally:
-                os.close(fd)
-
-
-@contextmanager
-def thread_watcher(interval_s: float = 0.001):
-    """Context manager that tracks the peak active thread count."""
-    peak = [threading.active_count()]
-    stop = [False]
-
-    def poll() -> None:
-        while not stop[0]:
-            n = threading.active_count()
-            if n > peak[0]:
-                peak[0] = n
-            time.sleep(interval_s)
-
-    watcher = threading.Thread(target=poll, daemon=True)
-    watcher.start()
-    try:
-        yield lambda: peak[0]
-    finally:
-        stop[0] = True
-        watcher.join(timeout=0.5)
-
-
-def time_call(fn) -> Run:
-    """Time one call of `fn` and capture process metrics."""
-    ru_before = resource.getrusage(resource.RUSAGE_SELF)
-    cpu_before = time.process_time()
-    wall_before = time.perf_counter()
-    with thread_watcher() as peak_fn:
-        fn()
-        peak = peak_fn()
-    wall_ms = (time.perf_counter() - wall_before) * 1000
-    cpu_ms = (time.process_time() - cpu_before) * 1000
-    ru_after = resource.getrusage(resource.RUSAGE_SELF)
-    return Run(
-        wall_ms=wall_ms,
-        cpu_ms=cpu_ms,
-        peak_threads=peak,
-        major_pf=ru_after.ru_majflt - ru_before.ru_majflt,
-        minor_pf=ru_after.ru_minflt - ru_before.ru_minflt,
-    )
-
-
-def bench_interleaved(
-    labels: list[str], fns: list, n_iter: int = 5, n_warmup: int = 2
-) -> list[Result]:
-    """Run several functions A/B/A/B-style and return per-fn Result lists.
-
-    Interleaving keeps page-cache and scheduler state comparable across
-    the variants; running A...A then B...B confounds the comparison.
-    """
-    results = [Result(label=label) for label in labels]
-    for fn in fns:
-        for _ in range(n_warmup):
-            fn()
-    for _ in range(n_iter):
-        for fn, result in zip(fns, results, strict=True):
-            result.runs.append(time_call(fn))
-    return results
+Result = _c.RichResult
+bench_interleaved = _c.bench_interleaved
+drop_pagecache_softly = _c.drop_pagecache
 
 
 def make_store(td: str, name: str, n_rows: int, n_cols: int, dtypes) -> Path:
