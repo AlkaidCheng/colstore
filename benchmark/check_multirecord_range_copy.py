@@ -20,7 +20,6 @@ parallelism change, so single-thread timing is the relevant measurement.
 
 from __future__ import annotations
 
-import argparse
 import tempfile
 from pathlib import Path
 
@@ -219,15 +218,13 @@ def run_bench(repeat: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeat", type=int, default=20, help="timed reps per config")
-    parser.add_argument("--skip-correctness", action="store_true")
-    parser.add_argument("--skip-bench", action="store_true")
-    args = parser.parse_args()
-    if not args.skip_correctness:
-        run_correctness()
-    if not args.skip_bench:
-        run_bench(args.repeat)
+    _c.run_script(
+        correctness=run_correctness,
+        bench=run_bench,
+        default_repeat=20,
+        skip_correctness_flag=True,
+        description=__doc__,
+    )
 
 
 if __name__ == "__main__":

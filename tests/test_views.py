@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from _helpers import opened
 
 import colstore
 from colstore import ColumnView, TableView
@@ -449,14 +450,11 @@ def test_multi_record_store_raises_with_compact_hint(tmp_path):
     with colstore.create(path) as writer:
         writer.write({"a": full[:800]})
         writer.write({"a": full[800:]})
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         with pytest.raises(ValueError, match="compact"):
             dataset["a"].array(copy=False)
         with pytest.raises(ValueError, match="compact"):
             dataset.dict(copy=False)
-    finally:
-        dataset.close()
 
 
 def test_copy_false_rejected_for_native_mask_route(tmp_path, monkeypatch):
@@ -474,14 +472,11 @@ def test_copy_false_rejected_for_native_mask_route(tmp_path, monkeypatch):
         for offset in range(0, total, 500):  # 12 records
             writer.write({"a": full[offset : offset + 500]})
     monkeypatch.setattr(config_mod, "_mask_density_gate", 0.1)  # native route eligible
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         mask = rng.random(total) < 0.6  # dense: above the gate
         assert np.array_equal(dataset[mask, "a"].array(), full[mask])  # copy=True ok
         with pytest.raises(ValueError, match="copy=True"):
             dataset[mask, "a"].array(copy=False)
-    finally:
-        dataset.close()
 
 
 def test_compacted_store_supports_zero_copy(tmp_path):
@@ -493,13 +488,10 @@ def test_compacted_store_supports_zero_copy(tmp_path):
             writer.write({"a": full[lo : lo + 500]})
     compacted = tmp_path / "compacted.cstore"
     colstore.compact(path, out=compacted, show_progress=False)
-    dataset = colstore.open(compacted)
-    try:
+    with opened(compacted) as dataset:
         view = dataset["a"].array(copy=False)
         assert np.shares_memory(view, dataset._memmaps["a"])
         assert np.array_equal(view, full)
-    finally:
-        dataset.close()
 
 
 def test_non_native_dtype_raises(single_record_store, monkeypatch):
