@@ -59,6 +59,7 @@ __all__ = [
     "make_store",
     "max_threads",
     "random_column",
+    "run_script",
     "standard_columns",
     "thread_watcher",
     "time_call",
@@ -458,3 +459,33 @@ def bench_interleaved(
         for fn, result in zip(fns, results, strict=True):
             result.runs.append(time_call(fn))
     return results
+
+
+# ---- Script driver and store context managers -------------------------------
+
+
+def run_script(
+    *,
+    correctness: Callable[[], Any] | None = None,
+    bench: Callable[[int], Any] | None = None,
+    default_repeat: int = 5,
+    skip_correctness_flag: bool = False,
+    description: str = "",
+) -> None:
+    """Standard ``main()`` for a single-purpose check script.
+
+    Owns the ``--repeat`` / ``--skip-bench`` (and optional
+    ``--skip-correctness``) parser, runs the correctness gate, then the
+    benchmark unless skipped. Replaces the near-identical hand-written
+    ``main()`` in each ``check_*.py``.
+    """
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--repeat", type=int, default=default_repeat)
+    if skip_correctness_flag:
+        parser.add_argument("--skip-correctness", action="store_true")
+    parser.add_argument("--skip-bench", action="store_true")
+    args = parser.parse_args()
+    if correctness is not None and not getattr(args, "skip_correctness", False):
+        correctness()
+    if bench is not None and not args.skip_bench:
+        bench(args.repeat)

@@ -27,7 +27,6 @@ becomes a linear walk).
 
 from __future__ import annotations
 
-import argparse
 import tempfile
 from pathlib import Path
 
@@ -157,13 +156,7 @@ def run_bench(repeat: int) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--skip-bench", action="store_true")
-    args = parser.parse_args()
-    check_correctness()
-    if not args.skip_bench:
-        run_bench(args.repeat)
+    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
 
 
 if __name__ == "__main__":

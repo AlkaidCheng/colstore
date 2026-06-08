@@ -15,7 +15,7 @@ import itertools
 
 import numpy as np
 import pytest
-from _helpers import kernel_spy, write_records, write_standard_store
+from _helpers import kernel_spy, opened, write_records, write_standard_store
 
 import colstore
 from colstore import config as config_mod
@@ -108,15 +108,12 @@ def test_routing_unchanged_for_sorted_and_unsorted(sortedness_store, monkeypatch
     sorted_idx = np.sort(unsorted_idx)
 
     routes = kernel_spy(monkeypatch, ["gather_multirecord_sorted", "gather_multirecord"])
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert np.array_equal(dataset[sorted_idx, "f8"].array(), full["f8"][sorted_idx])
         assert routes == ["gather_multirecord_sorted"]
         routes.clear()
         assert np.array_equal(dataset[unsorted_idx, "f8"].array(), full["f8"][unsorted_idx])
         assert routes == ["gather_multirecord"]
-    finally:
-        dataset.close()
 
 
 @pytest.mark.parametrize("size", [1_000, THRESHOLD * 2])
@@ -127,8 +124,7 @@ def test_bin_reuse_gate_unchanged(sortedness_store, monkeypatch, size):
     sorted_idx = np.sort(unsorted_idx)
 
     bins_calls = kernel_spy(monkeypatch, ["gather_multirecord_bins"])
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[unsorted_idx, ["f8", "i4"]].dict()
         assert len(bins_calls) == 1  # unsorted multi-column: bin-reuse route
         assert np.array_equal(result["f8"], full["f8"][unsorted_idx])
@@ -136,8 +132,6 @@ def test_bin_reuse_gate_unchanged(sortedness_store, monkeypatch, size):
         result = dataset[sorted_idx, ["f8", "i4"]].dict()
         assert len(bins_calls) == 1  # sorted multi-column: per-column path, no bins
         assert np.array_equal(result["f8"], full["f8"][sorted_idx])
-    finally:
-        dataset.close()
 
 
 def test_single_element_selector_keeps_fused_route(sortedness_store, monkeypatch):
@@ -145,12 +139,9 @@ def test_single_element_selector_keeps_fused_route(sortedness_store, monkeypatch
     # ``n > 1 and`` guard; the sortedness helper must not move it.
     path, full, _ = sortedness_store
     routes = kernel_spy(monkeypatch, ["gather_multirecord_sorted", "gather_multirecord"])
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert dataset[np.array([42], dtype=np.int64), "f8"].array()[0] == full["f8"][42]
         assert routes == ["gather_multirecord"]
-    finally:
-        dataset.close()
 
 
 # ---- Sorted-read routing ----------------------------------------------------
@@ -230,57 +221,45 @@ STEPS = [2, 3, 10, -1, -2, -7, 1000, -1000]
 @pytest.mark.parametrize("step", STEPS)
 def test_reader_strided_slice_matches_ground_truth(strided_store, step):
     path, full, total = strided_store
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         for name, values in full.items():
             result = dataset[::step, name].array()
             assert result.dtype == values.dtype
             assert np.array_equal(result, values[::step]), (name, step)
         offset_result = dataset[5 : total - 5 : step, "f8"].array()
         assert np.array_equal(offset_result, full["f8"][5 : total - 5 : step])
-    finally:
-        dataset.close()
 
 
 def test_reader_strided_slice_matches_fancy_path(strided_store):
     # The route this kernel replaces: explicit arange selector through the
     # fancy path. Identical selectors must produce identical results.
     path, _full, total = strided_store
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         for step in (4, -4):
             indices = np.arange(*slice(None, None, step).indices(total), dtype=np.int64)
             assert np.array_equal(
                 dataset[::step, "f4"].array(), dataset[indices, "f4"].array()
             ), step
-    finally:
-        dataset.close()
 
 
 def test_reader_strided_multi_column_dict(strided_store):
     path, full, _ = strided_store
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[::3, ["f8", "i2"]].dict()
         assert np.array_equal(result["f8"], full["f8"][::3])
         assert np.array_equal(result["i2"], full["i2"][::3])
-    finally:
-        dataset.close()
 
 
 def test_reader_routes_strided_slices_to_kernel(strided_store, monkeypatch):
     path, _, _ = strided_store
     calls = kernel_spy(monkeypatch, ["gather_multirecord_strided"])
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         dataset[::2, "f8"].array()
         assert len(calls) == 1
         dataset[100:1000, "f8"].array()  # unit step: contiguous route, not the kernel
         assert len(calls) == 1
         dataset[::-1, "i2"].array()
         assert len(calls) == 2
-    finally:
-        dataset.close()
 
 
 def test_reader_non_native_dtype_falls_back(strided_store, monkeypatch):
@@ -290,11 +269,8 @@ def test_reader_non_native_dtype_falls_back(strided_store, monkeypatch):
     path, full, _ = strided_store
     calls = kernel_spy(monkeypatch, ["gather_multirecord_strided"])
     monkeypatch.setattr(reader_mod, "_dtype_is_native", lambda dtype: False)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[::5, "f8"].array()
-    finally:
-        dataset.close()
     monkeypatch.undo()
     assert not calls
     assert result.dtype == np.dtype(np.float64).newbyteorder("=")
@@ -310,15 +286,12 @@ def test_reader_non_native_dtype_falls_back(strided_store, monkeypatch):
 @pytest.mark.parametrize("tail", [200, 57])
 def test_detection_accepts_uniform_layouts(tmp_path, tail):
     path, _, _ = write_standard_store(tmp_path, [200] * 9 + [tail], seed=11)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         layout = dataset._uniform_record_layout()
         assert layout is not None
         rows, stride, first_body, last_rows = layout
         assert rows == 200 and last_rows == tail
         assert stride > 0 and first_body >= 0
-    finally:
-        dataset.close()
 
 
 @pytest.mark.parametrize(
@@ -331,24 +304,18 @@ def test_detection_accepts_uniform_layouts(tmp_path, tail):
 )
 def test_detection_rejects_irregular_layouts(tmp_path, shape):
     path, _, _ = write_standard_store(tmp_path, shape, seed=11)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert dataset._uniform_record_layout() is None
-    finally:
-        dataset.close()
 
 
 def test_uniform_store_routes_single_column_to_uniform_kernel(tmp_path, monkeypatch):
     path, full, total = write_standard_store(tmp_path, [500] * 8, seed=11)
     calls = kernel_spy(monkeypatch, ["gather_multirecord_uniform", "gather_multirecord"])
     indices = np.random.default_rng(12).integers(0, total, 700).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         for name, values in full.items():
             assert np.array_equal(dataset[indices, name].array(), values[indices]), name
         assert calls == ["gather_multirecord_uniform"] * 3
-    finally:
-        dataset.close()
 
 
 def test_uniform_store_multi_column_uses_uniform_bins_pair(tmp_path, monkeypatch):
@@ -363,8 +330,7 @@ def test_uniform_store_multi_column_uses_uniform_bins_pair(tmp_path, monkeypatch
         ],
     )
     indices = np.random.default_rng(13).integers(0, total, 900).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[indices, ["f8", "f4", "i2"]].dict()
         assert calls == [
             "gather_multirecord_uniform_bins",
@@ -373,20 +339,15 @@ def test_uniform_store_multi_column_uses_uniform_bins_pair(tmp_path, monkeypatch
         ]
         for name in ("f8", "f4", "i2"):
             assert np.array_equal(result[name], full[name][indices]), name
-    finally:
-        dataset.close()
 
 
 def test_uniform_store_sorted_path_unaffected(tmp_path, monkeypatch):
     path, full, total = write_standard_store(tmp_path, [500] * 8, seed=11)
     calls = kernel_spy(monkeypatch, ["gather_multirecord_uniform", "gather_multirecord_sorted"])
     indices = np.sort(np.random.default_rng(15).integers(0, total, 700).astype(np.int64))
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert np.array_equal(dataset[indices, "f8"].array(), full["f8"][indices])
         assert calls == ["gather_multirecord_sorted"]
-    finally:
-        dataset.close()
 
 
 def test_forced_generic_route_matches_uniform_route(tmp_path, monkeypatch):
@@ -394,20 +355,14 @@ def test_forced_generic_route_matches_uniform_route(tmp_path, monkeypatch):
     # identical results through the generic kernels.
     path, _full, total = write_standard_store(tmp_path, [400] * 10, seed=11)
     indices = np.random.default_rng(18).integers(0, total, 1_500).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         via_uniform = dataset[indices, ["f8", "f4"]].dict()
-    finally:
-        dataset.close()
     monkeypatch.setattr(
         reader_mod.ColStoreReader, "_detect_uniform_record_layout", lambda self: None
     )
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert dataset._uniform_record_layout() is None
         via_generic = dataset[indices, ["f8", "f4"]].dict()
-    finally:
-        dataset.close()
     for name in ("f8", "f4"):
         assert np.array_equal(via_uniform[name], via_generic[name]), name
 
@@ -501,8 +456,7 @@ def test_large_read_routes_trailing_columns_to_rbase(rbase_irregular_store, monk
     calls = kernel_spy(monkeypatch, BINS_KERNELS)
     # n >= n_records * gate: 10 records, 5000 indices -> rbase engaged.
     indices = np.random.default_rng(32).integers(0, total, 5_000).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[indices, ["f8", "f4", "i2"]].dict()
         assert calls == [
             "gather_multirecord_bins",
@@ -511,8 +465,6 @@ def test_large_read_routes_trailing_columns_to_rbase(rbase_irregular_store, monk
         ]
         for name in ("f8", "f4", "i2"):
             assert np.array_equal(result[name], full[name][indices]), name
-    finally:
-        dataset.close()
 
 
 def test_small_read_keeps_generic_withbins(tmp_path, monkeypatch):
@@ -520,42 +472,30 @@ def test_small_read_keeps_generic_withbins(tmp_path, monkeypatch):
     path, full, total = write_standard_store(tmp_path, [17, 23] * 1000, seed=33, name="rbase")
     calls = kernel_spy(monkeypatch, BINS_KERNELS)
     indices = np.random.default_rng(34).integers(0, total, 30).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[indices, ["f8", "i2"]].dict()
         assert calls == ["gather_multirecord_bins", "gather_multirecord_withbins"]
         assert np.array_equal(result["f8"], full["f8"][indices])
-    finally:
-        dataset.close()
 
 
 def test_uniform_store_keeps_uniform_pair(tmp_path, monkeypatch):
     path, full, total = write_standard_store(tmp_path, [300] * 12, seed=35, name="rbase")
     calls = kernel_spy(monkeypatch, BINS_KERNELS)
     indices = np.random.default_rng(36).integers(0, total, 2_000).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         result = dataset[indices, ["f8", "f4"]].dict()
         assert calls == ["gather_multirecord_uniform_bins"]  # withbins variants unspied here
         assert np.array_equal(result["f8"], full["f8"][indices])
-    finally:
-        dataset.close()
 
 
 def test_rbase_route_matches_forced_generic_route(rbase_irregular_store, monkeypatch):
     path, full, total = rbase_irregular_store
     indices = np.random.default_rng(37).integers(0, total, 8_000).astype(np.int64)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         via_rbase = dataset[indices, ["f8", "f4", "i2"]].dict()
-    finally:
-        dataset.close()
     monkeypatch.setattr(reader_mod, "_RBASE_MIN_INDICES_PER_RECORD", float("inf"))
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         via_generic = dataset[indices, ["f8", "f4", "i2"]].dict()
-    finally:
-        dataset.close()
     for name in ("f8", "f4", "i2"):
         assert np.array_equal(via_rbase[name], via_generic[name]), name
         assert np.array_equal(via_rbase[name], full[name][indices]), name
@@ -585,8 +525,7 @@ def test_dense_mask_routes_to_mask_kernel(mask_irregular_store, monkeypatch):
     monkeypatch.setattr(config_mod, "_mask_density_gate", GATE)
     calls = kernel_spy(monkeypatch, MASK_SPIED)
     mask = np.random.default_rng(62).random(total) < 0.5
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert np.array_equal(dataset[mask, "f8"].array(), full["f8"][mask])
         assert calls == ["gather_multirecord_mask"]
         calls.clear()
@@ -594,8 +533,6 @@ def test_dense_mask_routes_to_mask_kernel(mask_irregular_store, monkeypatch):
         assert calls == ["gather_multirecord_mask"] * 3
         for name in ("f8", "f4", "i2"):
             assert np.array_equal(result[name], full[name][mask]), name
-    finally:
-        dataset.close()
 
 
 def test_sparse_mask_lowers_to_indices(mask_irregular_store, monkeypatch):
@@ -605,24 +542,18 @@ def test_sparse_mask_lowers_to_indices(mask_irregular_store, monkeypatch):
     mask = np.zeros(total, dtype=bool)
     mask[:: int(2 / GATE)] = True  # density well below the gate
     assert mask.mean() < GATE
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         assert np.array_equal(dataset[mask, "f8"].array(), full["f8"][mask])
         assert calls == ["gather_multirecord_sorted"]  # flatnonzero is sorted
-    finally:
-        dataset.close()
 
 
 def test_gate_seam_parity(mask_irregular_store, monkeypatch):
     path, full, total = mask_irregular_store
     mask = np.random.default_rng(63).random(total) < 0.4
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         via_mask = dataset[mask, ["f8", "i2"]].dict()
         monkeypatch.setattr(config_mod, "_mask_density_gate", 2.0)
         via_indices = dataset[mask, ["f8", "i2"]].dict()
-    finally:
-        dataset.close()
     for name in ("f8", "i2"):
         assert np.array_equal(via_mask[name], via_indices[name]), name
         assert np.array_equal(via_mask[name], full[name][mask]), name
@@ -633,12 +564,8 @@ def test_mask_zero_copy_still_rejected(tmp_path):
     path = tmp_path / "zc.cstore"
     with colstore.create(path) as writer:
         writer.write({"a": rng.standard_normal(100)})
-    dataset = colstore.open(path)
-    try:
-        with pytest.raises(ValueError, match="copy=True"):
-            dataset[np.ones(100, dtype=bool), "a"].array(copy=False)
-    finally:
-        dataset.close()
+    with opened(path) as dataset, pytest.raises(ValueError, match="copy=True"):
+        dataset[np.ones(100, dtype=bool), "a"].array(copy=False)
 
 
 # ---- Backend and byte-order fallbacks ----------------------------------------
@@ -842,8 +769,7 @@ def test_misaligned_store_reads_match_on_all_routes(request, store_fixture, unif
     path, full, total = request.getfixturevalue(store_fixture)
     value_columns = [name for name in full if name != "pad"]
     rng = np.random.default_rng(1)
-    dataset = colstore.open(path)
-    try:
+    with opened(path) as dataset:
         # Route discrimination: the two shapes must keep their own routes.
         assert (dataset._uniform_record_layout() is not None) == uniform
         # Unsorted fancy, single column (uniform kernel vs generic fused).
@@ -868,8 +794,6 @@ def test_misaligned_store_reads_match_on_all_routes(request, store_fixture, unif
         # Boolean mask (mask kernel on dense masks).
         mask = rng.random(total) < 0.5
         assert np.array_equal(dataset[mask, "f8"].array(), full["f8"][mask])
-    finally:
-        dataset.close()
 
 
 def test_misaligned_single_record_store(tmp_path):

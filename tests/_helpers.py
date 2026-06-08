@@ -9,6 +9,7 @@ reproducible from its seed.
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import NamedTuple
 
@@ -158,3 +159,13 @@ def kernel_spy(monkeypatch, names) -> list[str]:
 
         monkeypatch.setattr(_gather, name, wrapper)
     return calls
+
+
+@contextlib.contextmanager
+def opened(path):
+    """Open a store and guarantee it is closed (replaces try/finally close)."""
+    reader = colstore.open(path)
+    try:
+        yield reader
+    finally:
+        reader.close()
