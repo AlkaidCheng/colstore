@@ -29,14 +29,11 @@ compiled default of 0.0 (route on at every density) when uncalibrated.
 from __future__ import annotations
 
 import argparse
-import sys
 import tempfile
-import time
 from pathlib import Path
 
+import _common as _c
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
 from colstore import config
@@ -91,12 +88,7 @@ def check_correctness() -> None:
 
 
 def _best(f, repeat: int) -> float:
-    best = float("inf")
-    for _ in range(repeat):
-        start = time.perf_counter()
-        f()
-        best = min(best, time.perf_counter() - start)
-    return best
+    return _c.best_time(f, repeat=repeat, warmup=0)
 
 
 def run_bench(repeat: int) -> None:

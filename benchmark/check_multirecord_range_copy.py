@@ -21,15 +21,12 @@ parallelism change, so single-thread timing is the relevant measurement.
 from __future__ import annotations
 
 import argparse
-import sys
 import tempfile
-import time
 from pathlib import Path
 
-import numpy as np
-
 # Allow running directly without installing the package.
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+import _common as _c
+import numpy as np
 
 import colstore
 from colstore import kernels
@@ -150,14 +147,7 @@ def run_correctness() -> None:
 
 
 def _time(fn, *, repeat: int, warmup: int = 2) -> float:
-    for _ in range(warmup):
-        fn()
-    best = float("inf")
-    for _ in range(repeat):
-        t0 = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t0)
-    return best
+    return _c.best_time(fn, repeat=repeat, warmup=warmup)
 
 
 def _bench(total_rows: int, n_records: int, dtype_str: str, frac: float, repeat: int) -> None:
