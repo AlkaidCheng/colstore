@@ -605,33 +605,167 @@ def test_mask_kernel_validates_inputs():
 
 
 # ---- Contiguity rejection across all pointer-interpreting entries -----------
+# Every Cython entry hands ``PyArray_DATA`` pointers to the C++ kernels and
+# indexes them as dense arrays, so each must refuse a non-contiguous view of
+# ANY pointer-interpreted argument rather than misread it (positive strides
+# read wrong positions, negative strides read out of bounds -- the original
+# selector bug). The matrix below pins one rejection per (entry, argument)
+# pair, covering every pointer kind: source, indices, byte_offsets, output,
+# bins, record_base, mask, and the three record-index arrays.
 
 
-def test_kernel_entries_reject_strided_arrays():
-    # Direct-API backstop: every pointer-interpreting entry must refuse
-    # strided arrays rather than misread them.
+def _strided(array: np.ndarray) -> np.ndarray:
+    """A non-contiguous view with the same dtype, length, and ndim."""
+    doubled = np.repeat(array, 2)
+    view = doubled[::2]
+    assert not view.flags.c_contiguous and view.shape == array.shape
+    return view
+
+
+def _entry_contiguity_cases():
+    """(id, callable, kwargs, pointer_arg_names) for every entry point.
+
+    Arrays are structurally valid (right dtype / length / ndim) so the
+    contiguity guard is reached; the kernels never run, since the guard
+    raises before execution.
+    """
+    lay = build_layout([10] * 4, np.float64)  # 4 records, 40 rows, itemsize 8
+    uni = build_uniform_layout(4, 10, np.float64)
+    n = 8
+    indices = np.arange(n, dtype=np.int64)
+    byte_offsets = np.arange(n, dtype=np.int64) * 8
+    output = np.empty(n, dtype=np.float64)
+    bins = np.zeros(n, dtype=np.int32)
+    record_base = np.zeros(4, dtype=np.int64)
+    mask = np.zeros(lay.total, dtype=bool)
+    rec = {
+        "record_starts_rows": lay.rsr,
+        "record_starts_bytes": lay.rsb,
+        "n_rows_per_record": lay.nrr,
+    }
+    uni_scalars = dict(
+        rows_per_record=10,
+        record_stride_bytes=uni.stride,
+        first_body_offset=0,
+        n_records=4,
+        last_record_rows=10,
+        col_prefix_bytes=0,
+    )
+
+    cases = [
+        (
+            "gather",
+            _gather.gather,
+            dict(source=lay.buf.view(np.float64), indices=indices, output=output),
+            ["source", "indices", "output"],
+        ),
+        (
+            "gather_bytes",
+            _gather.gather_bytes,
+            dict(source=lay.buf, byte_offsets=byte_offsets, output=output),
+            ["source", "byte_offsets", "output"],
+        ),
+        (
+            "gather_multirecord",
+            _gather.gather_multirecord,
+            dict(source=lay.buf, indices=indices, output=output, col_prefix_bytes=0, **rec),
+            ["source", "indices", "output", *rec],
+        ),
+        (
+            "gather_multirecord_sorted",
+            _gather.gather_multirecord_sorted,
+            dict(source=lay.buf, indices=indices, output=output, col_prefix_bytes=0, **rec),
+            ["source", "indices", "output", *rec],
+        ),
+        (
+            "gather_multirecord_bins",
+            _gather.gather_multirecord_bins,
+            dict(
+                source=lay.buf, indices=indices, output=output, bins=bins, col_prefix_bytes=0, **rec
+            ),
+            ["source", "indices", "output", "bins", *rec],
+        ),
+        (
+            "gather_multirecord_withbins",
+            _gather.gather_multirecord_withbins,
+            dict(
+                source=lay.buf, indices=indices, output=output, bins=bins, col_prefix_bytes=0, **rec
+            ),
+            ["source", "indices", "output", "bins", *rec],
+        ),
+        (
+            "gather_multirecord_withbins_rbase",
+            _gather.gather_multirecord_withbins_rbase,
+            dict(
+                source=lay.buf, indices=indices, output=output, bins=bins, record_base=record_base
+            ),
+            ["source", "indices", "output", "bins", "record_base"],
+        ),
+        (
+            "gather_multirecord_strided",
+            _gather.gather_multirecord_strided,
+            dict(source=lay.buf, output=output, start=0, stop=n, step=1, col_prefix_bytes=0, **rec),
+            ["source", "output", *rec],
+        ),
+        (
+            "gather_multirecord_mask",
+            _gather.gather_multirecord_mask,
+            dict(source=lay.buf, mask=mask, output=output, col_prefix_bytes=0, **rec),
+            ["source", "mask", "output", *rec],
+        ),
+        (
+            "gather_multirecord_uniform",
+            _gather.gather_multirecord_uniform,
+            dict(source=uni.buf, indices=indices, output=output, **uni_scalars),
+            ["source", "indices", "output"],
+        ),
+        (
+            "gather_multirecord_uniform_bins",
+            _gather.gather_multirecord_uniform_bins,
+            dict(source=uni.buf, indices=indices, output=output, bins=bins, **uni_scalars),
+            ["source", "indices", "output", "bins"],
+        ),
+        (
+            "gather_multirecord_uniform_withbins",
+            _gather.gather_multirecord_uniform_withbins,
+            dict(source=uni.buf, indices=indices, output=output, bins=bins, **uni_scalars),
+            ["source", "indices", "output", "bins"],
+        ),
+        (
+            "copy_multirecord_range",
+            _gather.copy_multirecord_range,
+            dict(
+                source=lay.buf,
+                output=output,
+                start=0,
+                stop=n,
+                col_prefix_bytes=0,
+                itemsize=8,
+                **rec,
+            ),
+            ["source", "output", *rec],
+        ),
+    ]
+    params = []
+    for entry_id, fn, kwargs, ptr_args in cases:
+        for arg in ptr_args:
+            params.append(pytest.param(fn, kwargs, arg, id=f"{entry_id}-{arg}"))
+    return params
+
+
+@pytest.mark.parametrize("fn, kwargs, arg", _entry_contiguity_cases())
+def test_entry_rejects_noncontiguous_pointer_array(fn, kwargs, arg):
+    bad = dict(kwargs)
+    bad[arg] = _strided(kwargs[arg])
+    with pytest.raises(ValueError, match="C-contiguous"):
+        fn(**bad)
+
+
+def test_contiguity_guard_does_not_false_positive():
+    # Control: a fully contiguous, valid call must pass the guard and run.
     lay = build_layout([10] * 4, np.float64)
-    total_rows = lay.total
-    strided = np.arange(2 * total_rows, dtype=np.int64)[::2]
-    valid = np.arange(total_rows, dtype=np.int64)
-    out = np.empty(total_rows)
-    bins = np.empty(total_rows, dtype=np.int32)
-
-    # Contiguous control: must not raise.
-    _gather.gather_multirecord_bins(lay.buf, valid, out, bins, lay.rsr, lay.rsb, lay.nrr, 0)
-
-    with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_multirecord(lay.buf, strided, out, lay.rsr, lay.rsb, lay.nrr, 0)
-    with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_multirecord_sorted(lay.buf, strided, out, lay.rsr, lay.rsb, lay.nrr, 0)
-    with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_multirecord_bins(lay.buf, strided, out, bins, lay.rsr, lay.rsb, lay.nrr, 0)
-    with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_multirecord_withbins(
-            lay.buf, valid, out[::-1], bins, lay.rsr, lay.rsb, lay.nrr, 0
-        )
-    with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_bytes(lay.buf, strided, out, 1, 0)
-    flat = lay.buf.view(np.float64)
-    with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather(flat, strided, out, 1, 0)
+    indices = np.arange(8, dtype=np.int64)
+    out = np.empty(8, dtype=np.float64)
+    bins = np.empty(8, dtype=np.int32)
+    _gather.gather_multirecord_bins(lay.buf, indices, out, bins, lay.rsr, lay.rsb, lay.nrr, 0)
+    assert np.array_equal(out, lay.column[indices])

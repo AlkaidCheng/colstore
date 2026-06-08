@@ -434,6 +434,8 @@ def test_fancy_and_boolean_selectors_raise(single_record_store):
     dataset, _ = single_record_store
     with pytest.raises(ValueError, match="copy=True"):
         dataset[np.array([1, 5, 2]), "f8"].array(copy=False)
+    with pytest.raises(ValueError, match="copy=True"):
+        dataset[[1, 3, 5], "f8"].array(copy=False)  # Python-list fancy form
     mask = np.zeros(dataset.n_rows, dtype=bool)
     mask[::7] = True
     with pytest.raises(ValueError, match="copy=True"):
@@ -453,6 +455,31 @@ def test_multi_record_store_raises_with_compact_hint(tmp_path):
             dataset["a"].array(copy=False)
         with pytest.raises(ValueError, match="compact"):
             dataset.dict(copy=False)
+    finally:
+        dataset.close()
+
+
+def test_copy_false_rejected_for_native_mask_route(tmp_path, monkeypatch):
+    # A dense boolean mask on a multi-record store is exactly what the
+    # mask-native kernel optimizes for copy=True reads; copy=False must
+    # still refuse (multi-record stores are never zero-copy), so the native
+    # route cannot weaken the memory guarantee.
+    from colstore import config as config_mod
+
+    rng = np.random.default_rng(71)
+    total = 6_000
+    full = rng.standard_normal(total)
+    path = tmp_path / "multi_mask.cstore"
+    with colstore.create(path) as writer:
+        for offset in range(0, total, 500):  # 12 records
+            writer.write({"a": full[offset : offset + 500]})
+    monkeypatch.setattr(config_mod, "_mask_density_gate", 0.1)  # native route eligible
+    dataset = colstore.open(path)
+    try:
+        mask = rng.random(total) < 0.6  # dense: above the gate
+        assert np.array_equal(dataset[mask, "a"].array(), full[mask])  # copy=True ok
+        with pytest.raises(ValueError, match="copy=True"):
+            dataset[mask, "a"].array(copy=False)
     finally:
         dataset.close()
 
