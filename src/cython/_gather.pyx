@@ -354,8 +354,9 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
     byte_offsets : numpy.ndarray
         1D ``int64`` array. Each element is a byte offset into ``source``;
         the kernel reads ``output.dtype.itemsize`` bytes starting there.
-        The caller guarantees each offset points at an itemsize-aligned
-        address.
+        Offsets need not be itemsize-aligned: source loads are
+        alignment-safe (packed record bodies make misaligned columns
+        legal).
     output : numpy.ndarray
         1D array determining both the element size and the output dtype.
     thread_cap : int, optional
