@@ -25,14 +25,11 @@ to see the parallel component.
 from __future__ import annotations
 
 import argparse
-import sys
 import tempfile
-import time
 from pathlib import Path
 
+import _common as _c
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
 from colstore import _gather as _cpp_module  # type: ignore[attr-defined]
@@ -137,14 +134,7 @@ def run_correctness() -> None:
 
 
 def _time(fn, *, repeat: int, warmup: int = 3) -> float:
-    for _ in range(warmup):
-        fn()
-    best = float("inf")
-    for _ in range(repeat):
-        t0 = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - t0)
-    return best
+    return _c.best_time(fn, repeat=repeat, warmup=warmup)
 
 
 def _bench(total_rows: int, n_records: int, k: int, dtype_str: str, repeat: int) -> None:

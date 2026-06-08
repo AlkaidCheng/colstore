@@ -21,14 +21,11 @@ record count. Sorted reads and single-column reads are unaffected by design.
 from __future__ import annotations
 
 import argparse
-import sys
 import tempfile
-import time
 from pathlib import Path
 
+import _common as _c
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
 from colstore.reader import ColStoreReader
@@ -83,12 +80,7 @@ def check_correctness() -> None:
 
 
 def _time_read(dataset, indices, names, repeat: int) -> float:
-    best = float("inf")
-    for _ in range(repeat):
-        start = time.perf_counter()
-        dataset[indices, names].dict()
-        best = min(best, time.perf_counter() - start)
-    return best
+    return _c.best_time(lambda: dataset[indices, names].dict(), repeat=repeat, warmup=0)
 
 
 def run_bench(repeat: int) -> None:

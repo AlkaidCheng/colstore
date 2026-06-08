@@ -26,14 +26,11 @@ where event-organized physics data lives (10^4-10^5 records per file).
 from __future__ import annotations
 
 import argparse
-import sys
 import tempfile
-import time
 from pathlib import Path
 
+import _common as _c
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
 from colstore import reader as reader_mod
@@ -79,12 +76,7 @@ def check_correctness() -> None:
 
 
 def _time_read(dataset, indices, repeat: int) -> float:
-    best = float("inf")
-    for _ in range(repeat):
-        start = time.perf_counter()
-        dataset[indices, "value"].array()
-        best = min(best, time.perf_counter() - start)
-    return best
+    return _c.best_time(lambda: dataset[indices, "value"].array(), repeat=repeat, warmup=0)
 
 
 def run_bench(repeat: int) -> None:
