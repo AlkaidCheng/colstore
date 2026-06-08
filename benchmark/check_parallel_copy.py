@@ -17,135 +17,22 @@ Run with PYTHONPATH=src and an extension built into src/colstore/.
 
 from __future__ import annotations
 
-import ctypes
 import os
-import resource
-import statistics
 import tempfile
-import threading
-import time
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 
+import _common as _c
 import numpy as np
 
 import colstore
 from colstore import config
 
 
-@dataclass
-class Run:
-    wall_ms: float
-    cpu_ms: float
-    peak_threads: int
-    major_pf: int
-    minor_pf: int
-
-
-@dataclass
-class Result:
-    label: str
-    runs: list[Run] = field(default_factory=list)
-
-    def report(self) -> str:
-        if not self.runs:
-            return f"  {self.label:<60}  (no runs)"
-        # Use best-of-N for wall and cpu (lowest noise floor); medians for the rest.
-        best = min(self.runs, key=lambda r: r.wall_ms)
-        med_threads = statistics.median(r.peak_threads for r in self.runs)
-        med_major = statistics.median(r.major_pf for r in self.runs)
-        med_minor = statistics.median(r.minor_pf for r in self.runs)
-        ratio = best.cpu_ms / best.wall_ms if best.wall_ms > 0 else float("nan")
-        return (
-            f"  {self.label:<60} "
-            f"wall={best.wall_ms:7.1f}ms  cpu={best.cpu_ms:7.1f}ms  "
-            f"ratio={ratio:5.2f}x  threads={int(med_threads):2d}  "
-            f"pf={int(med_major)}/{int(med_minor)}"
-        )
-
-
-def drop_pagecache_softly(paths: list[Path]) -> None:
-    """Evict file pages from the kernel page cache via posix_fadvise(DONTNEED).
-
-    This is best-effort; it requires the file to be opened. Works without
-    root privileges.
-    """
-    POSIX_FADV_DONTNEED = 4
-    libc = ctypes.CDLL("libc.so.6")
-    for path in paths:
-        # Walk into the cstore dir if path is a directory.
-        if path.is_dir():
-            for sub in path.iterdir():
-                if sub.is_file():
-                    fd = os.open(str(sub), os.O_RDONLY)
-                    try:
-                        libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
-                    finally:
-                        os.close(fd)
-        else:
-            fd = os.open(str(path), os.O_RDONLY)
-            try:
-                libc.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
-            finally:
-                os.close(fd)
-
-
-@contextmanager
-def thread_watcher(interval_s: float = 0.001):
-    """Context manager that tracks the peak active thread count.
-
-    Polls threading.active_count() at `interval_s` resolution. Returns a
-    callable that yields the peak observed so far.
-    """
-    peak = [threading.active_count()]
-    stop = [False]
-
-    def poll() -> None:
-        while not stop[0]:
-            n = threading.active_count()
-            if n > peak[0]:
-                peak[0] = n
-            time.sleep(interval_s)
-
-    watcher = threading.Thread(target=poll, daemon=True)
-    watcher.start()
-    try:
-        yield lambda: peak[0]
-    finally:
-        stop[0] = True
-        watcher.join(timeout=0.5)
-
-
-def time_call(fn, *, drop_cache_paths: list[Path] | None = None) -> Run:
-    """Time one call of `fn`. Optionally evict page cache beforehand."""
-    if drop_cache_paths:
-        drop_pagecache_softly(drop_cache_paths)
-    ru_before = resource.getrusage(resource.RUSAGE_SELF)
-    cpu_before = time.process_time()
-    wall_before = time.perf_counter()
-    with thread_watcher() as peak_fn:
-        fn()
-        peak = peak_fn()
-    wall_ms = (time.perf_counter() - wall_before) * 1000
-    cpu_ms = (time.process_time() - cpu_before) * 1000
-    ru_after = resource.getrusage(resource.RUSAGE_SELF)
-    return Run(
-        wall_ms=wall_ms,
-        cpu_ms=cpu_ms,
-        peak_threads=peak,
-        major_pf=ru_after.ru_majflt - ru_before.ru_majflt,
-        minor_pf=ru_after.ru_minflt - ru_before.ru_minflt,
+def bench(label, fn, n_iter=5, *, n_warmup=2, drop_cache_paths=None):
+    """Label-first adapter over _common.bench (keeps existing call sites)."""
+    return _c.bench(
+        fn, label=label, n_iter=n_iter, n_warmup=n_warmup, drop_cache_paths=drop_cache_paths
     )
-
-
-def bench(label, fn, n_iter=5, *, n_warmup=2, drop_cache_paths=None) -> Result:
-    result = Result(label=label)
-    for _ in range(n_warmup):
-        fn()
-    for _ in range(n_iter):
-        result.runs.append(time_call(fn, drop_cache_paths=drop_cache_paths))
-    return result
 
 
 def make_store(td: str, name: str, n_rows: int, n_cols: int, dtype) -> Path:

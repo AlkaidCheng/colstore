@@ -25,9 +25,11 @@ import platform
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -42,17 +44,24 @@ from colstore.kernels import cpp_available, max_threads
 
 __all__ = [
     "Result",
+    "RichResult",
+    "Run",
     "TimeStats",
+    "bench",
+    "bench_interleaved",
     "best_time",
     "check_equal",
     "colstore",
     "cpp_available",
+    "drop_pagecache",
     "machine_fingerprint",
     "make_parser",
     "make_store",
     "max_threads",
     "random_column",
     "standard_columns",
+    "thread_watcher",
+    "time_call",
     "time_stats",
     "uniform_rows",
     "write_multirecord",
@@ -301,3 +310,151 @@ def write_summary(path: Path, results: list[Result], *, meta: dict[str, Any] | N
     if meta:
         payload["meta"] = meta
     path.write_text(json.dumps(payload, indent=2))
+
+
+# ---- Rich harness: wall + CPU + peak threads + page faults ------------------
+# Used by the benchmarks that need to *prove* parallelism (cpu/wall ratio),
+# observe peak thread counts, or distinguish cold (major-fault) from warm
+# reads -- check_numa, check_parallel_copy, check_frame_construction. Linux
+# specifics (resource.getrusage, posix_fadvise) are imported lazily so this
+# module still imports on platforms without them.
+
+
+@dataclass
+class Run:
+    """One timed call with process metrics."""
+
+    wall_ms: float
+    cpu_ms: float
+    peak_threads: int
+    major_pf: int
+    minor_pf: int
+
+
+@dataclass
+class RichResult:
+    """A labelled set of :class:`Run` samples, summarized by :meth:`report`."""
+
+    label: str
+    runs: list[Run] = field(default_factory=list)
+
+    def report(self) -> str:
+        if not self.runs:
+            return f"  {self.label:<62}  (no runs)"
+        # Best-of-N for wall/cpu (lowest noise floor); medians for the rest.
+        best = min(self.runs, key=lambda r: r.wall_ms)
+        med_threads = statistics.median(r.peak_threads for r in self.runs)
+        med_major = statistics.median(r.major_pf for r in self.runs)
+        med_minor = statistics.median(r.minor_pf for r in self.runs)
+        ratio = best.cpu_ms / best.wall_ms if best.wall_ms > 0 else float("nan")
+        return (
+            f"  {self.label:<62} "
+            f"wall={best.wall_ms:8.2f}ms  cpu={best.cpu_ms:8.1f}ms  "
+            f"ratio={ratio:5.2f}x  threads={int(med_threads):2d}  "
+            f"pf={int(med_major)}/{int(med_minor)}"
+        )
+
+
+@contextmanager
+def thread_watcher(interval_s: float = 0.001) -> Any:
+    """Track the peak ``threading.active_count()`` for the scope.
+
+    Yields a callable returning the peak observed so far.
+    """
+    peak = [threading.active_count()]
+    stop = [False]
+
+    def poll() -> None:
+        while not stop[0]:
+            n = threading.active_count()
+            if n > peak[0]:
+                peak[0] = n
+            time.sleep(interval_s)
+
+    watcher = threading.Thread(target=poll, daemon=True)
+    watcher.start()
+    try:
+        yield lambda: peak[0]
+    finally:
+        stop[0] = True
+        watcher.join(timeout=0.5)
+
+
+def drop_pagecache(paths: list[Path]) -> None:
+    """Evict file pages via ``posix_fadvise(DONTNEED)`` (no root needed).
+
+    Best-effort: the kernel ignores the hint for pages with live references
+    (e.g. an open ``np.memmap``), so callers wanting a true cold read must
+    not hold a reader across the eviction.
+    """
+    import ctypes
+
+    posix_fadv_dontneed = 4
+    libc = ctypes.CDLL("libc.so.6")
+    for path in paths:
+        targets = [p for p in path.iterdir() if p.is_file()] if path.is_dir() else [path]
+        for target in targets:
+            fd = os.open(str(target), os.O_RDONLY)
+            try:
+                libc.posix_fadvise(fd, 0, 0, posix_fadv_dontneed)
+            finally:
+                os.close(fd)
+
+
+def time_call(fn: Callable[[], Any], *, drop_cache_paths: list[Path] | None = None) -> Run:
+    """One call of ``fn``, capturing wall/cpu time, peak threads, and faults."""
+    import resource
+
+    if drop_cache_paths:
+        drop_pagecache(drop_cache_paths)
+    ru_before = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_before = time.process_time()
+    wall_before = time.perf_counter()
+    with thread_watcher() as peak_fn:
+        fn()
+        peak = peak_fn()
+    wall_ms = (time.perf_counter() - wall_before) * 1000.0
+    cpu_ms = (time.process_time() - cpu_before) * 1000.0
+    ru_after = resource.getrusage(resource.RUSAGE_SELF)
+    return Run(
+        wall_ms=wall_ms,
+        cpu_ms=cpu_ms,
+        peak_threads=peak,
+        major_pf=ru_after.ru_majflt - ru_before.ru_majflt,
+        minor_pf=ru_after.ru_minflt - ru_before.ru_minflt,
+    )
+
+
+def bench(
+    fn: Callable[[], Any],
+    *,
+    label: str = "",
+    n_iter: int = 5,
+    n_warmup: int = 2,
+    drop_cache_paths: list[Path] | None = None,
+) -> RichResult:
+    """Time ``fn`` over ``n_iter`` runs after ``n_warmup`` throwaways."""
+    result = RichResult(label=label)
+    for _ in range(n_warmup):
+        fn()
+    for _ in range(n_iter):
+        result.runs.append(time_call(fn, drop_cache_paths=drop_cache_paths))
+    return result
+
+
+def bench_interleaved(
+    labels: list[str], fns: list[Callable[[], Any]], *, n_iter: int = 5, n_warmup: int = 2
+) -> list[RichResult]:
+    """A/B/A/B-style timing of several functions; returns one result per fn.
+
+    Interleaving keeps page-cache and scheduler state comparable across the
+    variants; running A...A then B...B confounds the comparison.
+    """
+    results = [RichResult(label=label) for label in labels]
+    for fn in fns:
+        for _ in range(n_warmup):
+            fn()
+    for _ in range(n_iter):
+        for fn, result in zip(fns, results, strict=True):
+            result.runs.append(time_call(fn))
+    return results
