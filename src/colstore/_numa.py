@@ -1,39 +1,25 @@
 """Linux NUMA memory-policy helpers for colstore memmaps.
 
 Sets ``MPOL_INTERLEAVE`` on the page-aligned regions covering file-backed
-memmaps so that page-cache pages get distributed across NUMA nodes as
-they fault in, instead of concentrating on whichever node first touched
-them (the kernel's default first-touch policy).
-
-On multi-socket / multi-NPS hardware the win is significant. Measured
-on a dual-socket EPYC 7763 (8 NUMA nodes, 256 cores):
-
-  Scenario                          Default   Interleaved   Speedup
-  ds.dict()  1 GB / 50 cols         45.5 ms      25.4 ms     1.79x
-  ds.frame() 1 GB / 50 cols         42.7 ms      27.6 ms     1.55x
-
-The wall-time speedup understates the underlying improvement: process
-CPU time on the same gather drops from 688 ms to 292 ms, i.e. each
-worker thread spends ~2.4x less time stalled on remote-memory loads.
+memmaps so that page-cache pages distribute across NUMA nodes as they
+fault in, instead of concentrating on whichever node first touched them
+(the kernel's default first-touch policy). On multi-socket / multi-NPS
+hardware the win is significant: measured on a dual-socket EPYC 7763
+(8 nodes, 256 cores), ``ds.dict()`` on a 1 GB / 50-column store improves
+1.79x and ``ds.frame()`` 1.55x, with process CPU time on the same gather
+dropping from 688 ms to 292 ms (~2.4x less time stalled on remote loads).
 
 This module:
 
-  * No-ops cleanly on non-Linux platforms (macOS, Windows).
-  * No-ops on single-node Linux hosts (most desktops/laptops, single-
-    socket parts with NPS=1, anything not in a server topology).
+  * No-ops cleanly on non-Linux platforms and on single-node Linux hosts.
   * Honors cgroup ``cpuset.mems`` restrictions: the interleave mask
-    covers only nodes the process is actually allowed to allocate on.
-  * Falls back silently on older kernels without ``mbind(2)`` or on
-    seccomp-restricted environments that block syscall 237. A warning
-    is emitted exactly once so the operator can investigate, but the
-    store keeps working.
-  * Has zero new system-library dependencies (no ``libnuma``). The
-    ``mbind`` ABI is stable Linux history back to ~2.6.7 (2004).
-
-Implemented as a direct syscall via :mod:`ctypes`. The kernel-side
-syscall number varies by architecture; this module supports the
-mainline server archs (x86_64, aarch64, ppc64le, s390x) and falls
-back to no-op on anything else.
+    covers only nodes the process may allocate on.
+  * Falls back silently on kernels without ``mbind(2)`` or under seccomp
+    filters that block it, warning exactly once.
+  * Has zero new system-library dependencies (no ``libnuma``): the
+    syscalls are issued directly via :mod:`ctypes`. Syscall numbers vary
+    by architecture; the mainline server archs (x86_64, aarch64, ppc64le,
+    s390x) are supported and anything else no-ops.
 """
 
 from __future__ import annotations
@@ -166,14 +152,10 @@ _BITS_PER_LONG: int = ctypes.sizeof(ctypes.c_ulong) * 8
 def _maxnode_for_bitmap(n_words: int) -> int:
     """Compute the ``maxnode`` argument for ``mbind`` / ``set_mempolicy``.
 
-    The syscall's userspace convention -- documented in ``mbind(2)`` and
-    matched by ``libnuma`` -- is "the size of the nodes bitmap in bits,
-    plus one". For an ``n_words``-word bitmap that is
-    ``n_words * BITS_PER_LONG + 1``.
-
-    The bug this replaces was ``max_node_id + 1``, which looks
-    superficially right ("highest valid index plus one") but doesn't
-    match what the kernel does. Tracing through ``mm/mempolicy.c``::
+    The userspace convention -- documented in ``mbind(2)`` and matched by
+    ``libnuma`` -- is "the size of the nodes bitmap in bits, plus one":
+    ``n_words * BITS_PER_LONG + 1``. The intuitive ``max_node_id + 1`` is
+    WRONG; the kernel (``mm/mempolicy.c``) masks the bitmap's last word::
 
         --maxnode;                              # kernel decrements
         endmask = (maxnode % BITS_PER_LONG == 0)
@@ -181,16 +163,10 @@ def _maxnode_for_bitmap(n_words: int) -> int:
                     : (1UL << (maxnode % BITS_PER_LONG)) - 1;
         nodes_addr[nlongs - 1] &= endmask;      # mask the last word
 
-    With ``maxnode = max_id + 1`` and ``max_id = 7`` (an 8-node host),
-    the kernel computes ``endmask = (1 << 7) - 1 = 0x7f`` and ANDs that
-    into the last word -- silently dropping bit 7 (i.e. node 7). The
-    user-visible symptom is ``/proc/self/numa_maps`` reporting
-    ``interleave:0-6`` for what was intended as ``interleave:0-7``.
-
-    Returning ``n_words * BITS_PER_LONG + 1`` gives the kernel a
-    ``maxnode`` that's exactly a multiple of ``BITS_PER_LONG`` after
-    its ``--maxnode``, which makes ``endmask = ~0UL`` and preserves
-    every bit of the user's bitmap. Equivalent to what libnuma uses.
+    so ``maxnode = 8`` on an 8-node host yields ``endmask = 0x7f`` and
+    silently drops node 7 (symptom: ``/proc/self/numa_maps`` reports
+    ``interleave:0-6``). The whole-word value returned here makes
+    ``endmask = ~0UL`` after the kernel's decrement, preserving every bit.
     """
     return n_words * _BITS_PER_LONG + 1
 
@@ -334,32 +310,22 @@ def apply_interleave_to_memmap(memmap: np.ndarray) -> bool:
 def interleave_thread_policy() -> Iterator[bool]:
     """Set ``MPOL_INTERLEAVE`` on the calling thread for the scope.
 
-    Yields ``True`` if the policy was actually applied, ``False`` if
-    the helper degraded to no-op (non-applicable host, syscall
-    failure). The boolean lets callers branch on whether the
-    optimization is active without re-querying the module.
+    Yields ``True`` if the policy was applied, ``False`` if the helper
+    degraded to no-op (non-applicable host, syscall failure), so callers
+    can branch without re-querying the module.
 
-    ``set_mempolicy(2)`` affects the calling thread's default
-    mempolicy, which is what the kernel uses for page-cache
-    allocations during ``write(2)`` syscalls on this thread. Wrapping
-    :meth:`ColStoreWriter.write` in this scope causes the page-cache
-    pages backing the file to be allocated round-robin across the
-    allowed NUMA nodes at write time. Every subsequent reader of the
-    file -- this process or any other, now or weeks later -- sees the
-    distributed placement without needing any reader-side work.
+    ``set_mempolicy(2)`` governs page-cache allocations made during
+    ``write(2)`` on this thread, so wrapping writer body writes in this
+    scope distributes the file's page-cache pages round-robin across the
+    allowed nodes at write time -- and every subsequent reader, in any
+    process, sees the distributed placement. This is the lever that
+    delivers the NUMA win: reader-side ``apply_interleave_to_memmap``
+    affects only pages not yet in the page cache, and cannot move warm
+    pages already placed under the default policy.
 
-    This is the lever that actually delivers the NUMA win.
-    Reader-side ``apply_interleave_to_memmap`` only affects pages
-    not yet in the page cache (cold reads); for warm reads of files
-    we wrote ourselves under default policy, page placement is
-    already locked and reader-side ``mbind`` can't move it.
-
-    The previous policy is captured via ``get_mempolicy(2)`` and
-    restored on exit, so processes running under ``numactl
-    --interleave=all`` (which sets a non-default thread policy on
-    startup) get exactly what they had before the scope.
-
-    No-op on non-applicable hosts.
+    The previous policy is captured via ``get_mempolicy(2)`` and restored
+    on exit, so processes under ``numactl --interleave=all`` keep their
+    configured policy after the scope.
     """
     if not _AVAILABLE or _libc is None or _INTERLEAVE_MASK is None or _SYSCALLS is None:
         yield False
@@ -414,22 +380,15 @@ def interleave_thread_policy() -> Iterator[bool]:
 def writer_policy_scope() -> contextlib.AbstractContextManager[bool]:
     """Return the NUMA context manager wrapping writer body writes.
 
-    Single source of truth for "should this writer enter
-    ``MPOL_INTERLEAVE`` for its scope?". Both
-    :class:`colstore.writer.ColStoreWriter` (streaming writes) and
-    :func:`colstore.format.write_dataset` (one-shot
-    :func:`colstore.store` path) call this so the two write paths
-    have identical NUMA semantics.
-
-    Resolves :func:`colstore.config.get_numa_policy`:
-
-    * ``"local"`` -> :class:`contextlib.nullcontext` (no-op)
-    * non-applicable host -> :class:`contextlib.nullcontext`
-    * ``"auto"`` / ``"interleave"`` on multi-node Linux ->
-      :func:`interleave_thread_policy`
-
-    Importing :mod:`colstore.config` is deferred to call time to keep
-    this module free of intra-package import cycles at load.
+    Single source of truth for whether a writer enters
+    ``MPOL_INTERLEAVE``; both :class:`colstore.writer.ColStoreWriter` and
+    :func:`colstore.format.write_dataset` call this so the two write
+    paths have identical NUMA semantics. Resolves
+    :func:`colstore.config.get_numa_policy`: ``"local"`` or a
+    non-applicable host yields :class:`contextlib.nullcontext`;
+    ``"auto"`` / ``"interleave"`` on multi-node Linux yields
+    :func:`interleave_thread_policy`. The :mod:`colstore.config` import
+    is deferred to call time to avoid an import cycle.
     """
     from . import config  # local import: _numa is imported by reader/writer
 

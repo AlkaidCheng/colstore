@@ -2,26 +2,23 @@
 
 The static default from :func:`colstore.config._default_gather_thread_cap`
 (physical cores // 2, clamped to a small ceiling) lands within ~10-20% of
-optimal on most machines. :func:`calibrate` closes the remaining gap by
-measuring the gather kernel at a range of thread counts on a synthetic
-scatter, picking the smallest count whose throughput is within a tolerance of
-the best, and caching the result keyed by a hardware fingerprint.
+optimal on most machines. :func:`calibrate` closes the gap by measuring
+the gather kernel at a range of thread counts on a synthetic scatter,
+picking the smallest count within a tolerance of the best, and caching
+the result keyed by a hardware fingerprint at
+``$XDG_CACHE_HOME/colstore/threads.json`` (falling back to ``~/.cache``).
+The cache is consulted once, lazily; calibration itself runs only on an
+explicit :func:`calibrate` / :func:`ensure_calibrated` call, so import
+stays fast and no benchmark runs behind the user's back.
 
-The cache lives at ``$XDG_CACHE_HOME/colstore/threads.json`` (falling back to
-``~/.cache``). It is consulted once, lazily, the first time a default cap is
-needed; calibration itself is only ever run when the user explicitly calls
-:func:`calibrate` (or :func:`ensure_calibrated`), so import stays fast and no
-benchmark runs behind the user's back.
-
-The same pattern covers the gather prefetch distance: :func:`calibrate_prefetch`
-sweeps the distance over four access regimes ({cache-resident, DRAM-bound} x
-{sorted, unsorted}) and caches a per-regime table in
-``$XDG_CACHE_HOME/colstore/prefetch.json``. With
-``config.set_prefetch_distance("auto")`` (the default), each gather resolves
-its distance from that table using two cheap call-time signals -- source size
-vs last-level-cache size, and index sortedness. Uncalibrated ``"auto"`` falls
-back to the compiled default, so behavior is unchanged until calibration is
-explicitly run.
+The same pattern covers the prefetch distance: :func:`calibrate_prefetch`
+sweeps it over four access regimes ({cache-resident, DRAM-bound} x
+{sorted, unsorted}) into ``prefetch.json``. With
+``config.set_prefetch_distance("auto")`` (the default), each gather
+resolves its distance from that table using two cheap call-time signals
+(source size vs last-level-cache size, index sortedness); uncalibrated
+``"auto"`` falls back to the compiled default, so behavior is unchanged
+until calibration is explicitly run.
 """
 
 from __future__ import annotations

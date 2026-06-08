@@ -70,37 +70,29 @@ def store(
 ) -> ColStoreReader:
     """One-shot: write a single-record file and return an opened reader.
 
-    Accepted ``data`` types:
-
-    * ``dict[str, numpy.ndarray]`` -- column-major mapping.
-    * Structured ``numpy.ndarray`` (``dtype.names`` non-None) -- one
-      column per field.
-    * pandas ``DataFrame`` -- one column per series.
-
-    ``mode`` is ``"create"`` (default; fail if file exists) or
-    ``"recreate"`` (truncate if exists). For multi-record streaming
-    writes, use :func:`create` / :func:`recreate` / :func:`update`
-    directly.
+    Accepted ``data`` types: ``dict[str, numpy.ndarray]`` (column-major
+    mapping), structured ``numpy.ndarray`` (one column per field), or a
+    pandas ``DataFrame`` (one column per series). ``mode`` is ``"create"``
+    (default; fail if the file exists) or ``"recreate"`` (truncate if it
+    exists). For multi-record streaming writes, use :func:`create` /
+    :func:`recreate` / :func:`update` directly.
 
     Parameters
     ----------
     batch_size : int, str, or None, default ``"auto"``
-        Controls how the write is chunked for the progress bar. No effect
-        on the bytes written.
+        Write chunking for the progress bar; no effect on the bytes
+        written.
 
-        * ``"auto"`` (default) -- adaptive. Probes with a 1 MiB initial
-          batch and grows the batch size from EMA-smoothed measured
-          bandwidth, capped at 2x growth per batch. Tracks the medium
-          automatically: fast NVMe ramps to GiB-class batches, slow
-          disks settle at tens of MiB. Files under 16 MiB single-pass.
-        * ``None`` -- single pass: one ``tofile`` call per column, no
-          batching, one progress update per column.
-        * ``int N`` -- batch size as rows x columns per logical batch.
-          ``batch_size=100_000`` with 5 columns chunks each column into
-          20 000-row writes.
-        * ``str`` like ``"100 MB"``, ``"1.5 GiB"``, ``"512 KB"`` -- bytes
-          per batch. Binary multipliers throughout: ``MB`` ≡ ``MiB`` =
-          1024² bytes (the convention used by ``ls -lh`` / ``du -h``).
+        * ``"auto"`` -- adaptive: probe with a 1 MiB initial batch, then
+          grow from EMA-smoothed measured bandwidth (2x growth cap per
+          batch); fast NVMe ramps to GiB-class batches, slow disks settle
+          at tens of MiB. Files under 16 MiB single-pass.
+        * ``None`` -- single pass: one ``tofile`` call per column.
+        * ``int N`` -- rows x columns per logical batch
+          (``batch_size=100_000`` with 5 columns: 20 000-row writes).
+        * ``str`` like ``"100 MB"``, ``"1.5 GiB"`` -- bytes per batch.
+          Binary multipliers throughout: ``MB`` ≡ ``MiB`` = 1024² bytes
+          (the ``ls -lh`` / ``du -h`` convention).
 
     show_progress : bool, default ``True``
         Whether to display a tqdm progress bar. The bar's postfix shows
@@ -184,19 +176,14 @@ def compact(
 ) -> Path:
     """Collapse a multi-record file into a single-record file.
 
-    A streamed writer produces files with one record per :meth:`write`
-    call. Reads of slice / sorted-fancy patterns scale near-flat with
-    record count, but unsorted-fancy reads degrade as records
-    accumulate. Compaction concatenates every record's column bytes
-    into one contiguous block per column, after which all reads take
-    the single-record fast path.
-
-    The byte splice goes through ``os.sendfile`` on Linux (kernel-space
-    copy with no Python-side surfacing) and ``shutil.copyfileobj`` on
-    macOS / Windows; on both paths the memory footprint is independent
-    of file size -- bounded by the kernel's sendfile buffer on Linux,
-    by ``shutil.COPY_BUFSIZE`` (64 KB) elsewhere. Files much larger
-    than RAM compact fine.
+    Streamed writers produce one record per :meth:`write` call, and
+    unsorted-fancy reads degrade as records accumulate. Compaction
+    concatenates every record's column bytes into one contiguous block
+    per column, after which all reads take the single-record fast path.
+    The byte splice runs in bounded memory regardless of file size
+    (``os.sendfile`` on Linux, ``shutil.copyfileobj`` elsewhere; see
+    :mod:`colstore.compaction`), so files much larger than RAM compact
+    fine.
 
     Parameters
     ----------
@@ -221,15 +208,12 @@ def compact(
     Notes
     -----
     Already-compact files (``n_records <= 1``) are a no-op when ``out``
-    is ``None`` or points to the same file. When ``out`` points
-    elsewhere, the source is copied byte-for-byte (since the source is
-    already in the optimal layout).
-
-    Takes an advisory file lock on the source for the duration (``fcntl.flock``
-    on POSIX, ``msvcrt.locking`` on Windows); a concurrent
-    :func:`colstore.update` writer is blocked. Readers are unaffected
-    (they don't take the lock, and on POSIX they continue reading the
-    unlinked inode after the rename).
+    is ``None`` or the same file, and a byte-for-byte copy when ``out``
+    points elsewhere. An advisory lock is held on the source for the
+    duration (see :mod:`colstore._lock`): a concurrent
+    :func:`colstore.update` writer is blocked, while readers are
+    unaffected (they don't take the lock, and on POSIX they continue
+    reading the unlinked inode after the rename).
     """
     return compact_file(path, out, show_progress=show_progress)
 

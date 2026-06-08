@@ -2,23 +2,19 @@
 
 Invoked as the installed console script: ``colstore <command>``.
 
-Structure
----------
 The CLI is organized as *command groups*, one module per group under
-:mod:`colstore.cli`. Each group module exposes a single entry point::
+:mod:`colstore.cli`. Each group module exposes::
 
     def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None
 
 which adds its (sub)parsers and binds a ``handler`` callable via
 ``set_defaults(handler=...)``; the handler takes the parsed
-:class:`argparse.Namespace` and returns a process exit code. To add a future
-command group, create its module and append its ``register`` to
-``_COMMAND_GROUP_REGISTRARS`` below -- nothing else in the dispatcher changes.
-
-Naming convention: groups own a noun namespace (``colstore calibration run``)
-so top-level command names stay unambiguous as the surface grows; a group may
-additionally register a top-level verb as a convenience alias for its most
-common operation (``colstore calibrate``).
+:class:`argparse.Namespace` and returns a process exit code. Adding a
+command group is one new module plus an entry in
+``_COMMAND_GROUP_REGISTRARS`` below. Groups own a noun namespace
+(``colstore calibration run``) so top-level names stay unambiguous; a
+group may also register a top-level verb alias for its most common
+operation (``colstore calibrate``).
 """
 
 from __future__ import annotations

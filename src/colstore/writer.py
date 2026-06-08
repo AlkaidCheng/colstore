@@ -1,10 +1,13 @@
 """Streaming writer for record-based colstore files.
 
-A :class:`ColStoreWriter` appends one record per :meth:`write` call. The
-counters block (``n_records`` and ``committed_rows``) is rewritten in
-place on :meth:`close`, atomically committing the session's writes;
-readers opening the file mid-write see only what was committed by the
-last successful close.
+A :class:`ColStoreWriter` appends one record per :meth:`write` call.
+Record bytes are appended immediately, but the counters block
+(``n_records`` and ``committed_rows``) -- which is what makes records
+visible to readers -- is rewritten in place only on :meth:`close`,
+atomically committing the session. If the process dies before close, the
+appended-but-uncommitted bytes are orphaned past the committed end and
+truncated on the next update-mode open; readers always see exactly the
+records committed by the last successful close.
 
 Open modes
 ----------
@@ -12,37 +15,21 @@ Open modes
 * ``"create"``  -- new file, fail if it already exists.
 * ``"recreate"`` -- new file, truncate if it exists.
 * ``"update"``  -- open an existing file for append. The schema is loaded
-  from the existing manifest; the first :meth:`write` (and every one
-  after) must match it exactly. Orphan bytes from a crashed prior writer
-  are truncated on open.
+  from the existing manifest; every :meth:`write` must match it exactly.
+  Orphan bytes from a crashed prior writer are truncated on open.
 
 Module-level entry points :func:`colstore.create`, :func:`colstore.recreate`
 and :func:`colstore.update` are the recommended way to construct a writer.
 
-Crash safety
-------------
-
-The on-disk counters block is what makes a record visible to readers.
-The writer appends raw record bytes one at a time, but does not update
-the counters until :meth:`close`. If the process dies before close, the
-appended-but-uncommitted bytes are orphaned past the file's "committed
-end"; reopening for update truncates them. Readers always see exactly
-the records that were committed on the last close, regardless of any
-in-progress write that died.
-
 Lifecycle
 ---------
 
-The writer holds an advisory file lock for the
-duration of the session (``fcntl.flock`` on POSIX, ``msvcrt.locking``
-on Windows; see :mod:`colstore._lock`). Concurrent writers on the
-same path are rejected at :func:`__init__`. The lock is released on
-:meth:`close`.
-
-Closing twice is a no-op. Forgetting to close emits a
-:class:`ResourceWarning` and runs a best-effort commit from
-``__del__``; users should still call :meth:`close` (or use ``with``)
-explicitly because GC timing is not guaranteed.
+The writer holds an advisory file lock for the session (see
+:mod:`colstore._lock`); concurrent writers on the same path are rejected
+at :func:`__init__`, and the lock is released on :meth:`close`. Closing
+twice is a no-op. Forgetting to close emits a :class:`ResourceWarning`
+and runs a best-effort commit from ``__del__``; still call :meth:`close`
+(or use ``with``) explicitly, because GC timing is not guaranteed.
 """
 
 from __future__ import annotations
