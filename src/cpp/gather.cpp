@@ -160,19 +160,20 @@ struct BytesPolicy {
 
 }  // namespace
 
+// gather_indexed and gather_bytes each have a legacy hand-written loop and a
+// policy-based equivalent (gather_core + a policy). Both are compiled
+// unconditionally so the in-process A/B benchmark (check_policy_gather.py)
+// can call each on identical data in one process. The *_typed selector picks
+// one at compile time via COLSTORE_USE_POLICY_GATHER for production use.
 template <typename T>
-void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                          const std::int64_t* COLSTORE_RESTRICT indices,
-                          std::uint8_t* COLSTORE_RESTRICT output,
-                          std::ptrdiff_t n_indices,
-                          int thread_cap,
-                          std::ptrdiff_t prefetch_distance) {
+void gather_indexed_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                                 const std::int64_t* COLSTORE_RESTRICT indices,
+                                 std::uint8_t* COLSTORE_RESTRICT output,
+                                 std::ptrdiff_t n_indices,
+                                 int thread_cap,
+                                 std::ptrdiff_t prefetch_distance) {
   // Byte-based addressing: ``base`` may not be aligned for T (see
   // load_unaligned). The prefetch below only forms addresses, never loads.
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 IndexedPolicy<T>{indices});
-#else
   T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -187,6 +188,32 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     }
     dst[i] = load_unaligned<T>(base + indices[i] * static_cast<std::ptrdiff_t>(sizeof(T)));
   }
+}
+
+template <typename T>
+void gather_indexed_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                                 const std::int64_t* COLSTORE_RESTRICT indices,
+                                 std::uint8_t* COLSTORE_RESTRICT output,
+                                 std::ptrdiff_t n_indices,
+                                 int thread_cap,
+                                 std::ptrdiff_t prefetch_distance) {
+  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
+                 IndexedPolicy<T>{indices});
+}
+
+template <typename T>
+void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                          const std::int64_t* COLSTORE_RESTRICT indices,
+                          std::uint8_t* COLSTORE_RESTRICT output,
+                          std::ptrdiff_t n_indices,
+                          int thread_cap,
+                          std::ptrdiff_t prefetch_distance) {
+#ifdef COLSTORE_USE_POLICY_GATHER
+  gather_indexed_policy_typed<T>(base, indices, output, n_indices, thread_cap,
+                                 prefetch_distance);
+#else
+  gather_indexed_legacy_typed<T>(base, indices, output, n_indices, thread_cap,
+                                 prefetch_distance);
 #endif
 }
 
@@ -196,16 +223,12 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
 // the Python level (record-header skips, per-record column offsets). Offsets
 // need not be T-aligned; source loads go through load_unaligned.
 template <typename T>
-void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                        const std::int64_t* COLSTORE_RESTRICT byte_offsets,
-                        std::uint8_t* COLSTORE_RESTRICT output,
-                        std::ptrdiff_t n_indices,
-                        int thread_cap,
-                        std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 BytesPolicy{byte_offsets});
-#else
+void gather_bytes_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                               const std::int64_t* COLSTORE_RESTRICT byte_offsets,
+                               std::uint8_t* COLSTORE_RESTRICT output,
+                               std::ptrdiff_t n_indices,
+                               int thread_cap,
+                               std::ptrdiff_t prefetch_distance) {
   T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -220,7 +243,60 @@ void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     }
     dst[i] = load_unaligned<T>(base + byte_offsets[i]);
   }
+}
+
+template <typename T>
+void gather_bytes_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                               const std::int64_t* COLSTORE_RESTRICT byte_offsets,
+                               std::uint8_t* COLSTORE_RESTRICT output,
+                               std::ptrdiff_t n_indices,
+                               int thread_cap,
+                               std::ptrdiff_t prefetch_distance) {
+  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
+                 BytesPolicy{byte_offsets});
+}
+
+template <typename T>
+void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+                        const std::int64_t* COLSTORE_RESTRICT byte_offsets,
+                        std::uint8_t* COLSTORE_RESTRICT output,
+                        std::ptrdiff_t n_indices,
+                        int thread_cap,
+                        std::ptrdiff_t prefetch_distance) {
+#ifdef COLSTORE_USE_POLICY_GATHER
+  gather_bytes_policy_typed<T>(base, byte_offsets, output, n_indices,
+                               thread_cap, prefetch_distance);
+#else
+  gather_bytes_legacy_typed<T>(base, byte_offsets, output, n_indices,
+                               thread_cap, prefetch_distance);
 #endif
+}
+
+// Diagnostic dispatchers: pick legacy or policy at run time (use_policy).
+template <typename T>
+inline void gather_indexed_variant_typed(const std::uint8_t* base,
+                                         const std::int64_t* indices,
+                                         std::uint8_t* output, std::ptrdiff_t n,
+                                         int use_policy, int thread_cap,
+                                         std::ptrdiff_t pd) {
+  if (use_policy) {
+    gather_indexed_policy_typed<T>(base, indices, output, n, thread_cap, pd);
+  } else {
+    gather_indexed_legacy_typed<T>(base, indices, output, n, thread_cap, pd);
+  }
+}
+
+template <typename T>
+inline void gather_bytes_variant_typed(const std::uint8_t* base,
+                                       const std::int64_t* byte_offsets,
+                                       std::uint8_t* output, std::ptrdiff_t n,
+                                       int use_policy, int thread_cap,
+                                       std::ptrdiff_t pd) {
+  if (use_policy) {
+    gather_bytes_policy_typed<T>(base, byte_offsets, output, n, thread_cap, pd);
+  } else {
+    gather_bytes_legacy_typed<T>(base, byte_offsets, output, n, thread_cap, pd);
+  }
 }
 
 // Explicit instantiations -- four sizes for each entry point.
@@ -1180,6 +1256,40 @@ const char* colstore_build_flags(void) {
       "COLSTORE_USE_POLICY_GATHER "
 #endif
       "";
+}
+
+// Diagnostic A/B entries: call the legacy or policy implementation
+// explicitly (use_policy != 0 selects policy), dispatched by element size,
+// so check_policy_gather.py can compare both on identical data in one
+// process regardless of the production default.
+void colstore_gather_indexed_variant(const std::uint8_t* base,
+                                     const std::int64_t* indices,
+                                     std::uint8_t* output, std::ptrdiff_t n,
+                                     int itemsize, int use_policy,
+                                     int thread_cap,
+                                     std::ptrdiff_t prefetch_distance) {
+  switch (itemsize) {
+    case 1: colstore::gather_indexed_variant_typed<std::uint8_t>(base, indices, output, n, use_policy, thread_cap, prefetch_distance); break;
+    case 2: colstore::gather_indexed_variant_typed<std::uint16_t>(base, indices, output, n, use_policy, thread_cap, prefetch_distance); break;
+    case 4: colstore::gather_indexed_variant_typed<std::uint32_t>(base, indices, output, n, use_policy, thread_cap, prefetch_distance); break;
+    case 8: colstore::gather_indexed_variant_typed<std::uint64_t>(base, indices, output, n, use_policy, thread_cap, prefetch_distance); break;
+    default: break;
+  }
+}
+
+void colstore_gather_bytes_variant(const std::uint8_t* base,
+                                   const std::int64_t* byte_offsets,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   int itemsize, int use_policy,
+                                   int thread_cap,
+                                   std::ptrdiff_t prefetch_distance) {
+  switch (itemsize) {
+    case 1: colstore::gather_bytes_variant_typed<std::uint8_t>(base, byte_offsets, output, n, use_policy, thread_cap, prefetch_distance); break;
+    case 2: colstore::gather_bytes_variant_typed<std::uint16_t>(base, byte_offsets, output, n, use_policy, thread_cap, prefetch_distance); break;
+    case 4: colstore::gather_bytes_variant_typed<std::uint32_t>(base, byte_offsets, output, n, use_policy, thread_cap, prefetch_distance); break;
+    case 8: colstore::gather_bytes_variant_typed<std::uint64_t>(base, byte_offsets, output, n, use_policy, thread_cap, prefetch_distance); break;
+    default: break;
+  }
 }
 
 void colstore_gather_indexed_1(const std::uint8_t* base,

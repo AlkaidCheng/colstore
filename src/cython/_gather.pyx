@@ -41,6 +41,10 @@ cnp.import_array()
 
 cdef extern from "colstore/gather.hpp" nogil:
     const char* colstore_build_flags()
+    void colstore_gather_indexed_variant(const uint8_t*, const int64_t*, uint8_t*,
+                                         ptrdiff_t, int, int, int, ptrdiff_t)
+    void colstore_gather_bytes_variant(const uint8_t*, const int64_t*, uint8_t*,
+                                       ptrdiff_t, int, int, int, ptrdiff_t)
     void colstore_gather_indexed_1(const uint8_t*, const int64_t*, uint8_t*,
                                    ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_indexed_2(const uint8_t*, const int64_t*, uint8_t*,
@@ -1296,3 +1300,65 @@ def build_flags() -> set:
     """Names of the optimization toggles this extension was compiled with."""
     cdef bytes raw = colstore_build_flags()
     return set(raw.decode("ascii").split())
+
+
+def gather_variant(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
+                   bint use_policy, int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Diagnostic gather_indexed via the legacy or policy kernel explicitly.
+
+    Identical result to :func:`gather`; ``use_policy`` selects the
+    implementation so the A/B benchmark can call both in one process.
+    """
+    if source.ndim != 1 or indices.ndim != 1 or output.ndim != 1:
+        raise ValueError("All inputs to gather_variant must be 1D arrays.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if source.dtype != output.dtype:
+        raise TypeError(
+            f"source dtype {source.dtype} does not match output dtype {output.dtype}."
+        )
+    cdef ptrdiff_t n_indices = indices.shape[0]
+    if output.shape[0] != n_indices:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match indices length {n_indices}."
+        )
+    if n_indices == 0:
+        return
+    cdef int itemsize = source.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    with nogil:
+        colstore_gather_indexed_variant(base, indices_ptr, output_ptr, n_indices,
+                                        itemsize, use_policy, thread_cap, pd)
+
+
+def gather_bytes_variant(cnp.ndarray source, cnp.ndarray byte_offsets, cnp.ndarray output,
+                         bint use_policy, int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Diagnostic gather_bytes via the legacy or policy kernel explicitly."""
+    if source.ndim != 1 or byte_offsets.ndim != 1 or output.ndim != 1:
+        raise ValueError("All inputs to gather_bytes_variant must be 1D arrays.")
+    if byte_offsets.dtype != np.int64:
+        raise TypeError(f"byte_offsets must be int64; got {byte_offsets.dtype}.")
+    cdef ptrdiff_t n_indices = byte_offsets.shape[0]
+    if output.shape[0] != n_indices:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match byte_offsets length {n_indices}."
+        )
+    if n_indices == 0:
+        return
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("byte_offsets", byte_offsets), ("output", output)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* offsets_ptr = <const int64_t*>cnp.PyArray_DATA(byte_offsets)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    with nogil:
+        colstore_gather_bytes_variant(base, offsets_ptr, output_ptr, n_indices,
+                                      itemsize, use_policy, thread_cap, pd)

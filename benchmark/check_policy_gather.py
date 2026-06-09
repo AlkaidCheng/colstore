@@ -1,33 +1,32 @@
-"""A/B microbenchmark for the policy-based gather prototype.
+"""In-process A/B for the policy-based gather prototype.
 
-Times the two single-record kernels under test -- gather_indexed (via
-``_gather.gather``) and gather_bytes (via ``_gather.gather_bytes``) -- in
-isolation, over many rounds, and reports mean / stdev / median / min / p95
-so a regression is visible above the run-to-run noise.
+Compares the legacy hand-written gather kernels against the policy-based
+gather_core on identical data, *in one process*, by calling
+``_gather.gather_variant`` / ``_gather.gather_bytes_variant`` with
+``use_policy=False`` then ``True`` on the same arrays. Because both run in
+the same process against the same pages, thread team, affinity, and turbo
+state, the per-launch NUMA-placement variance that dominates a two-launch
+comparison cancels -- the measurement is *paired*, so only the per-round
+difference matters.
 
-The prototype is a compile-time switch (COLSTORE_USE_POLICY_GATHER), so a
-single build measures one implementation; the script reports which one via
-``_gather.build_flags()``. To compare, build and run twice:
+This needs only a SINGLE build (any toggle state); the diagnostic
+``_variant`` entries are always compiled. ``build_flags()`` reports which
+implementation the production ``gather`` symbol uses, for reference.
 
-    # legacy (hand-written loops)
-    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.dev0 pip install -e . \\
-        --no-build-isolation --force-reinstall
-    PYTHONPATH=src python benchmark/check_policy_gather.py --json legacy.json
+    PYTHONPATH=src python benchmark/check_policy_gather.py --repeat 200 \\
+        --threads 16 --prefetch 8 --json policy_ab.json
 
-    # policy (gather_core + IndexedPolicy/BytesPolicy)
-    COLSTORE_USE_POLICY_GATHER=1 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.dev0 \\
-        pip install -e . --no-build-isolation --force-reinstall
-    PYTHONPATH=src python benchmark/check_policy_gather.py --json policy.json
-
-then diff the two JSON files (or eyeball the two tables). "No regression"
-means the policy mean is within noise of the legacy mean -- expected, since
-the policy inlines to the same inner loop. Run on the target hardware; a
-single-socket dev box will not reflect the production NUMA/bandwidth regime.
+Run on the target hardware, on an idle node, ideally under
+``numactl --interleave=all`` with ``OMP_PROC_BIND=close OMP_PLACES=cores``
+and an explicit ``--threads`` (not max). A near-zero paired delta whose 95%
+CI straddles 0 is the expected "no regression" result -- the policy inlines
+to the same inner loop, so you are looking for the *absence* of a signal.
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 import statistics
 import time
 from dataclasses import asdict, dataclass
@@ -39,51 +38,75 @@ from colstore import _gather
 
 
 @dataclass
-class Stats:
+class Paired:
     op: str
     rounds: int
-    mean_ms: float
-    stdev_ms: float
-    median_ms: float
-    min_ms: float
-    p95_ms: float
-    throughput_rows_per_s: float
+    legacy_mean_ms: float
+    legacy_median_ms: float
+    legacy_min_ms: float
+    policy_mean_ms: float
+    policy_median_ms: float
+    policy_min_ms: float
+    delta_mean_ms: float  # policy - legacy, paired
+    delta_stdev_ms: float
+    delta_ci95_ms: float  # half-width of the 95% CI on the mean delta
+    delta_pct: float
+    verdict: str
 
 
-def _samples(fn, *, rounds: int, warmup: int) -> list[float]:
+def _paired_samples(fn_legacy, fn_policy, *, rounds: int, warmup: int):
     for _ in range(warmup):
-        fn()
-    out: list[float] = []
-    for _ in range(rounds):
-        start = time.perf_counter()
-        fn()
-        out.append((time.perf_counter() - start) * 1000.0)
-    return out
+        fn_legacy()
+        fn_policy()
+    legacy: list[float] = []
+    policy: list[float] = []
+    for i in range(rounds):
+        # Alternate which runs first to cancel any first/second-call bias.
+        if i % 2 == 0:
+            order = (("legacy", fn_legacy, legacy), ("policy", fn_policy, policy))
+        else:
+            order = (("policy", fn_policy, policy), ("legacy", fn_legacy, legacy))
+        for _, fn, bucket in order:
+            start = time.perf_counter()
+            fn()
+            bucket.append((time.perf_counter() - start) * 1000.0)
+    return legacy, policy
 
 
-def _summarize(op: str, samples: list[float], rows: int) -> Stats:
-    samples_sorted = sorted(samples)
-    p95 = (
-        statistics.quantiles(samples_sorted, n=20)[18]
-        if len(samples_sorted) >= 20
-        else max(samples_sorted)
-    )
-    mean = statistics.fmean(samples)
-    return Stats(
+def _summarize(op: str, legacy: list[float], policy: list[float]) -> Paired:
+    diffs = [p - lg for p, lg in zip(policy, legacy, strict=True)]
+    n = len(diffs)
+    delta_mean = statistics.fmean(diffs)
+    delta_sd = statistics.pstdev(diffs)
+    ci95 = 1.96 * delta_sd / math.sqrt(n) if n else 0.0
+    legacy_mean = statistics.fmean(legacy)
+    pct = (delta_mean / legacy_mean * 100.0) if legacy_mean else 0.0
+    if abs(delta_mean) <= ci95:
+        verdict = "no significant difference"
+    elif delta_mean > 0:
+        verdict = "policy SLOWER"
+    else:
+        verdict = "policy FASTER"
+    return Paired(
         op=op,
-        rounds=len(samples),
-        mean_ms=mean,
-        stdev_ms=statistics.pstdev(samples),
-        median_ms=statistics.median(samples),
-        min_ms=min(samples),
-        p95_ms=p95,
-        throughput_rows_per_s=rows / (mean / 1000.0) if mean > 0 else 0.0,
+        rounds=n,
+        legacy_mean_ms=legacy_mean,
+        legacy_median_ms=statistics.median(legacy),
+        legacy_min_ms=min(legacy),
+        policy_mean_ms=statistics.fmean(policy),
+        policy_median_ms=statistics.median(policy),
+        policy_min_ms=min(policy),
+        delta_mean_ms=delta_mean,
+        delta_stdev_ms=delta_sd,
+        delta_ci95_ms=ci95,
+        delta_pct=pct,
+        verdict=verdict,
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeat", type=int, default=100, help="timed rounds (default 100)")
+    parser.add_argument("--repeat", type=int, default=200, help="paired rounds (default 200)")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--scale", type=float, default=1.0, help="multiply source/index sizes")
     parser.add_argument("--threads", type=int, default=0, help="thread cap (0 = OpenMP max)")
@@ -99,47 +122,56 @@ def main() -> None:
     byte_offsets = indices * np.int64(source.itemsize)
     expected = source[indices]
     out = np.empty(k, dtype=np.float64)
+    tc, pf = args.threads, args.prefetch
 
-    flags = _gather.build_flags()
-    enabled = "COLSTORE_USE_POLICY_GATHER" in flags
-    impl = "policy" if enabled else "legacy"
-
-    # Correctness gate before any timing.
-    _gather.gather(source, indices, out, args.threads, args.prefetch)
-    if not np.array_equal(out, expected):
-        raise AssertionError("gather_indexed: value mismatch")
-    out[:] = 0
-    _gather.gather_bytes(source, byte_offsets, out, args.threads, args.prefetch)
-    if not np.array_equal(out, expected):
-        raise AssertionError("gather_bytes: value mismatch")
-
-    def run_indexed() -> None:
-        _gather.gather(source, indices, out, args.threads, args.prefetch)
-
-    def run_bytes() -> None:
-        _gather.gather_bytes(source, byte_offsets, out, args.threads, args.prefetch)
+    # Correctness gate for both implementations of both kernels, before timing.
+    for use_policy in (False, True):
+        out[:] = 0
+        _gather.gather_variant(source, indices, out, use_policy, tc, pf)
+        if not np.array_equal(out, expected):
+            raise AssertionError(f"gather_variant(use_policy={use_policy}): mismatch")
+        out[:] = 0
+        _gather.gather_bytes_variant(source, byte_offsets, out, use_policy, tc, pf)
+        if not np.array_equal(out, expected):
+            raise AssertionError(f"gather_bytes_variant(use_policy={use_policy}): mismatch")
 
     results = [
         _summarize(
-            "gather_indexed", _samples(run_indexed, rounds=args.repeat, warmup=args.warmup), k
+            "gather_indexed",
+            *_paired_samples(
+                lambda: _gather.gather_variant(source, indices, out, False, tc, pf),
+                lambda: _gather.gather_variant(source, indices, out, True, tc, pf),
+                rounds=args.repeat,
+                warmup=args.warmup,
+            ),
         ),
-        _summarize("gather_bytes", _samples(run_bytes, rounds=args.repeat, warmup=args.warmup), k),
+        _summarize(
+            "gather_bytes",
+            *_paired_samples(
+                lambda: _gather.gather_bytes_variant(source, byte_offsets, out, False, tc, pf),
+                lambda: _gather.gather_bytes_variant(source, byte_offsets, out, True, tc, pf),
+                rounds=args.repeat,
+                warmup=args.warmup,
+            ),
+        ),
     ]
 
-    print(
-        f"\nimplementation: {impl}  (COLSTORE_USE_POLICY_GATHER "
-        f"{'defined' if enabled else 'not defined'})"
-    )
+    flags = sorted(_gather.build_flags())
+    default = "policy" if "COLSTORE_USE_POLICY_GATHER" in flags else "legacy"
+    print(f"\nproduction default (gather symbol): {default}   build_flags={flags or '[]'}")
     print(
         f"source={n_src:,} f8 ({n_src * 8 / 1e6:.0f} MB)  k={k:,}  "
-        f"threads={args.threads or 'max'}  prefetch={args.prefetch}  rounds={args.repeat}"
+        f"threads={tc or 'max'}  prefetch={pf}  paired_rounds={args.repeat}"
     )
-    print(f"\n{'op':<16}{'mean':>9}{'stdev':>9}{'median':>9}{'min':>9}{'p95':>9}{'Mrows/s':>11}")
-    print("-" * 72)
+    print(
+        f"\n{'op':<16}{'legacy_med':>11}{'policy_med':>11}"
+        f"{'Δmean':>10}{'95%CI':>9}{'Δ%':>8}  verdict"
+    )
+    print("-" * 84)
     for r in results:
         print(
-            f"{r.op:<16}{r.mean_ms:>8.3f}{r.stdev_ms:>9.3f}{r.median_ms:>9.3f}"
-            f"{r.min_ms:>9.3f}{r.p95_ms:>9.3f}{r.throughput_rows_per_s / 1e6:>11.1f}"
+            f"{r.op:<16}{r.legacy_median_ms:>11.3f}{r.policy_median_ms:>11.3f}"
+            f"{r.delta_mean_ms:>+10.3f}{r.delta_ci95_ms:>9.3f}{r.delta_pct:>+7.1f}%  {r.verdict}"
         )
 
     if args.json:
@@ -148,13 +180,13 @@ def main() -> None:
         payload = {
             "fingerprint": _c.machine_fingerprint(),
             "meta": {
-                "implementation": impl,
-                "build_flags": sorted(flags),
+                "build_flags": flags,
+                "production_default": default,
                 "n_src": n_src,
                 "k": k,
-                "threads": args.threads,
-                "prefetch": args.prefetch,
-                "rounds": args.repeat,
+                "threads": tc,
+                "prefetch": pf,
+                "paired_rounds": args.repeat,
             },
             "results": [asdict(r) for r in results],
         }

@@ -346,6 +346,19 @@ extern "C" {
 // CMakeLists COLSTORE_TOGGLES); empty string when none.
 const char* colstore_build_flags(void);
 
+// Diagnostic A/B entries (use_policy selects policy vs legacy); see
+// benchmark/check_policy_gather.py.
+void colstore_gather_indexed_variant(const std::uint8_t* base,
+                                     const std::int64_t* indices,
+                                     std::uint8_t* output, std::ptrdiff_t n,
+                                     int itemsize, int use_policy,
+                                     int thread_cap, std::ptrdiff_t prefetch_distance);
+void colstore_gather_bytes_variant(const std::uint8_t* base,
+                                   const std::int64_t* byte_offsets,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   int itemsize, int use_policy,
+                                   int thread_cap, std::ptrdiff_t prefetch_distance);
+
 void colstore_gather_indexed_1(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,
