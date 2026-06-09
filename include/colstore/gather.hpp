@@ -342,6 +342,10 @@ int gather_multirecord_mask_typed(const std::uint8_t* base,
 // where <N> is element size in bytes: 1, 2, 4, or 8.
 extern "C" {
 
+// Space-separated names of the optimization toggles compiled in (see
+// CMakeLists COLSTORE_TOGGLES); empty string when none.
+const char* colstore_build_flags(void);
+
 void colstore_gather_indexed_1(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,

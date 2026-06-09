@@ -73,6 +73,32 @@ target_compile_definitions(_gather PRIVATE
   NPY_NO_DEPRECATED_API=NPY_1_7_API_VERSION
 )
 
+# --- Optimization-strategy toggles ---------------------------------------
+# Each name is both a CMake option and a compile definition. The option
+# default is seeded from the environment variable of the same name (on a
+# fresh configure), so all three of these work and add a new toggle in one
+# line:
+#   COLSTORE_USE_POLICY_GATHER=1 pip install -e . ...        (env convenience)
+#   pip install -e . ... -C cmake.define.COLSTORE_USE_POLICY_GATHER=ON
+#   cmake -DCOLSTORE_USE_POLICY_GATHER=ON ...
+# An explicit -D / -C cmake.define wins over the env seed; the env seed only
+# applies when the option is not already in the CMake cache (so changing the
+# env var alone needs a fresh build dir, while -C cmake.define always takes).
+set(COLSTORE_TOGGLES
+  COLSTORE_USE_POLICY_GATHER
+)
+foreach(_flag IN LISTS COLSTORE_TOGGLES)
+  set(_seed OFF)
+  if(DEFINED ENV{${_flag}} AND NOT "$ENV{${_flag}}" STREQUAL "0")
+    set(_seed ON)
+  endif()
+  option(${_flag} "Enable ${_flag}" ${_seed})
+  if(${_flag})
+    target_compile_definitions(_gather PRIVATE ${_flag})
+    message(STATUS "colstore toggle ${_flag}: ON")
+  endif()
+endforeach()
+
 # --- Install -------------------------------------------------------------
 # scikit-build-core copies this into the wheel under wheel.packages.
 install(TARGETS _gather DESTINATION colstore)
