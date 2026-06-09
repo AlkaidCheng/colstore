@@ -40,6 +40,7 @@ cnp.import_array()
 
 
 cdef extern from "colstore/gather.hpp" nogil:
+    const char* colstore_build_flags()
     void colstore_gather_indexed_1(const uint8_t*, const int64_t*, uint8_t*,
                                    ptrdiff_t, int, ptrdiff_t)
     void colstore_gather_indexed_2(const uint8_t*, const int64_t*, uint8_t*,
@@ -1290,3 +1291,8 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
         )
+
+def build_flags() -> set:
+    """Names of the optimization toggles this extension was compiled with."""
+    cdef bytes raw = colstore_build_flags()
+    return set(raw.decode("ascii").split())

@@ -113,6 +113,51 @@ inline T load_unaligned(const std::uint8_t* address) {
   return value;
 }
 
+// --- Policy-based gather prototype (toggled by COLSTORE_USE_POLICY_GATHER) ---
+//
+// gather_core holds the parallel + prefetch + store skeleton shared by the
+// single-record kernels; a Policy supplies the per-element byte offset.
+// IndexedPolicy and BytesPolicy reproduce the two addressing schemes below.
+// The Policy is a by-value functor whose offset() inlines into the loop, so
+// each instantiation emits the same machine code as the hand-written kernel
+// it replaces -- compile-time polymorphism, no virtual dispatch. This is an
+// intermediate prototype: benchmark/check_policy_gather.py compares a build
+// with this macro defined against one without it before the rest of the
+// scatter family is folded onto gather_core.
+template <typename T, typename Policy>
+inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
+                        std::uint8_t* COLSTORE_RESTRICT output,
+                        std::ptrdiff_t n_indices, int thread_cap,
+                        std::ptrdiff_t prefetch_distance, Policy policy) {
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      COLSTORE_PREFETCH(base + policy.offset(i + prefetch_distance));
+    }
+    dst[i] = load_unaligned<T>(base + policy.offset(i));
+  }
+}
+
+template <typename T>
+struct IndexedPolicy {
+  const std::int64_t* COLSTORE_RESTRICT indices;
+  inline std::ptrdiff_t offset(std::ptrdiff_t i) const {
+    return indices[i] * static_cast<std::ptrdiff_t>(sizeof(T));
+  }
+};
+
+struct BytesPolicy {
+  const std::int64_t* COLSTORE_RESTRICT byte_offsets;
+  inline std::ptrdiff_t offset(std::ptrdiff_t i) const { return byte_offsets[i]; }
+};
+
 }  // namespace
 
 template <typename T>
@@ -124,6 +169,10 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                           std::ptrdiff_t prefetch_distance) {
   // Byte-based addressing: ``base`` may not be aligned for T (see
   // load_unaligned). The prefetch below only forms addresses, never loads.
+#ifdef COLSTORE_USE_POLICY_GATHER
+  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
+                 IndexedPolicy<T>{indices});
+#else
   T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -138,6 +187,7 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     }
     dst[i] = load_unaligned<T>(base + indices[i] * static_cast<std::ptrdiff_t>(sizeof(T)));
   }
+#endif
 }
 
 // Byte-offset gather: ``output[i]`` is the T at ``base + byte_offsets[i]``.
@@ -152,6 +202,10 @@ void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                         std::ptrdiff_t n_indices,
                         int thread_cap,
                         std::ptrdiff_t prefetch_distance) {
+#ifdef COLSTORE_USE_POLICY_GATHER
+  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
+                 BytesPolicy{byte_offsets});
+#else
   T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -166,6 +220,7 @@ void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
     }
     dst[i] = load_unaligned<T>(base + byte_offsets[i]);
   }
+#endif
 }
 
 // Explicit instantiations -- four sizes for each entry point.
@@ -1114,6 +1169,18 @@ template int gather_multirecord_mask_typed<std::uint64_t>(
 }  // namespace colstore
 
 extern "C" {
+
+// Space-separated names of the optimization toggles this build compiled
+// with (see CMakeLists COLSTORE_TOGGLES). Empty when none are enabled.
+// Lets benchmarks/tests report exactly what they are measuring without a
+// per-flag accessor.
+const char* colstore_build_flags(void) {
+  return
+#ifdef COLSTORE_USE_POLICY_GATHER
+      "COLSTORE_USE_POLICY_GATHER "
+#endif
+      "";
+}
 
 void colstore_gather_indexed_1(const std::uint8_t* base,
                                const std::int64_t* indices,
