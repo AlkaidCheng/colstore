@@ -41,179 +41,56 @@ cnp.import_array()
 
 cdef extern from "colstore/gather.hpp" nogil:
     const char* colstore_build_flags()
-    void colstore_gather_indexed_variant(const uint8_t*, const int64_t*, uint8_t*,
+    int colstore_gather_indexed_variant(const uint8_t*, const int64_t*, uint8_t*,
                                          ptrdiff_t, int, int, int, ptrdiff_t)
-    void colstore_gather_bytes_variant(const uint8_t*, const int64_t*, uint8_t*,
+    int colstore_gather_bytes_variant(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, int, int, int, ptrdiff_t)
-    void colstore_gather_indexed_1(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_indexed_2(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_indexed_4(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_indexed_8(const uint8_t*, const int64_t*, uint8_t*,
-                                   ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_bytes_1(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_bytes_2(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_bytes_4(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int, ptrdiff_t)
-    void colstore_gather_bytes_8(const uint8_t*, const int64_t*, uint8_t*,
-                                 ptrdiff_t, int, ptrdiff_t)
+    int colstore_gather_indexed(const uint8_t*, const int64_t*, uint8_t*,
+                                   ptrdiff_t, int, int, ptrdiff_t)
+    int colstore_gather_bytes(const uint8_t*, const int64_t*, uint8_t*,
+                                 ptrdiff_t, int, int, ptrdiff_t)
     void colstore_copy_multirecord_range(const uint8_t*, uint8_t*,
                                          int64_t, int64_t,
                                          const int64_t*, const int64_t*,
                                          const int64_t*, int64_t,
                                          int64_t, int64_t)
-    void colstore_gather_multirecord_1(const uint8_t*, const int64_t*, uint8_t*,
+    int colstore_gather_multirecord(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_2(const uint8_t*, const int64_t*, uint8_t*,
-                                       ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_4(const uint8_t*, const int64_t*, uint8_t*,
-                                       ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_8(const uint8_t*, const int64_t*, uint8_t*,
-                                       ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_bins_1(
+                                       const int64_t*, int64_t, int64_t, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_bins_2(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_bins_4(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_bins_8(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_1(
+        int, int, ptrdiff_t)
+    int colstore_gather_multirecord_withbins(
         const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_2(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_4(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_8(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int, ptrdiff_t)
-    void colstore_gather_multirecord_sorted_1(
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_sorted(
         const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_sorted_2(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_sorted_4(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_sorted_8(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_strided_1(
+        int, int, ptrdiff_t)
+    int colstore_gather_multirecord_strided(
         const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_strided_2(
-        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_strided_4(
-        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_strided_8(
-        const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_1(
+        int, int, ptrdiff_t)
+    int colstore_gather_multirecord_uniform(
         const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_2(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_4(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_8(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_bins_1(
+        int, int, ptrdiff_t)
+    int colstore_gather_multirecord_uniform_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_bins_2(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_bins_4(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_bins_8(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_withbins_1(
+        int, int, ptrdiff_t)
+    int colstore_gather_multirecord_uniform_withbins(
         const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_withbins_2(
+        int, int, ptrdiff_t)
+    int colstore_gather_multirecord_withbins_rbase(
         const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_withbins_4(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_uniform_withbins_8(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-        int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_rbase_1(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_rbase_2(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_rbase_4(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, int, ptrdiff_t)
-    void colstore_gather_multirecord_withbins_rbase_8(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, int, ptrdiff_t)
-    int colstore_gather_multirecord_mask_1(
+        const int64_t*, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_mask(
         const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    int colstore_gather_multirecord_mask_2(
-        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    int colstore_gather_multirecord_mask_4(
-        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
-    int colstore_gather_multirecord_mask_8(
-        const uint8_t*, const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, ptrdiff_t)
+        int, int, ptrdiff_t)
     int colstore_max_threads()
 
 
@@ -314,23 +191,10 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_indexed_1(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_indexed_2(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_indexed_4(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_indexed_8(base, indices_ptr, output_ptr,
-                                      n_indices, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_indexed(base, indices_ptr, output_ptr, n_indices, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
@@ -406,23 +270,10 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_bytes_1(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_bytes_2(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_bytes_4(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_bytes_8(base, offsets_ptr, output_ptr,
-                                    n_indices, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_bytes(base, offsets_ptr, output_ptr, n_indices, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
@@ -490,31 +341,10 @@ def gather_multirecord_bins(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_bins_1(base, indices_ptr, output_ptr,
-                                               bins_ptr, n, rsr, rsb, nrr,
-                                               n_records, col_prefix_bytes,
-                                               thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_bins_2(base, indices_ptr, output_ptr,
-                                               bins_ptr, n, rsr, rsb, nrr,
-                                               n_records, col_prefix_bytes,
-                                               thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_bins_4(base, indices_ptr, output_ptr,
-                                               bins_ptr, n, rsr, rsb, nrr,
-                                               n_records, col_prefix_bytes,
-                                               thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_bins_8(base, indices_ptr, output_ptr,
-                                               bins_ptr, n, rsr, rsb, nrr,
-                                               n_records, col_prefix_bytes,
-                                               thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_bins(base, indices_ptr, output_ptr, bins_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -573,27 +403,10 @@ def gather_multirecord_withbins(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_withbins_1(base, indices_ptr, output_ptr,
-                                                   bins_ptr, n, rsr, rsb, nrr,
-                                                   col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_withbins_2(base, indices_ptr, output_ptr,
-                                                   bins_ptr, n, rsr, rsb, nrr,
-                                                   col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_withbins_4(base, indices_ptr, output_ptr,
-                                                   bins_ptr, n, rsr, rsb, nrr,
-                                                   col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_withbins_8(base, indices_ptr, output_ptr,
-                                                   bins_ptr, n, rsr, rsb, nrr,
-                                                   col_prefix_bytes, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_withbins(base, indices_ptr, output_ptr, bins_ptr, n, rsr, rsb, nrr, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -647,27 +460,10 @@ def gather_multirecord_sorted(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_sorted_1(base, indices_ptr, output_ptr, n,
-                                                 rsr, rsb, nrr, n_records,
-                                                 col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_sorted_2(base, indices_ptr, output_ptr, n,
-                                                 rsr, rsb, nrr, n_records,
-                                                 col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_sorted_4(base, indices_ptr, output_ptr, n,
-                                                 rsr, rsb, nrr, n_records,
-                                                 col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_sorted_8(base, indices_ptr, output_ptr, n,
-                                                 rsr, rsb, nrr, n_records,
-                                                 col_prefix_bytes, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_sorted(base, indices_ptr, output_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -722,27 +518,10 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_strided_1(base, output_ptr, start, step, n,
-                                                  rsr, rsb, nrr, n_records,
-                                                  col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_strided_2(base, output_ptr, start, step, n,
-                                                  rsr, rsb, nrr, n_records,
-                                                  col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_strided_4(base, output_ptr, start, step, n,
-                                                  rsr, rsb, nrr, n_records,
-                                                  col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_strided_8(base, output_ptr, start, step, n,
-                                                  rsr, rsb, nrr, n_records,
-                                                  col_prefix_bytes, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_strided(base, output_ptr, start, step, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -793,35 +572,10 @@ def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_uniform_1(base, indices_ptr, output_ptr, n,
-                                                  rows_per_record, record_stride_bytes,
-                                                  first_body_offset, n_records,
-                                                  last_record_rows, col_prefix_bytes,
-                                                  thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_uniform_2(base, indices_ptr, output_ptr, n,
-                                                  rows_per_record, record_stride_bytes,
-                                                  first_body_offset, n_records,
-                                                  last_record_rows, col_prefix_bytes,
-                                                  thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_uniform_4(base, indices_ptr, output_ptr, n,
-                                                  rows_per_record, record_stride_bytes,
-                                                  first_body_offset, n_records,
-                                                  last_record_rows, col_prefix_bytes,
-                                                  thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_uniform_8(base, indices_ptr, output_ptr, n,
-                                                  rows_per_record, record_stride_bytes,
-                                                  first_body_offset, n_records,
-                                                  last_record_rows, col_prefix_bytes,
-                                                  thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_uniform(base, indices_ptr, output_ptr, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -872,31 +626,10 @@ def gather_multirecord_uniform_bins(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_uniform_bins_1(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_uniform_bins_2(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_uniform_bins_4(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_uniform_bins_8(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_uniform_bins(base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -944,31 +677,10 @@ def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_uniform_withbins_1(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_uniform_withbins_2(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_uniform_withbins_4(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_uniform_withbins_8(
-                base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record,
-                record_stride_bytes, first_body_offset, n_records,
-                last_record_rows, col_prefix_bytes, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_uniform_withbins(base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -1015,23 +727,10 @@ def gather_multirecord_withbins_rbase(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_withbins_rbase_1(base, indices_ptr, output_ptr,
-                                                         bins_ptr, n, rbase, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_withbins_rbase_2(base, indices_ptr, output_ptr,
-                                                         bins_ptr, n, rbase, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_withbins_rbase_4(base, indices_ptr, output_ptr,
-                                                         bins_ptr, n, rbase, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_withbins_rbase_8(base, indices_ptr, output_ptr,
-                                                         bins_ptr, n, rbase, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_withbins_rbase(base, indices_ptr, output_ptr, bins_ptr, n, rbase, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
@@ -1090,31 +789,9 @@ def gather_multirecord_mask(cnp.ndarray source, cnp.ndarray mask,
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
     cdef int status = -1
-    if itemsize == 1:
-        with nogil:
-            status = colstore_gather_multirecord_mask_1(base, mask_ptr, output_ptr,
-                                                        n_rows, n_out, rsr, rsb, nrr,
-                                                        n_records, col_prefix_bytes,
-                                                        thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            status = colstore_gather_multirecord_mask_2(base, mask_ptr, output_ptr,
-                                                        n_rows, n_out, rsr, rsb, nrr,
-                                                        n_records, col_prefix_bytes,
-                                                        thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            status = colstore_gather_multirecord_mask_4(base, mask_ptr, output_ptr,
-                                                        n_rows, n_out, rsr, rsb, nrr,
-                                                        n_records, col_prefix_bytes,
-                                                        thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            status = colstore_gather_multirecord_mask_8(base, mask_ptr, output_ptr,
-                                                        n_rows, n_out, rsr, rsb, nrr,
-                                                        n_records, col_prefix_bytes,
-                                                        thread_cap, pd)
-    else:
+    with nogil:
+        status = colstore_gather_multirecord_mask(base, mask_ptr, output_ptr, n_rows, n_out, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status == -1:
         raise TypeError(f"unsupported itemsize {itemsize}.")
     if status != 0:
         raise ValueError("output length does not match the mask's selected count.")
@@ -1270,27 +947,10 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
-    if itemsize == 1:
-        with nogil:
-            colstore_gather_multirecord_1(base, indices_ptr, output_ptr, n,
-                                          rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 2:
-        with nogil:
-            colstore_gather_multirecord_2(base, indices_ptr, output_ptr, n,
-                                          rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 4:
-        with nogil:
-            colstore_gather_multirecord_4(base, indices_ptr, output_ptr, n,
-                                          rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap, pd)
-    elif itemsize == 8:
-        with nogil:
-            colstore_gather_multirecord_8(base, indices_ptr, output_ptr, n,
-                                          rsr, rsb, nrr, n_records,
-                                          col_prefix_bytes, thread_cap, pd)
-    else:
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord(base, indices_ptr, output_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
@@ -1332,9 +992,14 @@ def gather_variant(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
+    cdef int status
     with nogil:
-        colstore_gather_indexed_variant(base, indices_ptr, output_ptr, n_indices,
-                                        itemsize, use_policy, thread_cap, pd)
+        status = colstore_gather_indexed_variant(base, indices_ptr, output_ptr, n_indices, itemsize, use_policy, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
 
 
 def gather_bytes_variant(cnp.ndarray source, cnp.ndarray byte_offsets, cnp.ndarray output,
@@ -1359,6 +1024,11 @@ def gather_bytes_variant(cnp.ndarray source, cnp.ndarray byte_offsets, cnp.ndarr
     cdef ptrdiff_t pd = (
         DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
     )
+    cdef int status
     with nogil:
-        colstore_gather_bytes_variant(base, offsets_ptr, output_ptr, n_indices,
-                                      itemsize, use_policy, thread_cap, pd)
+        status = colstore_gather_bytes_variant(base, offsets_ptr, output_ptr, n_indices, itemsize, use_policy, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )

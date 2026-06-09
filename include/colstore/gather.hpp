@@ -348,57 +348,27 @@ const char* colstore_build_flags(void);
 
 // Diagnostic A/B entries (use_policy selects policy vs legacy); see
 // benchmark/check_policy_gather.py.
-void colstore_gather_indexed_variant(const std::uint8_t* base,
+int colstore_gather_indexed_variant(const std::uint8_t* base,
                                      const std::int64_t* indices,
                                      std::uint8_t* output, std::ptrdiff_t n,
                                      int itemsize, int use_policy,
                                      int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_bytes_variant(const std::uint8_t* base,
+int colstore_gather_bytes_variant(const std::uint8_t* base,
                                    const std::int64_t* byte_offsets,
                                    std::uint8_t* output, std::ptrdiff_t n,
                                    int itemsize, int use_policy,
                                    int thread_cap, std::ptrdiff_t prefetch_distance);
 
-void colstore_gather_indexed_1(const std::uint8_t* base,
+int colstore_gather_indexed(const std::uint8_t* base,
                                const std::int64_t* indices,
                                std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_indexed_2(const std::uint8_t* base,
-                               const std::int64_t* indices,
-                               std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_indexed_4(const std::uint8_t* base,
-                               const std::int64_t* indices,
-                               std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_indexed_8(const std::uint8_t* base,
-                               const std::int64_t* indices,
-                               std::uint8_t* output,
-                               std::ptrdiff_t n, int thread_cap,
+                               std::ptrdiff_t n, int itemsize, int thread_cap,
                                std::ptrdiff_t prefetch_distance);
 
-void colstore_gather_bytes_1(const std::uint8_t* base,
+int colstore_gather_bytes(const std::uint8_t* base,
                              const std::int64_t* byte_offsets,
                              std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_bytes_2(const std::uint8_t* base,
-                             const std::int64_t* byte_offsets,
-                             std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_bytes_4(const std::uint8_t* base,
-                             const std::int64_t* byte_offsets,
-                             std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_bytes_8(const std::uint8_t* base,
-                             const std::int64_t* byte_offsets,
-                             std::uint8_t* output,
-                             std::ptrdiff_t n, int thread_cap,
+                             std::ptrdiff_t n, int itemsize, int thread_cap,
                                std::ptrdiff_t prefetch_distance);
 
 // Contiguous multi-record range copy (size-agnostic; one memcpy per record).
@@ -416,264 +386,83 @@ void colstore_copy_multirecord_range(const std::uint8_t* base,
 
 // Fused multi-record fancy gather, one per element size (1/2/4/8 bytes).
 // See colstore::gather_multirecord_typed for the addressing contract.
-void colstore_gather_multirecord_1(const std::uint8_t* base,
+int colstore_gather_multirecord(const std::uint8_t* base,
                                    const std::int64_t* indices,
                                    std::uint8_t* output, std::ptrdiff_t n,
                                    const std::int64_t* record_starts_rows,
                                    const std::int64_t* record_starts_bytes,
                                    const std::int64_t* n_rows_per_record,
                                    std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_2(const std::uint8_t* base,
-                                   const std::int64_t* indices,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   const std::int64_t* record_starts_rows,
-                                   const std::int64_t* record_starts_bytes,
-                                   const std::int64_t* n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_4(const std::uint8_t* base,
-                                   const std::int64_t* indices,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   const std::int64_t* record_starts_rows,
-                                   const std::int64_t* record_starts_bytes,
-                                   const std::int64_t* n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_8(const std::uint8_t* base,
-                                   const std::int64_t* indices,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   const std::int64_t* record_starts_rows,
-                                   const std::int64_t* record_starts_bytes,
-                                   const std::int64_t* n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int thread_cap,
+                                   std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
                                std::ptrdiff_t prefetch_distance);
 
 // Sorted walk; see gather_multirecord_sorted_typed.
-void colstore_gather_multirecord_sorted_1(
+int colstore_gather_multirecord_sorted(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     std::ptrdiff_t n, const std::int64_t* record_starts_rows,
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_sorted_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_sorted_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_sorted_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
     std::ptrdiff_t prefetch_distance);
 
 // Strided range walk; see gather_multirecord_strided_typed.
-void colstore_gather_multirecord_strided_1(
+int colstore_gather_multirecord_strided(
     const std::uint8_t* base, std::uint8_t* output,
     std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
     const std::int64_t* record_starts_rows,
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_strided_2(
-    const std::uint8_t* base, std::uint8_t* output,
-    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
-    const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_strided_4(
-    const std::uint8_t* base, std::uint8_t* output,
-    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
-    const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_strided_8(
-    const std::uint8_t* base, std::uint8_t* output,
-    std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
-    const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
     std::ptrdiff_t prefetch_distance);
 
 // Uniform-record arithmetic-bin gather; see gather_multirecord_uniform_typed.
-void colstore_gather_multirecord_uniform_1(
+int colstore_gather_multirecord_uniform(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
     std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
-    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
-    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
-    std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+    std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Uniform bins/withbins pair; see the *_typed declarations.
-void colstore_gather_multirecord_uniform_bins_1(
+int colstore_gather_multirecord_uniform_bins(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
     std::int64_t record_stride_bytes, std::int64_t first_body_offset,
     std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_bins_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
-    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
-    std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_bins_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
-    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
-    std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_bins_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
-    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
-    std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_withbins_1(
+    std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_uniform_withbins(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
     std::int64_t record_stride_bytes, std::int64_t first_body_offset,
     std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_withbins_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
-    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
-    std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_withbins_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
-    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
-    std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_uniform_withbins_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, std::int64_t rows_per_record,
-    std::int64_t record_stride_bytes, std::int64_t first_body_offset,
-    std::int64_t n_records, std::int64_t last_record_rows,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+    std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Bin-reuse pair; see gather_multirecord_bins_typed.
-void colstore_gather_multirecord_bins_1(
+int colstore_gather_multirecord_bins(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
     std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_1(
+int colstore_gather_multirecord_withbins(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_bins_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_bins_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_bins_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int thread_cap, std::ptrdiff_t prefetch_distance);
+    std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Record-base withbins variant; see gather_multirecord_withbins_rbase_typed.
-void colstore_gather_multirecord_withbins_rbase_1(
+int colstore_gather_multirecord_withbins_rbase(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_rbase_2(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_rbase_4(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int thread_cap, std::ptrdiff_t prefetch_distance);
-void colstore_gather_multirecord_withbins_rbase_8(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int thread_cap, std::ptrdiff_t prefetch_distance);
+    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Returns OpenMP's maximum thread count, or 1 if OpenMP is not compiled in.
 // Exposed for diagnostics.
 int colstore_max_threads();
 
-
 // Boolean-mask-native gather; see gather_multirecord_mask_typed.
-int colstore_gather_multirecord_mask_1(
+int colstore_gather_multirecord_mask(
     const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
     std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-int colstore_gather_multirecord_mask_2(
-    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
-    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-int colstore_gather_multirecord_mask_4(
-    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
-    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-int colstore_gather_multirecord_mask_8(
-    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
-    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int thread_cap,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
     std::ptrdiff_t prefetch_distance);
 
 }  // extern "C"
