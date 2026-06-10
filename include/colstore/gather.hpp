@@ -358,6 +358,30 @@ int colstore_gather_bytes_variant(const std::uint8_t* base,
                                    std::uint8_t* output, std::ptrdiff_t n,
                                    int itemsize, int use_policy,
                                    int thread_cap, std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_variant(const std::uint8_t* base,
+                                   const std::int64_t* indices,
+                                   std::uint8_t* output, std::ptrdiff_t n,
+                                   const std::int64_t* record_starts_rows,
+                                   const std::int64_t* record_starts_bytes,
+                                   const std::int64_t* n_rows_per_record,
+                                   std::int64_t n_records,
+                                   std::int64_t col_prefix_bytes, int itemsize, int use_policy, int thread_cap,
+                               std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_bins_variant(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int use_policy, int thread_cap,
+    std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_withbins_variant(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
+    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
+    std::int64_t col_prefix_bytes, int itemsize, int use_policy, int thread_cap, std::ptrdiff_t prefetch_distance);
+int colstore_gather_multirecord_withbins_rbase_variant(
+    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
+    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
+    int itemsize, int use_policy, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 int colstore_gather_indexed(const std::uint8_t* base,
                                const std::int64_t* indices,
