@@ -346,6 +346,10 @@ extern "C" {
 // CMakeLists COLSTORE_TOGGLES); empty string when none.
 const char* colstore_build_flags(void);
 
+// Thread count a kernel would use for n_indices elements under a caller
+// cap (cap <= 0 means the OpenMP maximum).
+long long colstore_resolve_thread_count(long long n_indices, int cap);
+
 // Diagnostic A/B entries (use_policy selects policy vs legacy); see
 // benchmark/check_policy_gather.py.
 int colstore_gather_indexed_variant(const std::uint8_t* base,

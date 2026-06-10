@@ -41,6 +41,7 @@ cnp.import_array()
 
 cdef extern from "colstore/gather.hpp" nogil:
     const char* colstore_build_flags()
+    long long colstore_resolve_thread_count(long long, int)
     int colstore_gather_indexed_variant(const uint8_t*, const int64_t*, uint8_t*,
                                          ptrdiff_t, int, int, int, ptrdiff_t)
     int colstore_gather_bytes_variant(const uint8_t*, const int64_t*, uint8_t*,
@@ -1248,3 +1249,13 @@ def gather_multirecord_withbins_rbase_variant(cnp.ndarray source, cnp.ndarray in
         status = colstore_gather_multirecord_withbins_rbase_variant(base, indices_ptr, output_ptr, bins_ptr, n, rbase, itemsize, use_policy, thread_cap, pd)
     if status != 0:
         raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def resolve_thread_count(n_indices: int, thread_cap: int = 0) -> int:
+    """Thread count a kernel would use for ``n_indices`` elements.
+
+    Mirrors the C++ resolution exactly (serial below the parallel threshold,
+    then ~one thread per 1<<20 elements, clamped to ``thread_cap``;
+    ``thread_cap <= 0`` means the OpenMP maximum).
+    """
+    return colstore_resolve_thread_count(n_indices, thread_cap)

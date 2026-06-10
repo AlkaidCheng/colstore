@@ -17,10 +17,23 @@ implementation the production ``gather`` symbol uses, for reference.
         --threads 16 --prefetch 8 --json policy_ab.json
 
 Run on the target hardware, on an idle node, ideally under
-``numactl --interleave=all`` with ``OMP_PROC_BIND=close OMP_PLACES=cores``
-and an explicit ``--threads`` (not max). A near-zero paired delta whose 95%
-CI straddles 0 is the expected "no regression" result -- the policy inlines
-to the same inner loop, so you are looking for the *absence* of a signal.
+``numactl --interleave=all`` with ``OMP_PROC_BIND=close OMP_PLACES=cores``.
+``--threads`` defaults to the calibrated production cap
+(``colstore.config.get_gather_thread_cap()``), so the comparison is made at
+the operating point the reader actually uses; pass ``--threads 0`` for the
+OpenMP maximum, or an explicit count. The header prints the thread count the
+kernels actually resolve for this workload (work-proportional scaling can
+use fewer than the cap).
+
+Statistics: the per-arm columns are medians (robust to OS-noise outliers);
+the verdict is based on the mean of the PAIRED per-round differences, whose
+95% CI is 1.96*sigma_diff/sqrt(n) -- pairing cancels the per-round noise the
+two arms share, which is what resolves sub-1% effects. delta_med (median of
+the paired differences) is shown alongside as the robust counterpart;
+delta_pct is delta_mean over the legacy mean. A near-zero paired delta whose
+95% CI straddles 0 is the expected "no regression" result -- the policy
+inlines to the same inner loop, so you are looking for the *absence* of a
+signal.
 """
 
 from __future__ import annotations
@@ -35,6 +48,7 @@ import _common as _c
 import numpy as np
 
 from colstore import _gather
+from colstore.config import get_gather_thread_cap
 
 
 @dataclass
@@ -48,6 +62,7 @@ class Paired:
     policy_median_ms: float
     policy_min_ms: float
     delta_mean_ms: float  # policy - legacy, paired
+    delta_median_ms: float
     delta_stdev_ms: float
     delta_ci95_ms: float  # half-width of the 95% CI on the mean delta
     delta_pct: float
@@ -97,6 +112,7 @@ def _summarize(op: str, legacy: list[float], policy: list[float]) -> Paired:
         policy_median_ms=statistics.median(policy),
         policy_min_ms=min(policy),
         delta_mean_ms=delta_mean,
+        delta_median_ms=statistics.median(diffs),
         delta_stdev_ms=delta_sd,
         delta_ci95_ms=ci95,
         delta_pct=pct,
@@ -109,7 +125,12 @@ def main() -> None:
     parser.add_argument("--repeat", type=int, default=200, help="paired rounds (default 200)")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--scale", type=float, default=1.0, help="multiply source/index sizes")
-    parser.add_argument("--threads", type=int, default=0, help="thread cap (0 = OpenMP max)")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help="thread cap (default: calibrated get_gather_thread_cap(); 0 = OpenMP max)",
+    )
     parser.add_argument("--prefetch", type=int, default=8, help="prefetch distance (0 disables)")
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
@@ -122,7 +143,8 @@ def main() -> None:
     byte_offsets = indices * np.int64(source.itemsize)
     expected = source[indices]
     out = np.empty(k, dtype=np.float64)
-    tc, pf = args.threads, args.prefetch
+    tc = get_gather_thread_cap() if args.threads is None else args.threads
+    pf = args.prefetch
 
     # Correctness gate for both implementations of both kernels, before timing.
     for use_policy in (False, True):
@@ -247,19 +269,23 @@ def main() -> None:
     flags = sorted(_gather.build_flags())
     default = "policy" if "COLSTORE_USE_POLICY_GATHER" in flags else "legacy"
     print(f"\nproduction default (gather symbol): {default}   build_flags={flags or '[]'}")
+    resolved = _gather.resolve_thread_count(k, tc)
+    cap_label = "omp-max" if tc == 0 else str(tc)
     print(
-        f"source={n_src:,} f8 ({n_src * 8 / 1e6:.0f} MB)  k={k:,}  "
-        f"threads={tc or 'max'}  prefetch={pf}  paired_rounds={args.repeat}"
+        f"source={n_src:,} f8 ({n_src * 8 / 1e6:.0f} MB)  k={k:,}  n_records={n_records:,}  "
+        f"thread_cap={cap_label}  resolved_threads={resolved}  prefetch={pf}  "
+        f"paired_rounds={args.repeat}"
     )
     print(
         f"\n{'op':<16}{'legacy_med':>11}{'policy_med':>11}"
-        f"{'Δmean':>10}{'95%CI':>9}{'Δ%':>8}  verdict"
+        f"{'Δmean':>10}{'Δmed':>9}{'95%CI':>9}{'Δ%':>8}  verdict"
     )
-    print("-" * 84)
+    print("-" * 93)
     for r in results:
         print(
             f"{r.op:<16}{r.legacy_median_ms:>11.3f}{r.policy_median_ms:>11.3f}"
-            f"{r.delta_mean_ms:>+10.3f}{r.delta_ci95_ms:>9.3f}{r.delta_pct:>+7.1f}%  {r.verdict}"
+            f"{r.delta_mean_ms:>+10.3f}{r.delta_median_ms:>+9.3f}{r.delta_ci95_ms:>9.3f}"
+            f"{r.delta_pct:>+7.1f}%  {r.verdict}"
         )
 
     if args.json:
@@ -273,7 +299,8 @@ def main() -> None:
                 "n_src": n_src,
                 "k": k,
                 "n_records": n_records,
-                "threads": tc,
+                "thread_cap": tc,
+                "resolved_threads": resolved,
                 "prefetch": pf,
                 "paired_rounds": args.repeat,
             },
