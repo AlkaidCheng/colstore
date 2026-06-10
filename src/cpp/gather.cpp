@@ -1417,6 +1417,14 @@ const char* colstore_build_flags(void) {
       "";
 }
 
+// The thread count a kernel would use for n_indices elements under a caller
+// cap (cap <= 0 means the OpenMP maximum). Exposed so benchmarks and tests
+// can report the operating point without replicating the formula.
+long long colstore_resolve_thread_count(long long n_indices, int cap) {
+  return static_cast<long long>(
+      colstore::resolve_thread_count(static_cast<std::ptrdiff_t>(n_indices), cap));
+}
+
 // Diagnostic A/B entries: call the legacy or policy implementation
 // explicitly (use_policy != 0 selects policy), dispatched by element size,
 // so check_policy_gather.py can compare both on identical data in one
