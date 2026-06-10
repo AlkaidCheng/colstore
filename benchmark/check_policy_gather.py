@@ -135,6 +135,42 @@ def main() -> None:
         if not np.array_equal(out, expected):
             raise AssertionError(f"gather_bytes_variant(use_policy={use_policy}): mismatch")
 
+    # ---- multirecord layout: R records over the same source column ---------
+    n_records = max(8, int(1000 * args.scale))
+    cuts = np.sort(rng.choice(np.arange(1, n_src), size=n_records - 1, replace=False))
+    rsr = np.concatenate(([0], cuts, [n_src])).astype(np.int64)  # R+1 entries
+    nrr = np.diff(rsr).astype(np.int64)
+    rsb = (rsr[:-1] * source.itemsize).astype(np.int64)  # packed single column
+    record_base = (rsb - rsr[:-1] * source.itemsize).astype(np.int64)
+    bins = np.empty(k, dtype=np.int32)
+    out2 = np.empty(k, dtype=np.float64)
+
+    for use_policy in (False, True):
+        out2[:] = 0
+        _gather.gather_multirecord_variant(
+            source, indices, out2, rsr, rsb, nrr, 0, use_policy, tc, pf
+        )
+        if not np.array_equal(out2, expected):
+            raise AssertionError(f"gather_multirecord_variant(use_policy={use_policy}): mismatch")
+        out2[:] = 0
+        _gather.gather_multirecord_bins_variant(
+            source, indices, out2, bins, rsr, rsb, nrr, 0, use_policy, tc, pf
+        )
+        if not np.array_equal(out2, expected):
+            raise AssertionError(f"bins_variant(use_policy={use_policy}): mismatch")
+        out2[:] = 0
+        _gather.gather_multirecord_withbins_variant(
+            source, indices, out2, bins, rsr, rsb, nrr, 0, use_policy, tc, pf
+        )
+        if not np.array_equal(out2, expected):
+            raise AssertionError(f"withbins_variant(use_policy={use_policy}): mismatch")
+        out2[:] = 0
+        _gather.gather_multirecord_withbins_rbase_variant(
+            source, indices, out2, bins, record_base, use_policy, tc, pf
+        )
+        if not np.array_equal(out2, expected):
+            raise AssertionError(f"rbase_variant(use_policy={use_policy}): mismatch")
+
     results = [
         _summarize(
             "gather_indexed",
@@ -150,6 +186,58 @@ def main() -> None:
             *_paired_samples(
                 lambda: _gather.gather_bytes_variant(source, byte_offsets, out, False, tc, pf),
                 lambda: _gather.gather_bytes_variant(source, byte_offsets, out, True, tc, pf),
+                rounds=args.repeat,
+                warmup=args.warmup,
+            ),
+        ),
+        _summarize(
+            "multirecord",
+            *_paired_samples(
+                lambda: _gather.gather_multirecord_variant(
+                    source, indices, out2, rsr, rsb, nrr, 0, False, tc, pf
+                ),
+                lambda: _gather.gather_multirecord_variant(
+                    source, indices, out2, rsr, rsb, nrr, 0, True, tc, pf
+                ),
+                rounds=args.repeat,
+                warmup=args.warmup,
+            ),
+        ),
+        _summarize(
+            "multirecord_bins",
+            *_paired_samples(
+                lambda: _gather.gather_multirecord_bins_variant(
+                    source, indices, out2, bins, rsr, rsb, nrr, 0, False, tc, pf
+                ),
+                lambda: _gather.gather_multirecord_bins_variant(
+                    source, indices, out2, bins, rsr, rsb, nrr, 0, True, tc, pf
+                ),
+                rounds=args.repeat,
+                warmup=args.warmup,
+            ),
+        ),
+        _summarize(
+            "withbins",
+            *_paired_samples(
+                lambda: _gather.gather_multirecord_withbins_variant(
+                    source, indices, out2, bins, rsr, rsb, nrr, 0, False, tc, pf
+                ),
+                lambda: _gather.gather_multirecord_withbins_variant(
+                    source, indices, out2, bins, rsr, rsb, nrr, 0, True, tc, pf
+                ),
+                rounds=args.repeat,
+                warmup=args.warmup,
+            ),
+        ),
+        _summarize(
+            "withbins_rbase",
+            *_paired_samples(
+                lambda: _gather.gather_multirecord_withbins_rbase_variant(
+                    source, indices, out2, bins, record_base, False, tc, pf
+                ),
+                lambda: _gather.gather_multirecord_withbins_rbase_variant(
+                    source, indices, out2, bins, record_base, True, tc, pf
+                ),
                 rounds=args.repeat,
                 warmup=args.warmup,
             ),
@@ -184,6 +272,7 @@ def main() -> None:
                 "production_default": default,
                 "n_src": n_src,
                 "k": k,
+                "n_records": n_records,
                 "threads": tc,
                 "prefetch": pf,
                 "paired_rounds": args.repeat,

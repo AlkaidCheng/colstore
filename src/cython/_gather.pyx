@@ -45,6 +45,19 @@ cdef extern from "colstore/gather.hpp" nogil:
                                          ptrdiff_t, int, int, int, ptrdiff_t)
     int colstore_gather_bytes_variant(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, int, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_variant(const uint8_t*, const int64_t*, uint8_t*,
+                                       ptrdiff_t, const int64_t*, const int64_t*,
+                                       const int64_t*, int64_t, int64_t, int, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_bins_variant(
+        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
+        int, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_withbins_variant(
+        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+        const int64_t*, const int64_t*, const int64_t*, int64_t, int, int, int, ptrdiff_t)
+    int colstore_gather_multirecord_withbins_rbase_variant(
+        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+        const int64_t*, int, int, int, ptrdiff_t)
     int colstore_gather_indexed(const uint8_t*, const int64_t*, uint8_t*,
                                    ptrdiff_t, int, int, ptrdiff_t)
     int colstore_gather_bytes(const uint8_t*, const int64_t*, uint8_t*,
@@ -1032,3 +1045,206 @@ def gather_bytes_variant(cnp.ndarray source, cnp.ndarray byte_offsets, cnp.ndarr
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
         )
+
+
+def gather_multirecord_variant(cnp.ndarray source, cnp.ndarray indices,
+                       cnp.ndarray output,
+                       cnp.ndarray record_starts_rows,
+                       cnp.ndarray record_starts_bytes,
+                       cnp.ndarray n_rows_per_record,
+                       long long col_prefix_bytes, bint use_policy, int thread_cap=0,
+                       Py_ssize_t prefetch_distance=-1):
+    """Diagnostic gather_multirecord via the legacy or policy kernel explicitly."""
+    if (indices.ndim != 1 or output.ndim != 1 or record_starts_rows.ndim != 1
+            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
+        raise ValueError("indices, output, and index arrays must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n:
+        raise ValueError(
+            f"output length {output.shape[0]} does not match indices length {n}."
+        )
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_variant(base, indices_ptr, output_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, use_policy, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+
+def gather_multirecord_bins_variant(cnp.ndarray source, cnp.ndarray indices,
+                            cnp.ndarray output, cnp.ndarray bins,
+                            cnp.ndarray record_starts_rows,
+                            cnp.ndarray record_starts_bytes,
+                            cnp.ndarray n_rows_per_record,
+                            long long col_prefix_bytes, bint use_policy, int thread_cap=0,
+                            Py_ssize_t prefetch_distance=-1):
+    """Diagnostic gather_multirecord_bins via the legacy or policy kernel explicitly."""
+    if (indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1
+            or record_starts_rows.ndim != 1
+            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
+        raise ValueError("indices, output, bins, and index arrays must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if bins.dtype != np.int32:
+        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError(
+            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
+            f"match indices length {n}."
+        )
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef int32_t* bins_ptr = <int32_t*>cnp.PyArray_DATA(bins)
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_bins_variant(base, indices_ptr, output_ptr, bins_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, use_policy, thread_cap, pd)
+    if status != 0:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_withbins_variant(cnp.ndarray source, cnp.ndarray indices,
+                                cnp.ndarray output, cnp.ndarray bins,
+                                cnp.ndarray record_starts_rows,
+                                cnp.ndarray record_starts_bytes,
+                                cnp.ndarray n_rows_per_record,
+                                long long col_prefix_bytes, bint use_policy, int thread_cap=0,
+                                Py_ssize_t prefetch_distance=-1):
+    """Diagnostic gather_multirecord_withbins via the legacy or policy kernel explicitly."""
+    if (indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1
+            or record_starts_rows.ndim != 1
+            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
+        raise ValueError("indices, output, bins, and index arrays must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if bins.dtype != np.int32:
+        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError(
+            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
+            f"match indices length {n}."
+        )
+    cdef long long n_records = record_starts_bytes.shape[0]
+    if n_rows_per_record.shape[0] != n_records:
+        raise ValueError("n_rows_per_record length must match record count.")
+    if record_starts_rows.shape[0] != n_records + 1:
+        raise ValueError("record_starts_rows length must be n_records + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int32_t* bins_ptr = <const int32_t*>cnp.PyArray_DATA(bins)
+    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_withbins_variant(base, indices_ptr, output_ptr, bins_ptr, n, rsr, rsb, nrr, col_prefix_bytes, itemsize, use_policy, thread_cap, pd)
+    if status != 0:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+
+
+def gather_multirecord_withbins_rbase_variant(cnp.ndarray source, cnp.ndarray indices,
+                                      cnp.ndarray output, cnp.ndarray bins,
+                                      cnp.ndarray record_base, bint use_policy, int thread_cap=0,
+                                      Py_ssize_t prefetch_distance=-1):
+    """Diagnostic gather_multirecord_withbins_rbase via the legacy or policy kernel explicitly."""
+    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1 or record_base.ndim != 1:
+        raise ValueError("indices, output, bins, and record_base must be 1D.")
+    if indices.dtype != np.int64:
+        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    if bins.dtype != np.int32:
+        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    if record_base.dtype != np.int64:
+        raise TypeError(f"record_base must be int64; got {record_base.dtype}.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError("output and bins lengths must match indices length.")
+    if record_base.shape[0] <= 0:
+        raise ValueError("record_base must be non-empty.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_base", record_base)))
+    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int32_t* bins_ptr = <const int32_t*>cnp.PyArray_DATA(bins)
+    cdef const int64_t* rbase = <const int64_t*>cnp.PyArray_DATA(record_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multirecord_withbins_rbase_variant(base, indices_ptr, output_ptr, bins_ptr, n, rbase, itemsize, use_policy, thread_cap, pd)
+    if status != 0:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
