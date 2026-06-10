@@ -113,22 +113,37 @@ inline T load_unaligned(const std::uint8_t* address) {
   return value;
 }
 
-// --- Policy-based gather prototype (toggled by COLSTORE_USE_POLICY_GATHER) ---
+// --- Policy-based gather (toggled by COLSTORE_USE_POLICY_GATHER) -----------
 //
 // gather_core holds the parallel + prefetch + store skeleton shared by the
-// single-record kernels; a Policy supplies the per-element byte offset.
-// IndexedPolicy and BytesPolicy reproduce the two addressing schemes below.
-// The Policy is a by-value functor whose offset() inlines into the loop, so
-// each instantiation emits the same machine code as the hand-written kernel
-// it replaces -- compile-time polymorphism, no virtual dispatch. This is an
-// intermediate prototype: benchmark/check_policy_gather.py compares a build
-// with this macro defined against one without it before the rest of the
-// scatter family is folded onto gather_core.
-template <typename T, typename Policy>
+// scatter-family kernels; a Policy supplies the per-element byte offset.
+//
+// Policies are STATELESS: offset/prefetch_offset are static functions, and
+// the per-call state (index arrays, record metadata, scalars) threads
+// through gather_core as an individual-parameter pack rather than a struct.
+// Two reasons, both measured:
+//   1. restrict survives: qualifiers on function parameters carry through
+//      GCC inlining; qualifiers on struct members do not, so a struct-state
+//      policy forced per-element metadata reloads (the dst store could
+//      alias the state).
+//   2. register allocation: the OpenMP outliner captures each parameter as
+//      its own field and hoists it into a register before the loop, exactly
+//      like the hand-written kernels. An aggregate policy was captured
+//      behind the context pointer, costing one register (a per-iteration
+//      col_prefix_bytes reload plus a stack spill in the withbins kernel,
+//      measured 1-5% slower on instruction-bound kernels).
+// With this shape the emitted loop bodies are instruction-identical to the
+// hand-written kernels.
+//
+// offset(i, ...) may have a side effect (the bins-recording policy writes
+// bins[i]); prefetch_offset(i, ...) must be pure -- the look-ahead element
+// can belong to another thread's chunk, so a write there would race.
+
+template <typename T, typename Policy, typename... State>
 inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
                         std::uint8_t* COLSTORE_RESTRICT output,
                         std::ptrdiff_t n_indices, int thread_cap,
-                        std::ptrdiff_t prefetch_distance, Policy policy) {
+                        std::ptrdiff_t prefetch_distance, State... state) {
   T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -139,30 +154,33 @@ inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      COLSTORE_PREFETCH(base + policy.prefetch_offset(i + prefetch_distance));
+      COLSTORE_PREFETCH(base + Policy::prefetch_offset(i + prefetch_distance, state...));
     }
-    dst[i] = load_unaligned<T>(base + policy.offset(i));
+    dst[i] = load_unaligned<T>(base + Policy::offset(i, state...));
   }
 }
 
-// A policy supplies offset(i) for the data load -- it may have a side
-// effect (the bins-recording policy writes bins[i]) -- and a pure
-// prefetch_offset(i) for the look-ahead hint, which must not write: the
-// look-ahead element may belong to another thread's chunk, so a write there
-// would race.
 template <typename T>
 struct IndexedPolicy {
-  const std::int64_t* COLSTORE_RESTRICT indices;
-  inline std::ptrdiff_t offset(std::ptrdiff_t i) const {
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+                                      const std::int64_t* COLSTORE_RESTRICT indices) {
     return indices[i] * static_cast<std::ptrdiff_t>(sizeof(T));
   }
-  inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i) const { return offset(i); }
+  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
+                                               const std::int64_t* COLSTORE_RESTRICT indices) {
+    return offset(i, indices);
+  }
 };
 
 struct BytesPolicy {
-  const std::int64_t* COLSTORE_RESTRICT byte_offsets;
-  inline std::ptrdiff_t offset(std::ptrdiff_t i) const { return byte_offsets[i]; }
-  inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i) const { return byte_offsets[i]; }
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+                                      const std::int64_t* COLSTORE_RESTRICT byte_offsets) {
+    return byte_offsets[i];
+  }
+  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
+                                               const std::int64_t* COLSTORE_RESTRICT byte_offsets) {
+    return byte_offsets[i];
+  }
 };
 
 // Branchless "largest r with rsr[r] <= idx" over the R+1 cumulative row
@@ -191,101 +209,101 @@ inline std::int64_t bin_record(const std::int64_t* rsr, std::int64_t len,
 // the branchless search, then rsb[r] + col_prefix*nrr[r] + (idx-rsr[r])*T.
 template <typename T>
 struct MultiRecordPolicy {
-  const std::int64_t* COLSTORE_RESTRICT indices;
-  const std::int64_t* COLSTORE_RESTRICT rsr;
-  const std::int64_t* COLSTORE_RESTRICT rsb;
-  const std::int64_t* COLSTORE_RESTRICT nrr;
-  std::int64_t len;  // n_records + 1 entries in rsr
-  std::int64_t col_prefix_bytes;
-  // Members copied to local restrict pointers per call: restrict on struct
-  // members is not honored through inlining the way parameter/local restrict
-  // is, and without it the dst store forces per-element metadata reloads
-  // (measured 3% slower).
-  inline std::ptrdiff_t offset(std::ptrdiff_t i) const {
-    const std::int64_t* COLSTORE_RESTRICT rsr_l = rsr;
-    const std::int64_t* COLSTORE_RESTRICT rsb_l = rsb;
-    const std::int64_t* COLSTORE_RESTRICT nrr_l = nrr;
-    const std::int64_t* COLSTORE_RESTRICT idx_l = indices;
-    const std::int64_t idx = idx_l[i];
-    const std::int64_t r = bin_record(rsr_l, len, idx);
-    return rsb_l[r] + col_prefix_bytes * nrr_l[r] +
-           (idx - rsr_l[r]) * static_cast<std::int64_t>(sizeof(T));
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+                                      const std::int64_t* COLSTORE_RESTRICT indices,
+                                      const std::int64_t* COLSTORE_RESTRICT rsr,
+                                      const std::int64_t* COLSTORE_RESTRICT rsb,
+                                      const std::int64_t* COLSTORE_RESTRICT nrr,
+                                      std::int64_t len, std::int64_t col_prefix_bytes) {
+    const std::int64_t idx = indices[i];
+    const std::int64_t r = bin_record(rsr, len, idx);
+    return rsb[r] + col_prefix_bytes * nrr[r] +
+           (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
   }
-  inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i) const { return offset(i); }
+  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
+                                               const std::int64_t* COLSTORE_RESTRICT indices,
+                                               const std::int64_t* COLSTORE_RESTRICT rsr,
+                                               const std::int64_t* COLSTORE_RESTRICT rsb,
+                                               const std::int64_t* COLSTORE_RESTRICT nrr,
+                                               std::int64_t len, std::int64_t col_prefix_bytes) {
+    return offset(i, indices, rsr, rsb, nrr, len, col_prefix_bytes);
+  }
 };
 
 // As MultiRecordPolicy, plus bins[i] = r on the load path so later columns
 // reuse the binning. prefetch_offset repeats the search WITHOUT the write.
 template <typename T>
 struct MultiRecordBinsPolicy {
-  const std::int64_t* COLSTORE_RESTRICT indices;
-  std::int32_t* COLSTORE_RESTRICT bins;
-  const std::int64_t* COLSTORE_RESTRICT rsr;
-  const std::int64_t* COLSTORE_RESTRICT rsb;
-  const std::int64_t* COLSTORE_RESTRICT nrr;
-  std::int64_t len;
-  std::int64_t col_prefix_bytes;
-  inline std::ptrdiff_t offset(std::ptrdiff_t i) const {
-    const std::int64_t* COLSTORE_RESTRICT rsr_l = rsr;
-    const std::int64_t* COLSTORE_RESTRICT rsb_l = rsb;
-    const std::int64_t* COLSTORE_RESTRICT nrr_l = nrr;
-    std::int32_t* COLSTORE_RESTRICT bins_l = bins;
-    const std::int64_t* COLSTORE_RESTRICT idx_l = indices;
-    const std::int64_t idx = idx_l[i];
-    const std::int64_t r = bin_record(rsr_l, len, idx);
-    bins_l[i] = static_cast<std::int32_t>(r);
-    return rsb_l[r] + col_prefix_bytes * nrr_l[r] +
-           (idx - rsr_l[r]) * static_cast<std::int64_t>(sizeof(T));
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+                                      const std::int64_t* COLSTORE_RESTRICT indices,
+                                      std::int32_t* COLSTORE_RESTRICT bins,
+                                      const std::int64_t* COLSTORE_RESTRICT rsr,
+                                      const std::int64_t* COLSTORE_RESTRICT rsb,
+                                      const std::int64_t* COLSTORE_RESTRICT nrr,
+                                      std::int64_t len, std::int64_t col_prefix_bytes) {
+    const std::int64_t idx = indices[i];
+    const std::int64_t r = bin_record(rsr, len, idx);
+    bins[i] = static_cast<std::int32_t>(r);
+    return rsb[r] + col_prefix_bytes * nrr[r] +
+           (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
   }
-  inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i) const {
-    const std::int64_t* COLSTORE_RESTRICT rsr_l = rsr;
-    const std::int64_t* COLSTORE_RESTRICT rsb_l = rsb;
-    const std::int64_t* COLSTORE_RESTRICT nrr_l = nrr;
-    const std::int64_t* COLSTORE_RESTRICT idx_l = indices;
-    const std::int64_t idx = idx_l[i];
-    const std::int64_t r = bin_record(rsr_l, len, idx);
-    return rsb_l[r] + col_prefix_bytes * nrr_l[r] +
-           (idx - rsr_l[r]) * static_cast<std::int64_t>(sizeof(T));
+  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
+                                               const std::int64_t* COLSTORE_RESTRICT indices,
+                                               std::int32_t* COLSTORE_RESTRICT bins,
+                                               const std::int64_t* COLSTORE_RESTRICT rsr,
+                                               const std::int64_t* COLSTORE_RESTRICT rsb,
+                                               const std::int64_t* COLSTORE_RESTRICT nrr,
+                                               std::int64_t len, std::int64_t col_prefix_bytes) {
+    (void)bins;
+    const std::int64_t idx = indices[i];
+    const std::int64_t r = bin_record(rsr, len, idx);
+    return rsb[r] + col_prefix_bytes * nrr[r] +
+           (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
   }
 };
 
 // Bins-provided: the record is a sequential int32 read, no search.
 template <typename T>
 struct WithBinsPolicy {
-  const std::int64_t* COLSTORE_RESTRICT indices;
-  const std::int32_t* COLSTORE_RESTRICT bins;
-  const std::int64_t* COLSTORE_RESTRICT rsr;
-  const std::int64_t* COLSTORE_RESTRICT rsb;
-  const std::int64_t* COLSTORE_RESTRICT nrr;
-  std::int64_t col_prefix_bytes;
-  inline std::ptrdiff_t offset(std::ptrdiff_t i) const {
-    const std::int64_t* COLSTORE_RESTRICT rsr_l = rsr;
-    const std::int64_t* COLSTORE_RESTRICT rsb_l = rsb;
-    const std::int64_t* COLSTORE_RESTRICT nrr_l = nrr;
-    const std::int32_t* COLSTORE_RESTRICT bins_l = bins;
-    const std::int64_t* COLSTORE_RESTRICT idx_l = indices;
-    const std::int64_t r = bins_l[i];
-    return rsb_l[r] + col_prefix_bytes * nrr_l[r] +
-           (idx_l[i] - rsr_l[r]) * static_cast<std::int64_t>(sizeof(T));
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+                                      const std::int64_t* COLSTORE_RESTRICT indices,
+                                      const std::int32_t* COLSTORE_RESTRICT bins,
+                                      const std::int64_t* COLSTORE_RESTRICT rsr,
+                                      const std::int64_t* COLSTORE_RESTRICT rsb,
+                                      const std::int64_t* COLSTORE_RESTRICT nrr,
+                                      std::int64_t col_prefix_bytes) {
+    const std::int64_t r = bins[i];
+    return rsb[r] + col_prefix_bytes * nrr[r] +
+           (indices[i] - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
   }
-  inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i) const { return offset(i); }
+  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
+                                               const std::int64_t* COLSTORE_RESTRICT indices,
+                                               const std::int32_t* COLSTORE_RESTRICT bins,
+                                               const std::int64_t* COLSTORE_RESTRICT rsr,
+                                               const std::int64_t* COLSTORE_RESTRICT rsb,
+                                               const std::int64_t* COLSTORE_RESTRICT nrr,
+                                               std::int64_t col_prefix_bytes) {
+    return offset(i, indices, bins, rsr, rsb, nrr, col_prefix_bytes);
+  }
 };
 
 // Record-base: record_base[r] folds the column prefix and row-to-byte
 // conversion, leaving one lookup and one multiply-add per element.
 template <typename T>
 struct RBasePolicy {
-  const std::int64_t* COLSTORE_RESTRICT indices;
-  const std::int32_t* COLSTORE_RESTRICT bins;
-  const std::int64_t* COLSTORE_RESTRICT record_base;
-  inline std::ptrdiff_t offset(std::ptrdiff_t i) const {
-    const std::int64_t* COLSTORE_RESTRICT rb_l = record_base;
-    const std::int32_t* COLSTORE_RESTRICT bins_l = bins;
-    const std::int64_t* COLSTORE_RESTRICT idx_l = indices;
-    return rb_l[bins_l[i]] +
-           idx_l[i] * static_cast<std::int64_t>(sizeof(T));
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+                                      const std::int64_t* COLSTORE_RESTRICT indices,
+                                      const std::int32_t* COLSTORE_RESTRICT bins,
+                                      const std::int64_t* COLSTORE_RESTRICT record_base) {
+    return record_base[bins[i]] +
+           indices[i] * static_cast<std::int64_t>(sizeof(T));
   }
-  inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i) const { return offset(i); }
+  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
+                                               const std::int64_t* COLSTORE_RESTRICT indices,
+                                               const std::int32_t* COLSTORE_RESTRICT bins,
+                                               const std::int64_t* COLSTORE_RESTRICT record_base) {
+    return offset(i, indices, bins, record_base);
+  }
 };
 
 // Compile-time itemsize -> element-type dispatch. The generic lambda is
@@ -358,8 +376,8 @@ void gather_indexed_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                  std::ptrdiff_t n_indices,
                                  int thread_cap,
                                  std::ptrdiff_t prefetch_distance) {
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 IndexedPolicy<T>{indices});
+  gather_core<T, IndexedPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
+                 indices);
 }
 
 template <typename T>
@@ -413,8 +431,8 @@ void gather_bytes_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                std::ptrdiff_t n_indices,
                                int thread_cap,
                                std::ptrdiff_t prefetch_distance) {
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 BytesPolicy{byte_offsets});
+  gather_core<T, BytesPolicy>(base, output, n_indices, thread_cap, prefetch_distance,
+                 byte_offsets);
 }
 
 template <typename T>
@@ -583,9 +601,9 @@ void gather_multirecord_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                               std::int64_t col_prefix_bytes,
                               int thread_cap,
                               std::ptrdiff_t prefetch_distance) {
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 MultiRecordPolicy<T>{indices, record_starts_rows, record_starts_bytes,
-                     n_rows_per_record, n_records + 1, col_prefix_bytes});
+  gather_core<T, MultiRecordPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
+                 indices, record_starts_rows, record_starts_bytes, n_rows_per_record,
+                 n_records + 1, col_prefix_bytes);
 }
 
 template <typename T>
@@ -666,9 +684,9 @@ void gather_multirecord_bins_policy_typed(const std::uint8_t* COLSTORE_RESTRICT 
                                    std::int64_t col_prefix_bytes,
                                    int thread_cap,
                                    std::ptrdiff_t prefetch_distance) {
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 MultiRecordBinsPolicy<T>{indices, bins, record_starts_rows, record_starts_bytes,
-                         n_rows_per_record, n_records + 1, col_prefix_bytes});
+  gather_core<T, MultiRecordBinsPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
+                 indices, bins, record_starts_rows, record_starts_bytes, n_rows_per_record,
+                 n_records + 1, col_prefix_bytes);
 }
 
 template <typename T>
@@ -745,9 +763,9 @@ void gather_multirecord_withbins_policy_typed(const std::uint8_t* COLSTORE_RESTR
                                        std::int64_t col_prefix_bytes,
                                        int thread_cap,
                                        std::ptrdiff_t prefetch_distance) {
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 WithBinsPolicy<T>{indices, bins, record_starts_rows, record_starts_bytes,
-                  n_rows_per_record, col_prefix_bytes});
+  gather_core<T, WithBinsPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
+                 indices, bins, record_starts_rows, record_starts_bytes, n_rows_per_record,
+                 col_prefix_bytes);
 }
 
 template <typename T>
@@ -1142,8 +1160,8 @@ void gather_multirecord_withbins_rbase_policy_typed(const std::uint8_t* COLSTORE
                                              const std::int64_t* COLSTORE_RESTRICT record_base,
                                              int thread_cap,
                                              std::ptrdiff_t prefetch_distance) {
-  gather_core<T>(base, output, n_indices, thread_cap, prefetch_distance,
-                 RBasePolicy<T>{indices, bins, record_base});
+  gather_core<T, RBasePolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
+                 indices, bins, record_base);
 }
 
 template <typename T>
