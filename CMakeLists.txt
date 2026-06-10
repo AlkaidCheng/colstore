@@ -78,14 +78,15 @@ target_compile_definitions(_gather PRIVATE
 # default is seeded from the environment variable of the same name (on a
 # fresh configure), so all three of these work and add a new toggle in one
 # line:
-#   COLSTORE_USE_POLICY_GATHER=1 pip install -e . ...        (env convenience)
-#   pip install -e . ... -C cmake.define.COLSTORE_USE_POLICY_GATHER=ON
-#   cmake -DCOLSTORE_USE_POLICY_GATHER=ON ...
+#   COLSTORE_SOME_TOGGLE=1 pip install -e . ...               (env convenience)
+#   pip install -e . ... -C cmake.define.COLSTORE_SOME_TOGGLE=ON
+#   cmake -DCOLSTORE_SOME_TOGGLE=ON ...
 # An explicit -D / -C cmake.define wins over the env seed; the env seed only
 # applies when the option is not already in the CMake cache (so changing the
 # env var alone needs a fresh build dir, while -C cmake.define always takes).
+# Toggled builds report their flags via _gather.build_flags().
 set(COLSTORE_TOGGLES
-  COLSTORE_USE_POLICY_GATHER
+  # (none at present; append one name per line to add a toggle)
 )
 foreach(_flag IN LISTS COLSTORE_TOGGLES)
   set(_seed OFF)

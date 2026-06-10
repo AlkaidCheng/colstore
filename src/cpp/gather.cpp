@@ -115,7 +115,7 @@ inline T load_unaligned(const std::uint8_t* address) {
   return value;
 }
 
-// --- Policy-based gather (toggled by COLSTORE_USE_POLICY_GATHER) -----------
+// --- Policy-based gather core ----------------------------------------------
 //
 // gather_core holds the parallel + prefetch + store skeleton shared by the
 // scatter-family kernels; a Policy supplies the per-element byte offset.
@@ -331,47 +331,8 @@ inline bool dispatch_itemsize(int itemsize, F&& f) {
 
 }  // namespace
 
-// gather_indexed and gather_bytes each have a legacy hand-written loop and a
-// policy-based equivalent (gather_core + a policy). Both are compiled
-// unconditionally so the in-process A/B benchmark (check_policy_gather.py)
-// can call each on identical data in one process. The *_typed selector picks
-// one at compile time via COLSTORE_USE_POLICY_GATHER for production use.
-template <typename T>
-void gather_indexed_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                 const std::int64_t* COLSTORE_RESTRICT indices,
-                                 std::uint8_t* COLSTORE_RESTRICT output,
-                                 std::ptrdiff_t n_indices,
-                                 int thread_cap,
-                                 std::ptrdiff_t prefetch_distance) {
-  // Byte-based addressing: ``base`` may not be aligned for T (see
-  // load_unaligned). The prefetch below only forms addresses, never loads.
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
-    if (n_threads > 1)
-#else
-  (void)n_threads;
-#endif
-  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
-    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      COLSTORE_PREFETCH(base + indices[i + prefetch_distance] * static_cast<std::ptrdiff_t>(sizeof(T)));
-    }
-    dst[i] = load_unaligned<T>(base + indices[i] * static_cast<std::ptrdiff_t>(sizeof(T)));
-  }
-}
-
-template <typename T>
-void gather_indexed_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                 const std::int64_t* COLSTORE_RESTRICT indices,
-                                 std::uint8_t* COLSTORE_RESTRICT output,
-                                 std::ptrdiff_t n_indices,
-                                 int thread_cap,
-                                 std::ptrdiff_t prefetch_distance) {
-  gather_core<T, IndexedPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
-                 indices);
-}
-
+// Single-record kernels: per-element offsets come straight from the index
+// or byte-offset array.
 template <typename T>
 void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                           const std::int64_t* COLSTORE_RESTRICT indices,
@@ -379,13 +340,8 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                           std::ptrdiff_t n_indices,
                           int thread_cap,
                           std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_indexed_policy_typed<T>(base, indices, output, n_indices, thread_cap,
-                                 prefetch_distance);
-#else
-  gather_indexed_legacy_typed<T>(base, indices, output, n_indices, thread_cap,
-                                 prefetch_distance);
-#endif
+  gather_core<T, IndexedPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
+                 indices);
 }
 
 // Byte-offset gather: ``output[i]`` is the T at ``base + byte_offsets[i]``.
@@ -394,80 +350,14 @@ void gather_indexed_typed(const std::uint8_t* COLSTORE_RESTRICT base,
 // the Python level (record-header skips, per-record column offsets). Offsets
 // need not be T-aligned; source loads go through load_unaligned.
 template <typename T>
-void gather_bytes_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                               const std::int64_t* COLSTORE_RESTRICT byte_offsets,
-                               std::uint8_t* COLSTORE_RESTRICT output,
-                               std::ptrdiff_t n_indices,
-                               int thread_cap,
-                               std::ptrdiff_t prefetch_distance) {
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
-    if (n_threads > 1)
-#else
-  (void)n_threads;
-#endif
-  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
-    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      COLSTORE_PREFETCH(base + byte_offsets[i + prefetch_distance]);
-    }
-    dst[i] = load_unaligned<T>(base + byte_offsets[i]);
-  }
-}
-
-template <typename T>
-void gather_bytes_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                               const std::int64_t* COLSTORE_RESTRICT byte_offsets,
-                               std::uint8_t* COLSTORE_RESTRICT output,
-                               std::ptrdiff_t n_indices,
-                               int thread_cap,
-                               std::ptrdiff_t prefetch_distance) {
-  gather_core<T, BytesPolicy>(base, output, n_indices, thread_cap, prefetch_distance,
-                 byte_offsets);
-}
-
-template <typename T>
 void gather_bytes_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                         const std::int64_t* COLSTORE_RESTRICT byte_offsets,
                         std::uint8_t* COLSTORE_RESTRICT output,
                         std::ptrdiff_t n_indices,
                         int thread_cap,
                         std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_bytes_policy_typed<T>(base, byte_offsets, output, n_indices,
-                               thread_cap, prefetch_distance);
-#else
-  gather_bytes_legacy_typed<T>(base, byte_offsets, output, n_indices,
-                               thread_cap, prefetch_distance);
-#endif
-}
-
-// Diagnostic dispatchers: pick legacy or policy at run time (use_policy).
-template <typename T>
-inline void gather_indexed_variant_typed(const std::uint8_t* base,
-                                         const std::int64_t* indices,
-                                         std::uint8_t* output, std::ptrdiff_t n,
-                                         int use_policy, int thread_cap,
-                                         std::ptrdiff_t pd) {
-  if (use_policy) {
-    gather_indexed_policy_typed<T>(base, indices, output, n, thread_cap, pd);
-  } else {
-    gather_indexed_legacy_typed<T>(base, indices, output, n, thread_cap, pd);
-  }
-}
-
-template <typename T>
-inline void gather_bytes_variant_typed(const std::uint8_t* base,
-                                       const std::int64_t* byte_offsets,
-                                       std::uint8_t* output, std::ptrdiff_t n,
-                                       int use_policy, int thread_cap,
-                                       std::ptrdiff_t pd) {
-  if (use_policy) {
-    gather_bytes_policy_typed<T>(base, byte_offsets, output, n, thread_cap, pd);
-  } else {
-    gather_bytes_legacy_typed<T>(base, byte_offsets, output, n, thread_cap, pd);
-  }
+  gather_core<T, BytesPolicy>(base, output, n_indices, thread_cap, prefetch_distance,
+                 byte_offsets);
 }
 
 // Contiguous multi-record range copy. See header for the addressing contract.
@@ -542,47 +432,7 @@ void copy_multirecord_range(const std::uint8_t* COLSTORE_RESTRICT base,
 // the search is cheap relative to the DRAM latency it hides for the scattered
 // data load.
 template <typename T>
-void gather_multirecord_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                              const std::int64_t* COLSTORE_RESTRICT indices,
-                              std::uint8_t* COLSTORE_RESTRICT output,
-                              std::ptrdiff_t n_indices,
-                              const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                              const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                              const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                              std::int64_t n_records,
-                              std::int64_t col_prefix_bytes,
-                              int thread_cap,
-                              std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  const std::int64_t len = n_records + 1;  // entries in record_starts_rows
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
-    if (n_threads > 1)
-#else
-  (void)n_threads;
-#endif
-  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
-    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      const std::int64_t j = indices[i + prefetch_distance];
-      const std::int64_t rj = bin_record(record_starts_rows, len, j);
-      const std::int64_t off_j = record_starts_bytes[rj] +
-                                 col_prefix_bytes * n_rows_per_record[rj] +
-                                 (j - record_starts_rows[rj]) * itemsize;
-      COLSTORE_PREFETCH(base + off_j);
-    }
-    const std::int64_t idx = indices[i];
-    const std::int64_t r = bin_record(record_starts_rows, len, idx);
-    const std::int64_t off = record_starts_bytes[r] +
-                             col_prefix_bytes * n_rows_per_record[r] +
-                             (idx - record_starts_rows[r]) * itemsize;
-    dst[i] = load_unaligned<T>(base + off);
-  }
-}
-
-template <typename T>
-void gather_multirecord_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+void gather_multirecord_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                               const std::int64_t* COLSTORE_RESTRICT indices,
                               std::uint8_t* COLSTORE_RESTRICT output,
                               std::ptrdiff_t n_indices,
@@ -598,73 +448,12 @@ void gather_multirecord_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                  n_records + 1, col_prefix_bytes);
 }
 
-template <typename T>
-void gather_multirecord_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                              const std::int64_t* COLSTORE_RESTRICT indices,
-                              std::uint8_t* COLSTORE_RESTRICT output,
-                              std::ptrdiff_t n_indices,
-                              const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                              const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                              const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                              std::int64_t n_records,
-                              std::int64_t col_prefix_bytes,
-                              int thread_cap,
-                              std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_multirecord_policy_typed<T>(base, indices, output, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-#else
-  gather_multirecord_legacy_typed<T>(base, indices, output, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-#endif
-}
-
 // Bin-recording variant: identical addressing to gather_multirecord_typed,
 // plus ``bins[i] = r`` so subsequent columns of the same read reuse the
 // binning (the dominant cost of this kernel) instead of recomputing it per
 // column.
 template <typename T>
-void gather_multirecord_bins_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                   const std::int64_t* COLSTORE_RESTRICT indices,
-                                   std::uint8_t* COLSTORE_RESTRICT output,
-                                   std::int32_t* COLSTORE_RESTRICT bins,
-                                   std::ptrdiff_t n_indices,
-                                   const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                   const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                   const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes,
-                                   int thread_cap,
-                                   std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  const std::int64_t len = n_records + 1;
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
-    if (n_threads > 1)
-#else
-  (void)n_threads;
-#endif
-  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
-    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      const std::int64_t j = indices[i + prefetch_distance];
-      const std::int64_t rj = bin_record(record_starts_rows, len, j);
-      const std::int64_t off_j = record_starts_bytes[rj] +
-                                 col_prefix_bytes * n_rows_per_record[rj] +
-                                 (j - record_starts_rows[rj]) * itemsize;
-      COLSTORE_PREFETCH(base + off_j);
-    }
-    const std::int64_t idx = indices[i];
-    const std::int64_t r = bin_record(record_starts_rows, len, idx);
-    bins[i] = static_cast<std::int32_t>(r);
-    const std::int64_t off = record_starts_bytes[r] +
-                             col_prefix_bytes * n_rows_per_record[r] +
-                             (idx - record_starts_rows[r]) * itemsize;
-    dst[i] = load_unaligned<T>(base + off);
-  }
-}
-
-template <typename T>
-void gather_multirecord_bins_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+void gather_multirecord_bins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                    const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::int32_t* COLSTORE_RESTRICT bins,
@@ -681,70 +470,11 @@ void gather_multirecord_bins_policy_typed(const std::uint8_t* COLSTORE_RESTRICT 
                  n_records + 1, col_prefix_bytes);
 }
 
-template <typename T>
-void gather_multirecord_bins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                   const std::int64_t* COLSTORE_RESTRICT indices,
-                                   std::uint8_t* COLSTORE_RESTRICT output,
-                                   std::int32_t* COLSTORE_RESTRICT bins,
-                                   std::ptrdiff_t n_indices,
-                                   const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                   const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                   const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes,
-                                   int thread_cap,
-                                   std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_multirecord_bins_policy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-#else
-  gather_multirecord_bins_legacy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-#endif
-}
-
 // Bins-provided companion: the per-element record bin is a sequential int32
 // read instead of a branchless search, and the prefetch look-ahead likewise
 // reads ``bins[i + d]`` -- no second search anywhere.
 template <typename T>
-void gather_multirecord_withbins_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                       const std::int64_t* COLSTORE_RESTRICT indices,
-                                       std::uint8_t* COLSTORE_RESTRICT output,
-                                       const std::int32_t* COLSTORE_RESTRICT bins,
-                                       std::ptrdiff_t n_indices,
-                                       const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                       const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                       const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                       std::int64_t col_prefix_bytes,
-                                       int thread_cap,
-                                       std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
-    if (n_threads > 1)
-#else
-  (void)n_threads;
-#endif
-  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
-    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      const std::int64_t j = indices[i + prefetch_distance];
-      const std::int64_t rj = bins[i + prefetch_distance];
-      const std::int64_t off_j = record_starts_bytes[rj] +
-                                 col_prefix_bytes * n_rows_per_record[rj] +
-                                 (j - record_starts_rows[rj]) * itemsize;
-      COLSTORE_PREFETCH(base + off_j);
-    }
-    const std::int64_t idx = indices[i];
-    const std::int64_t r = bins[i];
-    const std::int64_t off = record_starts_bytes[r] +
-                             col_prefix_bytes * n_rows_per_record[r] +
-                             (idx - record_starts_rows[r]) * itemsize;
-    dst[i] = load_unaligned<T>(base + off);
-  }
-}
-
-template <typename T>
-void gather_multirecord_withbins_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+void gather_multirecord_withbins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                        const std::int64_t* COLSTORE_RESTRICT indices,
                                        std::uint8_t* COLSTORE_RESTRICT output,
                                        const std::int32_t* COLSTORE_RESTRICT bins,
@@ -758,25 +488,6 @@ void gather_multirecord_withbins_policy_typed(const std::uint8_t* COLSTORE_RESTR
   gather_core<T, WithBinsPolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
                  indices, bins, record_starts_rows, record_starts_bytes, n_rows_per_record,
                  col_prefix_bytes);
-}
-
-template <typename T>
-void gather_multirecord_withbins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                       const std::int64_t* COLSTORE_RESTRICT indices,
-                                       std::uint8_t* COLSTORE_RESTRICT output,
-                                       const std::int32_t* COLSTORE_RESTRICT bins,
-                                       std::ptrdiff_t n_indices,
-                                       const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                       const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                       const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                       std::int64_t col_prefix_bytes,
-                                       int thread_cap,
-                                       std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_multirecord_withbins_policy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, col_prefix_bytes, thread_cap, prefetch_distance);
-#else
-  gather_multirecord_withbins_legacy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, col_prefix_bytes, thread_cap, prefetch_distance);
-#endif
 }
 
 // Sorted multi-record fancy gather. ``indices`` must be non-decreasing
@@ -1117,34 +828,7 @@ void gather_multirecord_uniform_withbins_typed(const std::uint8_t* COLSTORE_REST
 // per column (O(R), vectorized) and folds the column prefix and the
 // row-to-byte conversion into a single per-record scalar.
 template <typename T>
-void gather_multirecord_withbins_rbase_legacy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                             const std::int64_t* COLSTORE_RESTRICT indices,
-                                             std::uint8_t* COLSTORE_RESTRICT output,
-                                             const std::int32_t* COLSTORE_RESTRICT bins,
-                                             std::ptrdiff_t n_indices,
-                                             const std::int64_t* COLSTORE_RESTRICT record_base,
-                                             int thread_cap,
-                                             std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
-    if (n_threads > 1)
-#else
-  (void)n_threads;
-#endif
-  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
-    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      const std::ptrdiff_t j = i + prefetch_distance;
-      COLSTORE_PREFETCH(base + record_base[bins[j]] + indices[j] * itemsize);
-    }
-    dst[i] = load_unaligned<T>(base + record_base[bins[i]] + indices[i] * itemsize);
-  }
-}
-
-template <typename T>
-void gather_multirecord_withbins_rbase_policy_typed(const std::uint8_t* COLSTORE_RESTRICT base,
+void gather_multirecord_withbins_rbase_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                              const std::int64_t* COLSTORE_RESTRICT indices,
                                              std::uint8_t* COLSTORE_RESTRICT output,
                                              const std::int32_t* COLSTORE_RESTRICT bins,
@@ -1154,96 +838,6 @@ void gather_multirecord_withbins_rbase_policy_typed(const std::uint8_t* COLSTORE
                                              std::ptrdiff_t prefetch_distance) {
   gather_core<T, RBasePolicy<T>>(base, output, n_indices, thread_cap, prefetch_distance,
                  indices, bins, record_base);
-}
-
-template <typename T>
-void gather_multirecord_withbins_rbase_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                             const std::int64_t* COLSTORE_RESTRICT indices,
-                                             std::uint8_t* COLSTORE_RESTRICT output,
-                                             const std::int32_t* COLSTORE_RESTRICT bins,
-                                             std::ptrdiff_t n_indices,
-                                             const std::int64_t* COLSTORE_RESTRICT record_base,
-                                             int thread_cap,
-                                             std::ptrdiff_t prefetch_distance) {
-#ifdef COLSTORE_USE_POLICY_GATHER
-  gather_multirecord_withbins_rbase_policy_typed<T>(base, indices, output, bins, n_indices, record_base, thread_cap, prefetch_distance);
-#else
-  gather_multirecord_withbins_rbase_legacy_typed<T>(base, indices, output, bins, n_indices, record_base, thread_cap, prefetch_distance);
-#endif
-}
-
-template <typename T>
-inline void gather_multirecord_variant_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                              const std::int64_t* COLSTORE_RESTRICT indices,
-                              std::uint8_t* COLSTORE_RESTRICT output,
-                              std::ptrdiff_t n_indices,
-                              const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                              const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                              const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                              std::int64_t n_records,
-                              std::int64_t col_prefix_bytes,
-                              int use_policy, int thread_cap,
-                              std::ptrdiff_t prefetch_distance) {
-  if (use_policy) {
-    gather_multirecord_policy_typed<T>(base, indices, output, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-  } else {
-    gather_multirecord_legacy_typed<T>(base, indices, output, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-  }
-}
-
-template <typename T>
-inline void gather_multirecord_bins_variant_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                   const std::int64_t* COLSTORE_RESTRICT indices,
-                                   std::uint8_t* COLSTORE_RESTRICT output,
-                                   std::int32_t* COLSTORE_RESTRICT bins,
-                                   std::ptrdiff_t n_indices,
-                                   const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                   const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                   const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes,
-                                   int use_policy, int thread_cap,
-                                   std::ptrdiff_t prefetch_distance) {
-  if (use_policy) {
-    gather_multirecord_bins_policy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-  } else {
-    gather_multirecord_bins_legacy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-  }
-}
-
-template <typename T>
-inline void gather_multirecord_withbins_variant_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                       const std::int64_t* COLSTORE_RESTRICT indices,
-                                       std::uint8_t* COLSTORE_RESTRICT output,
-                                       const std::int32_t* COLSTORE_RESTRICT bins,
-                                       std::ptrdiff_t n_indices,
-                                       const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                       const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                       const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                       std::int64_t col_prefix_bytes,
-                                       int use_policy, int thread_cap,
-                                       std::ptrdiff_t prefetch_distance) {
-  if (use_policy) {
-    gather_multirecord_withbins_policy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, col_prefix_bytes, thread_cap, prefetch_distance);
-  } else {
-    gather_multirecord_withbins_legacy_typed<T>(base, indices, output, bins, n_indices, record_starts_rows, record_starts_bytes, n_rows_per_record, col_prefix_bytes, thread_cap, prefetch_distance);
-  }
-}
-
-template <typename T>
-inline void gather_multirecord_withbins_rbase_variant_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                             const std::int64_t* COLSTORE_RESTRICT indices,
-                                             std::uint8_t* COLSTORE_RESTRICT output,
-                                             const std::int32_t* COLSTORE_RESTRICT bins,
-                                             std::ptrdiff_t n_indices,
-                                             const std::int64_t* COLSTORE_RESTRICT record_base,
-                                             int use_policy, int thread_cap,
-                                             std::ptrdiff_t prefetch_distance) {
-  if (use_policy) {
-    gather_multirecord_withbins_rbase_policy_typed<T>(base, indices, output, bins, n_indices, record_base, thread_cap, prefetch_distance);
-  } else {
-    gather_multirecord_withbins_rbase_legacy_typed<T>(base, indices, output, bins, n_indices, record_base, thread_cap, prefetch_distance);
-  }
 }
 
 // Boolean-mask-native gather. Pass 1 counts each thread chunk's selected
@@ -1403,9 +997,6 @@ extern "C" {
 // per-flag accessor.
 const char* colstore_build_flags(void) {
   return
-#ifdef COLSTORE_USE_POLICY_GATHER
-      "COLSTORE_USE_POLICY_GATHER "
-#endif
       "";
 }
 
@@ -1415,94 +1006,6 @@ const char* colstore_build_flags(void) {
 long long colstore_resolve_thread_count(long long n_indices, int cap) {
   return static_cast<long long>(
       colstore::resolve_thread_count(static_cast<std::ptrdiff_t>(n_indices), cap));
-}
-
-// Diagnostic A/B entries: call the legacy or policy implementation
-// explicitly (use_policy != 0 selects policy), dispatched by element size,
-// so check_policy_gather.py can compare both on identical data in one
-// process regardless of the production default.
-int colstore_gather_indexed_variant(const std::uint8_t* base,
-                                     const std::int64_t* indices,
-                                     std::uint8_t* output, std::ptrdiff_t n,
-                                     int itemsize, int use_policy,
-                                     int thread_cap,
-                                     std::ptrdiff_t prefetch_distance) {
-  return colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_indexed_variant_typed<T>(base, indices, output, n, use_policy, thread_cap, prefetch_distance);
-  })
-             ? 0
-             : -1;
-}
-
-int colstore_gather_bytes_variant(const std::uint8_t* base,
-                                   const std::int64_t* byte_offsets,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   int itemsize, int use_policy,
-                                   int thread_cap,
-                                   std::ptrdiff_t prefetch_distance) {
-  return colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_bytes_variant_typed<T>(base, byte_offsets, output, n, use_policy, thread_cap, prefetch_distance);
-  })
-             ? 0
-             : -1;
-}
-
-int colstore_gather_multirecord_variant(const std::uint8_t* base,
-                                   const std::int64_t* indices,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   const std::int64_t* record_starts_rows,
-                                   const std::int64_t* record_starts_bytes,
-                                   const std::int64_t* n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int itemsize, int use_policy, int thread_cap,
-                               std::ptrdiff_t prefetch_distance) {
-  return colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_variant_typed<T>(base, indices, output, n, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, use_policy, thread_cap, prefetch_distance);
-  })
-             ? 0
-             : -1;
-}
-
-int colstore_gather_multirecord_bins_variant(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int use_policy, int thread_cap,
-    std::ptrdiff_t prefetch_distance) {
-  return colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_bins_variant_typed<T>(base, indices, output, bins, n, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, use_policy, thread_cap, prefetch_distance);
-  })
-             ? 0
-             : -1;
-}
-
-int colstore_gather_multirecord_withbins_variant(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int itemsize, int use_policy, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_withbins_variant_typed<T>(base, indices, output, bins, n, record_starts_rows, record_starts_bytes, n_rows_per_record, col_prefix_bytes, use_policy, thread_cap, prefetch_distance);
-  })
-             ? 0
-             : -1;
-}
-
-int colstore_gather_multirecord_withbins_rbase_variant(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int itemsize, int use_policy, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_withbins_rbase_variant_typed<T>(base, indices, output, bins, n, record_base, use_policy, thread_cap, prefetch_distance);
-  })
-             ? 0
-             : -1;
 }
 
 int colstore_gather_indexed(const std::uint8_t* base,
