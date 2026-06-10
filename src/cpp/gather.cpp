@@ -46,6 +46,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace colstore {
@@ -136,8 +138,25 @@ inline T load_unaligned(const std::uint8_t* address) {
 // hand-written kernels.
 //
 // offset(i, ...) may have a side effect (the bins-recording policy writes
-// bins[i]); prefetch_offset(i, ...) must be pure -- the look-ahead element
-// can belong to another thread's chunk, so a write there would race.
+// bins[i]). The prefetch hint uses prefetch_offset(i, ...) when the policy
+// defines one and falls back to offset otherwise, so pure policies define
+// only offset. A policy whose offset HAS a side effect MUST define a pure
+// prefetch_offset: the look-ahead element can belong to another thread's
+// chunk, so a write there would race.
+
+template <typename Policy, typename Void, typename... State>
+struct has_prefetch_offset : std::false_type {};
+
+template <typename Policy, typename... State>
+struct has_prefetch_offset<
+    Policy,
+    std::void_t<decltype(Policy::prefetch_offset(std::declval<std::ptrdiff_t>(),
+                                                 std::declval<State>()...))>,
+    State...> : std::true_type {};
+
+template <typename Policy, typename... State>
+inline constexpr bool has_prefetch_offset_v =
+    has_prefetch_offset<Policy, void, State...>::value;
 
 template <typename T, typename Policy, typename... State>
 inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
@@ -154,7 +173,11 @@ inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
 #endif
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
-      COLSTORE_PREFETCH(base + Policy::prefetch_offset(i + prefetch_distance, state...));
+      if constexpr (has_prefetch_offset_v<Policy, State...>) {
+        COLSTORE_PREFETCH(base + Policy::prefetch_offset(i + prefetch_distance, state...));
+      } else {
+        COLSTORE_PREFETCH(base + Policy::offset(i + prefetch_distance, state...));
+      }
     }
     dst[i] = load_unaligned<T>(base + Policy::offset(i, state...));
   }
@@ -166,19 +189,11 @@ struct IndexedPolicy {
                                       const std::int64_t* COLSTORE_RESTRICT indices) {
     return indices[i] * static_cast<std::ptrdiff_t>(sizeof(T));
   }
-  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
-                                               const std::int64_t* COLSTORE_RESTRICT indices) {
-    return offset(i, indices);
-  }
 };
 
 struct BytesPolicy {
   static inline std::ptrdiff_t offset(std::ptrdiff_t i,
                                       const std::int64_t* COLSTORE_RESTRICT byte_offsets) {
-    return byte_offsets[i];
-  }
-  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
-                                               const std::int64_t* COLSTORE_RESTRICT byte_offsets) {
     return byte_offsets[i];
   }
 };
@@ -219,14 +234,6 @@ struct MultiRecordPolicy {
     const std::int64_t r = bin_record(rsr, len, idx);
     return rsb[r] + col_prefix_bytes * nrr[r] +
            (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
-  }
-  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
-                                               const std::int64_t* COLSTORE_RESTRICT indices,
-                                               const std::int64_t* COLSTORE_RESTRICT rsr,
-                                               const std::int64_t* COLSTORE_RESTRICT rsb,
-                                               const std::int64_t* COLSTORE_RESTRICT nrr,
-                                               std::int64_t len, std::int64_t col_prefix_bytes) {
-    return offset(i, indices, rsr, rsb, nrr, len, col_prefix_bytes);
   }
 };
 
@@ -276,15 +283,6 @@ struct WithBinsPolicy {
     return rsb[r] + col_prefix_bytes * nrr[r] +
            (indices[i] - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
   }
-  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
-                                               const std::int64_t* COLSTORE_RESTRICT indices,
-                                               const std::int32_t* COLSTORE_RESTRICT bins,
-                                               const std::int64_t* COLSTORE_RESTRICT rsr,
-                                               const std::int64_t* COLSTORE_RESTRICT rsb,
-                                               const std::int64_t* COLSTORE_RESTRICT nrr,
-                                               std::int64_t col_prefix_bytes) {
-    return offset(i, indices, bins, rsr, rsb, nrr, col_prefix_bytes);
-  }
 };
 
 // Record-base: record_base[r] folds the column prefix and row-to-byte
@@ -297,12 +295,6 @@ struct RBasePolicy {
                                       const std::int64_t* COLSTORE_RESTRICT record_base) {
     return record_base[bins[i]] +
            indices[i] * static_cast<std::int64_t>(sizeof(T));
-  }
-  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
-                                               const std::int64_t* COLSTORE_RESTRICT indices,
-                                               const std::int32_t* COLSTORE_RESTRICT bins,
-                                               const std::int64_t* COLSTORE_RESTRICT record_base) {
-    return offset(i, indices, bins, record_base);
   }
 };
 

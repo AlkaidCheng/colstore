@@ -153,6 +153,40 @@ def _require_c_contiguous(pairs):
             )
 
 
+cdef inline void _require_1d(tuple arrays, str message) except *:
+    """Raise ValueError(message) unless every array is 1D."""
+    cdef cnp.ndarray arr
+    for arr in arrays:
+        if arr.ndim != 1:
+            raise ValueError(message)
+
+
+cdef inline void _require_int64(cnp.ndarray arr, str name) except *:
+    if arr.dtype != np.int64:
+        raise TypeError(f"{name} must be int64; got {arr.dtype}.")
+
+
+cdef inline void _require_int32(cnp.ndarray arr, str name) except *:
+    if arr.dtype != np.int32:
+        raise TypeError(f"{name} must be int32; got {arr.dtype}.")
+
+
+cdef inline void _require_output_len(cnp.ndarray output, Py_ssize_t n, str other) except *:
+    if output.shape[0] != n:
+        raise ValueError(f"output length {output.shape[0]} does not match {other} length {n}.")
+
+
+cdef inline void _require_record_arrays(
+    cnp.ndarray record_starts_rows,
+    cnp.ndarray record_starts_bytes,
+    cnp.ndarray n_rows_per_record,
+) except *:
+    if (record_starts_rows.dtype != np.int64
+            or record_starts_bytes.dtype != np.int64
+            or n_rows_per_record.dtype != np.int64):
+        raise TypeError("record index arrays must be int64.")
+
+
 def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
            int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Element-indexed gather: ``output[i] = source[indices[i]]``.
@@ -177,10 +211,8 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     ValueError
         If shapes are incompatible.
     """
-    if source.ndim != 1 or indices.ndim != 1 or output.ndim != 1:
-        raise ValueError("All inputs to gather must be 1D arrays.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    _require_1d((source, indices, output), "All inputs to gather must be 1D arrays.")
+    _require_int64(indices, "indices")
     if source.dtype != output.dtype:
         raise TypeError(
             f"source dtype {source.dtype} does not match output dtype "
@@ -188,11 +220,7 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         )
 
     cdef ptrdiff_t n_indices = indices.shape[0]
-    if output.shape[0] != n_indices:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match indices "
-            f"length {n_indices}."
-        )
+    _require_output_len(output, n_indices, "indices")
     if n_indices == 0:
         return
 
@@ -261,17 +289,11 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
     ValueError
         If shapes are incompatible.
     """
-    if byte_offsets.ndim != 1 or output.ndim != 1:
-        raise ValueError("byte_offsets and output must be 1D arrays.")
-    if byte_offsets.dtype != np.int64:
-        raise TypeError(f"byte_offsets must be int64; got {byte_offsets.dtype}.")
+    _require_1d((byte_offsets, output), "byte_offsets and output must be 1D arrays.")
+    _require_int64(byte_offsets, "byte_offsets")
 
     cdef ptrdiff_t n_indices = byte_offsets.shape[0]
-    if output.shape[0] != n_indices:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match byte_offsets "
-            f"length {n_indices}."
-        )
+    _require_output_len(output, n_indices, "byte_offsets")
     if n_indices == 0:
         return
 
@@ -315,18 +337,10 @@ def gather_multirecord_bins(cnp.ndarray source, cnp.ndarray indices,
     caller guarantees ``n_records <= 2**31 - 1``. All other parameters and
     errors match :func:`gather_multirecord`.
     """
-    if (indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1
-            or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, bins, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, bins, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, bins, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
     if output.shape[0] != n or bins.shape[0] != n:
@@ -377,18 +391,10 @@ def gather_multirecord_withbins(cnp.ndarray source, cnp.ndarray indices,
     ``col_prefix_bytes``. Other parameters and errors match
     :func:`gather_multirecord`.
     """
-    if (indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1
-            or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, bins, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, bins, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, bins, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
     if output.shape[0] != n or bins.shape[0] != n:
@@ -439,21 +445,12 @@ def gather_multirecord_sorted(cnp.ndarray source, cnp.ndarray indices,
     undefined otherwise. Parameters and errors match
     :func:`gather_multirecord`; see ``gather.hpp`` for the walk design.
     """
-    if (indices.ndim != 1 or output.ndim != 1 or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match indices length {n}."
-        )
+    _require_output_len(output, n, "indices")
     cdef long long n_records = record_starts_bytes.shape[0]
     if n_rows_per_record.shape[0] != n_records:
         raise ValueError("n_rows_per_record length must match record count.")
@@ -498,21 +495,13 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
     that the dtype is in native byte order (raw typed loads cannot
     byteswap). Other parameters and errors match :func:`gather_multirecord`.
     """
-    if (output.ndim != 1 or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("output and index arrays must be 1D.")
+    _require_1d((output, record_starts_rows, record_starts_bytes, n_rows_per_record), "output and index arrays must be 1D.")
     if step == 0:
         raise ValueError("step must be non-zero.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = len(range(start, stop, step))
-    if output.shape[0] != n:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match the slice length {n}."
-        )
+    _require_output_len(output, n, "the slice")
     cdef long long n_records = record_starts_bytes.shape[0]
     if n_rows_per_record.shape[0] != n_records:
         raise ValueError("n_rows_per_record length must match record count.")
@@ -558,10 +547,8 @@ def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
     validates only the scalar sanity conditions and the array contracts
     shared by every kernel.
     """
-    if indices.ndim != 1 or output.ndim != 1:
-        raise ValueError("indices and output must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    _require_1d((indices, output), "indices and output must be 1D.")
+    _require_int64(indices, "indices")
     if rows_per_record <= 0:
         raise ValueError("rows_per_record must be positive.")
     if n_records <= 0:
@@ -570,10 +557,7 @@ def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
         raise ValueError("last_record_rows must be in [1, rows_per_record].")
 
     cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match indices length {n}."
-        )
+    _require_output_len(output, n, "indices")
     if n == 0:
         return
 
@@ -611,12 +595,9 @@ def gather_multirecord_uniform_bins(cnp.ndarray source, cnp.ndarray indices,
     Layout invariants and other parameters match
     :func:`gather_multirecord_uniform`.
     """
-    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1:
-        raise ValueError("indices, output, and bins must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    _require_1d((indices, output, bins), "indices, output, and bins must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
     if rows_per_record <= 0:
         raise ValueError("rows_per_record must be positive.")
     if n_records <= 0:
@@ -662,12 +643,9 @@ def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
     the same ``indices`` and layout; behavior is undefined otherwise. Other
     parameters and errors match :func:`gather_multirecord_uniform_bins`.
     """
-    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1:
-        raise ValueError("indices, output, and bins must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
+    _require_1d((indices, output, bins), "indices, output, and bins must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
     if rows_per_record <= 0:
         raise ValueError("rows_per_record must be positive.")
     if n_records <= 0:
@@ -713,14 +691,10 @@ def gather_multirecord_withbins_rbase(cnp.ndarray source, cnp.ndarray indices,
     caller's contract and are not re-validated. Other parameters and
     errors match :func:`gather_multirecord_withbins`.
     """
-    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1 or record_base.ndim != 1:
-        raise ValueError("indices, output, bins, and record_base must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
-    if record_base.dtype != np.int64:
-        raise TypeError(f"record_base must be int64; got {record_base.dtype}.")
+    _require_1d((indices, output, bins, record_base), "indices, output, bins, and record_base must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_int64(record_base, "record_base")
 
     cdef ptrdiff_t n = indices.shape[0]
     if output.shape[0] != n or bins.shape[0] != n:
@@ -765,14 +739,10 @@ def gather_multirecord_mask(cnp.ndarray source, cnp.ndarray mask,
     nothing in that case. Native byte order required; other parameters and
     errors match :func:`gather_multirecord_sorted`.
     """
-    if mask.ndim != 1 or output.ndim != 1:
-        raise ValueError("mask and output must be 1D.")
+    _require_1d((mask, output), "mask and output must be 1D.")
     if mask.dtype != np.bool_:
         raise TypeError(f"mask must be bool; got {mask.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
     cdef long long n_records = record_starts_bytes.shape[0]
     if n_rows_per_record.shape[0] != n_records:
         raise ValueError("n_rows_per_record length must match record count.")
@@ -852,13 +822,8 @@ def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
     ValueError
         If the index arrays are not 1D or have inconsistent lengths.
     """
-    if (record_starts_rows.ndim != 1 or record_starts_bytes.ndim != 1
-            or n_rows_per_record.ndim != 1 or output.ndim != 1):
-        raise ValueError("Index arrays and output must be 1D.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((record_starts_rows, record_starts_bytes, n_rows_per_record, output), "Index arrays and output must be 1D.")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef long long n_records = record_starts_bytes.shape[0]
     if n_rows_per_record.shape[0] != n_records:
@@ -926,21 +891,12 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
     ValueError
         If shapes are 1D-inconsistent or lengths disagree.
     """
-    if (indices.ndim != 1 or output.ndim != 1 or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match indices length {n}."
-        )
+    _require_output_len(output, n, "indices")
     cdef long long n_records = record_starts_bytes.shape[0]
     if n_rows_per_record.shape[0] != n_records:
         raise ValueError("n_rows_per_record length must match record count.")
@@ -983,19 +939,14 @@ def gather_variant(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     Identical result to :func:`gather`; ``use_policy`` selects the
     implementation so the A/B benchmark can call both in one process.
     """
-    if source.ndim != 1 or indices.ndim != 1 or output.ndim != 1:
-        raise ValueError("All inputs to gather_variant must be 1D arrays.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
+    _require_1d((source, indices, output), "All inputs to gather_variant must be 1D arrays.")
+    _require_int64(indices, "indices")
     if source.dtype != output.dtype:
         raise TypeError(
             f"source dtype {source.dtype} does not match output dtype {output.dtype}."
         )
     cdef ptrdiff_t n_indices = indices.shape[0]
-    if output.shape[0] != n_indices:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match indices length {n_indices}."
-        )
+    _require_output_len(output, n_indices, "indices")
     if n_indices == 0:
         return
     cdef int itemsize = source.dtype.itemsize
@@ -1019,15 +970,10 @@ def gather_variant(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
 def gather_bytes_variant(cnp.ndarray source, cnp.ndarray byte_offsets, cnp.ndarray output,
                          bint use_policy, int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Diagnostic gather_bytes via the legacy or policy kernel explicitly."""
-    if source.ndim != 1 or byte_offsets.ndim != 1 or output.ndim != 1:
-        raise ValueError("All inputs to gather_bytes_variant must be 1D arrays.")
-    if byte_offsets.dtype != np.int64:
-        raise TypeError(f"byte_offsets must be int64; got {byte_offsets.dtype}.")
+    _require_1d((source, byte_offsets, output), "All inputs to gather_bytes_variant must be 1D arrays.")
+    _require_int64(byte_offsets, "byte_offsets")
     cdef ptrdiff_t n_indices = byte_offsets.shape[0]
-    if output.shape[0] != n_indices:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match byte_offsets length {n_indices}."
-        )
+    _require_output_len(output, n_indices, "byte_offsets")
     if n_indices == 0:
         return
     cdef int itemsize = output.dtype.itemsize
@@ -1056,21 +1002,12 @@ def gather_multirecord_variant(cnp.ndarray source, cnp.ndarray indices,
                        long long col_prefix_bytes, bint use_policy, int thread_cap=0,
                        Py_ssize_t prefetch_distance=-1):
     """Diagnostic gather_multirecord via the legacy or policy kernel explicitly."""
-    if (indices.ndim != 1 or output.ndim != 1 or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n:
-        raise ValueError(
-            f"output length {output.shape[0]} does not match indices length {n}."
-        )
+    _require_output_len(output, n, "indices")
     cdef long long n_records = record_starts_bytes.shape[0]
     if n_rows_per_record.shape[0] != n_records:
         raise ValueError("n_rows_per_record length must match record count.")
@@ -1109,18 +1046,10 @@ def gather_multirecord_bins_variant(cnp.ndarray source, cnp.ndarray indices,
                             long long col_prefix_bytes, bint use_policy, int thread_cap=0,
                             Py_ssize_t prefetch_distance=-1):
     """Diagnostic gather_multirecord_bins via the legacy or policy kernel explicitly."""
-    if (indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1
-            or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, bins, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, bins, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, bins, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
     if output.shape[0] != n or bins.shape[0] != n:
@@ -1164,18 +1093,10 @@ def gather_multirecord_withbins_variant(cnp.ndarray source, cnp.ndarray indices,
                                 long long col_prefix_bytes, bint use_policy, int thread_cap=0,
                                 Py_ssize_t prefetch_distance=-1):
     """Diagnostic gather_multirecord_withbins via the legacy or policy kernel explicitly."""
-    if (indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1
-            or record_starts_rows.ndim != 1
-            or record_starts_bytes.ndim != 1 or n_rows_per_record.ndim != 1):
-        raise ValueError("indices, output, bins, and index arrays must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
-    if (record_starts_rows.dtype != np.int64
-            or record_starts_bytes.dtype != np.int64
-            or n_rows_per_record.dtype != np.int64):
-        raise TypeError("record index arrays must be int64.")
+    _require_1d((indices, output, bins, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, bins, and index arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
 
     cdef ptrdiff_t n = indices.shape[0]
     if output.shape[0] != n or bins.shape[0] != n:
@@ -1216,14 +1137,10 @@ def gather_multirecord_withbins_rbase_variant(cnp.ndarray source, cnp.ndarray in
                                       cnp.ndarray record_base, bint use_policy, int thread_cap=0,
                                       Py_ssize_t prefetch_distance=-1):
     """Diagnostic gather_multirecord_withbins_rbase via the legacy or policy kernel explicitly."""
-    if indices.ndim != 1 or output.ndim != 1 or bins.ndim != 1 or record_base.ndim != 1:
-        raise ValueError("indices, output, bins, and record_base must be 1D.")
-    if indices.dtype != np.int64:
-        raise TypeError(f"indices must be int64; got {indices.dtype}.")
-    if bins.dtype != np.int32:
-        raise TypeError(f"bins must be int32; got {bins.dtype}.")
-    if record_base.dtype != np.int64:
-        raise TypeError(f"record_base must be int64; got {record_base.dtype}.")
+    _require_1d((indices, output, bins, record_base), "indices, output, bins, and record_base must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_int64(record_base, "record_base")
 
     cdef ptrdiff_t n = indices.shape[0]
     if output.shape[0] != n or bins.shape[0] != n:
