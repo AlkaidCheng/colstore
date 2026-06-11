@@ -24,6 +24,7 @@ to see the parallel component.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -132,11 +133,9 @@ def run_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED\n")
 
 
-def _time(fn, *, repeat: int, warmup: int = 3) -> float:
-    return _c.best_time(fn, repeat=repeat, warmup=warmup)
-
-
-def _bench(total_rows: int, n_records: int, k: int, dtype_str: str, repeat: int) -> None:
+def _run_one(
+    total_rows: int, n_records: int, k: int, dtype_str: str, repeat: int, warmup: int
+) -> None:
     dtype = np.dtype(dtype_str)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "b.cstore"
@@ -159,34 +158,44 @@ def _bench(total_rows: int, n_records: int, k: int, dtype_str: str, repeat: int)
         ref = _numpy_pipeline(ds, indices, disk_dtype)
         assert np.array_equal(native_out, ref)
 
-        t_native = _time(lambda: ds[indices, "a"].array(), repeat=repeat)
-        t_numpy = _time(lambda: _numpy_pipeline(ds, indices, disk_dtype), repeat=repeat)
-        ds.close()
-        speedup = t_numpy / t_native if t_native > 0 else float("nan")
-        print(
-            f"  R={n_records:>5} K={k:>9} dtype={dtype_str} | "
-            f"numpy={t_numpy * 1e3:8.2f} ms  native={t_native * 1e3:8.2f} ms  "
-            f"speedup={speedup:5.2f}x"
+        print(f"R={n_records:>5} K={k:>9,} dtype={dtype_str}")
+        _c.compare(
+            [
+                ("numpy pipeline", lambda: _numpy_pipeline(ds, indices, disk_dtype)),
+                ("native fused", lambda: ds[indices, "a"].array()),
+            ],
+            repeat=repeat,
+            warmup=warmup,
+            baseline=0,
         )
+        ds.close()
 
 
-def run_bench(repeat: int) -> None:
+def run_bench(args: argparse.Namespace) -> None:
     print("Timing: native fused gather vs numpy searchsorted pipeline")
-    print(f"  max_threads = {kernels.max_threads()} (set OMP_NUM_THREADS>1 for the parallel part)")
-    for n_records in (100, 1000):
-        for k in (200_000, 1_000_000):
-            _bench(2_000_000, n_records, k, "<f8", repeat)
-    _bench(2_000_000, 1000, 1_000_000, "<i4", repeat)
+    print(f"  max_threads = {kernels.max_threads()} (raise --thread / OMP_NUM_THREADS to scale)")
+    for n_records in args.record_counts:
+        _run_one(args.rows, n_records, args.indices, args.dtype, args.repeat, args.warmup)
 
 
 def main() -> None:
-    _c.run_script(
-        correctness=run_correctness,
-        bench=run_bench,
-        default_repeat=20,
-        skip_correctness_flag=True,
-        description=__doc__,
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        repeat=20,
+        warmup=3,
+        rows=2_000_000,
+        record_counts=[100, 1_000],
+        indices=1_000_000,
+        dtype="<f8",
+        threads=True,
     )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        run_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":
