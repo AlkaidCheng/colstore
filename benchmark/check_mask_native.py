@@ -28,6 +28,7 @@ compiled default of 0.0 (route on at every density) when uncalibrated.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -37,8 +38,6 @@ import numpy as np
 import colstore
 from colstore import config
 
-LAYOUTS = ((1_000, 20_000), (10_000, 2_000), (100_000, 200))
-DENSITIES = (0.9, 0.5, 0.2, 0.1, 0.05, 0.01)
 RECORD_CUT_FRACTION = 0.3
 
 
@@ -86,23 +85,21 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (mask route == lowered route == ground truth)\n")
 
 
-def _best(f, repeat: int) -> float:
-    return _c.best_time(f, repeat=repeat, warmup=0)
+def _lowered(dataset, mask, cols):
+    """One mask read forced through the lowered flatnonzero path."""
+    with _force_lowered():
+        view = dataset[mask, cols]
+        return view.dict() if isinstance(cols, list) else view.array()
 
 
-def run_bench(repeat: int) -> None:
-    for n_records, rows in LAYOUTS:
+def run_bench(args: argparse.Namespace) -> None:
+    for n_records in args.record_counts:
+        rows = args.rows // n_records
         with tempfile.TemporaryDirectory() as tmp:
             path, _, total = _build_store(Path(tmp), n_records, rows)
             rng = np.random.default_rng(2)
             dataset = colstore.open(path)
-            print(f"layout R={n_records} rows/rec={rows}")
-            print(
-                f"  {'selector':<24}{'K':>10}"
-                f"{'1col low':>10}{'1col mask':>10}{'x':>6}"
-                f"{'2col low':>10}{'2col mask':>10}{'x':>6}"
-            )
-            cases = [(f"density {p}", rng.random(total) < p) for p in DENSITIES]
+            cases = [(f"density {p}", rng.random(total) < p) for p in args.densities]
             cases.append(
                 (
                     f"record cut {RECORD_CUT_FRACTION}",
@@ -110,23 +107,53 @@ def run_bench(repeat: int) -> None:
                 )
             )
             for label, mask in cases:
-                dataset[mask, "a"].array()  # fault pages before either side
-                t1_mask = _best(lambda m=mask, ds=dataset: ds[m, "a"].array(), repeat)
-                t2_mask = _best(lambda m=mask, ds=dataset: ds[m, ["a", "b"]].dict(), repeat)
-                with _force_lowered():
-                    t1_low = _best(lambda m=mask, ds=dataset: ds[m, "a"].array(), repeat)
-                    t2_low = _best(lambda m=mask, ds=dataset: ds[m, ["a", "b"]].dict(), repeat)
+                dataset[mask, "a"].array()  # fault pages first
                 print(
-                    f"  {label:<24}{int(mask.sum()):>10}"
-                    f"{t1_low * 1e3:>8.1f}ms{t1_mask * 1e3:>8.1f}ms{t1_low / t1_mask:>6.2f}"
-                    f"{t2_low * 1e3:>8.1f}ms{t2_mask * 1e3:>8.1f}ms{t2_low / t2_mask:>6.2f}"
+                    f"R={n_records:<7} rows/rec={rows:<7} {label:<16} selected={int(mask.sum()):,}"
                 )
+                _c.compare(
+                    [
+                        ("lowered 1col", lambda d=dataset, m=mask: _lowered(d, m, "a")),
+                        ("mask    1col", lambda d=dataset, m=mask: d[m, "a"].array()),
+                    ],
+                    repeat=args.repeat,
+                    warmup=args.warmup,
+                    baseline=0,
+                )
+                _c.compare(
+                    [
+                        ("lowered 2col", lambda d=dataset, m=mask: _lowered(d, m, ["a", "b"])),
+                        ("mask    2col", lambda d=dataset, m=mask: d[m, ["a", "b"]].dict()),
+                    ],
+                    repeat=args.repeat,
+                    warmup=args.warmup,
+                    baseline=0,
+                )
+                print()
             dataset.close()
-            print()
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        rows=20_000_000,
+        record_counts=[1_000, 10_000, 100_000],
+        threads=True,
+    )
+    parser.add_argument(
+        "--densities",
+        type=float,
+        nargs="+",
+        default=[0.9, 0.5, 0.2, 0.1, 0.05, 0.01],
+        help="mask selected-fraction sweep",
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":

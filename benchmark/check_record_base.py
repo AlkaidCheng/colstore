@@ -27,6 +27,7 @@ applies to columns 2..C only, so the ceiling grows with the column count.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -35,10 +36,6 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
-
-LAYOUTS = ((1_000, 20_000), (10_000, 2_000), (100_000, 200))
-K_SIZES = (2_000_000, 10_000_000)
-N_COLUMNS = 4
 
 
 class _force_generic:
@@ -52,12 +49,12 @@ class _force_generic:
         return False
 
 
-def _build_irregular_store(directory: Path, n_records: int, mean_rows: int):
+def _build_irregular_store(directory: Path, n_records: int, mean_rows: int, n_columns: int):
     """Record sizes drawn around the mean so detection stays irregular."""
     rng = np.random.default_rng(0)
     rows = rng.integers(mean_rows // 2, mean_rows + mean_rows // 2, n_records)
     total = int(rows.sum())
-    full = {f"c{i}": rng.standard_normal(total) for i in range(N_COLUMNS)}
+    full = {f"c{i}": rng.standard_normal(total) for i in range(n_columns)}
     path = directory / f"r{n_records}.cstore"
     offset = 0
     with colstore.create(path) as writer:
@@ -69,7 +66,7 @@ def _build_irregular_store(directory: Path, n_records: int, mean_rows: int):
 
 def check_correctness() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        path, full, total = _build_irregular_store(Path(tmp), 500, 300)
+        path, full, total = _build_irregular_store(Path(tmp), 500, 300, 4)
         dataset = colstore.open(path)
         assert dataset._uniform_record_layout() is None
         indices = np.random.default_rng(1).integers(0, total, 50_000).astype(np.int64)
@@ -86,32 +83,51 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (rbase route == generic route == ground truth)\n")
 
 
-def _best(f, repeat: int) -> float:
-    return _c.best_time(f, repeat=repeat, warmup=0)
+def _read_generic(dataset, indices, cols):
+    """One multi-column read forced through the generic withbins route."""
+    with _force_generic():
+        return dataset[indices, cols].dict()
 
 
-def run_bench(repeat: int) -> None:
-    cols = [f"c{i}" for i in range(N_COLUMNS)]
-    print(f"{'layout':<32}{'K':>10}{'generic':>11}{'rbase':>10}{'speedup':>9}")
-    for n_records, mean_rows in LAYOUTS:
+def run_bench(args: argparse.Namespace) -> None:
+    cols = [f"c{i}" for i in range(args.cols)]
+    for n_records in args.record_counts:
+        mean_rows = args.rows // n_records
         with tempfile.TemporaryDirectory() as tmp:
-            path, _, total = _build_irregular_store(Path(tmp), n_records, mean_rows)
+            path, _, total = _build_irregular_store(Path(tmp), n_records, mean_rows, args.cols)
             dataset = colstore.open(path)
-            for k in K_SIZES:
-                indices = np.random.default_rng(2).integers(0, total, k).astype(np.int64)
-                dataset[indices, cols].dict()  # fault pages before either side
-                t_new = _best(lambda idx=indices, ds=dataset: ds[idx, cols].dict(), repeat)
-                with _force_generic():
-                    t_old = _best(lambda idx=indices, ds=dataset: ds[idx, cols].dict(), repeat)
-                print(
-                    f"  R={n_records:<8} ~rows/rec={mean_rows:<7}{k:>10}"
-                    f"{t_old * 1e3:9.1f}ms{t_new * 1e3:8.1f}ms{t_old / t_new:8.2f}x"
-                )
+            idx = np.random.default_rng(2).integers(0, total, args.indices).astype(np.int64)
+            dataset[idx, cols].dict()  # fault pages first
+            print(f"R={n_records:<7} ~rows/rec={mean_rows:<7} C={args.cols} K={args.indices:,}")
+            _c.compare(
+                [
+                    ("generic", lambda d=dataset, i=idx, c=cols: _read_generic(d, i, c)),
+                    ("rbase", lambda d=dataset, i=idx, c=cols: d[i, c].dict()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
+            )
+            print()
             dataset.close()
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        rows=20_000_000,
+        record_counts=[1_000, 10_000, 100_000],
+        cols=4,
+        indices=10_000_000,
+        threads=True,
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":

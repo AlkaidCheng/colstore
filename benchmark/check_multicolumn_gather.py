@@ -20,6 +20,7 @@ record count. Sorted reads and single-column reads are unaffected by design.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -28,10 +29,6 @@ import numpy as np
 
 import colstore
 from colstore.reader import ColStoreReader
-
-K = 1_000_000
-LAYOUTS = ((1000, 20_000), (10_000, 2_000))
-COLUMN_COUNTS = (4, 8)
 
 
 def _build_store(directory: Path, n_records: int, rows: int, n_cols: int):
@@ -78,37 +75,56 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (routed == per-column == ground truth)\n")
 
 
-def _time_read(dataset, indices, names, repeat: int) -> float:
-    return _c.best_time(lambda: dataset[indices, names].dict(), repeat=repeat, warmup=0)
+def _read_per_column(dataset, indices, names):
+    """One multi-column read forced onto the per-column fallback path."""
+    original = _disable_route()
+    try:
+        return dataset[indices, names].dict()
+    finally:
+        _restore_route(original)
 
 
-def run_bench(repeat: int) -> None:
-    print(f"{'layout':<34}{'per-column':>12}{'bin-reuse':>12}{'speedup':>9}")
-    for n_records, rows in LAYOUTS:
-        for n_cols in COLUMN_COUNTS:
-            with tempfile.TemporaryDirectory() as tmp:
-                path, names, _ = _build_store(Path(tmp), n_records, rows, n_cols)
-                dataset = colstore.open(path)
-                indices = (
-                    np.random.default_rng(1).integers(0, n_records * rows, size=K).astype(np.int64)
-                )
-                dataset[indices[:1000], names].dict()  # warm mmap + route
-                t_routed = _time_read(dataset, indices, names, repeat)
-                original = _disable_route()
-                try:
-                    t_fallback = _time_read(dataset, indices, names, repeat)
-                finally:
-                    _restore_route(original)
-                dataset.close()
-            print(
-                f"  R={n_records:<6} rows/rec={rows:<8} C={n_cols}:"
-                f"{t_fallback * 1e3:10.1f}ms{t_routed * 1e3:10.1f}ms"
-                f"{t_fallback / t_routed:8.2f}x"
+def run_bench(args: argparse.Namespace) -> None:
+    for n_records in args.record_counts:
+        rows = args.rows // n_records
+        total = rows * n_records
+        with tempfile.TemporaryDirectory() as tmp:
+            path, names, _ = _build_store(Path(tmp), n_records, rows, args.cols)
+            dataset = colstore.open(path)
+            indices = (
+                np.random.default_rng(1).integers(0, total, size=args.indices).astype(np.int64)
             )
+            dataset[indices[:1000], names].dict()  # warm mmap + route
+            print(f"R={n_records:<7} rows/rec={rows:<8} C={args.cols} K={args.indices:,}")
+            _c.compare(
+                [
+                    ("per-column", lambda d=dataset, i=indices, n=names: _read_per_column(d, i, n)),
+                    ("bin-reuse", lambda d=dataset, i=indices, n=names: d[i, n].dict()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
+            )
+            print()
+            dataset.close()
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        rows=20_000_000,
+        record_counts=[1_000, 10_000],
+        cols=4,
+        indices=1_000_000,
+        threads=True,
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":
