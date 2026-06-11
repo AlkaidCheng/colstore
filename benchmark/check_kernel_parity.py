@@ -32,15 +32,13 @@ from colstore import _gather  # type: ignore[attr-defined]
 from colstore.kernels import cpp_available
 
 
-def _best(fn, repeats: int) -> float:
-    return _c.best_time(fn, repeat=repeats, warmup=1)
+def _best(fn, repeat: int, warmup: int) -> float:
+    return _c.best_time(fn, repeat=repeat, warmup=warmup)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-rows", type=int, default=20_000_000)
-    parser.add_argument("--repeats", type=int, default=15)
-    parser.add_argument("--dtype", default="float32")
+    _c.add_common_args(parser, repeat=15, rows=20_000_000, dtype="float32", skip_correctness=False)
     args = parser.parse_args()
 
     if not cpp_available():
@@ -48,14 +46,14 @@ def main() -> None:
 
     dtype = np.dtype(args.dtype)
     rng = np.random.default_rng(0)
-    source = rng.standard_normal(args.source_rows).astype(dtype)
+    source = rng.standard_normal(args.rows).astype(dtype)
     itemsize = dtype.itemsize
 
     sizes = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
     print(
-        f"Source: {args.source_rows:,} x {dtype} = "
-        f"{args.source_rows * itemsize / 1e6:.1f} MB | "
-        f"repeats={args.repeats}, thread_cap=1"
+        f"Source: {args.rows:,} x {dtype} = "
+        f"{args.rows * itemsize / 1e6:.1f} MB | "
+        f"repeat={args.repeat}, thread_cap=1"
     )
     print()
 
@@ -68,14 +66,12 @@ def main() -> None:
         print(header)
         print("-" * len(header))
         for n in sizes:
-            if n > args.source_rows:
+            if n > args.rows:
                 continue
             if pattern == "sorted":
-                indices = np.sort(rng.choice(args.source_rows, size=n, replace=False)).astype(
-                    np.int64
-                )
+                indices = np.sort(rng.choice(args.rows, size=n, replace=False)).astype(np.int64)
             else:
-                indices = rng.permutation(args.source_rows)[:n].astype(np.int64)
+                indices = rng.permutation(args.rows)[:n].astype(np.int64)
             byte_offsets = indices * itemsize
 
             out_np = np.empty(n, dtype=dtype)
@@ -87,17 +83,22 @@ def main() -> None:
             assert np.array_equal(out_g, out_np)
             assert np.array_equal(out_gb, out_np)
 
+            if args.skip_bench:
+                continue
             t_np = _best(
                 lambda s=source, i=indices, o=out_np: np.take(s, i, out=o),
-                args.repeats,
+                args.repeat,
+                args.warmup,
             )
             t_g = _best(
                 lambda s=source, i=indices, o=out_g: _gather.gather(s, i, o, 1),
-                args.repeats,
+                args.repeat,
+                args.warmup,
             )
             t_gb = _best(
                 lambda s=source, b=byte_offsets, o=out_gb: _gather.gather_bytes(s, b, o, 1),
-                args.repeats,
+                args.repeat,
+                args.warmup,
             )
             print(
                 f"{n:>11,}  {t_np*1000:>11.3f}  {t_g*1000:>11.3f}  "

@@ -9,6 +9,7 @@ characterizes the overhead so future PRs can catch regressions.
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 
 import _common as _c
@@ -17,27 +18,33 @@ import numpy as np
 import colstore
 
 
-def _best(fn, repeats: int) -> float:
-    return _c.best_time(fn, repeat=repeats, warmup=1)
+def _best(fn, repeat: int, warmup: int) -> float:
+    return _c.best_time(fn, repeat=repeat, warmup=warmup)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=1_000_000)
-    parser.add_argument("--record-counts", type=int, nargs="+", default=[1, 10, 100, 1000])
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--dtype", default="float32")
-    parser.add_argument("--tmpdir", default="/tmp/colstore_writer_bench")
+    _c.add_common_args(
+        parser,
+        repeat=3,
+        rows=1_000_000,
+        record_counts=[1, 10, 100, 1000],
+        dtype="float32",
+        tmpdir=True,
+        skip_correctness=False,
+    )
     args = parser.parse_args()
 
     dtype = np.dtype(args.dtype)
-    tmpdir = Path(args.tmpdir)
+    tmpdir = args.tmpdir or Path(tempfile.mkdtemp(prefix="colstore_writer_bench"))
     tmpdir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(0)
     data = rng.standard_normal(args.rows).astype(dtype)
 
     print(f"Setup: {args.rows:,} rows of {dtype}")
+    if args.skip_bench:
+        return
     print(f"{'records':<10} {'wall ms':>10}  {'us/record':>12}  {'rows/record':>14}")
     print("-" * 55)
 
@@ -54,7 +61,7 @@ def main() -> None:
                     e = (i + 1) * c if i < nr - 1 else args.rows
                     w.write({"x": data[s:e]})
 
-        t = _best(write_all, args.repeats)
+        t = _best(write_all, args.repeat, args.warmup)
         us_per_record = t * 1e6 / n_rec
         print(f"R={n_rec:<8} {t * 1000:>10.3f}  {us_per_record:>11.2f}   {chunk:>14,}")
 
