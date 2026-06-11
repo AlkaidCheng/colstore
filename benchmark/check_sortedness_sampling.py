@@ -29,6 +29,7 @@ OMP_NUM_THREADS because the kernels parallelize and the check does not.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -37,8 +38,6 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
-
-K_SIZES = (200_000, 1_000_000, 10_000_000)
 
 
 def _full_check(indices: np.ndarray) -> bool:
@@ -83,56 +82,83 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (sampled gate == full check, incl. adversarial)\n")
 
 
-def _best(f, repeat: int) -> float:
-    return _c.best_time(f, repeat=repeat, warmup=0)
+def _read_baseline(dataset, indices, cols):
+    """One read forced through the full-check sortedness gate."""
+    with _force_baseline():
+        view = dataset[indices, cols]
+        return view.dict() if isinstance(cols, list) else view.array()
 
 
-def run_bench(repeat: int) -> None:
-    rng = np.random.default_rng(1)
-    print(f"{'check only':<24}{'full pass':>12}{'sampled':>10}{'speedup':>9}")
-    for k in K_SIZES:
-        rand = rng.integers(0, 10**9, k).astype(np.int64)
-        t_full = _best(lambda arr=rand: _full_check(arr), repeat * 4)
-        t_sampled = _best(lambda arr=rand: reader_mod._indices_are_sorted(arr), repeat * 4)
-        print(
-            f"  K={k:<12} (random){t_full * 1e6:10.1f}us{t_sampled * 1e6:8.1f}us"
-            f"{t_full / t_sampled:8.1f}x"
-        )
+def run_bench(args: argparse.Namespace) -> None:
+    # Part 1: the gate in isolation (no store) -- full pass vs sampled.
+    rand = np.random.default_rng(1).integers(0, 10**9, args.indices).astype(np.int64)
+    print(f"check only (random)  K={args.indices:,}")
+    _c.compare(
+        [
+            ("full pass", lambda a=rand: _full_check(a)),
+            ("sampled", lambda a=rand: reader_mod._indices_are_sorted(a)),
+        ],
+        repeat=args.repeat * 4,  # the check is microseconds; oversample it
+        warmup=args.warmup,
+        baseline=0,
+    )
     print()
-    print(f"{'end-to-end unsorted read':<34}{'full pass':>11}{'sampled':>10}{'speedup':>9}")
-    with tempfile.TemporaryDirectory() as tmp:
-        n_records, rows = 10_000, 2_000
-        total = n_records * rows
-        full = np.random.default_rng(2).standard_normal(total)
-        path = Path(tmp) / "s.cstore"
-        with colstore.create(path) as writer:
-            for r in range(n_records):
-                chunk = full[r * rows : (r + 1) * rows]
-                writer.write({"value": chunk, "aux": chunk})
-        dataset = colstore.open(path)
-        for k in (2_000_000, 10_000_000):
-            indices = np.random.default_rng(3).integers(0, total, k).astype(np.int64)
-            dataset[indices[: k // 100], "value"].array()  # warm pages
-            t_new_1col = _best(lambda idx=indices: dataset[idx, "value"].array(), repeat)
-            t_new_2col = _best(lambda idx=indices: dataset[idx, ["value", "aux"]].dict(), repeat)
-            with _force_baseline():
-                t_old_1col = _best(lambda idx=indices: dataset[idx, "value"].array(), repeat)
-                t_old_2col = _best(
-                    lambda idx=indices: dataset[idx, ["value", "aux"]].dict(), repeat
-                )
-            print(
-                f"  K={k:<10} single column {t_old_1col * 1e3:8.1f}ms{t_new_1col * 1e3:8.1f}ms"
-                f"{t_old_1col / t_new_1col:8.2f}x"
+
+    # Part 2: end-to-end unsorted reads -- the gate's share of the whole read.
+    for n_records in args.record_counts:
+        rows = args.rows // n_records
+        total = rows * n_records
+        with tempfile.TemporaryDirectory() as tmp:
+            full = np.random.default_rng(2).standard_normal(total)
+            path = Path(tmp) / "s.cstore"
+            with colstore.create(path) as writer:
+                for r in range(n_records):
+                    chunk = full[r * rows : (r + 1) * rows]
+                    writer.write({"value": chunk, "aux": chunk})
+            dataset = colstore.open(path)
+            indices = np.random.default_rng(3).integers(0, total, args.indices).astype(np.int64)
+            dataset[indices[: max(1, args.indices // 100)], "value"].array()  # warm pages
+            print(f"end-to-end  R={n_records:<7} rows/rec={rows:<7} K={args.indices:,}")
+            _c.compare(
+                [
+                    ("full-gate 1col", lambda d=dataset, i=indices: _read_baseline(d, i, "value")),
+                    ("sampled   1col", lambda d=dataset, i=indices: d[i, "value"].array()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
             )
-            print(
-                f"  K={k:<10} 2-col bin-reuse{t_old_2col * 1e3:7.1f}ms{t_new_2col * 1e3:8.1f}ms"
-                f"{t_old_2col / t_new_2col:8.2f}x"
+            _c.compare(
+                [
+                    (
+                        "full-gate 2col",
+                        lambda d=dataset, i=indices: _read_baseline(d, i, ["value", "aux"]),
+                    ),
+                    ("sampled   2col", lambda d=dataset, i=indices: d[i, ["value", "aux"]].dict()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
             )
-        dataset.close()
+            print()
+            dataset.close()
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        rows=20_000_000,
+        record_counts=[10_000],
+        indices=10_000_000,
+        threads=True,
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":
