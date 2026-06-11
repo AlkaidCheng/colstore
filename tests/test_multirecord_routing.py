@@ -34,6 +34,12 @@ pytestmark = pytest.mark.skipif(not cpp_available(), reason="C++ extension not b
 
 THRESHOLD = reader_mod._SORTEDNESS_SAMPLE_MIN_SIZE
 
+# Mirrors PARALLEL_THRESHOLD in include/colstore/gather.hpp: the gather
+# kernels run serial below this index count and work-proportionally parallel
+# at or above it. The bin-reuse routing gate only engages in that parallel
+# regime, so the gate tests below draw selectors past this size.
+_KERNEL_PARALLEL_THRESHOLD = 1 << 18
+
 
 def _full_check(indices: np.ndarray) -> bool:
     return bool(np.all(indices[1:] >= indices[:-1]))
@@ -402,6 +408,97 @@ def bin_reuse_store(tmp_path):
 def rbase_irregular_store(tmp_path):
     shape = [137, 64, 350, 99, 200, 13, 470, 261, 88, 318]
     return write_standard_store(tmp_path, shape, seed=31, name="rbase")
+
+
+@pytest.fixture()
+def parallel_regime_store(tmp_path):
+    # Enough rows to draw a parallel-regime fancy index (>= the kernel
+    # threshold). Irregular records pin the generic bins route; two native
+    # columns satisfy the bin-reuse precondition.
+    rng = np.random.default_rng(118)
+    total = 300_000
+    full = {
+        "f8": rng.standard_normal(total),
+        "i4": rng.integers(-(2**20), 2**20, total).astype(np.int32),
+    }
+    path = tmp_path / "parallel.cstore"
+    boundaries = [0, 500, *range(1_000, total + 1, 1_000)]
+    rows_per_record = [hi - lo for lo, hi in itertools.pairwise(boundaries)]
+    write_records(path, full, rows_per_record)
+    return path, full, total
+
+
+def _bin_reuse_widths(n: int) -> tuple[int, int]:
+    """(sequential, concurrent) parallel widths the gate compares, for ``n``.
+
+    Mirrors the gate in ``_gather_many_bin_reuse`` for a two-column read so a
+    test can tell whether the running box can realize a decline at all (a
+    decline needs the concurrent column pool to out-field the single
+    sequential kernel, which is impossible when the OpenMP width is too low).
+    """
+    from colstore import _gather
+
+    cap = config_mod.get_gather_thread_cap()
+    sequential = _gather.resolve_thread_count(n, cap)
+    n_workers = min(config_mod.get_max_workers(), 2)
+    per_column_cap = max(1, cap // n_workers)
+    concurrent = min(
+        _gather.max_threads(), n_workers * _gather.resolve_thread_count(n, per_column_cap)
+    )
+    return sequential, concurrent
+
+
+def test_parallel_regime_route_taken_without_concurrent_alternative(
+    parallel_regime_store, monkeypatch
+):
+    # With a single worker the concurrent column pool cannot field more
+    # parallel streams than the sequential bins route, so the gate keeps the
+    # work-saving route in the parallel regime (and the serial regime never
+    # gates at all). Portable: holds whether or not OpenMP can parallelize.
+    path, full, total = parallel_regime_store
+    n = _KERNEL_PARALLEL_THRESHOLD * 2
+    indices = np.random.default_rng(5).integers(0, total, size=n).astype(np.int64)
+    bins_calls = kernel_spy(monkeypatch, ["gather_multirecord_bins"])
+    original = config_mod.get_max_workers()
+    try:
+        config_mod.set_max_workers(1)
+        with opened(path) as dataset:
+            result = dataset[indices, ["f8", "i4"]].dict()
+        assert bins_calls == ["gather_multirecord_bins"]  # route taken
+        assert np.array_equal(result["f8"], full["f8"][indices])
+        assert np.array_equal(result["i4"], full["i4"][indices])
+    finally:
+        config_mod.set_max_workers(original)
+
+
+def test_parallel_regime_route_declines_when_pool_fields_more_threads(
+    parallel_regime_store, monkeypatch
+):
+    # Multiple workers let the concurrent column pool field one resolved width
+    # per column at once; in the parallel regime that out-fields the single
+    # sequential kernel, so the gate declines and the read falls through to
+    # the per-column pool -- no bins kernel runs. Skipped when the box's
+    # OpenMP width is too low to realize a decline (e.g. a single-core CI box).
+    path, full, total = parallel_regime_store
+    n = _KERNEL_PARALLEL_THRESHOLD * 2
+    original_workers = config_mod.get_max_workers()
+    original_cap = config_mod.get_gather_thread_cap()
+    try:
+        config_mod.set_max_workers(4)
+        config_mod.set_gather_thread_cap(8)
+        sequential, concurrent = _bin_reuse_widths(n)
+        if not (sequential > 1 and concurrent > sequential):
+            pytest.skip("OpenMP width too low to realize a bin-reuse decline")
+        indices = np.random.default_rng(6).integers(0, total, size=n).astype(np.int64)
+        bins_calls = kernel_spy(monkeypatch, ["gather_multirecord_bins"])
+        with opened(path) as dataset:
+            result = dataset[indices, ["f8", "i4"]].dict()
+        assert bins_calls == []  # route declined: fell through to column pool
+        assert np.array_equal(result["f8"], full["f8"][indices])
+        assert np.array_equal(result["i4"], full["i4"][indices])
+    finally:
+        config_mod.set_max_workers(original_workers)
+        config_mod.set_gather_thread_cap(original_cap)
 
 
 def test_multicolumn_read_routes_and_matches_per_column(bin_reuse_store, monkeypatch):
