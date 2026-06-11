@@ -347,54 +347,74 @@ def test_cpp_kernel_output_matches_numpy(tmp_path):
 # ---- Parallel contiguous copy helper -----------------------------------
 
 
-def test_parallel_contiguous_copy_below_threshold_uses_single_thread():
+def test_parallel_copy_below_threshold_uses_single_thread():
     """Tiny sources go through the np.array path regardless of thread_cap."""
-    from colstore.reader import _parallel_contiguous_copy
+    from colstore.reader import _parallel_copy
 
     source = np.arange(1000, dtype=np.int64)
-    out = _parallel_contiguous_copy(source, source.dtype, thread_cap=8)
+    out = _parallel_copy(source, source.dtype, thread_cap=8)
     assert np.array_equal(out, source)
     assert out.dtype == source.dtype
     # Returned array must own its data (not a view of source).
     assert out.base is None
 
 
-def test_parallel_contiguous_copy_thread_cap_one_is_serial():
+def test_parallel_copy_thread_cap_one_is_serial():
     """thread_cap=1 must not spin up the threadpool even for big inputs."""
-    from colstore.reader import _parallel_contiguous_copy
+    from colstore.reader import _parallel_copy
 
     # 32 MiB of int8 -- above the size threshold but cap forbids parallel.
     source = np.zeros(32 * 1024 * 1024, dtype=np.int8)
     source[::1024] = 1
-    out = _parallel_contiguous_copy(source, source.dtype, thread_cap=1)
+    out = _parallel_copy(source, source.dtype, thread_cap=1)
     assert np.array_equal(out, source)
     assert out.base is None
 
 
-def test_parallel_contiguous_copy_produces_identical_bytes_above_threshold():
+def test_parallel_copy_produces_identical_bytes_above_threshold():
     """The parallel path must be byte-equivalent to a single np.array copy."""
-    from colstore.reader import _parallel_contiguous_copy
+    from colstore.reader import _parallel_copy
 
     # 32 MiB of float64 -- above the size threshold; with cap=4 the path
     # splits into multiple chunks.
     rng = np.random.default_rng(0)
     source = rng.standard_normal(4 * 1024 * 1024).astype(np.float64)
     assert source.nbytes >= 16 * 1024 * 1024  # >= _PARALLEL_COPY_MIN_BYTES
-    out_parallel = _parallel_contiguous_copy(source, source.dtype, thread_cap=4)
+    out_parallel = _parallel_copy(source, source.dtype, thread_cap=4)
     out_serial = np.array(source, copy=True)
     assert np.array_equal(out_parallel, out_serial)
     assert out_parallel.base is None
 
 
-def test_parallel_contiguous_copy_handles_dtype_change():
+def test_parallel_copy_handles_dtype_change():
     """A non-native source dtype is byte-swapped during the copy on
     little-endian hosts; correctness must be identical to np.array."""
-    from colstore.reader import _parallel_contiguous_copy
+    from colstore.reader import _parallel_copy
 
     # Force a big-endian source so the dtype conversion does real work.
     big_endian_source = np.arange(4 * 1024 * 1024, dtype=">f8")
     assert big_endian_source.nbytes >= 16 * 1024 * 1024
-    out = _parallel_contiguous_copy(big_endian_source, np.dtype("<f8"), thread_cap=4)
+    out = _parallel_copy(big_endian_source, np.dtype("<f8"), thread_cap=4)
     expected = np.array(big_endian_source, dtype=np.dtype("<f8"), copy=True)
     assert np.array_equal(out, expected)
     assert out.dtype == np.dtype("<f8")
+
+
+def test_parallel_copy_strided_source_is_byte_identical():
+    """A strided (stepped) source must copy identically whether the row-range
+    split engages or not -- the helper sizes by logical nbytes, so a strided
+    view large enough clears the threshold and parallelizes like a contiguous
+    one. The result must equal a single np.array copy of the same view."""
+    from colstore.reader import _parallel_copy
+
+    rng = np.random.default_rng(1)
+    # Base big enough that the step-2 view's logical size (8 MiB elements ->
+    # 64 MiB) clears _PARALLEL_COPY_BYTES_PER_THREAD for cap=4.
+    base = rng.standard_normal(16 * 1024 * 1024).astype(np.float64)
+    strided = base[::2]
+    assert not strided.flags["C_CONTIGUOUS"]
+    assert strided.nbytes >= 16 * 1024 * 1024  # >= _PARALLEL_COPY_MIN_BYTES
+    out = _parallel_copy(strided, strided.dtype, thread_cap=4)
+    expected = np.array(strided, copy=True)
+    assert np.array_equal(out, expected)
+    assert out.base is None  # owns its data, not a view of base

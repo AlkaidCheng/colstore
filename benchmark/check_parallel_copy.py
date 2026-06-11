@@ -120,19 +120,27 @@ def main():
             print(r.report())
         ds.close()
 
-        # --- Scenario D: above-threshold slice (parallel-copy active path).
-        big_slice = make_store(td, "slice.cstore", 5_000_000, 1, np.float64)
-        col_bytes = 5_000_000 * 8
-        banner(f"BIG STEP-1 SLICE, {col_bytes/1e6:.0f} MB (warm)")
+        # --- Scenario D: slice reads, contiguous and strided. Sized so the
+        #     step-2 strided view (half the rows) clears the parallel-copy
+        #     threshold -- strided reads now take the same row-range split as
+        #     contiguous ones. The ::16 line stays below the threshold to show
+        #     the serial fallback is intact for small strided reads.
+        big_slice = make_store(td, "slice.cstore", 16_000_000, 1, np.float64)
+        col_bytes = 16_000_000 * 8
+        banner(f"SLICE READS, {col_bytes/1e6:.0f} MB column (warm)")
         ds = colstore.open(str(big_slice))
         results = [
             bench(
-                "ds[100_000:4_900_000, 'c0'].array()   (37 MiB step-1)",
-                lambda: ds[100_000:4_900_000, "c0"].array(),
+                "ds[100_000:15_900_000, 'c0'].array()  (~121 MiB step-1)",
+                lambda: ds[100_000:15_900_000, "c0"].array(),
             ),
             bench(
-                "ds[::2, 'c0'].array()                  (step-2 strided)",
+                "ds[::2, 'c0'].array()                  (64 MiB step-2, now parallel)",
                 lambda: ds[::2, "c0"].array(),
+            ),
+            bench(
+                "ds[::16, 'c0'].array()                 (8 MiB step-16, sub-threshold)",
+                lambda: ds[::16, "c0"].array(),
             ),
         ]
         for r in results:
@@ -141,7 +149,7 @@ def main():
 
         # --- Scenario E: FORCE the parallel-copy path even on a 1-CPU sandbox
         #     by raising gather_thread_cap. ratio > 1.0 would prove the
-        #     ThreadPoolExecutor inside _parallel_contiguous_copy is actually
+        #     ThreadPoolExecutor inside _parallel_copy is actually
         #     running chunks concurrently; ratio == 1.0 means the GIL or
         #     scheduling is serializing them; ratio < 1.0 means we're paying
         #     pool overhead for no benefit.

@@ -111,13 +111,18 @@ _PARALLEL_COPY_MIN_BYTES = 16 * 1024 * 1024
 _PARALLEL_COPY_BYTES_PER_THREAD = 16 * 1024 * 1024
 
 
-def _parallel_contiguous_copy(
+def _parallel_copy(
     source: NDArray[Any],
     dst_dtype: np.dtype[Any],
     *,
     thread_cap: int,
 ) -> NDArray[Any]:
-    """Copy a contiguous numpy view into a new owning ndarray, optionally in parallel.
+    """Copy a 1-D numpy view into a new owning ndarray, optionally in parallel.
+
+    The ``source`` may be contiguous (a plain slice) or strided (a stepped
+    slice). The per-chunk ``out[a:b] = source[a:b]`` assignment handles either
+    layout -- NumPy walks the source's strides and releases the GIL during the
+    bulk element copy -- so the same row-range splitting parallelizes both.
 
     Falls back to a single ``np.array`` copy when:
 
@@ -128,10 +133,8 @@ def _parallel_contiguous_copy(
       * the per-thread share would be below
         ``_PARALLEL_COPY_BYTES_PER_THREAD`` after dividing by ``thread_cap``.
 
-    Otherwise it spawns up to ``thread_cap`` threads, each doing a slice
-    assignment into a preallocated output. NumPy releases the GIL during
-    the bulk memcpy of slice assignment, so the chunks actually run
-    concurrently on multi-core systems.
+    ``source.nbytes`` is the logical element count times itemsize, so a
+    strided view is sized by the data actually copied, not the span it walks.
     """
     n_bytes = source.nbytes
     if thread_cap <= 1 or n_bytes < _PARALLEL_COPY_MIN_BYTES:
@@ -592,18 +595,21 @@ class ColStoreReader:
         # the older ``np.asarray(x).copy()`` chain returns ``Any`` under
         # current numpy stubs, hence the explicit constructor calls.
         if row_indexer is None:
-            return _parallel_contiguous_copy(source, native_dtype, thread_cap=effective_cap)
+            return _parallel_copy(source, native_dtype, thread_cap=effective_cap)
         if isinstance(row_indexer, int):
             return np.atleast_1d(np.array(source[row_indexer], dtype=native_dtype, copy=True))
         if isinstance(row_indexer, slice):
             start, stop, step = row_indexer.indices(self._n_rows)
             if step == 1:
-                return _parallel_contiguous_copy(
-                    source[start:stop], native_dtype, thread_cap=effective_cap
-                )
-            # Strided slice: cheap rebuild via numpy is fine; not worth
-            # parallelizing the non-contiguous case.
-            return np.array(source[row_indexer], dtype=native_dtype, copy=True)
+                return _parallel_copy(source[start:stop], native_dtype, thread_cap=effective_cap)
+            # Strided slice (incl. negative steps): index with the original
+            # slice object -- reconstructing it from indices() would misread a
+            # -1 stop sentinel. A stepped view copies element-wise, and the
+            # threshold-gated row-range split parallelizes it the same way the
+            # contiguous case is split once the read clears
+            # _PARALLEL_COPY_BYTES_PER_THREAD; below that it falls back to a
+            # single np.array copy, exactly as before.
+            return _parallel_copy(source[row_indexer], native_dtype, thread_cap=effective_cap)
         # Integer ndarray (fancy index): dispatch to chosen backend.
         return kernels.gather(
             source, row_indexer, native_dtype, backend=self._backend, thread_cap=thread_cap
