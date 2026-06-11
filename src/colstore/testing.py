@@ -1,0 +1,137 @@
+"""Synthetic data and store builders for tests, checks, and benchmarks.
+
+A single, namespaced source of truth for the synthetic artifacts the project
+(and downstream users) need when exercising colstore: parameterized column
+sets and multi-record stores, sized by row count, column count, record count,
+and dtype. Centralizing them keeps every test, check, and benchmark building
+inputs the same way, and pairs directly with the canonical benchmark options
+(``--rows`` / ``--cols`` / ``--record-counts`` / ``--dtype``) and with
+:mod:`colstore.profiling`.
+
+Generation is fully reproducible: the same ``(rows, cols, dtype, seed)`` always
+yields identical data, so a correctness check can recover ground truth with a
+second :func:`make_columns` call rather than reading it back::
+
+    import colstore
+    from colstore import testing
+
+    expected = testing.make_columns(1000, 2, dtype="float32", seed=7)
+    with testing.make_store(path, rows=1000, cols=2, dtype="float32", seed=7) as ds:
+        assert (ds[:, "c0"].array() == expected["c0"]).all()
+
+Value distributions are a stable part of the contract: float columns are drawn
+from a standard normal, integer columns uniformly from the central half of the
+dtype's range. Columns are named ``c0`` .. ``c{cols-1}``.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from numpy.typing import NDArray
+
+from . import api
+from .reader import ColStoreReader
+
+__all__ = [
+    "make_columns",
+    "make_store",
+    "uniform_record_rows",
+]
+
+
+def _random_column(rng: np.random.Generator, rows: int, dt: np.dtype[Any]) -> NDArray[Any]:
+    """A length-``rows`` column of ``dt`` with representative random values."""
+    if dt.kind == "f":
+        return rng.standard_normal(rows).astype(dt)
+    if dt.kind in ("i", "u"):
+        info = np.iinfo(dt)
+        return rng.integers(info.min // 2, info.max // 2, size=rows, dtype=np.int64).astype(dt)
+    raise ValueError(f"unsupported dtype {dt!r}: only float and integer columns are generated")
+
+
+def _resolve_dtypes(dtype: str | Sequence[str], cols: int) -> list[np.dtype[Any]]:
+    """Resolve ``dtype`` to one validated np.dtype per column, cycling a sequence."""
+    specs = [dtype] if isinstance(dtype, str) else list(dtype)
+    if not specs:
+        raise ValueError("dtype sequence must be non-empty")
+    resolved = [np.dtype(spec) for spec in specs]
+    return [resolved[i % len(resolved)] for i in range(cols)]
+
+
+def make_columns(
+    rows: int,
+    cols: int,
+    *,
+    dtype: str | Sequence[str] = "float64",
+    seed: int = 0,
+) -> dict[str, NDArray[Any]]:
+    """Build ``cols`` reproducible columns of ``rows`` rows each.
+
+    ``dtype`` is a single dtype applied to every column, or a sequence cycled
+    across the columns (column ``i`` uses ``dtype[i % len(dtype)]``), so mixed
+    layouts like ``("f8", "f4", "i4", "i2")`` are a single call. Columns are
+    named ``c0`` .. ``c{cols-1}`` and the result is deterministic in ``seed``.
+    """
+    if rows < 0:
+        raise ValueError("rows must be >= 0")
+    if cols < 1:
+        raise ValueError("cols must be >= 1")
+    dtypes = _resolve_dtypes(dtype, cols)
+    rng = np.random.default_rng(seed)
+    return {f"c{i}": _random_column(rng, rows, dtypes[i]) for i in range(cols)}
+
+
+def uniform_record_rows(total: int, records: int) -> list[int]:
+    """Split ``total`` rows into ``records`` near-equal record sizes.
+
+    Every record gets ``total // records`` rows; the last absorbs the
+    remainder. When ``records > total`` the surplus records are empty (a valid
+    stress shape).
+    """
+    if records < 1:
+        raise ValueError("records must be >= 1")
+    if total < 0:
+        raise ValueError("total must be >= 0")
+    per = total // records
+    rows = [per] * (records - 1)
+    rows.append(total - per * (records - 1))
+    return rows
+
+
+def make_store(
+    path: Path | str,
+    *,
+    rows: int,
+    cols: int = 1,
+    records: int | Sequence[int] = 1,
+    dtype: str | Sequence[str] = "float64",
+    seed: int = 0,
+) -> ColStoreReader:
+    """Write a multi-record store of synthetic data and return an open reader.
+
+    The columns are :func:`make_columns` ``(rows, cols, dtype, seed)``. ``records``
+    is either a record *count* (rows are split uniformly via
+    :func:`uniform_record_rows`) or an explicit sequence of per-record row
+    counts, which must sum to ``rows``. The caller owns the returned reader and
+    should close it (``with testing.make_store(...) as ds:``).
+    """
+    columns = make_columns(rows, cols, dtype=dtype, seed=seed)
+    if isinstance(records, int):
+        rows_per_record = uniform_record_rows(rows, records)
+    else:
+        rows_per_record = list(records)
+        if any(n < 0 for n in rows_per_record):
+            raise ValueError("record row counts must be >= 0")
+        if sum(rows_per_record) != rows:
+            raise ValueError(f"records sum to {sum(rows_per_record)}, expected rows={rows}")
+    target = Path(path)
+    offset = 0
+    with api.create(target) as writer:
+        for n in rows_per_record:
+            writer.write({name: column[offset : offset + n] for name, column in columns.items()})
+            offset += n
+    return api.open(target)
