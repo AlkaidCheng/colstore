@@ -25,6 +25,7 @@ where event-organized physics data lives (10^4-10^5 records per file).
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -33,9 +34,6 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
-
-K = 1_000_000
-LAYOUTS = ((100, 200_000), (1000, 20_000), (10_000, 2_000), (100_000, 200))
 
 
 def _build_store(directory: Path, n_records: int, rows: int):
@@ -74,37 +72,59 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (walk kernel == partition pipeline == ground truth)\n")
 
 
-def _time_read(dataset, indices, repeat: int) -> float:
-    return _c.best_time(lambda: dataset[indices, "value"].array(), repeat=repeat, warmup=0)
+def _read_pipeline(dataset, indices):
+    """One sorted read forced through the pre-change partition pipeline
+    (the non-native fallback, identical to the old path on a LE host)."""
+    original = reader_mod._dtype_is_native
+    reader_mod._dtype_is_native = lambda dtype: False  # type: ignore[assignment]
+    try:
+        return dataset[indices, "value"].array()
+    finally:
+        reader_mod._dtype_is_native = original  # type: ignore[assignment]
 
 
-def run_bench(repeat: int) -> None:
-    print(f"{'layout':<32}{'pipeline':>11}{'walk kernel':>12}{'speedup':>9}")
-    for n_records, rows in LAYOUTS:
+def run_bench(args: argparse.Namespace) -> None:
+    for n_records in args.record_counts:
+        rows = args.rows // n_records
+        total = rows * n_records
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = _build_store(Path(tmp), n_records, rows)
             dataset = colstore.open(path)
             indices = np.sort(
-                np.random.default_rng(1).integers(0, n_records * rows, size=K).astype(np.int64)
+                np.random.default_rng(1).integers(0, total, size=args.indices).astype(np.int64)
             )
             dataset[indices[:1000], "value"].array()  # warm mmap
-            t_kernel = _time_read(dataset, indices, repeat)
-            original = reader_mod._dtype_is_native
-            reader_mod._dtype_is_native = lambda dtype: False  # type: ignore[assignment]
-            try:
-                t_pipeline = _time_read(dataset, indices, repeat)
-            finally:
-                reader_mod._dtype_is_native = original  # type: ignore[assignment]
+            print(f"R={n_records:<7} rows/rec={rows:<8} K={args.indices:,}")
+            _c.compare(
+                [
+                    ("partition pipeline", lambda d=dataset, i=indices: _read_pipeline(d, i)),
+                    ("walk kernel", lambda d=dataset, i=indices: d[i, "value"].array()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
+            )
+            print()
             dataset.close()
-        print(
-            f"  R={n_records:<7} rows/rec={rows:<8}"
-            f"{t_pipeline * 1e3:9.1f}ms{t_kernel * 1e3:10.1f}ms"
-            f"{t_pipeline / t_kernel:8.2f}x"
-        )
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        repeat=5,
+        warmup=1,
+        rows=20_000_000,
+        record_counts=[100, 1_000, 10_000, 100_000],
+        indices=1_000_000,
+        threads=True,
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":

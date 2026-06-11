@@ -20,6 +20,7 @@ parallelism change, so single-thread timing is the relevant measurement.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -145,11 +146,9 @@ def run_correctness() -> None:
 # ---- timing -------------------------------------------------------------
 
 
-def _time(fn, *, repeat: int, warmup: int = 2) -> float:
-    return _c.best_time(fn, repeat=repeat, warmup=warmup)
-
-
-def _bench(total_rows: int, n_records: int, dtype_str: str, frac: float, repeat: int) -> None:
+def _run_one(
+    total_rows: int, n_records: int, dtype_str: str, frac: float, repeat: int, warmup: int
+) -> None:
     dtype = np.dtype(dtype_str)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "b.cstore"
@@ -183,48 +182,55 @@ def _bench(total_rows: int, n_records: int, dtype_str: str, frac: float, repeat:
             ds._read_contiguous_range_multi_record(lo, hi, disk_dtype, nd, cp, its),
             ds._copy_multirecord_range_python(lo, hi, disk_dtype, cp, its, np.empty(hi - lo, nd)),
         )
-
-        t_native = _time(
-            lambda: ds._read_contiguous_range_multi_record(lo, hi, disk_dtype, nd, cp, its),
-            repeat=repeat,
+        print(
+            f"rows={total_rows:>9,} records={n_records:>5} span={frac:>4.0%} "
+            f"(~{rec_span} recs span) dtype={dtype_str}"
         )
-        t_py = _time(
-            lambda: ds._copy_multirecord_range_python(
-                lo, hi, disk_dtype, cp, its, np.empty(hi - lo, dtype=nd)
-            ),
+        _c.compare(
+            [
+                (
+                    "python",
+                    lambda: ds._copy_multirecord_range_python(
+                        lo, hi, disk_dtype, cp, its, np.empty(hi - lo, dtype=nd)
+                    ),
+                ),
+                (
+                    "native",
+                    lambda: ds._read_contiguous_range_multi_record(lo, hi, disk_dtype, nd, cp, its),
+                ),
+            ],
             repeat=repeat,
+            warmup=warmup,
+            baseline=0,
         )
         ds.close()
-        speedup = t_py / t_native if t_native > 0 else float("nan")
-        print(
-            f"  rows={total_rows:>9} records={n_records:>5} span={frac:>4.0%} "
-            f"(~{rec_span:>5} recs) | py={t_py * 1e3:8.3f} ms  "
-            f"native={t_native * 1e3:8.3f} ms  speedup={speedup:5.2f}x"
-        )
 
 
-def run_bench(repeat: int) -> None:
+def run_bench(args: argparse.Namespace) -> None:
     print("Timing: native vs python contiguous multi-record range copy (single thread)")
-    print("Many small records (overhead-dominated; the target case):")
-    _bench(2_000_000, 2000, "<f8", 1.00, repeat)
-    _bench(2_000_000, 2000, "<f8", 0.50, repeat)
-    _bench(2_000_000, 5000, "<f8", 1.00, repeat)
-    _bench(2_000_000, 10000, "<f8", 1.00, repeat)
-    print("Few large records (memcpy-dominated; expect convergence, ~1x):")
-    _bench(2_000_000, 10, "<f8", 1.00, repeat)
-    _bench(8_000_000, 4, "<f8", 1.00, repeat)
-    print("Smaller dtype (per-record overhead is a larger fraction):")
-    _bench(2_000_000, 4000, "<i4", 1.00, repeat)
+    print("The win grows with the record count the range spans; few large records converge to ~1x.")
+    for n_records in args.record_counts:
+        _run_one(args.rows, n_records, args.dtype, args.frac, args.repeat, args.warmup)
 
 
 def main() -> None:
-    _c.run_script(
-        correctness=run_correctness,
-        bench=run_bench,
-        default_repeat=20,
-        skip_correctness_flag=True,
-        description=__doc__,
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        repeat=20,
+        warmup=2,
+        rows=2_000_000,
+        record_counts=[10, 2_000, 5_000, 10_000],
+        dtype="<f8",
     )
+    parser.add_argument(
+        "--frac", type=float, default=1.0, help="fraction of total rows the range spans"
+    )
+    args = parser.parse_args()
+    if not args.skip_correctness:
+        run_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":
