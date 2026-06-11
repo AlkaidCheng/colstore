@@ -27,6 +27,7 @@ Run with PYTHONPATH=src and an extension built into src/colstore/.
 
 from __future__ import annotations
 
+import argparse
 import os
 import tempfile
 from pathlib import Path
@@ -38,8 +39,6 @@ import pandas as pd
 import colstore
 from colstore.reader import _make_dataframe_no_consolidate
 
-Result = _c.RichResult
-bench_interleaved = _c.bench_interleaved
 drop_pagecache_softly = _c.drop_pagecache
 
 
@@ -76,7 +75,25 @@ def construction_pair(
     return baseline, optimized
 
 
+def _compare_construction(dict_data: dict[str, np.ndarray], repeat: int, warmup: int) -> None:
+    """Time the consolidating vs no-consolidate DataFrame constructor, A/B."""
+    baseline, optimized = construction_pair(dict_data)
+    _c.compare(
+        [
+            ("pd.DataFrame(dict)    (baseline)", baseline),
+            ("no_consolidate(dict)  (optimized)", optimized),
+        ],
+        repeat=repeat,
+        warmup=warmup,
+        baseline=0,
+    )
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(parser, repeat=5, warmup=2, scale=True)
+    args = parser.parse_args()
+
     print("Environment:")
     print(f"  os.cpu_count() = {os.cpu_count()}")
     print(f"  pandas         = {pd.__version__}")
@@ -89,37 +106,29 @@ def main():
         # block, which is a 1 GB extra allocation + memcpy on top of the dict
         # that already owns 1 GB of data. The no-consolidate path keeps each
         # column in its own Block.
-        many_homog = make_store(td, "homog.cstore", 2_500_000, 50, [np.float64])
+        many_homog = make_store(
+            td, "homog.cstore", _c.scaled_rows(2_500_000, args), 50, [np.float64]
+        )
         ds = colstore.open(str(many_homog))
         try:
             dict_data = ds.dict()  # do the gather once, time only construction
             total_mb = sum(arr.nbytes for arr in dict_data.values()) / 1e6
-            banner(f"SAME-DTYPE: 50 cols x 2.5M rows float64 ({total_mb:.0f} MB)")
-            baseline, optimized = construction_pair(dict_data)
-            results = bench_interleaved(
-                [
-                    "pd.DataFrame(dict)                       (baseline)",
-                    "_make_dataframe_no_consolidate(dict)     (optimized)",
-                ],
-                [baseline, optimized],
-            )
-            for r in results:
-                print(r.report())
+            banner(f"SAME-DTYPE: 50 cols float64 ({total_mb:.0f} MB)")
+            _compare_construction(dict_data, args.repeat, args.warmup)
 
             # Full end-to-end timing including the gather, since that is what
             # users actually see.
-            banner(f"END-TO-END: 50 cols x 2.5M rows float64 ({total_mb:.0f} MB)")
+            banner(f"END-TO-END: 50 cols float64 ({total_mb:.0f} MB)")
             drop_pagecache_softly([many_homog])
-            results = bench_interleaved(
+            _c.compare(
                 [
-                    "ds.dict()                                (gather only)",
-                    "ds.frame()                               (gather + new frame)",
+                    ("ds.dict()   (gather only)", lambda: ds.dict()),
+                    ("ds.frame()  (gather + new frame)", lambda: ds.frame()),
                 ],
-                [lambda: ds.dict(), lambda: ds.frame()],
-                n_warmup=1,
+                repeat=args.repeat,
+                warmup=1,
+                baseline=0,
             )
-            for r in results:
-                print(r.report())
         finally:
             ds.close()
 
@@ -130,7 +139,7 @@ def main():
         many_mixed = make_store(
             td,
             "mixed.cstore",
-            2_500_000,
+            _c.scaled_rows(2_500_000, args),
             50,
             [np.float64, np.float32, np.int32, np.int64],
         )
@@ -138,17 +147,8 @@ def main():
         try:
             dict_data = ds.dict()
             total_mb = sum(arr.nbytes for arr in dict_data.values()) / 1e6
-            banner(f"MIXED-DTYPE: 50 cols x 2.5M rows (4 dtypes, {total_mb:.0f} MB)")
-            baseline, optimized = construction_pair(dict_data)
-            results = bench_interleaved(
-                [
-                    "pd.DataFrame(dict)                       (baseline)",
-                    "_make_dataframe_no_consolidate(dict)     (optimized)",
-                ],
-                [baseline, optimized],
-            )
-            for r in results:
-                print(r.report())
+            banner(f"MIXED-DTYPE: 50 cols (4 dtypes, {total_mb:.0f} MB)")
+            _compare_construction(dict_data, args.repeat, args.warmup)
         finally:
             ds.close()
 
@@ -158,7 +158,7 @@ def main():
         wide = make_store(
             td,
             "wide.cstore",
-            100_000,
+            _c.scaled_rows(100_000, args),
             200,
             [np.float64, np.float32, np.int32, np.int64],
         )
@@ -166,17 +166,8 @@ def main():
         try:
             dict_data = ds.dict()
             total_mb = sum(arr.nbytes for arr in dict_data.values()) / 1e6
-            banner(f"WIDE: 200 cols x 100K rows ({total_mb:.0f} MB)")
-            baseline, optimized = construction_pair(dict_data)
-            results = bench_interleaved(
-                [
-                    "pd.DataFrame(dict)                       (baseline)",
-                    "_make_dataframe_no_consolidate(dict)     (optimized)",
-                ],
-                [baseline, optimized],
-            )
-            for r in results:
-                print(r.report())
+            banner(f"WIDE: 200 cols ({total_mb:.0f} MB)")
+            _compare_construction(dict_data, args.repeat, args.warmup)
         finally:
             ds.close()
 
@@ -185,25 +176,14 @@ def main():
         # (Index construction, list copy, pandas private imports) needs to
         # stay small. The previous PR caught a +6 us per-call regression on
         # a tiny dict materialization that this scenario is designed to
-        # surface.
-        tiny = make_store(td, "tiny.cstore", 1_000, 50, [np.float64])
+        # surface, so it oversamples.
+        tiny = make_store(td, "tiny.cstore", _c.scaled_rows(1_000, args), 50, [np.float64])
         ds = colstore.open(str(tiny))
         try:
             dict_data = ds.dict()
             total_kb = sum(arr.nbytes for arr in dict_data.values()) / 1e3
-            banner(f"TINY: 50 cols x 1K rows float64 ({total_kb:.0f} KB)")
-            baseline, optimized = construction_pair(dict_data)
-            results = bench_interleaved(
-                [
-                    "pd.DataFrame(dict)                       (baseline)",
-                    "_make_dataframe_no_consolidate(dict)     (optimized)",
-                ],
-                [baseline, optimized],
-                n_iter=20,
-                n_warmup=5,
-            )
-            for r in results:
-                print(r.report())
+            banner(f"TINY: 50 cols float64 ({total_kb:.0f} KB)")
+            _compare_construction(dict_data, max(20, args.repeat), max(5, args.warmup))
         finally:
             ds.close()
 
@@ -212,21 +192,11 @@ def main():
         # is a common idiom for materializing a row subset; verify it benefits.
         ds = colstore.open(str(many_homog))
         try:
-            slice_dict = ds[500_000:2_000_000].dict()
+            lo, hi = _c.scaled_rows(500_000, args), _c.scaled_rows(2_000_000, args)
+            slice_dict = ds[lo:hi].dict()
             slice_mb = sum(arr.nbytes for arr in slice_dict.values()) / 1e6
-            banner(
-                f"SLICED VIEW: ds[500K:2M].frame()  " f"(50 cols x 1.5M rows, {slice_mb:.0f} MB)"
-            )
-            baseline, optimized = construction_pair(slice_dict)
-            results = bench_interleaved(
-                [
-                    "pd.DataFrame(dict)                       (baseline)",
-                    "_make_dataframe_no_consolidate(dict)     (optimized)",
-                ],
-                [baseline, optimized],
-            )
-            for r in results:
-                print(r.report())
+            banner(f"SLICED VIEW: ds[{lo}:{hi}].frame() ({slice_mb:.0f} MB)")
+            _compare_construction(slice_dict, args.repeat, args.warmup)
         finally:
             ds.close()
 

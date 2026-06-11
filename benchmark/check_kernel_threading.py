@@ -16,75 +16,62 @@ Three independent observations are reported for a 10M-element gather:
 
 from __future__ import annotations
 
+import argparse
 import os
-import resource
-import time
 
+import _common as _c
 import numpy as np
 
 from colstore import _gather  # type: ignore[attr-defined]
 
 
-def _cpu_times() -> tuple[float, float]:
-    r = resource.getrusage(resource.RUSAGE_SELF)
-    return r.ru_utime, r.ru_stime
-
-
-def report(label: str, fn, repeats: int = 5) -> None:
-    fn()  # warmup
-    walls, users, syss = [], [], []
-    for _ in range(repeats):
-        u0, s0 = _cpu_times()
-        w0 = time.perf_counter()
-        fn()
-        w = time.perf_counter() - w0
-        u1, s1 = _cpu_times()
-        walls.append(w)
-        users.append(u1 - u0)
-        syss.append(s1 - s0)
-    wall = min(walls)
-    user = users[walls.index(wall)]
-    sys_t = syss[walls.index(wall)]
-    util = (user + sys_t) / wall * 100 if wall > 0 else 0
-    flag = " <-- MULTI-THREADED" if util > 150 else ""
-    print(
-        f"  {label:<32} wall={wall*1000:7.2f} ms  user={user*1000:7.2f} ms  "
-        f"sys={sys_t*1000:6.2f} ms  util={util:6.1f}%{flag}"
-    )
+def report(label: str, fn, repeat: int, warmup: int) -> None:
+    # The public profiler captures wall/cpu/threads/faults; cpu/wall ratio is
+    # the utilization signal -- above ~1.5 the kernel is using multiple cores.
+    result = _c.profile(fn, repeat=repeat, warmup=warmup, label=label)
+    flag = "  <-- MULTI-THREADED" if result.cpu_wall_ratio > 1.5 else ""
+    print(result.report() + flag)
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(parser, repeat=5, warmup=1, rows=20_000_000, indices=10_000_000)
+    args = parser.parse_args()
+
     rng = np.random.default_rng(0)
-    source = rng.standard_normal(20_000_000).astype(np.float32)
-    n = 10_000_000
-    sorted_idx = np.sort(rng.choice(20_000_000, size=n, replace=False)).astype(np.int64)
-    unsorted_idx = rng.permutation(20_000_000)[:n].astype(np.int64)
+    source = rng.standard_normal(args.rows).astype(np.float32)
+    n = args.indices
+    sorted_idx = np.sort(rng.choice(args.rows, size=n, replace=False)).astype(np.int64)
+    unsorted_idx = rng.permutation(args.rows)[:n].astype(np.int64)
 
     out_np = np.empty(n, dtype=np.float32)
     out_cpp = np.empty(n, dtype=np.float32)
 
     print(f"OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS', '(unset)')}")
     print(f"_gather.max_threads()      = {_gather.max_threads()}")
-    print(f"thread_count_for(10M, 1)   = {_gather.thread_count_for(n, 1)}")
-    print(f"thread_count_for(10M, 8)   = {_gather.thread_count_for(n, 8)}")
+    print(f"thread_count_for({n}, 1)   = {_gather.thread_count_for(n, 1)}")
+    print(f"thread_count_for({n}, 8)   = {_gather.thread_count_for(n, 8)}")
     print()
 
-    print("---- 10M sorted ----")
-    report("np.take (no out)", lambda: np.take(source, sorted_idx))
-    report("np.take(out=)", lambda: np.take(source, sorted_idx, out=out_np))
-    report("_gather.gather_into cap=1", lambda: _gather.gather_into(source, sorted_idx, out_cpp, 1))
-    report("_gather.gather_into cap=8", lambda: _gather.gather_into(source, sorted_idx, out_cpp, 8))
-    print()
-    print("---- 10M unsorted ----")
-    u_idx = unsorted_idx
-    report("np.take (no out)", lambda: np.take(source, u_idx))
-    report("np.take(out=)", lambda: np.take(source, u_idx, out=out_np))
-    report(
-        "_gather.gather_into cap=1", lambda: _gather.gather_into(source, unsorted_idx, out_cpp, 1)
-    )
-    report(
-        "_gather.gather_into cap=8", lambda: _gather.gather_into(source, unsorted_idx, out_cpp, 8)
-    )
+    for label, idx in (("sorted", sorted_idx), ("unsorted", unsorted_idx)):
+        print(f"---- {n:,} {label} ----")
+        report("np.take (no out)", lambda i=idx: np.take(source, i), args.repeat, args.warmup)
+        report(
+            "np.take(out=)", lambda i=idx: np.take(source, i, out=out_np), args.repeat, args.warmup
+        )
+        report(
+            "gather_into cap=1",
+            lambda i=idx: _gather.gather_into(source, i, out_cpp, 1),
+            args.repeat,
+            args.warmup,
+        )
+        report(
+            "gather_into cap=8",
+            lambda i=idx: _gather.gather_into(source, i, out_cpp, 8),
+            args.repeat,
+            args.warmup,
+        )
+        print()
 
 
 if __name__ == "__main__":
