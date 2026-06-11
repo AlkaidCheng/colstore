@@ -56,7 +56,7 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from . import profiling
+from . import profiling, testing
 from .api import (
     ColStoreInfo,
     compact,
@@ -121,6 +121,7 @@ __all__ = [
     "set_gather_thread_cap",
     "set_max_workers",
     "store",
+    "testing",
     "update",
     "use_passive_openmp_wait",
 ]
