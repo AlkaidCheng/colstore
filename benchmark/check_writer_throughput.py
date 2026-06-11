@@ -25,9 +25,9 @@ import argparse
 import hashlib
 import sys
 import tempfile
-import time
 from pathlib import Path
 
+import _common as _c
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -44,10 +44,9 @@ REGIMES = (
     (2, 5_000_000),
     (1, 10_000_000),
 )
-N_COLUMNS = 4
 
 
-def check_correctness() -> None:
+def check_correctness(n_columns: int) -> None:
     rng = np.random.default_rng(3)
     records = [
         {
@@ -80,54 +79,61 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (paths byte-identical)\n")
 
 
-def _bench_one(n_records: int, rows_per_record: int, repeat: int, vectored: bool) -> float:
+def _make_write_spec(vectored, pool, n_records, base_dir):
+    """A (setup, write) pair: setup mints a fresh store dir outside timing;
+    write streams ``n_records`` records into it with writev forced on/off."""
+    state: dict[str, Path] = {}
+
+    def setup() -> None:
+        state["path"] = Path(tempfile.mkdtemp(dir=base_dir)) / "b.cstore"
+
+    def write() -> None:
+        original = writer_mod._HAS_WRITEV
+        writer_mod._HAS_WRITEV = original and vectored
+        try:
+            with colstore.create(state["path"]) as writer:
+                for i in range(n_records):
+                    writer.write(pool[i % len(pool)])
+        finally:
+            writer_mod._HAS_WRITEV = original
+
+    return setup, write
+
+
+def run_bench(repeat: int, warmup: int, n_columns: int) -> None:
     rng = np.random.default_rng(0)
-    pool = [
-        {f"c{j}": rng.standard_normal(rows_per_record) for j in range(N_COLUMNS)}
-        for _ in range(min(n_records, 50))
-    ]
-    original = writer_mod._HAS_WRITEV
-    writer_mod._HAS_WRITEV = original and vectored
-    try:
-        best = float("inf")
-        for _ in range(repeat):
-            with tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp) / "b.cstore"
-                start = time.perf_counter()
-                with colstore.create(path) as writer:
-                    for i in range(n_records):
-                        writer.write(pool[i % len(pool)])
-                best = min(best, time.perf_counter() - start)
-        return best
-    finally:
-        writer_mod._HAS_WRITEV = original
-
-
-def run_bench(repeat: int) -> None:
-    print(f"{'regime':<30}{'sequential':>12}{'vectored':>12}{'speedup':>9}")
-    for n_records, rows in REGIMES:
-        t_seq = _bench_one(n_records, rows, repeat, vectored=False)
-        t_vec = _bench_one(n_records, rows, repeat, vectored=True)
-        total_mb = n_records * rows * N_COLUMNS * 8 / 1e6
-        print(
-            f"R={n_records:<7} rows/rec={rows:<10}"
-            f"{t_seq * 1e3:10.1f}ms{t_vec * 1e3:10.1f}ms{t_seq / t_vec:8.2f}x"
-            f"   ({total_mb / t_vec:6.0f} MB/s vectored)"
-        )
+    with tempfile.TemporaryDirectory() as base:
+        base_dir = Path(base)
+        for n_records, rows in REGIMES:
+            pool = [
+                {f"c{j}": rng.standard_normal(rows) for j in range(n_columns)}
+                for _ in range(min(n_records, 50))
+            ]
+            seq_setup, seq_write = _make_write_spec(False, pool, n_records, base_dir)
+            vec_setup, vec_write = _make_write_spec(True, pool, n_records, base_dir)
+            total_mb = n_records * rows * n_columns * 8 / 1e6
+            print(f"R={n_records:<7} rows/rec={rows:<10} ({total_mb:.0f} MB total)")
+            _seq_res, vec_res = _c.compare(
+                [("sequential", seq_write), ("vectored", vec_write)],
+                repeat=repeat,
+                warmup=warmup,
+                baseline=0,
+                setups=[seq_setup, vec_setup],
+            )
+            print(f"    vectored throughput: {total_mb / (vec_res.wall_ms / 1000.0):.0f} MB/s\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--skip-bench", action="store_true")
+    _c.add_common_args(parser, repeat=3, cols=4, skip_correctness=False)
     args = parser.parse_args()
 
     if not writer_mod._HAS_WRITEV:
         print("os.writev unavailable on this platform; only the fallback path exists.")
         return
-    check_correctness()
+    check_correctness(args.cols)
     if not args.skip_bench:
-        run_bench(args.repeat)
+        run_bench(args.repeat, args.warmup, args.cols)
 
 
 if __name__ == "__main__":
