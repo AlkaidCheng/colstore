@@ -8,14 +8,18 @@ Two questions:
 
 2. Read perf delta: how much does compaction help the patterns it was
    designed to fix? We focus on unsorted-fancy reads at large R, where
-   the multi-record path degrades most.
+   the multi-record path degrades most. The before/after reads are timed
+   interleaved (A/B/A/B) so the comparison isn't confounded by first-touch
+   placement or page-cache warmth differing between two sequential blocks.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import _common as _c
 import numpy as np
@@ -23,8 +27,9 @@ import numpy as np
 import colstore
 
 
-def _best(fn, repeats: int) -> float:
-    return _c.best_time(fn, repeat=repeats, warmup=1)
+def _read_fn(ds: Any, idx: np.ndarray) -> Callable[[], Any]:
+    """A zero-arg closure timing one unsorted-fancy read of column ``x``."""
+    return lambda: ds[idx, "x"].array()
 
 
 def main() -> None:
@@ -32,7 +37,8 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=2_000_000)
     parser.add_argument("--n-indices", type=int, default=200_000)
     parser.add_argument("--record-counts", type=int, nargs="+", default=[10, 100, 1000])
-    parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=5, help="interleaved A/B rounds (n_iter)")
+    parser.add_argument("--warmup", type=int, default=2, help="warmup passes per variant")
     parser.add_argument("--dtype", default="float32")
     parser.add_argument("--tmpdir", default="/tmp/colstore_compact_bench")
     args = parser.parse_args()
@@ -67,13 +73,8 @@ def main() -> None:
         info_before = colstore.info(path)
         print(f"  size on disk: {info_before.file_size / 1e6:.1f} MB")
 
-        # Read perf BEFORE compaction.
-        with colstore.open(path) as ds:
-            t_before = _best(lambda d=ds: d[unsorted_idx, "x"].array(), args.repeats)
-        print(f"  unsorted-fancy read BEFORE: {t_before * 1000:7.2f} ms")
-
-        # Compact (out-of-place so we can re-time the "before" case from the
-        # untouched original on subsequent re-runs of the script).
+        # Compact out-of-place so both files stay live and the before/after
+        # reads can be timed interleaved against each other (see below).
         compacted = tmpdir / f"compact_r{n_rec}_done.cstore"
         if compacted.exists():
             compacted.unlink()
@@ -83,11 +84,36 @@ def main() -> None:
         mb = info_before.file_size / 1e6
         print(f"  compact: {t_compact * 1000:7.2f} ms ({mb / t_compact:.1f} MB/s throughput)")
 
-        # Read perf AFTER compaction.
-        with colstore.open(compacted) as ds:
-            t_after = _best(lambda d=ds: d[unsorted_idx, "x"].array(), args.repeats)
-        speedup = t_before / t_after if t_after > 0 else float("inf")
-        print(f"  unsorted-fancy read AFTER:  {t_after * 1000:7.2f} ms  ({speedup:.1f}x speedup)")
+        # Read perf: BEFORE vs AFTER, timed *interleaved* (A/B/A/B) rather than
+        # as two sequential blocks. Timing them in sequence -- all BEFORE
+        # samples, then all AFTER samples, on two separately written files --
+        # lets first-touch NUMA placement and page-cache warmth differ between
+        # the two measurements, which at large sizes (where both paths are
+        # bandwidth-bound and effectively at parity) manufactured misleading
+        # sub-1x ratios. bench_interleaved warms both readers first, then
+        # alternates them each round, keeping cache and scheduler state
+        # comparable; it also reports cpu/wall ratio, thread count, and
+        # page-fault deltas so a near-1x ratio can be read as genuine parity
+        # rather than noise.
+        with colstore.open(path) as ds_before, colstore.open(compacted) as ds_after:
+            before, after = _c.bench_interleaved(
+                [
+                    "unsorted-fancy read BEFORE (fragmented)",
+                    "unsorted-fancy read AFTER  (compacted) ",
+                ],
+                [
+                    _read_fn(ds_before, unsorted_idx),
+                    _read_fn(ds_after, unsorted_idx),
+                ],
+                n_iter=args.repeats,
+                n_warmup=args.warmup,
+            )
+        print(before.report())
+        print(after.report())
+        best_before = min(r.wall_ms for r in before.runs)
+        best_after = min(r.wall_ms for r in after.runs)
+        speedup = best_before / best_after if best_after > 0 else float("inf")
+        print(f"  -> compaction speedup on this pattern: {speedup:.2f}x (best wall / best wall)")
 
 
 if __name__ == "__main__":
