@@ -27,6 +27,7 @@ becomes a linear walk).
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -127,36 +128,51 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (strided kernel == arange route == ground truth)\n")
 
 
-def _time_read(dataset, s, repeat: int) -> float:
-    return _c.best_time(lambda: dataset[s, "value"].array(), repeat=repeat, warmup=0)
+def _read_baseline(dataset, s):
+    """One strided read forced through the pre-change arange route."""
+    with _force_baseline():
+        return dataset[s, "value"].array()
 
 
-def run_bench(repeat: int) -> None:
-    header = f"{'layout':<30}{'step':>6}{'K':>10}{'arange route':>14}{'strided':>10}{'speedup':>9}"
-    print(header)
-    for n_records, rows in LAYOUTS:
+def run_bench(args: argparse.Namespace) -> None:
+    for n_records in args.record_counts:
+        rows = args.rows // n_records
+        total = rows * n_records
         with tempfile.TemporaryDirectory() as tmp:
             path, _ = _build_store(Path(tmp), n_records, rows)
-            total = n_records * rows
             dataset = colstore.open(path)
             for step in STEPS:
                 s = slice(None, None, step)
                 k = len(range(*s.indices(total)))
-                dataset[s, "value"].array()  # fault this slice's pages before either side
-                t_kernel = _time_read(dataset, s, repeat)
-                with _force_baseline():
-                    t_baseline = _time_read(dataset, s, repeat)
-                print(
-                    f"  R={n_records:<8} rows/rec={rows:<8}"
-                    f"{step:>6}{k:>10}"
-                    f"{t_baseline * 1e3:11.2f}ms{t_kernel * 1e3:8.2f}ms"
-                    f"{t_baseline / t_kernel:8.2f}x"
+                dataset[s, "value"].array()  # fault this slice's pages first
+                print(f"R={n_records:<7} rows/rec={rows:<7} step={step:<4} K={k:,}")
+                _c.compare(
+                    [
+                        ("arange route", lambda d=dataset, sl=s: _read_baseline(d, sl)),
+                        ("strided", lambda d=dataset, sl=s: d[sl, "value"].array()),
+                    ],
+                    repeat=args.repeat,
+                    warmup=args.warmup,
+                    baseline=0,
                 )
+            print()
             dataset.close()
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        rows=20_000_000,
+        record_counts=[1_000, 10_000, 100_000],
+        threads=True,
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":
