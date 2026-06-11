@@ -27,6 +27,7 @@ detection accepts; irregular files keep the generic kernels unchanged.
 
 from __future__ import annotations
 
+import argparse
 import tempfile
 from pathlib import Path
 
@@ -35,10 +36,6 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
-
-LAYOUTS = ((1_000, 20_000), (10_000, 2_000), (100_000, 200))
-K_SIZES = (2_000_000, 10_000_000)
-N_COLUMNS = 4
 
 
 class _force_generic:
@@ -52,7 +49,7 @@ class _force_generic:
         return False
 
 
-def _build_store(directory: Path, n_records: int, rows: int, n_columns: int = N_COLUMNS):
+def _build_store(directory: Path, n_records: int, rows: int, n_columns: int):
     rng = np.random.default_rng(0)
     total = n_records * rows
     full = {f"c{i}": rng.standard_normal(total) for i in range(n_columns)}
@@ -99,43 +96,60 @@ def check_correctness() -> None:
     )
 
 
-def _best(f, repeat: int) -> float:
-    return _c.best_time(f, repeat=repeat, warmup=0)
-
-
-def run_bench(repeat: int) -> None:
-    cols = [f"c{i}" for i in range(N_COLUMNS)]
-    head = f"{'layout':<28}{'K':>10}{'read':>16}{'generic':>10}{'uniform':>10}{'speedup':>9}"
-    print(head)
-    for n_records, rows in LAYOUTS:
+def run_bench(args: argparse.Namespace) -> None:
+    cols = [f"c{i}" for i in range(args.cols)]
+    for n_records in args.record_counts:
+        rows = args.rows // n_records
+        total = rows * n_records
         with tempfile.TemporaryDirectory() as tmp:
-            path, _ = _build_store(Path(tmp), n_records, rows)
-            total = n_records * rows
+            path, _ = _build_store(Path(tmp), n_records, rows, args.cols)
+            # Routing is fixed at open time, so a generic-opened reader stays on
+            # the generic route without the patch held during the timed reads.
             dataset = colstore.open(path)
-            for k in K_SIZES:
-                indices = np.random.default_rng(2).integers(0, total, k).astype(np.int64)
-                dataset[indices, "c0"].array()  # fault pages before either side
-                dataset[indices, cols].dict()
-                t_new_1 = _best(lambda idx=indices, ds=dataset: ds[idx, "c0"].array(), repeat)
-                t_new_c = _best(lambda idx=indices, ds=dataset: ds[idx, cols].dict(), repeat)
-                with _force_generic():
-                    generic = colstore.open(path)
-                    t_old_1 = _best(lambda idx=indices, ds=generic: ds[idx, "c0"].array(), repeat)
-                    t_old_c = _best(lambda idx=indices, ds=generic: ds[idx, cols].dict(), repeat)
-                    generic.close()
-                print(
-                    f"  R={n_records:<7} rows/rec={rows:<7}{k:>10}{'1 col':>16}"
-                    f"{t_old_1 * 1e3:8.1f}ms{t_new_1 * 1e3:8.1f}ms{t_old_1 / t_new_1:8.2f}x"
-                )
-                print(
-                    f"{'':38}{f'{N_COLUMNS} col bins':>16}"
-                    f"{t_old_c * 1e3:8.1f}ms{t_new_c * 1e3:8.1f}ms{t_old_c / t_new_c:8.2f}x"
-                )
+            with _force_generic():
+                generic = colstore.open(path)
+            idx = np.random.default_rng(2).integers(0, total, args.indices).astype(np.int64)
+            dataset[idx, "c0"].array()  # fault this index pattern's pages
+            print(f"R={n_records:<7} rows/rec={rows:<7} K={args.indices:,}")
+            _c.compare(
+                [
+                    ("generic  1-col", lambda d=generic, i=idx: d[i, "c0"].array()),
+                    ("uniform  1-col", lambda d=dataset, i=idx: d[i, "c0"].array()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
+            )
+            _c.compare(
+                [
+                    (f"generic {args.cols}-col", lambda d=generic, i=idx: d[i, cols].dict()),
+                    (f"uniform {args.cols}-col", lambda d=dataset, i=idx: d[i, cols].dict()),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
+            )
+            print()
             dataset.close()
+            generic.close()
 
 
 def main() -> None:
-    _c.run_script(correctness=check_correctness, bench=run_bench, description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser,
+        rows=20_000_000,
+        record_counts=[1_000, 10_000, 100_000],
+        cols=4,
+        indices=10_000_000,
+        threads=True,
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+    if not args.skip_correctness:
+        check_correctness()
+    if not args.skip_bench:
+        run_bench(args)
 
 
 if __name__ == "__main__":
