@@ -1202,6 +1202,11 @@ class ColStoreReader:
         rather than a per-element search, so there is nothing to amortize
         across columns. Non-native columns of a mixed read fall back to
         :meth:`_gather_one` individually.
+
+        In the parallel regime the route also declines when the concurrent
+        column-pool fallback would field strictly more parallel threads: the
+        gather is bandwidth-bound, so the fallback's extra memory-level
+        parallelism beats the work this route saves. See the gate below.
         """
         if not self._is_multi_record or len(column_names) <= 1:
             return None
@@ -1225,6 +1230,31 @@ class ColStoreReader:
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
         effective_cap = config.get_gather_thread_cap()
+        # Parallel-regime routing gate. The bins kernels do less total work
+        # than a per-column gather (the record search is computed once and
+        # reused), but this route runs the columns sequentially, leaning on a
+        # single kernel's intra-column OpenMP for all its parallelism. Thread
+        # assignment is work-proportional (resolve_thread_count), so at a
+        # moderate index count one kernel claims only a fraction of the cap,
+        # while the concurrent column-pool fallback fields one resolved width
+        # per column at once -- more independent memory streams on a read that
+        # is bandwidth-bound, not compute-bound. When the fallback would field
+        # strictly more parallel threads than this route, its extra memory-level
+        # parallelism outweighs the work saved here, so decline and let the
+        # caller take it. Gated on the parallel regime only: in the serial
+        # regime every resolved width is one, the comparison is moot, and the
+        # existing routing contracts (all below PARALLEL_THRESHOLD) are
+        # untouched.
+        sequential_width = _cpp_module.resolve_thread_count(n, effective_cap)
+        if sequential_width > 1:
+            n_workers = min(self.max_workers, len(column_names))
+            per_column_cap = max(1, effective_cap // n_workers)
+            concurrent_width = min(
+                _cpp_module.max_threads(),
+                n_workers * _cpp_module.resolve_thread_count(n, per_column_cap),
+            )
+            if concurrent_width > sequential_width:
+                return None
         prefetch = config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False)
         gathered: dict[str, NDArray[Any]] = {}
         uniform = self._uniform_record_layout()
