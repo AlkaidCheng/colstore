@@ -25,10 +25,8 @@ import platform
 import statistics
 import subprocess
 import sys
-import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,8 +39,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import colstore
 from colstore.config import get_gather_thread_cap
 from colstore.kernels import cpp_available, max_threads
+from colstore.profiling import (
+    ProfileResult,
+    peak_thread_watcher,
+    profile,
+    profile_interleaved,
+)
 
 __all__ = [
+    "ProfileResult",
     "Result",
     "RichResult",
     "Run",
@@ -54,12 +59,16 @@ __all__ = [
     "best_time",
     "check_equal",
     "colstore",
+    "compare",
     "cpp_available",
     "drop_pagecache",
     "machine_fingerprint",
     "make_parser",
     "make_store",
     "max_threads",
+    "peak_thread_watcher",
+    "profile",
+    "profile_interleaved",
     "random_column",
     "run_script",
     "scaled_rows",
@@ -465,29 +474,9 @@ class RichResult:
         )
 
 
-@contextmanager
-def thread_watcher(interval_s: float = 0.001) -> Any:
-    """Track the peak ``threading.active_count()`` for the scope.
-
-    Yields a callable returning the peak observed so far.
-    """
-    peak = [threading.active_count()]
-    stop = [False]
-
-    def poll() -> None:
-        while not stop[0]:
-            n = threading.active_count()
-            if n > peak[0]:
-                peak[0] = n
-            time.sleep(interval_s)
-
-    watcher = threading.Thread(target=poll, daemon=True)
-    watcher.start()
-    try:
-        yield lambda: peak[0]
-    finally:
-        stop[0] = True
-        watcher.join(timeout=0.5)
+# The peak-thread watcher now lives in the public profiling API; alias it so
+# existing callers (and time_call below) keep one implementation.
+thread_watcher = peak_thread_watcher
 
 
 def drop_pagecache(paths: list[Path]) -> None:
@@ -567,6 +556,52 @@ def bench_interleaved(
     for _ in range(n_iter):
         for fn, result in zip(fns, results, strict=True):
             result.runs.append(time_call(fn))
+    return results
+
+
+def compare(
+    specs: list[tuple[str, Callable[[], Any]]],
+    *,
+    repeat: int = 5,
+    warmup: int = 2,
+    baseline: int = 0,
+    setups: list[Callable[[], Any] | None] | None = None,
+    throughput_rows: int | None = None,
+    show: bool = True,
+) -> list[ProfileResult]:
+    """Interleaved A/B comparison with the suite's standard presentation.
+
+    The harmonized path for variant comparisons: profiles the ``(label, fn)``
+    specs interleaved (via :func:`colstore.profiling.profile_interleaved`, so
+    page-cache and scheduler state stay comparable), then prints one
+    standard line per variant -- wall, cpu, cpu/wall ratio, peak threads,
+    page-fault deltas -- followed by a speedup column versus the variant at
+    index ``baseline``, and an optional rows/s throughput column when
+    ``throughput_rows`` is given. Returns the :class:`ProfileResult` per spec
+    in input order, so a caller can print a domain-specific footer (e.g. MB/s)
+    from the same measurements.
+
+    ``setups`` supplies a per-variant setup run outside the timed region
+    (``None`` for variants that need none) -- use it for destructive workloads
+    that must rebuild state (e.g. a fresh store) before each timed write.
+    """
+    labels = [label for label, _ in specs]
+    fns = [fn for _, fn in specs]
+    results: list[ProfileResult] = profile_interleaved(
+        labels, fns, repeat=repeat, warmup=warmup, setups=setups
+    )
+    if show:
+        base_wall = results[baseline].wall_ms
+        for i, result in enumerate(results):
+            if i == baseline:
+                speedup = "  (baseline)"
+            else:
+                ratio = base_wall / result.wall_ms if result.wall_ms > 0 else float("inf")
+                speedup = f"  speedup={ratio:5.2f}x"
+            tput = ""
+            if throughput_rows is not None:
+                tput = f"  {result.throughput(throughput_rows) / 1e6:7.1f}M rows/s"
+            print(result.report() + speedup + tput)
     return results
 
 
