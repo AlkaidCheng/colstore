@@ -72,3 +72,6 @@ ENV/
 
 # OS
 .DS_Store
+
+# Archive
+*.zip
