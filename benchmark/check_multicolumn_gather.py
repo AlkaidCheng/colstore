@@ -28,17 +28,16 @@ import _common as _c
 import numpy as np
 
 import colstore
+from colstore import testing
 from colstore.reader import ColStoreReader
 
 
 def _build_store(directory: Path, n_records: int, rows: int, n_cols: int):
-    rng = np.random.default_rng(0)
-    names = [f"c{i}" for i in range(n_cols)]
-    full = {name: rng.standard_normal(n_records * rows) for name in names}
+    total = n_records * rows
+    full = testing.make_columns(total, n_cols, seed=0)
+    names = list(full)
     path = directory / f"r{n_records}_c{n_cols}.cstore"
-    with colstore.create(path) as writer:
-        for r in range(n_records):
-            writer.write({name: full[name][r * rows : (r + 1) * rows] for name in names})
+    testing.write_columns(path, full, records=n_records).close()
     return path, names, full
 
 

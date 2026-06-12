@@ -36,7 +36,7 @@ import _common as _c
 import numpy as np
 
 import colstore
-from colstore import config
+from colstore import config, testing
 
 RECORD_CUT_FRACTION = 0.3
 
@@ -53,13 +53,10 @@ class _force_lowered:
 
 
 def _build_store(directory: Path, n_records: int, rows: int):
-    rng = np.random.default_rng(0)
     total = n_records * rows
-    full = {"a": rng.standard_normal(total), "b": rng.standard_normal(total)}
+    full = testing.make_columns(total, 2, names=("a", "b"), seed=0)
     path = directory / f"r{n_records}.cstore"
-    with colstore.create(path) as writer:
-        for r in range(n_records):
-            writer.write({k: v[r * rows : (r + 1) * rows] for k, v in full.items()})
+    testing.write_columns(path, full, records=n_records).close()
     return path, full, total
 
 
