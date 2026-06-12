@@ -97,10 +97,15 @@ def _cold_compare(specs, *, repeat: int, warmup: int):
         holder = holders[i]
 
         def setup() -> None:
-            if "reader" in holder:
-                holder["reader"].close()
-                del holder["reader"]
-            gc.collect()  # release the memmap before evicting
+            # Close EVERY open reader before evicting -- not just this variant's
+            # -- so no memmap pins the pages we are about to drop. This matters
+            # when two variants read the SAME file (reader-side A/B): the other
+            # variant's still-open reader would otherwise decline the eviction.
+            for other in holders:
+                if "reader" in other:
+                    other["reader"].close()
+                    del other["reader"]
+            gc.collect()  # release the memmaps before evicting
             drop_pagecache_softly([path])
             with policy_scope(policy):
                 holder["reader"] = colstore.open(str(path))
@@ -165,6 +170,9 @@ def main() -> None:
         write_store_under_policy(local_path, cols, "local")
         write_store_under_policy(interleave_path, cols, "interleave")
 
+        # Phase 1 -- WARM scenarios. The two readers are held open here and
+        # CLOSED before any cold scenario, so their memmaps don't pin the pages
+        # the cold A/B evicts (the cold-cache pitfall this benchmark avoids).
         local_reader = colstore.open(str(local_path))
         interleave_reader = colstore.open(str(interleave_path))
         try:
@@ -192,50 +200,6 @@ def main() -> None:
                         baseline=0,
                     )
 
-            # 3a. Writer-side A/B, COLD (pin-test: ~noise expected).
-            banner(f"WRITER-SIDE A/B (cold)  {total_gb:.2f} GB  ds.dict()")
-            _cold_compare(
-                [
-                    (
-                        "writer=local      reader=local  ds.dict() cold",
-                        local_path,
-                        "local",
-                        lambda r: r.dict(),
-                    ),
-                    (
-                        "writer=interleave reader=local  ds.dict() cold",
-                        interleave_path,
-                        "local",
-                        lambda r: r.dict(),
-                    ),
-                ],
-                repeat=args.repeat,
-                warmup=args.warmup,
-            )
-            print("  (pin-test: expected ~noise -- evicted pages forget the writer's placement)")
-
-            # 2. Reader-side A/B, COLD (where reader-side mbind earns its place).
-            banner(f"READER-SIDE A/B (cold)  {total_gb:.2f} GB  ds.dict()")
-            _cold_compare(
-                [
-                    (
-                        "reader=local      writer=local  ds.dict() cold",
-                        local_path,
-                        "local",
-                        lambda r: r.dict(),
-                    ),
-                    (
-                        "reader=interleave writer=local  ds.dict() cold",
-                        local_path,
-                        "interleave",
-                        lambda r: r.dict(),
-                    ),
-                ],
-                repeat=args.repeat,
-                warmup=args.warmup,
-            )
-            print("  (cold: reader-side mbind controls re-fault allocation)")
-
             # 3b. Reader-side A/B, WARM (pin-test: ~noise expected). Open each
             #     reader under its policy once, then time warm reads.
             banner(f"READER-SIDE A/B (warm)  {total_gb:.2f} GB  ds.dict()")
@@ -260,23 +224,71 @@ def main() -> None:
         finally:
             local_reader.close()
             interleave_reader.close()
+        gc.collect()  # drop the warm memmaps before evicting for the cold A/B
 
-        # 4. End-to-end under the default "auto" policy.
+        # Phase 2 -- COLD scenarios. No reader is open across an eviction now:
+        # Phase 1's readers are closed, and _cold_compare closes every reader
+        # before each evict.
+        # 3a. Writer-side A/B, COLD (pin-test: ~noise expected).
+        banner(f"WRITER-SIDE A/B (cold)  {total_gb:.2f} GB  ds.dict()")
+        _cold_compare(
+            [
+                (
+                    "writer=local      reader=local  ds.dict() cold",
+                    local_path,
+                    "local",
+                    lambda r: r.dict(),
+                ),
+                (
+                    "writer=interleave reader=local  ds.dict() cold",
+                    interleave_path,
+                    "local",
+                    lambda r: r.dict(),
+                ),
+            ],
+            repeat=args.repeat,
+            warmup=args.warmup,
+        )
+        print("  (pin-test: expected ~noise -- evicted pages forget the writer's placement)")
+
+        # 2. Reader-side A/B, COLD (where reader-side mbind earns its place).
+        banner(f"READER-SIDE A/B (cold)  {total_gb:.2f} GB  ds.dict()")
+        _cold_compare(
+            [
+                (
+                    "reader=local      writer=local  ds.dict() cold",
+                    local_path,
+                    "local",
+                    lambda r: r.dict(),
+                ),
+                (
+                    "reader=interleave writer=local  ds.dict() cold",
+                    local_path,
+                    "interleave",
+                    lambda r: r.dict(),
+                ),
+            ],
+            repeat=args.repeat,
+            warmup=args.warmup,
+        )
+        print("  (cold: reader-side mbind controls re-fault allocation)")
+
+        # 4. End-to-end under the default "auto" policy. dict and frame are
+        #    different operations (frame = dict + construction), so profile each
+        #    rather than reporting a misleading dict-vs-frame "speedup".
         banner(f"END-TO-END default policy  {total_gb:.2f} GB")
         e2e_path = Path(td) / "end_to_end.cstore"
         write_store_under_policy(e2e_path, cols, "auto")
         with policy_scope("auto"):
             ds = colstore.open(str(e2e_path))
             try:
-                _c.compare(
-                    [
-                        ("ds.dict()  writer=auto reader=auto", lambda: ds.dict()),
-                        ("ds.frame() writer=auto reader=auto", lambda: ds.frame()),
-                    ],
-                    repeat=args.repeat,
-                    warmup=args.warmup,
-                    baseline=0,
-                )
+                for label, fn in (
+                    ("ds.dict()  writer=auto reader=auto", ds.dict),
+                    ("ds.frame() writer=auto reader=auto", ds.frame),
+                ):
+                    print(
+                        _c.profile(fn, repeat=args.repeat, warmup=args.warmup, label=label).report()
+                    )
             finally:
                 ds.close()
 
