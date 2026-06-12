@@ -43,10 +43,9 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import _common as _c
-import numpy as np
 
 import colstore
-from colstore import _numa, config
+from colstore import _numa, config, testing
 
 drop_pagecache_softly = _c.drop_pagecache
 
@@ -164,8 +163,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         local_path = Path(td) / "store_local.cstore"
         interleave_path = Path(td) / "store_interleave.cstore"
-        rng = np.random.default_rng(0)
-        cols = {f"c{i:02d}": rng.standard_normal(n_rows) for i in range(n_cols)}
+        names = [f"c{i:02d}" for i in range(n_cols)]
+        cols = testing.make_columns(n_rows, n_cols, names=names, seed=0)
         print(f"\nWriting two stores ({n_cols} x {n_rows:,} = {total_gb:.2f} GB each)...")
         write_store_under_policy(local_path, cols, "local")
         write_store_under_policy(interleave_path, cols, "interleave")

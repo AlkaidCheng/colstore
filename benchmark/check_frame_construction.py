@@ -37,6 +37,7 @@ import numpy as np
 import pandas as pd
 
 import colstore
+from colstore import testing
 from colstore.reader import _make_dataframe_no_consolidate
 
 drop_pagecache_softly = _c.drop_pagecache
@@ -45,16 +46,8 @@ drop_pagecache_softly = _c.drop_pagecache
 def make_store(td: str, name: str, n_rows: int, n_cols: int, dtypes) -> Path:
     """Materialize a store with `n_cols` columns cycling through `dtypes`."""
     path = Path(td) / name
-    rng = np.random.default_rng(0)
-    columns = {}
-    for i in range(n_cols):
-        dtype = dtypes[i % len(dtypes)]
-        if np.issubdtype(dtype, np.floating):
-            arr = rng.standard_normal(n_rows).astype(dtype)
-        else:
-            arr = rng.integers(0, 10_000, size=n_rows, dtype=dtype)
-        columns[f"c{i:03d}"] = arr
-    colstore.store(columns, str(path), show_progress=False)
+    spec = tuple(np.dtype(d).str for d in dtypes)
+    testing.make_store(path, rows=n_rows, cols=n_cols, dtype=spec, seed=0).close()
     return path
 
 
