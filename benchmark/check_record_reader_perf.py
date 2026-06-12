@@ -65,10 +65,6 @@ def _make_file(path: Path, n_rows: int, n_records: int, dtype: np.dtype) -> None
     write_record_file(path, [("x", dtype.str)], records)
 
 
-def _best(fn, repeat: int, warmup: int) -> float:
-    return _c.best_time(fn, repeat=repeat, warmup=warmup)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     _c.add_common_args(
@@ -119,26 +115,20 @@ def main() -> None:
     ]
     for pattern, selector in patterns:
         print(f"---- pattern: {pattern} ----")
-        header = f"{'records':<10} {'wall ms':>10}  {'vs R=1':>8}"
-        print(header)
-        print("-" * len(header))
-
-        # Baseline: R=1 (post-compaction). All other counts compared against it.
-        ds_baseline = ColStoreReader(paths[1])
-        assert ds_baseline._is_multi_record is False, "R=1 should take the fast path"
-        t_baseline = _best(
-            lambda d=ds_baseline, s=selector: d[s, "x"].array(), args.repeat, args.warmup
-        )
-        ds_baseline.close()
-        print(f"{'R=1':<10} {t_baseline * 1000:>10.3f}  {'1.00x':>8}")
-
+        # R=1 (post-compaction, fast path) is the baseline; record layouts are
+        # compared against it reading the same selector.
+        readers = {1: ColStoreReader(paths[1])}
+        assert readers[1]._is_multi_record is False, "R=1 should take the fast path"
         for n_rec in args.record_counts:
-            ds = ColStoreReader(paths[n_rec])
-            assert ds._is_multi_record is True
-            t = _best(lambda d=ds, s=selector: d[s, "x"].array(), args.repeat, args.warmup)
+            readers[n_rec] = ColStoreReader(paths[n_rec])
+            assert readers[n_rec]._is_multi_record is True
+        specs = [
+            (f"R={r:<6}", lambda d=readers[r], s=selector: d[s, "x"].array())
+            for r in (1, *args.record_counts)
+        ]
+        _c.compare(specs, repeat=args.repeat, warmup=args.warmup, baseline=0)
+        for ds in readers.values():
             ds.close()
-            label = f"R={n_rec}"
-            print(f"{label:<10} {t * 1000:>10.3f}  {t / t_baseline:>7.2f}x")
         print()
 
 
