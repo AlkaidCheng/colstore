@@ -115,6 +115,65 @@ inline T load_unaligned(const std::uint8_t* address) {
   return value;
 }
 
+// --- Reciprocal division by a per-gather constant --------------------------
+//
+// The uniform-record kernels recover a record index as ``idx / rows_per_record``
+// for every element. ``rows_per_record`` is invariant across the whole gather,
+// so a runtime 64-bit integer division (~20-40 cycles on the target EPYC) is
+// pure waste: it loses to the generic route's branch-predicted binary search
+// over a cache-resident record table. Precomputing a magic reciprocal once
+// turns each division into a 64x64 high-multiply plus two shifts
+// (Granlund-Montgomery, the libdivide branchfull form). The divisor is a
+// positive row count and the dividend a non-negative row index, so unsigned
+// arithmetic is exact for the full int64 index range.
+struct UniformDivisor {
+  std::uint64_t magic = 0;
+  std::uint32_t shift = 0;
+  bool add = false;
+  bool shift_only = false;  // divisor is a power of two (incl. 1)
+};
+
+inline UniformDivisor make_uniform_divisor(std::uint64_t d) {
+  UniformDivisor r{};
+  const std::uint32_t floor_log2 = 63u - static_cast<std::uint32_t>(__builtin_clzll(d));
+  if ((d & (d - 1)) == 0) {
+    r.shift_only = true;
+    r.shift = floor_log2;
+    return r;
+  }
+  const __uint128_t num = static_cast<__uint128_t>(1) << (64 + floor_log2);
+  std::uint64_t proposed_m = static_cast<std::uint64_t>(num / d);
+  const std::uint64_t rem =
+      static_cast<std::uint64_t>(num - static_cast<__uint128_t>(proposed_m) * d);
+  const std::uint64_t e = d - rem;
+  if (e < (static_cast<std::uint64_t>(1) << floor_log2)) {
+    r.add = false;
+  } else {
+    proposed_m += proposed_m;
+    const std::uint64_t twice_rem = rem + rem;
+    if (twice_rem >= d || twice_rem < rem) {
+      proposed_m += 1;
+    }
+    r.add = true;
+  }
+  r.shift = floor_log2;
+  r.magic = proposed_m + 1;
+  return r;
+}
+
+inline std::uint64_t uniform_divide(std::uint64_t n, const UniformDivisor& d) {
+  if (d.shift_only) {
+    return n >> d.shift;
+  }
+  const std::uint64_t q =
+      static_cast<std::uint64_t>((static_cast<__uint128_t>(d.magic) * n) >> 64);
+  if (d.add) {
+    const std::uint64_t t = ((n - q) >> 1) + q;
+    return t >> d.shift;
+  }
+  return q >> d.shift;
+}
+
 // --- Policy-based gather core ----------------------------------------------
 //
 // gather_core holds the parallel + prefetch + store skeleton shared by the
@@ -647,11 +706,13 @@ void gather_multirecord_uniform_typed(const std::uint8_t* COLSTORE_RESTRICT base
                                  (n_records - 1) * record_stride_bytes +
                                  col_prefix_bytes * last_record_rows -
                                  last_first_row * itemsize;
+  const UniformDivisor rpr_div = make_uniform_divisor(static_cast<std::uint64_t>(rows_per_record));
   const auto offset_of = [&](std::int64_t idx) -> std::int64_t {
     if (idx >= last_first_row) {
       return last_base + idx * itemsize;
     }
-    const std::int64_t r = idx / rows_per_record;
+    const std::int64_t r =
+        static_cast<std::int64_t>(uniform_divide(static_cast<std::uint64_t>(idx), rpr_div));
     return full_base + r * per_record_step + idx * itemsize;
   };
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
@@ -699,11 +760,14 @@ void gather_multirecord_uniform_bins_typed(const std::uint8_t* COLSTORE_RESTRICT
                                  (n_records - 1) * record_stride_bytes +
                                  col_prefix_bytes * last_record_rows -
                                  last_first_row * itemsize;
+  const UniformDivisor rpr_div = make_uniform_divisor(static_cast<std::uint64_t>(rows_per_record));
   const auto offset_of = [&](std::int64_t idx) -> std::int64_t {
     if (idx >= last_first_row) {
       return last_base + idx * itemsize;
     }
-    return full_base + (idx / rows_per_record) * per_record_step + idx * itemsize;
+    const std::int64_t r =
+        static_cast<std::int64_t>(uniform_divide(static_cast<std::uint64_t>(idx), rpr_div));
+    return full_base + r * per_record_step + idx * itemsize;
   };
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -723,7 +787,7 @@ void gather_multirecord_uniform_bins_typed(const std::uint8_t* COLSTORE_RESTRICT
       r = n_records - 1;
       off = last_base + idx * itemsize;
     } else {
-      r = idx / rows_per_record;
+      r = static_cast<std::int64_t>(uniform_divide(static_cast<std::uint64_t>(idx), rpr_div));
       off = full_base + r * per_record_step + idx * itemsize;
     }
     bins[i] = static_cast<std::int32_t>(r);
