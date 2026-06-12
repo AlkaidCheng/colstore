@@ -38,6 +38,7 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
+from colstore import testing
 
 
 def _full_check(indices: np.ndarray) -> bool:
@@ -109,7 +110,7 @@ def run_bench(args: argparse.Namespace) -> None:
         rows = args.rows // n_records
         total = rows * n_records
         with tempfile.TemporaryDirectory() as tmp:
-            full = np.random.default_rng(2).standard_normal(total)
+            full = testing.make_columns(total, 1, names=("value",), seed=2)["value"]
             path = Path(tmp) / "s.cstore"
             with colstore.create(path) as writer:
                 for r in range(n_records):

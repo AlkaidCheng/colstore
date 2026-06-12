@@ -34,14 +34,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
+from colstore import testing
 
 SIZES = (1_000_000, 10_000_000, 100_000_000)  # f8 rows: 8 MB / 80 MB / 800 MB
 
 
 def check_correctness() -> None:
     with tempfile.TemporaryDirectory() as tmp:
-        rng = np.random.default_rng(0)
-        data = {"a": rng.standard_normal(100_000), "b": rng.standard_normal(100_000)}
+        data = testing.make_columns(100_000, 2, names=("a", "b"), seed=0)
         path = Path(tmp) / "z.cstore"
         with colstore.create(path) as writer:
             writer.write(data)
@@ -77,7 +77,7 @@ def run_bench(repeat: int) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / f"n{n}.cstore"
             with colstore.create(path) as writer:
-                writer.write({"a": np.random.default_rng(1).standard_normal(n)})
+                writer.write({"a": testing.make_columns(n, 1, names=("a",), seed=1)["a"]})
             dataset = colstore.open(path)
             dataset["a"].array(copy=False).sum()  # warm page cache
             t_call_copy = _best(lambda ds=dataset: ds["a"].array(), repeat)

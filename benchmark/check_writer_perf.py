@@ -16,6 +16,7 @@ import _common as _c
 import numpy as np
 
 import colstore
+from colstore import testing
 
 
 def _best(fn, repeat: int, warmup: int) -> float:
@@ -39,8 +40,7 @@ def main() -> None:
     tmpdir = args.tmpdir or Path(tempfile.mkdtemp(prefix="colstore_writer_bench"))
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    rng = np.random.default_rng(0)
-    data = rng.standard_normal(args.rows).astype(dtype)
+    data = testing.make_columns(args.rows, 1, dtype=args.dtype, seed=0)["c0"]
 
     print(f"Setup: {args.rows:,} rows of {dtype}")
     if args.skip_bench:

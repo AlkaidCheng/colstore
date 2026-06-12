@@ -33,6 +33,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import colstore
+from colstore import testing
 from colstore import writer as writer_mod
 
 REGIMES = (
@@ -49,11 +50,7 @@ REGIMES = (
 def check_correctness(n_columns: int) -> None:
     rng = np.random.default_rng(3)
     records = [
-        {
-            "a": rng.standard_normal(n),
-            "b": rng.integers(0, 100, n).astype(np.int32),
-            "c": rng.standard_normal(n).astype(np.float32),
-        }
+        testing.make_columns(n, 3, dtype=("f8", "i4", "f4"), names=("a", "b", "c"), rng=rng)
         for n in (50, 0, 1, 1000, 7)
     ]
     digests = {}
@@ -106,8 +103,7 @@ def run_bench(repeat: int, warmup: int, n_columns: int) -> None:
         base_dir = Path(base)
         for n_records, rows in REGIMES:
             pool = [
-                {f"c{j}": rng.standard_normal(rows) for j in range(n_columns)}
-                for _ in range(min(n_records, 50))
+                testing.make_columns(rows, n_columns, rng=rng) for _ in range(min(n_records, 50))
             ]
             seq_setup, seq_write = _make_write_spec(False, pool, n_records, base_dir)
             vec_setup, vec_write = _make_write_spec(True, pool, n_records, base_dir)
