@@ -36,6 +36,7 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
+from colstore import testing
 
 
 class _force_generic:
@@ -54,13 +55,9 @@ def _build_irregular_store(directory: Path, n_records: int, mean_rows: int, n_co
     rng = np.random.default_rng(0)
     rows = rng.integers(mean_rows // 2, mean_rows + mean_rows // 2, n_records)
     total = int(rows.sum())
-    full = {f"c{i}": rng.standard_normal(total) for i in range(n_columns)}
+    full = testing.make_columns(total, n_columns, rng=rng)
     path = directory / f"r{n_records}.cstore"
-    offset = 0
-    with colstore.create(path) as writer:
-        for rec_rows in rows.tolist():
-            writer.write({k: v[offset : offset + rec_rows] for k, v in full.items()})
-            offset += rec_rows
+    testing.write_columns(path, full, records=rows.tolist()).close()
     return path, full, total
 
 

@@ -26,7 +26,7 @@ import _common as _c
 import numpy as np
 
 import colstore
-from colstore import config
+from colstore import config, testing
 
 _REPEAT, _WARMUP = 5, 2
 
@@ -46,9 +46,7 @@ def bench(label, fn, *, repeat=None, warmup=None, drop_cache_paths=None):
 def make_store(td: str, name: str, n_rows: int, n_cols: int, dtype) -> Path:
     """Materialize a store with `n_cols` columns of `n_rows` rows."""
     path = Path(td) / name
-    arr = np.arange(n_rows, dtype=dtype)
-    cols = {f"c{i}": arr for i in range(n_cols)}
-    colstore.store(cols, str(path), show_progress=False)
+    testing.make_store(path, rows=n_rows, cols=n_cols, dtype=np.dtype(dtype).str, seed=0).close()
     return path
 
 
