@@ -59,18 +59,13 @@ __all__ = [
     "cpp_available",
     "drop_pagecache",
     "machine_fingerprint",
-    "make_store",
     "max_threads",
     "peak_thread_watcher",
     "profile",
     "profile_interleaved",
-    "random_column",
     "run_script",
     "scaled_rows",
-    "standard_columns",
     "time_stats",
-    "uniform_rows",
-    "write_multirecord",
     "write_summary",
 ]
 
@@ -245,55 +240,6 @@ def apply_runtime_config(args: argparse.Namespace) -> None:
 def scaled_rows(n: int, args: argparse.Namespace) -> int:
     """``n`` multiplied by ``--scale`` (1.0 when the flag is absent), as an int."""
     return int(n * getattr(args, "scale", 1.0))
-
-
-# ---- Synthetic data and stores ----------------------------------------------
-
-
-def random_column(rng: np.random.Generator, n: int, dtype: Any) -> np.ndarray:
-    """A length-``n`` column of ``dtype`` with representative random values."""
-    dt = np.dtype(dtype)
-    if dt.kind == "f":
-        return rng.standard_normal(n).astype(dt)
-    info = np.iinfo(dt)
-    return rng.integers(info.min // 2, info.max // 2, size=n, dtype=np.int64).astype(dt)
-
-
-def standard_columns(rng: np.random.Generator, n: int) -> dict[str, np.ndarray]:
-    """An f8/f4/i4/i2 column set, the default multi-column workload."""
-    return {
-        "f8": random_column(rng, n, np.float64),
-        "f4": random_column(rng, n, np.float32),
-        "i4": random_column(rng, n, np.int32),
-        "i2": random_column(rng, n, np.int16),
-    }
-
-
-def uniform_rows(total: int, n_records: int) -> list[int]:
-    """Split ``total`` rows into ``n_records`` near-equal records."""
-    per = total // n_records
-    rows = [per] * (n_records - 1)
-    rows.append(total - per * (n_records - 1))
-    return rows
-
-
-def write_multirecord(
-    path: Path, columns: dict[str, np.ndarray], rows_per_record: list[int]
-) -> None:
-    """Stream ``columns`` into ``path`` as one record per ``rows_per_record`` entry."""
-    offset = 0
-    with colstore.create(path) as writer:
-        for n in rows_per_record:
-            writer.write({k: v[offset : offset + n] for k, v in columns.items()})
-            offset += n
-
-
-def make_store(
-    path: Path, columns: dict[str, np.ndarray], rows_per_record: list[int]
-) -> colstore.ColStoreReader:
-    """Build a multi-record store and return an open reader for it."""
-    write_multirecord(path, columns, rows_per_record)
-    return colstore.open(path)
 
 
 # ---- Result records ---------------------------------------------------------

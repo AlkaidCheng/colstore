@@ -35,7 +35,7 @@ import numpy as np
 from _common import Result, check_equal, time_stats
 
 import colstore
-from colstore import config
+from colstore import config, testing
 from colstore import reader as reader_mod
 
 _WARMUP = 1  # warmup passes discarded before timing; set from --warmup in main
@@ -79,7 +79,9 @@ def _measure(
 
 
 def scenario_write(results: list[Result], rng, total: int, *, repeat: int, gate: bool, bench: bool):
-    cols = C.standard_columns(rng, total)
+    cols = testing.make_columns(
+        total, 4, dtype=("f8", "f4", "i4", "i2"), names=("f8", "f4", "i4", "i2"), rng=rng
+    )
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "w.cstore"
         if gate:
@@ -101,7 +103,7 @@ def scenario_write(results: list[Result], rng, total: int, *, repeat: int, gate:
 def scenario_single_record_fancy(
     results: list[Result], rng, total: int, k: int, *, repeat: int, gate: bool, bench: bool
 ):
-    cols = {"f8": C.random_column(rng, total, np.float64)}
+    cols = testing.make_columns(total, 1, dtype="f8", names=("f8",), rng=rng)
     indices = rng.integers(0, total, size=k).astype(np.int64)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "s.cstore"
@@ -142,13 +144,15 @@ def scenario_single_record_fancy(
 def scenario_multirecord_fancy(
     results: list[Result], rng, total: int, k: int, n_records_list, *, repeat: int, gate, bench
 ):
-    full = C.random_column(rng, total, np.float64)
+    full = testing.make_columns(total, 1, dtype="f8", rng=rng)["c0"]
     indices = rng.integers(0, total, size=k).astype(np.int64)
     sorted_idx = np.sort(indices)
     for n_records in n_records_list:
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "m.cstore"
-            C.write_multirecord(path, {"f8": full}, C.uniform_rows(total, n_records))
+            testing.write_columns(
+                path, {"f8": full}, records=testing.uniform_record_rows(total, n_records)
+            ).close()
             ds = colstore.open(path)
             try:
                 if gate:
@@ -183,11 +187,15 @@ def scenario_multirecord_fancy(
 def scenario_uniform_vs_generic(
     results: list[Result], rng, total: int, k: int, n_records: int, *, repeat, gate, bench
 ):
-    cols = C.standard_columns(rng, total)
+    cols = testing.make_columns(
+        total, 4, dtype=("f8", "f4", "i4", "i2"), names=("f8", "f4", "i4", "i2"), rng=rng
+    )
     indices = rng.integers(0, total, size=k).astype(np.int64)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "u.cstore"
-        C.write_multirecord(path, cols, [total // n_records] * n_records)  # exactly uniform
+        testing.write_columns(
+            path, cols, records=[total // n_records] * n_records
+        ).close()  # exactly uniform
         ds = colstore.open(path)
         try:
             if gate:
@@ -228,16 +236,18 @@ def scenario_uniform_vs_generic(
 def scenario_multicolumn_bin_reuse(
     results: list[Result], rng, total: int, k: int, n_records: int, *, repeat, gate, bench
 ):
-    cols = C.standard_columns(rng, total)
+    cols = testing.make_columns(
+        total, 4, dtype=("f8", "f4", "i4", "i2"), names=("f8", "f4", "i4", "i2"), rng=rng
+    )
     names = list(cols)
     indices = rng.integers(0, total, size=k).astype(np.int64)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "mc.cstore"
         # Irregular sizes so the generic bin-reuse route is exercised.
-        rows = C.uniform_rows(total, n_records)
+        rows = testing.uniform_record_rows(total, n_records)
         rows[0] += 1
         rows[-1] -= 1
-        C.write_multirecord(path, cols, rows)
+        testing.write_columns(path, cols, records=rows).close()
         ds = colstore.open(path)
         try:
             if gate:
@@ -273,15 +283,17 @@ def scenario_multicolumn_bin_reuse(
 def scenario_record_base(
     results: list[Result], rng, total: int, k: int, n_records: int, *, repeat, gate, bench
 ):
-    cols = C.standard_columns(rng, total)
+    cols = testing.make_columns(
+        total, 4, dtype=("f8", "f4", "i4", "i2"), names=("f8", "f4", "i4", "i2"), rng=rng
+    )
     names = list(cols)
     indices = rng.integers(0, total, size=k).astype(np.int64)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "rb.cstore"
-        rows = C.uniform_rows(total, n_records)
+        rows = testing.uniform_record_rows(total, n_records)
         rows[0] += 1
         rows[-1] -= 1
-        C.write_multirecord(path, cols, rows)
+        testing.write_columns(path, cols, records=rows).close()
         ds = colstore.open(path)
         try:
             if gate:
@@ -318,10 +330,12 @@ def scenario_record_base(
 def scenario_strided(
     results: list[Result], rng, total: int, n_records: int, step: int, *, repeat, gate, bench
 ):
-    full = C.random_column(rng, total, np.float64)
+    full = testing.make_columns(total, 1, dtype="f8", rng=rng)["c0"]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "st.cstore"
-        C.write_multirecord(path, {"f8": full}, C.uniform_rows(total, n_records))
+        testing.write_columns(
+            path, {"f8": full}, records=testing.uniform_record_rows(total, n_records)
+        ).close()
         ds = colstore.open(path)
         try:
             arange_idx = np.arange(*slice(None, None, step).indices(total), dtype=np.int64)
@@ -358,10 +372,12 @@ def scenario_strided(
 def scenario_mask_native(
     results: list[Result], rng, total: int, n_records: int, densities, *, repeat, gate, bench
 ):
-    full = C.random_column(rng, total, np.float64)
+    full = testing.make_columns(total, 1, dtype="f8", rng=rng)["c0"]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "mk.cstore"
-        C.write_multirecord(path, {"f8": full}, C.uniform_rows(total, n_records))
+        testing.write_columns(
+            path, {"f8": full}, records=testing.uniform_record_rows(total, n_records)
+        ).close()
         ds = colstore.open(path)
         try:
             for density in densities:
@@ -403,11 +419,13 @@ def scenario_mask_native(
 def scenario_range_copy(
     results: list[Result], rng, total: int, n_records: int, *, repeat, gate, bench
 ):
-    full = C.random_column(rng, total, np.float64)
+    full = testing.make_columns(total, 1, dtype="f8", rng=rng)["c0"]
     lo, hi = total // 4, total // 4 + total // 2
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "rc.cstore"
-        C.write_multirecord(path, {"f8": full}, C.uniform_rows(total, n_records))
+        testing.write_columns(
+            path, {"f8": full}, records=testing.uniform_record_rows(total, n_records)
+        ).close()
         ds = colstore.open(path)
         try:
             arange_idx = np.arange(lo, hi, dtype=np.int64)
@@ -441,7 +459,7 @@ def scenario_range_copy(
 
 
 def scenario_zero_copy(results: list[Result], rng, total: int, *, repeat, gate, bench):
-    cols = {"f8": C.random_column(rng, total, np.float64)}
+    cols = testing.make_columns(total, 1, dtype="f8", names=("f8",), rng=rng)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "z.cstore"
         colstore.store(cols, path, mode="recreate", show_progress=False).close()  # single record
@@ -478,7 +496,9 @@ def scenario_zero_copy(results: list[Result], rng, total: int, *, repeat, gate, 
 def scenario_frame(results: list[Result], rng, total: int, *, repeat, gate, bench):
     import pandas as pd
 
-    cols = C.standard_columns(rng, total)
+    cols = testing.make_columns(
+        total, 4, dtype=("f8", "f4", "i4", "i2"), names=("f8", "f4", "i4", "i2"), rng=rng
+    )
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "f.cstore"
         colstore.store(cols, path, mode="recreate", show_progress=False).close()
