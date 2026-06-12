@@ -16,6 +16,7 @@ from typing import NamedTuple
 import numpy as np
 
 import colstore
+from colstore import testing
 
 
 class Layout(NamedTuple):
@@ -109,33 +110,23 @@ def build_uniform_layout(
     return UniformLayout(buf, column, rsr, rsb, nrr, stride, col_prefix_rows, total)
 
 
-def standard_columns(total: int, seed: int) -> dict[str, np.ndarray]:
-    """The f8/f4/i2 column trio used by the routing stores."""
-    rng = np.random.default_rng(seed)
-    return {
-        "f8": rng.standard_normal(total),
-        "f4": rng.standard_normal(total).astype(np.float32),
-        "i2": rng.integers(-(2**14), 2**14, total).astype(np.int16),
-    }
-
-
 def write_records(path: Path, columns: dict[str, np.ndarray], rows_per_record) -> None:
     """Stream ``columns`` into ``path`` as one record per entry of
-    ``rows_per_record`` (slicing each column in order)."""
-    offset = 0
-    with colstore.create(path) as writer:
-        for rows in rows_per_record:
-            writer.write({k: v[offset : offset + rows] for k, v in columns.items()})
-            offset += rows
+    ``rows_per_record``. Thin wrapper over :func:`colstore.testing.write_columns`."""
+    testing.write_columns(path, columns, records=list(rows_per_record)).close()
 
 
 def write_standard_store(tmp_path, rows_per_record, seed: int, name: str = "store"):
-    """Write a multi-record store of :func:`standard_columns`.
+    """Write a multi-record store of the standard f8/f4/i2 routing columns.
 
-    Returns ``(path, full_columns, total_rows)``.
+    Returns ``(path, full_columns, total_rows)``. The columns come from
+    :func:`colstore.testing.make_columns`, so store and ground truth share one
+    reproducible source.
     """
     total = sum(rows_per_record)
-    full = standard_columns(total, seed)
+    full = testing.make_columns(
+        total, 3, dtype=("f8", "f4", "i2"), names=("f8", "f4", "i2"), seed=seed
+    )
     path = tmp_path / f"{name}.cstore"
     write_records(path, full, rows_per_record)
     return path, full, total

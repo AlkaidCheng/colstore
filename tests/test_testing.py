@@ -23,6 +23,32 @@ def test_make_columns_shape_names_and_dtype():
         assert arr.dtype == np.dtype("float32")
 
 
+def test_make_columns_custom_names():
+    cols = testing.make_columns(64, 3, dtype=("f8", "f4", "i2"), names=("f8", "f4", "i2"), seed=1)
+    assert list(cols) == ["f8", "f4", "i2"]
+    assert cols["f4"].dtype == np.dtype("f4")
+
+
+def test_make_columns_rejects_bad_names():
+    with pytest.raises(ValueError):
+        testing.make_columns(10, 2, names=("a",))  # wrong length
+    with pytest.raises(ValueError):
+        testing.make_columns(10, 2, names=("a", "a"))  # not unique
+
+
+def test_make_columns_rng_threads_one_stream():
+    # Drawing two batches from one rng matches drawing four from a fresh rng
+    # of the same seed -- i.e. rng= threads a single stream across calls.
+    rng = np.random.default_rng(7)
+    first = testing.make_columns(50, 2, rng=rng)
+    second = testing.make_columns(50, 2, rng=rng)
+    combined = testing.make_columns(50, 4, seed=7)
+    assert np.array_equal(first["c0"], combined["c0"])
+    assert np.array_equal(first["c1"], combined["c1"])
+    assert np.array_equal(second["c0"], combined["c2"])
+    assert np.array_equal(second["c1"], combined["c3"])
+
+
 def test_make_columns_is_reproducible_by_seed():
     a = testing.make_columns(500, 2, dtype="int32", seed=42)
     b = testing.make_columns(500, 2, dtype="int32", seed=42)
