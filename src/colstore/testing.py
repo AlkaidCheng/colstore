@@ -69,21 +69,36 @@ def make_columns(
     *,
     dtype: str | Sequence[str] = "float64",
     seed: int = 0,
+    names: Sequence[str] | None = None,
+    rng: np.random.Generator | None = None,
 ) -> dict[str, NDArray[Any]]:
     """Build ``cols`` reproducible columns of ``rows`` rows each.
 
     ``dtype`` is a single dtype applied to every column, or a sequence cycled
     across the columns (column ``i`` uses ``dtype[i % len(dtype)]``), so mixed
-    layouts like ``("f8", "f4", "i4", "i2")`` are a single call. Columns are
-    named ``c0`` .. ``c{cols-1}`` and the result is deterministic in ``seed``.
+    layouts like ``("f8", "f4", "i4", "i2")`` are a single call.
+
+    Columns are named ``c0`` .. ``c{cols-1}`` unless ``names`` overrides them
+    (which must have length ``cols`` and be unique). The data is drawn from
+    ``rng`` when given -- so a caller can thread one generator across several
+    calls -- otherwise from ``numpy.random.default_rng(seed)`` (``seed`` is
+    ignored when ``rng`` is supplied).
     """
     if rows < 0:
         raise ValueError("rows must be >= 0")
     if cols < 1:
         raise ValueError("cols must be >= 1")
+    if names is None:
+        column_names = [f"c{i}" for i in range(cols)]
+    else:
+        column_names = list(names)
+        if len(column_names) != cols:
+            raise ValueError(f"names has {len(column_names)} entries, expected cols={cols}")
+        if len(set(column_names)) != cols:
+            raise ValueError("names must be unique")
     dtypes = _resolve_dtypes(dtype, cols)
-    rng = np.random.default_rng(seed)
-    return {f"c{i}": _random_column(rng, rows, dtypes[i]) for i in range(cols)}
+    generator = rng if rng is not None else np.random.default_rng(seed)
+    return {column_names[i]: _random_column(generator, rows, dtypes[i]) for i in range(cols)}
 
 
 def uniform_record_rows(total: int, records: int) -> list[int]:
