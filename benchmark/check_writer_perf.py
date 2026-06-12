@@ -19,10 +19,6 @@ import colstore
 from colstore import testing
 
 
-def _best(fn, repeat: int, warmup: int) -> float:
-    return _c.best_time(fn, repeat=repeat, warmup=warmup)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     _c.add_common_args(
@@ -45,8 +41,6 @@ def main() -> None:
     print(f"Setup: {args.rows:,} rows of {dtype}")
     if args.skip_bench:
         return
-    print(f"{'records':<10} {'wall ms':>10}  {'us/record':>12}  {'rows/record':>14}")
-    print("-" * 55)
 
     for n_rec in args.record_counts:
         chunk = args.rows // n_rec
@@ -61,9 +55,12 @@ def main() -> None:
                     e = (i + 1) * c if i < nr - 1 else args.rows
                     w.write({"x": data[s:e]})
 
-        t = _best(write_all, args.repeat, args.warmup)
-        us_per_record = t * 1e6 / n_rec
-        print(f"R={n_rec:<8} {t * 1000:>10.3f}  {us_per_record:>11.2f}   {chunk:>14,}")
+        result = _c.profile(
+            write_all, repeat=args.repeat, warmup=args.warmup, label=f"R={n_rec:<6}"
+        )
+        print(
+            f"{result.report()}  {result.wall_ms * 1000 / n_rec:.1f}us/record  {chunk:,} rows/rec"
+        )
 
 
 if __name__ == "__main__":
