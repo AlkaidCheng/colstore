@@ -14,10 +14,10 @@ chosen from measurements on the *target* host rather than guessed:
 Run on the deployment hardware:
 
     python benchmark/sweep_prefetch_distance.py
-    python benchmark/sweep_prefetch_distance.py --threads 8   # at a real cap
+    python benchmark/sweep_prefetch_distance.py --thread 8   # at a real cap
 
 Single-threaded by default so the per-element behavior is isolated; with
---threads the sweep runs at that thread cap, which shifts the knee (each
+--thread the sweep runs at that thread cap, which shifts the knee (each
 thread sees a fraction of the loop, but the same memory latency).
 """
 
@@ -107,7 +107,7 @@ def sweep_multirecord(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--threads", type=int, default=1, help="kernel thread cap")
+    parser.add_argument("--thread", type=int, default=1, help="kernel thread cap")
     parser.add_argument("--repeat", type=int, default=15)
     parser.add_argument(
         "--big-rows",
@@ -118,20 +118,20 @@ def main() -> None:
     args = parser.parse_args()
 
     header = "".join(f"     d{d:<3}" for d in DISTANCES)
-    print(f"Prefetch distance sweep (threads={args.threads}, best-of-{args.repeat}, ms)")
+    print(f"Prefetch distance sweep (thread={args.thread}, best-of-{args.repeat}, ms)")
     print(f"  {'regime':<34}{header}")
 
     # Cache-resident-ish: 2M f8 = 16 MB (fits many L3s). Prefetch is expected
     # to matter little here; d0 may even win.
-    sweep_single_record(2_000_000, 1_000_000, args.threads, args.repeat, "16MB src,")
-    sweep_multirecord(2_000_000, 1000, 1_000_000, args.threads, args.repeat, "16MB src,")
+    sweep_single_record(2_000_000, 1_000_000, args.thread, args.repeat, "16MB src,")
+    sweep_multirecord(2_000_000, 1000, 1_000_000, args.thread, args.repeat, "16MB src,")
 
     # DRAM-bound: well past any L3. This is the regime the distance exists
     # for; the knee here is the number that should drive the default.
     sweep_single_record(
         args.big_rows,
         2_000_000,
-        args.threads,
+        args.thread,
         args.repeat,
         f"{args.big_rows * 8 // 1_000_000}MB src,",
     )
@@ -139,7 +139,7 @@ def main() -> None:
         args.big_rows,
         1000,
         2_000_000,
-        args.threads,
+        args.thread,
         args.repeat,
         f"{args.big_rows * 8 // 1_000_000}MB src,",
     )
