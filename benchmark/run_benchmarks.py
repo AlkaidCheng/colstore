@@ -23,6 +23,7 @@ vs lowered across density, zero-copy vs copy.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import tempfile
 from collections.abc import Callable, Iterator
@@ -36,6 +37,8 @@ from _common import Result, check_equal, time_stats
 import colstore
 from colstore import config
 from colstore import reader as reader_mod
+
+_WARMUP = 1  # warmup passes discarded before timing; set from --warmup in main
 
 
 @contextlib.contextmanager
@@ -63,7 +66,9 @@ def _measure(
     repeat: int,
     rows: int | None = None,
 ) -> Result:
-    res = Result.from_stats(scenario, variant, params, time_stats(thunk, repeat=repeat), rows=rows)
+    res = Result.from_stats(
+        scenario, variant, params, time_stats(thunk, repeat=repeat, warmup=_WARMUP), rows=rows
+    )
     results.append(res)
     return res
 
@@ -523,8 +528,11 @@ def _print_table(results: list[Result]) -> None:
 
 
 def main() -> None:
-    parser = C.make_parser(__doc__ or "")
+    parser = argparse.ArgumentParser(description=__doc__ or "")
+    C.add_common_args(parser, repeat=10, scale=True, json=True)
     args = parser.parse_args()
+    global _WARMUP
+    _WARMUP = args.warmup
     scale = args.scale
     repeat = args.repeat
     gate = not args.skip_correctness

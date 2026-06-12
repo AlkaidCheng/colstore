@@ -16,6 +16,7 @@ Two questions:
 from __future__ import annotations
 
 import argparse
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -34,17 +35,21 @@ def _read_fn(ds: Any, idx: np.ndarray) -> Callable[[], Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=2_000_000)
-    parser.add_argument("--n-indices", type=int, default=200_000)
-    parser.add_argument("--record-counts", type=int, nargs="+", default=[10, 100, 1000])
-    parser.add_argument("--repeats", type=int, default=5, help="interleaved A/B rounds (n_iter)")
-    parser.add_argument("--warmup", type=int, default=2, help="warmup passes per variant")
-    parser.add_argument("--dtype", default="float32")
-    parser.add_argument("--tmpdir", default="/tmp/colstore_compact_bench")
+    _c.add_common_args(
+        parser,
+        repeat=5,
+        warmup=2,
+        rows=2_000_000,
+        indices=200_000,
+        record_counts=[10, 100, 1000],
+        dtype="float32",
+        tmpdir=True,
+        skip_correctness=False,
+    )
     args = parser.parse_args()
 
     dtype = np.dtype(args.dtype)
-    tmpdir = Path(args.tmpdir)
+    tmpdir = args.tmpdir or Path(tempfile.mkdtemp(prefix="colstore_compact_bench"))
     tmpdir.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(0)
     data = rng.standard_normal(args.rows).astype(dtype)
@@ -54,9 +59,9 @@ def main() -> None:
         f"\nSetup: {args.rows:,} rows of {dtype}, "
         f"file size ~{args.rows * bytes_per_row / 1e6:.1f} MB"
     )
-    print(f"Indices: {args.n_indices:,} (unsorted-fancy is the worst-case pattern)")
+    print(f"Indices: {args.indices:,} (unsorted-fancy is the worst-case pattern)")
 
-    unsorted_idx = rng.permutation(args.rows)[: args.n_indices].astype(np.int64)
+    unsorted_idx = rng.permutation(args.rows)[: args.indices].astype(np.int64)
 
     for n_rec in args.record_counts:
         print(f"\n---- R = {n_rec} records ----")
@@ -84,35 +89,26 @@ def main() -> None:
         mb = info_before.file_size / 1e6
         print(f"  compact: {t_compact * 1000:7.2f} ms ({mb / t_compact:.1f} MB/s throughput)")
 
-        # Read perf: BEFORE vs AFTER, timed *interleaved* (A/B/A/B) rather than
-        # as two sequential blocks. Timing them in sequence -- all BEFORE
-        # samples, then all AFTER samples, on two separately written files --
-        # lets first-touch NUMA placement and page-cache warmth differ between
-        # the two measurements, which at large sizes (where both paths are
-        # bandwidth-bound and effectively at parity) manufactured misleading
-        # sub-1x ratios. bench_interleaved warms both readers first, then
-        # alternates them each round, keeping cache and scheduler state
-        # comparable; it also reports cpu/wall ratio, thread count, and
-        # page-fault deltas so a near-1x ratio can be read as genuine parity
-        # rather than noise.
+        # Read perf: BEFORE vs AFTER, timed *interleaved* (A/B/A/B) via
+        # compare() rather than as two sequential blocks. Timing them in
+        # sequence -- all BEFORE samples, then all AFTER samples, on two
+        # separately written files -- lets first-touch NUMA placement and
+        # page-cache warmth differ between the two measurements, which at large
+        # sizes (where both paths are bandwidth-bound and at parity)
+        # manufactured misleading sub-1x ratios. compare() warms both readers,
+        # alternates them each round, and reports cpu/wall ratio, threads, and
+        # page-fault deltas so a near-1x ratio reads as genuine parity.
         with colstore.open(path) as ds_before, colstore.open(compacted) as ds_after:
-            before, after = _c.bench_interleaved(
+            before, after = _c.compare(
                 [
-                    "unsorted-fancy read BEFORE (fragmented)",
-                    "unsorted-fancy read AFTER  (compacted) ",
+                    ("unsorted-fancy read BEFORE (fragmented)", _read_fn(ds_before, unsorted_idx)),
+                    ("unsorted-fancy read AFTER  (compacted) ", _read_fn(ds_after, unsorted_idx)),
                 ],
-                [
-                    _read_fn(ds_before, unsorted_idx),
-                    _read_fn(ds_after, unsorted_idx),
-                ],
-                n_iter=args.repeats,
-                n_warmup=args.warmup,
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
             )
-        print(before.report())
-        print(after.report())
-        best_before = min(r.wall_ms for r in before.runs)
-        best_after = min(r.wall_ms for r in after.runs)
-        speedup = best_before / best_after if best_after > 0 else float("inf")
+        speedup = before.wall_ms / after.wall_ms if after.wall_ms > 0 else float("inf")
         print(f"  -> compaction speedup on this pattern: {speedup:.2f}x (best wall / best wall)")
 
 
