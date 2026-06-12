@@ -1,78 +1,46 @@
 """Robust benchmark for the NUMA optimization (writer + reader sides).
 
-This benchmark is the fourth revision in the NUMA series. The earlier
-issue was that opening a fresh ``ColStoreReader`` inside the timed
-region dragged ~30 ms of setup cost into every wall-time measurement;
-the version before this fixed that but had a second bug: ``posix_
-fadvise(DONTNEED)`` was being called while readers were still open
-across the eviction. The ``np.memmap`` references kept the pages
-pinned in the cache and the "cold" measurements were actually warm
-(seen in the field: writer=local "cold" 56 ms < writer=local "warm"
-81 ms -- physically impossible if eviction worked).
+Cold-cache benchmarking has a subtle pitfall: ``posix_fadvise(DONTNEED)`` is
+advisory and the kernel ignores it for any page that still has a live
+reference. If a ``ColStoreReader`` is open across the eviction, its
+``np.memmap`` pins the pages and the "cold" reads are actually warm (the
+field symptom was writer=local "cold" 56 ms < "warm" 81 ms -- impossible if
+eviction worked). The cold A/B here therefore runs through ``_cold_compare``:
+each variant's setup closes the prior reader, ``gc.collect()``s, evicts the
+file's pages with **no reader open**, then reopens under the policy, so the
+timed gather faults pages fresh. The reader open is outside the timed region
+(its cost is policy-independent). ``_warn_if_not_cold`` watches the major-fault
+counter to surface incomplete eviction.
 
-This revision fixes the second bug via ``time_cold``: no reader is
-open across the eviction, ``gc.collect()`` is called to drop straggler
-references, and a fresh reader is allocated inside each measurement.
-``_warn_if_not_cold`` watches the major-fault counter to surface
-incomplete eviction.
+Cold A/B is reader-side, not writer-side: evicted pages are re-faulted by the
+faulting thread per its mempolicy, so writer-side placement is forgotten on
+eviction and only reader-side mbind controls cold re-fault distribution.
 
-The benchmark also makes one structural change: cold-cache A/B is
-now reader-side, not writer-side. Cold reads reallocate page-cache
-pages on the FAULTING thread per its mempolicy, not per the original
-writer's mempolicy. Writer-side placement is forgotten on eviction.
-The right A/B for cold reads is reader-side mbind, which controls
-how re-faulted pages get distributed; the original PR's reader-side
-mbind earns its place here. Writer-side cold A/B stays as a pin-test
-of the "evicted pages forget writer placement" claim.
+The scenarios:
 
-Three things this measures:
+  1. Writer-side A/B, WARM (headline): the same data written under "local" vs
+     "interleave", read with reader policy fixed local. Warm reads pick up
+     whatever pages the writer placed.
+  2. Reader-side A/B, COLD: one file (writer=local), read under each reader
+     policy after proper eviction; the VMA mempolicy governs re-fault placement.
+  3. Pin-tests: writer-side COLD (~noise -- evicted pages forget the writer);
+     reader-side WARM (~noise -- mbind cannot move resident pages).
+  4. End-to-end ds.dict()/ds.frame() under the default "auto" policy.
+  5. Low-concurrency regression check (workers=1), justifying the "local" opt-out.
 
-  1. Writer-side policy A/B, WARM cache (headline). Write the SAME
-     data twice -- once under ``"local"`` policy, once under
-     ``"interleave"`` -- then read each with the same reader policy.
-     Warm-cache reads pick up whatever pages the writer placed; this
-     is where the writer-side ``set_mempolicy`` from commit 4 shows
-     up in the numbers.
-
-  2. Reader-side policy A/B, COLD cache. Same file (writer=local),
-     read with each reader policy after proper eviction. The VMA
-     mempolicy governs where re-faulted pages get allocated.
-
-  3. Pin-tests:
-
-     * Writer-side cold A/B should be ~noise (evicted -> reallocated
-       by faulting thread, regardless of where the writer placed).
-     * Reader-side warm A/B should be ~noise (mbind cannot move
-       already-resident pages on a MAP_SHARED read mapping).
-
-  4. End-to-end ``ds.dict()`` / ``ds.frame()`` numbers under the
-     default ``"auto"`` policy so the user sees what the PR
-     delivers without any explicit config change.
-
-  5. Low-concurrency regression check (workers=1) so the ``"local"``
-     opt-out has empirical justification.
-
-For each scenario we report:
-
-  wall    : best-of-N wall-clock time (ms)
-  cpu     : best-of-N process CPU time (ms)
-  ratio   : cpu / wall (utilization)
-  threads : peak active thread count
-  faults  : (major, minor) page-fault delta
-
-Run with ``PYTHONPATH=src`` after building the extension.
+Run with ``PYTHONPATH=src`` after building the extension. ``--scale`` shrinks
+every store for a quick smoke run.
 """
 
 from __future__ import annotations
 
+import argparse
 import gc
 import os
 import sys
 import tempfile
-from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
 import _common as _c
 import numpy as np
@@ -80,98 +48,7 @@ import numpy as np
 import colstore
 from colstore import _numa, config
 
-Run = _c.Run
-Result = _c.RichResult
-time_call = _c.time_call
 drop_pagecache_softly = _c.drop_pagecache
-bench = _c.bench
-
-
-def time_cold(path: Path, gather_fn, *, drop_cache_paths: list[Path] | None = None) -> Run:
-    """One cold-cache measurement.
-
-    Cold-cache benchmarking has a subtle pitfall: ``posix_fadvise(
-    DONTNEED)`` is an advisory hint that the kernel ignores for any
-    page that still has live references. If a ``ColStoreReader`` is
-    open across the eviction, its ``np.memmap`` keeps the pages
-    pinned and the "cold" reads are actually warm. The original
-    cold scenario in check_numa.py made exactly this mistake and
-    reported writer=local at 56 ms warm vs 81 ms cold -- cold faster
-    than warm, which is physically impossible if eviction worked.
-
-    The fix is this helper: no reader is open during eviction. Each
-    cold measurement allocates a fresh reader inside the function
-    after the eviction, times only the gather (open is outside the
-    timed region by design; the few hundred microseconds it costs
-    are independent of NUMA policy), and closes the reader before
-    returning. ``gc.collect()`` after the close releases any stray
-    memmap references before the NEXT measurement evicts.
-
-    The major-fault count in the returned ``Run`` is the empirical
-    check: real cold reads of a 1 GB store should record thousands
-    of major faults. Zero major faults means the eviction was
-    declined by the kernel; ``_warn_if_not_cold`` surfaces that.
-    """
-    if drop_cache_paths is None:
-        drop_cache_paths = [path]
-    gc.collect()  # release any straggling memmap refs before evicting
-    drop_pagecache_softly(drop_cache_paths)
-
-    reader = colstore.open(str(path))
-    try:
-        return time_call(lambda: gather_fn(reader))
-    finally:
-        reader.close()
-        gc.collect()  # release the memmap before the next iteration's evict
-
-
-def bench_cold_pair(
-    pair_a: tuple[str, Path, Callable[[Any], Any]],
-    pair_b: tuple[str, Path, Callable[[Any], Any]],
-    *,
-    n_iter: int = 3,
-) -> tuple[Result, Result]:
-    """A/B cold benchmark: alternate A and B across n_iter iterations.
-
-    Each iteration measures A then B, with the target file's pages
-    evicted immediately before each measurement. Per-measurement
-    eviction (vs. evicting once at iteration start) means A's now-warm
-    cache state after its measurement doesn't influence B's cold
-    measurement -- the kernel sees clean per-file eviction signals.
-    """
-    label_a, path_a, fn_a = pair_a
-    label_b, path_b, fn_b = pair_b
-    result_a = Result(label=label_a)
-    result_b = Result(label=label_b)
-    for _ in range(n_iter):
-        result_a.runs.append(time_cold(path_a, fn_a))
-        result_b.runs.append(time_cold(path_b, fn_b))
-    return result_a, result_b
-
-
-def _warn_if_not_cold(result: Result) -> None:
-    """Print a warning if the major-fault count suggests the cache wasn't cold.
-
-    Real cold reads of a 1 GB file with readahead should record
-    hundreds to thousands of major faults. Zero majors across every
-    run of a "cold" scenario means ``posix_fadvise(DONTNEED)`` was
-    ignored -- either because the kernel declined the hint (rare),
-    or because some process / reference held the file open during
-    eviction (the bug fixed by ``time_cold``).
-    """
-    if not result.runs:
-        return
-    if all(run.major_pf == 0 for run in result.runs):
-        print(
-            f"  warning: '{result.label.strip()}' recorded 0 major page faults "
-            "across all runs; the page cache may not have been evicted, "
-            "so these numbers reflect warm reads, not true cold reads."
-        )
-
-
-def labeled(label: str, result: Result) -> Result:
-    result.label = label
-    return result
 
 
 @contextmanager
@@ -185,215 +62,229 @@ def policy_scope(policy):
 
 
 def write_store_under_policy(path: Path, columns: dict, policy: str) -> None:
-    """Write a fresh store at `path` with the given NUMA policy active.
-
-    The point of this benchmark is to compare files written under
-    different policies; this helper enforces that each variant gets
-    a clean write under exactly the policy it claims.
-    """
+    """Write a fresh store at ``path`` under the given NUMA policy."""
     if path.exists():
         path.unlink()
     with policy_scope(policy):
         colstore.store(columns, str(path), show_progress=False).close()
 
 
-def banner(s):
+def _warn_if_not_cold(result) -> None:
+    """Warn when a 'cold' result's best run logged no major faults.
+
+    Real cold reads of a large store record many major faults; zero means the
+    eviction was declined (kernel hint ignored, or a reference held the file
+    open during eviction) and the numbers reflect warm reads.
+    """
+    if result.major_pf == 0:
+        print(
+            f"  warning: '{result.label.strip()}' best run logged 0 major faults; "
+            "the cache may not have been evicted (warm, not cold)."
+        )
+
+
+def _cold_compare(specs, *, repeat: int, warmup: int):
+    """Cold-cache A/B over ``(label, path, reader_policy, gather_fn)`` specs.
+
+    Each variant's setup closes the prior reader, evicts the file with no
+    reader open, then reopens under the policy -- so the timed gather faults
+    pages fresh. Open is excluded from timing; it is policy-independent.
+    """
+    holders: list[dict] = [{} for _ in specs]
+
+    def make_setup(i: int):
+        _, path, policy, _ = specs[i]
+        holder = holders[i]
+
+        def setup() -> None:
+            if "reader" in holder:
+                holder["reader"].close()
+                del holder["reader"]
+            gc.collect()  # release the memmap before evicting
+            drop_pagecache_softly([path])
+            with policy_scope(policy):
+                holder["reader"] = colstore.open(str(path))
+
+        return setup
+
+    def make_fn(i: int):
+        gather_fn = specs[i][3]
+        holder = holders[i]
+        return lambda: gather_fn(holder["reader"])
+
+    pairs = [(specs[i][0], make_fn(i)) for i in range(len(specs))]
+    results = _c.compare(
+        pairs,
+        repeat=repeat,
+        warmup=warmup,
+        baseline=0,
+        setups=[make_setup(i) for i in range(len(specs))],
+    )
+    for holder in holders:
+        if "reader" in holder:
+            holder["reader"].close()
+    gc.collect()
+    for result in results:
+        _warn_if_not_cold(result)
+    return results
+
+
+def banner(s: str) -> None:
     print(f"\n=== {s} ===")
 
 
-def main():
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(
+        parser, repeat=5, warmup=2, rows=2_500_000, cols=50, scale=True, threads=True
+    )
+    args = parser.parse_args()
+    _c.apply_runtime_config(args)
+
     print("Environment:")
-    print(f"  os.cpu_count()              = {os.cpu_count()}")
-    print(f"  config.get_max_workers()    = {config.get_max_workers()}")
+    print(f"  os.cpu_count()                 = {os.cpu_count()}")
+    print(f"  config.get_max_workers()       = {config.get_max_workers()}")
     print(f"  config.get_gather_thread_cap() = {config.get_gather_thread_cap()}")
-    print(f"  _numa.is_available()        = {_numa.is_available()}")
-    print(f"  _numa.allowed_nodes()       = {_numa.allowed_nodes()}")
+    print(f"  _numa.is_available()           = {_numa.is_available()}")
+    print(f"  _numa.allowed_nodes()          = {_numa.allowed_nodes()}")
     if not _numa.is_available():
-        print()
-        print("  NOTE: NUMA optimization is a no-op on this host. The benchmark")
-        print("  will still run and exercise the code paths, but A/B numbers")
-        print("  will be within noise of each other. To see the actual win,")
-        print("  run on a multi-socket / multi-NPS Linux server.")
+        print(
+            "\n  NOTE: NUMA is a no-op on this host; A/B numbers will be within noise.\n"
+            "  Run on a multi-socket Linux server to see the actual win."
+        )
 
+    n_rows = _c.scaled_rows(args.rows, args)
+    n_cols = args.cols
+    total_gb = n_rows * n_cols * 8 / 1e9
     with tempfile.TemporaryDirectory() as td:
-        n_rows, n_cols = 2_500_000, 50
-        total_bytes = n_rows * n_cols * 8
-
-        # Two copies of the same data, written under different policies.
-        local_path = Path(td) / "store_written_under_local.cstore"
-        interleave_path = Path(td) / "store_written_under_interleave.cstore"
+        local_path = Path(td) / "store_local.cstore"
+        interleave_path = Path(td) / "store_interleave.cstore"
         rng = np.random.default_rng(0)
         cols = {f"c{i:02d}": rng.standard_normal(n_rows) for i in range(n_cols)}
-        print()
-        print("Writing two stores (one under each writer policy)...")
+        print(f"\nWriting two stores ({n_cols} x {n_rows:,} = {total_gb:.2f} GB each)...")
         write_store_under_policy(local_path, cols, "local")
         write_store_under_policy(interleave_path, cols, "interleave")
-        print(f"  {local_path.name}: written under policy=local")
-        print(f"  {interleave_path.name}: written under policy=interleave")
 
-        # ---- Writer-side A/B, warm cache: SAME reads on two files written
-        # under different writer policies. This is the headline measurement
-        # -- writer-side placement is what actually controls warm-cache
-        # gather throughput, because reader-side mbind cannot move pages
-        # that are already in the page cache (MAP_SHARED read mapping).
-        banner(f"WRITER-SIDE A/B (warm)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.dict()")
         local_reader = colstore.open(str(local_path))
         interleave_reader = colstore.open(str(interleave_path))
         try:
-            with policy_scope("local"):
-                # Reader policy fixed at "local" to isolate the writer-side
-                # effect. Whatever delta we see is attributable to where the
-                # writer placed the pages.
-                r_local = labeled(
-                    "writer=local      reader=local  ds.dict()",
-                    bench(lambda: local_reader.dict()),
-                )
-                r_inter = labeled(
-                    "writer=interleave reader=local  ds.dict()",
-                    bench(lambda: interleave_reader.dict()),
-                )
-            print(r_local.report())
-            print(r_inter.report())
+            # 1. Writer-side A/B, warm (headline). Reader policy fixed local so
+            #    the delta is attributable to where the writer placed pages.
+            for op_label, op in (
+                ("ds.dict()", lambda r: r.dict()),
+                ("ds.frame()", lambda r: r.frame()),
+            ):
+                banner(f"WRITER-SIDE A/B (warm)  {total_gb:.2f} GB  {op_label}")
+                with policy_scope("local"):
+                    _c.compare(
+                        [
+                            (
+                                f"writer=local      reader=local  {op_label}",
+                                lambda o=op: o(local_reader),
+                            ),
+                            (
+                                f"writer=interleave reader=local  {op_label}",
+                                lambda o=op: o(interleave_reader),
+                            ),
+                        ],
+                        repeat=args.repeat,
+                        warmup=args.warmup,
+                        baseline=0,
+                    )
 
-            banner(f"WRITER-SIDE A/B (warm)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.frame()")
+            # 3a. Writer-side A/B, COLD (pin-test: ~noise expected).
+            banner(f"WRITER-SIDE A/B (cold)  {total_gb:.2f} GB  ds.dict()")
+            _cold_compare(
+                [
+                    (
+                        "writer=local      reader=local  ds.dict() cold",
+                        local_path,
+                        "local",
+                        lambda r: r.dict(),
+                    ),
+                    (
+                        "writer=interleave reader=local  ds.dict() cold",
+                        interleave_path,
+                        "local",
+                        lambda r: r.dict(),
+                    ),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+            )
+            print("  (pin-test: expected ~noise -- evicted pages forget the writer's placement)")
+
+            # 2. Reader-side A/B, COLD (where reader-side mbind earns its place).
+            banner(f"READER-SIDE A/B (cold)  {total_gb:.2f} GB  ds.dict()")
+            _cold_compare(
+                [
+                    (
+                        "reader=local      writer=local  ds.dict() cold",
+                        local_path,
+                        "local",
+                        lambda r: r.dict(),
+                    ),
+                    (
+                        "reader=interleave writer=local  ds.dict() cold",
+                        local_path,
+                        "interleave",
+                        lambda r: r.dict(),
+                    ),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+            )
+            print("  (cold: reader-side mbind controls re-fault allocation)")
+
+            # 3b. Reader-side A/B, WARM (pin-test: ~noise expected). Open each
+            #     reader under its policy once, then time warm reads.
+            banner(f"READER-SIDE A/B (warm)  {total_gb:.2f} GB  ds.dict()")
             with policy_scope("local"):
-                r_local = labeled(
-                    "writer=local      reader=local  ds.frame()",
-                    bench(lambda: local_reader.frame()),
+                warm_local = colstore.open(str(local_path))
+            with policy_scope("interleave"):
+                warm_inter = colstore.open(str(local_path))
+            try:
+                _c.compare(
+                    [
+                        ("reader=local      writer=local  ds.dict()", lambda: warm_local.dict()),
+                        ("reader=interleave writer=local  ds.dict()", lambda: warm_inter.dict()),
+                    ],
+                    repeat=args.repeat,
+                    warmup=args.warmup,
+                    baseline=0,
                 )
-                r_inter = labeled(
-                    "writer=interleave reader=local  ds.frame()",
-                    bench(lambda: interleave_reader.frame()),
-                )
-            print(r_local.report())
-            print(r_inter.report())
+            finally:
+                warm_local.close()
+                warm_inter.close()
+            print("  (pin-test: expected ~noise -- reader mbind cannot move warm pages)")
         finally:
             local_reader.close()
             interleave_reader.close()
 
-        # ---- Writer-side A/B, COLD cache (PIN-TEST: ~noise expected).
-        # On cold reads, writer-side placement is irrelevant: evicted pages
-        # are reallocated by the FAULTING thread according to its own
-        # mempolicy, not by whoever wrote the file originally. The page-
-        # cache placement decision happens fresh at re-fault time.
-        # This A/B should therefore land in noise. If it doesn't, our
-        # mental model of MAP_SHARED page placement is wrong and we need
-        # to revisit the diagnosis. The "evicted -> reallocated by
-        # faulting thread" claim is exactly what makes writer-side a
-        # warm-cache-only phenomenon.
-        banner(f"WRITER-SIDE A/B (cold)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.dict()")
-        with policy_scope("local"):
-            r_local, r_inter = bench_cold_pair(
-                (
-                    "writer=local      reader=local  ds.dict() cold",
-                    local_path,
-                    lambda ds: ds.dict(),
-                ),
-                (
-                    "writer=interleave reader=local  ds.dict() cold",
-                    interleave_path,
-                    lambda ds: ds.dict(),
-                ),
-            )
-        print(r_local.report())
-        print(r_inter.report())
-        print("  (pin-test: expected ~noise -- evicted pages forget the writer's placement)")
-        _warn_if_not_cold(r_local)
-        _warn_if_not_cold(r_inter)
-
-        # ---- Reader-side A/B, COLD cache (where reader-side mbind earns
-        # its place). On cold reads the page-cache allocation happens
-        # DURING the gather's read faults, and the VMA's mempolicy
-        # governs that allocation. This is the scenario where the
-        # original PR's reader-side mbind actually does work: cold reads
-        # of files written under "local" (or by external tools that
-        # didn't apply writer-side interleave) benefit from setting
-        # MPOL_INTERLEAVE on the read mapping so the re-faulted pages
-        # spread across nodes. Same file used for both runs; only the
-        # reader policy changes.
-        banner(f"READER-SIDE A/B (cold)  50 x 20 MB = {total_bytes / 1e9:.1f} GB  ds.dict()")
-        with policy_scope("local"):
-            r_off, _ = bench_cold_pair(
-                (
-                    "reader=local      writer=local  ds.dict() cold",
-                    local_path,
-                    lambda ds: ds.dict(),
-                ),
-                # bench_cold_pair always measures two; pair the second with
-                # a throwaway file so the per-iteration cadence is preserved.
-                # The second result is discarded.
-                ("(throwaway)", local_path, lambda ds: ds.dict()),
-                n_iter=3,
-            )
-        with policy_scope("interleave"):
-            r_on, _ = bench_cold_pair(
-                (
-                    "reader=interleave writer=local  ds.dict() cold",
-                    local_path,
-                    lambda ds: ds.dict(),
-                ),
-                ("(throwaway)", local_path, lambda ds: ds.dict()),
-                n_iter=3,
-            )
-        print(r_off.report())
-        print(r_on.report())
-        print("  (cold: reader-side mbind controls re-fault allocation)")
-        _warn_if_not_cold(r_off)
-        _warn_if_not_cold(r_on)
-
-        # ---- Reader-side A/B, WARM cache (PIN-TEST: ~noise expected).
-        # Kept from before the cold-methodology fix because it pins a
-        # different claim: mbind cannot move pages that are already in
-        # the page cache (MAP_SHARED read mapping). The writer placed
-        # them on whichever node serviced the I/O; reader-side mbind
-        # recorded a VMA policy but the kernel has nothing to do with
-        # it for already-resident pages. Expect ~noise here too.
-        banner("READER-SIDE A/B on writer=local file (warm)  ds.dict()")
-        with policy_scope("local"):
-            r_off = labeled(
-                "reader=local      writer=local  ds.dict()",
-                bench(lambda: colstore.open(str(local_path)).dict()),
-            )
-        with policy_scope("interleave"):
-            r_on = labeled(
-                "reader=interleave writer=local  ds.dict()",
-                bench(lambda: colstore.open(str(local_path)).dict()),
-            )
-        print(r_off.report())
-        print(r_on.report())
-        print("  (pin-test: expected ~noise -- reader mbind cannot move warm pages)")
-
-        # ---- End-to-end: what the user actually sees with config defaults.
-        # With config.set_numa_policy("auto") (the default), the writer
-        # interleaves at write time and the reader's mbind is a small
-        # cold-cache complement. This is the "after the PR lands, what do
-        # the workloads in question look like" number.
-        banner(f"END-TO-END default policy  50 x 20 MB = {total_bytes / 1e9:.1f} GB")
-        end_to_end_path = Path(td) / "end_to_end.cstore"
-        write_store_under_policy(end_to_end_path, cols, "auto")
+        # 4. End-to-end under the default "auto" policy.
+        banner(f"END-TO-END default policy  {total_gb:.2f} GB")
+        e2e_path = Path(td) / "end_to_end.cstore"
+        write_store_under_policy(e2e_path, cols, "auto")
         with policy_scope("auto"):
-            ds = colstore.open(str(end_to_end_path))
+            ds = colstore.open(str(e2e_path))
             try:
-                r_dict = labeled(
-                    "ds.dict()  writer=auto reader=auto",
-                    bench(lambda: ds.dict()),
-                )
-                r_frame = labeled(
-                    "ds.frame() writer=auto reader=auto",
-                    bench(lambda: ds.frame()),
+                _c.compare(
+                    [
+                        ("ds.dict()  writer=auto reader=auto", lambda: ds.dict()),
+                        ("ds.frame() writer=auto reader=auto", lambda: ds.frame()),
+                    ],
+                    repeat=args.repeat,
+                    warmup=args.warmup,
+                    baseline=0,
                 )
             finally:
                 ds.close()
-        print(r_dict.report())
-        print(r_frame.report())
 
-        # ---- Low-concurrency regression check. With only one consumer
-        # thread, "interleave" forces 7/8 remote loads on an 8-node host;
-        # writer-side and reader-side both can hurt slightly here. The
-        # "local" opt-out documented in set_numa_policy exists for this case.
-        banner("LOW-CONCURRENCY regression check (workers=1, 1 GB / 50-col)")
-        prev_workers = config.get_max_workers()
-        prev_cap = config.get_gather_thread_cap()
+        # 5. Low-concurrency regression check (workers=1): "interleave" forces
+        #    mostly-remote loads with one consumer; the "local" opt-out exists
+        #    for exactly this case.
+        banner(f"LOW-CONCURRENCY regression check (workers=1)  {total_gb:.2f} GB")
+        prev_workers, prev_cap = config.get_max_workers(), config.get_gather_thread_cap()
         try:
             config.set_max_workers(1)
             config.set_gather_thread_cap(1)
@@ -401,16 +292,15 @@ def main():
             ds_inter = colstore.open(str(interleave_path))
             try:
                 with policy_scope("local"):
-                    r_local = labeled(
-                        "workers=1  writer=local      reader=local",
-                        bench(lambda: ds_local.dict()),
+                    _c.compare(
+                        [
+                            ("workers=1  writer=local      reader=local", lambda: ds_local.dict()),
+                            ("workers=1  writer=interleave reader=local", lambda: ds_inter.dict()),
+                        ],
+                        repeat=args.repeat,
+                        warmup=args.warmup,
+                        baseline=0,
                     )
-                    r_inter = labeled(
-                        "workers=1  writer=interleave reader=local",
-                        bench(lambda: ds_inter.dict()),
-                    )
-                print(r_local.report())
-                print(r_inter.report())
             finally:
                 ds_local.close()
                 ds_inter.close()
