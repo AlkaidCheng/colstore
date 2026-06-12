@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -43,7 +44,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tests"))
 import _common as _c
 from _format_fixture import write_record_file
 
-from colstore import ColStoreReader
+from colstore import ColStoreReader, testing
 
 
 def _make_file(path: Path, n_rows: int, n_records: int, dtype: np.dtype) -> None:
@@ -52,8 +53,7 @@ def _make_file(path: Path, n_rows: int, n_records: int, dtype: np.dtype) -> None
     Records are roughly equal-sized; any remainder lands in the last record
     so the total exactly matches.
     """
-    rng = np.random.default_rng(0)
-    all_data = rng.standard_normal(n_rows).astype(dtype)
+    all_data = testing.make_columns(n_rows, 1, dtype=dtype.str, seed=0)["c0"]
     base_size = n_rows // n_records
     remainder = n_rows % n_records
     records = []
@@ -65,26 +65,30 @@ def _make_file(path: Path, n_rows: int, n_records: int, dtype: np.dtype) -> None
     write_record_file(path, [("x", dtype.str)], records)
 
 
-def _best(fn, repeats: int) -> float:
-    return _c.best_time(fn, repeat=repeats, warmup=1)
+def _best(fn, repeat: int, warmup: int) -> float:
+    return _c.best_time(fn, repeat=repeat, warmup=warmup)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, default=10_000_000)
-    parser.add_argument("--n-indices", type=int, default=1_000_000)
-    parser.add_argument("--record-counts", type=int, nargs="+", default=[10, 100, 1000])
-    parser.add_argument("--repeats", type=int, default=10)
-    parser.add_argument("--dtype", default="float32")
-    parser.add_argument("--tmpdir", default="/tmp/colstore_v2_bench")
+    _c.add_common_args(
+        parser,
+        repeat=10,
+        rows=10_000_000,
+        indices=1_000_000,
+        record_counts=[10, 100, 1000],
+        dtype="float32",
+        tmpdir=True,
+        skip_correctness=False,
+    )
     args = parser.parse_args()
 
     dtype = np.dtype(args.dtype)
-    tmpdir = Path(args.tmpdir)
+    tmpdir = args.tmpdir or Path(tempfile.mkdtemp(prefix="colstore_v2_bench"))
     tmpdir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Setup: {args.rows:,} rows of {dtype}, {args.n_indices:,} fancy-index reads")
-    print(f"Repeats: {args.repeats} (reporting best)")
+    print(f"Setup: {args.rows:,} rows of {dtype}, {args.indices:,} fancy-index reads")
+    print(f"Repeat: {args.repeat} (reporting best)")
     print()
 
     # R=1 (post-compaction baseline) plus the requested record counts.
@@ -100,10 +104,10 @@ def main() -> None:
     print()
 
     rng = np.random.default_rng(0)
-    sorted_indices = np.sort(rng.choice(args.rows, size=args.n_indices, replace=False)).astype(
+    sorted_indices = np.sort(rng.choice(args.rows, size=args.indices, replace=False)).astype(
         np.int64
     )
-    unsorted_indices = rng.permutation(args.rows)[: args.n_indices].astype(np.int64)
+    unsorted_indices = rng.permutation(args.rows)[: args.indices].astype(np.int64)
     # Slice covering ~10% of the rows (some records partially, some fully)
     slice_obj = slice(args.rows // 10, 2 * args.rows // 10)
 
@@ -122,14 +126,16 @@ def main() -> None:
         # Baseline: R=1 (post-compaction). All other counts compared against it.
         ds_baseline = ColStoreReader(paths[1])
         assert ds_baseline._is_multi_record is False, "R=1 should take the fast path"
-        t_baseline = _best(lambda d=ds_baseline, s=selector: d[s, "x"].array(), args.repeats)
+        t_baseline = _best(
+            lambda d=ds_baseline, s=selector: d[s, "x"].array(), args.repeat, args.warmup
+        )
         ds_baseline.close()
         print(f"{'R=1':<10} {t_baseline * 1000:>10.3f}  {'1.00x':>8}")
 
         for n_rec in args.record_counts:
             ds = ColStoreReader(paths[n_rec])
             assert ds._is_multi_record is True
-            t = _best(lambda d=ds, s=selector: d[s, "x"].array(), args.repeats)
+            t = _best(lambda d=ds, s=selector: d[s, "x"].array(), args.repeat, args.warmup)
             ds.close()
             label = f"R={n_rec}"
             print(f"{label:<10} {t * 1000:>10.3f}  {t / t_baseline:>7.2f}x")

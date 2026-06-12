@@ -33,6 +33,8 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+import _common as _c
+
 import colstore
 from colstore import testing
 
@@ -59,7 +61,9 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (views == owning arrays; read-only; survive close)\n")
 
 
-def _best(f, repeat: int) -> float:
+def _best(f, repeat: int, warmup: int) -> float:
+    for _ in range(warmup):
+        f()
     best = float("inf")
     for _ in range(repeat):
         start = time.perf_counter()
@@ -68,7 +72,7 @@ def _best(f, repeat: int) -> float:
     return best
 
 
-def run_bench(repeat: int) -> None:
+def run_bench(repeat: int, warmup: int) -> None:
     print(
         f"{'rows':>12}{'call copy=True':>16}{'call copy=False':>17}"
         f"{'sum copy=True':>15}{'sum copy=False':>16}"
@@ -80,10 +84,10 @@ def run_bench(repeat: int) -> None:
                 writer.write({"a": testing.make_columns(n, 1, names=("a",), seed=1)["a"]})
             dataset = colstore.open(path)
             dataset["a"].array(copy=False).sum()  # warm page cache
-            t_call_copy = _best(lambda ds=dataset: ds["a"].array(), repeat)
-            t_call_view = _best(lambda ds=dataset: ds["a"].array(copy=False), repeat)
-            t_sum_copy = _best(lambda ds=dataset: ds["a"].array().sum(), repeat)
-            t_sum_view = _best(lambda ds=dataset: ds["a"].array(copy=False).sum(), repeat)
+            t_call_copy = _best(lambda ds=dataset: ds["a"].array(), repeat, warmup)
+            t_call_view = _best(lambda ds=dataset: ds["a"].array(copy=False), repeat, warmup)
+            t_sum_copy = _best(lambda ds=dataset: ds["a"].array().sum(), repeat, warmup)
+            t_sum_view = _best(lambda ds=dataset: ds["a"].array(copy=False).sum(), repeat, warmup)
             dataset.close()
         print(
             f"{n:>12}{t_call_copy * 1e3:>14.2f}ms{t_call_view * 1e6:>14.1f}us"
@@ -93,12 +97,11 @@ def run_bench(repeat: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--skip-bench", action="store_true")
+    _c.add_common_args(parser, repeat=5, skip_correctness=False)
     args = parser.parse_args()
     check_correctness()
     if not args.skip_bench:
-        run_bench(args.repeat)
+        run_bench(args.repeat, args.warmup)
 
 
 if __name__ == "__main__":
