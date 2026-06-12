@@ -126,6 +126,15 @@ inline T load_unaligned(const std::uint8_t* address) {
 // (Granlund-Montgomery, the libdivide branchfull form). The divisor is a
 // positive row count and the dividend a non-negative row index, so unsigned
 // arithmetic is exact for the full int64 index range.
+//
+// The fast path needs a 128-bit intermediate (for the one-time magic and the
+// per-element high-multiply), available as __int128 on 64-bit GCC/Clang -- the
+// deployment toolchain and the platforms where this gather actually runs hot.
+// Where it isn't (notably MSVC, which has neither __int128 nor __builtin_clzll),
+// fall back to a plain runtime division: correct everywhere, and the reciprocal
+// speedup is simply not applied there.
+#if defined(__SIZEOF_INT128__)
+
 struct UniformDivisor {
   std::uint64_t magic = 0;
   std::uint32_t shift = 0;
@@ -173,6 +182,20 @@ inline std::uint64_t uniform_divide(std::uint64_t n, const UniformDivisor& d) {
   }
   return q >> d.shift;
 }
+
+#else  // portable fallback (e.g. MSVC): a plain runtime division.
+
+struct UniformDivisor {
+  std::uint64_t divisor = 1;
+};
+
+inline UniformDivisor make_uniform_divisor(std::uint64_t d) { return UniformDivisor{d}; }
+
+inline std::uint64_t uniform_divide(std::uint64_t n, const UniformDivisor& d) {
+  return n / d.divisor;
+}
+
+#endif  // __SIZEOF_INT128__
 
 // --- Policy-based gather core ----------------------------------------------
 //
