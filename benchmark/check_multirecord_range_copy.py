@@ -29,7 +29,7 @@ import _common as _c
 import numpy as np
 
 import colstore
-from colstore import kernels
+from colstore import kernels, testing
 from colstore.reader import ColStoreReader, _dtype_is_native
 
 # ---- shared file builder ------------------------------------------------
@@ -39,15 +39,8 @@ def _build_multirecord(
     path: Path, dtype: np.dtype, rows_per_record: list[int], *, second_col: bool
 ) -> dict[str, np.ndarray]:
     """Stream a multi-record file; return the full ground-truth columns."""
-    rng = np.random.default_rng(12345)
     total = sum(rows_per_record)
-    if dtype.kind == "f":
-        full_a = rng.standard_normal(total).astype(dtype)
-    elif dtype.kind in ("i", "u"):
-        info = np.iinfo(dtype)
-        full_a = rng.integers(info.min // 2, info.max // 2, size=total).astype(dtype)
-    else:
-        raise ValueError(f"unsupported dtype for builder: {dtype}")
+    full_a = testing.make_columns(total, 1, dtype=dtype.str, seed=12345)["c0"]
     full_b = np.arange(total, dtype=np.int64)
 
     cols: dict[str, np.ndarray] = {"a": full_a}
@@ -152,8 +145,7 @@ def _run_one(
     dtype = np.dtype(dtype_str)
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "b.cstore"
-        rng = np.random.default_rng(7)
-        full = rng.standard_normal(total_rows).astype(dtype)
+        full = testing.make_columns(total_rows, 1, dtype=dtype.str, seed=7)["c0"]
         per = total_rows // n_records
         with colstore.create(path) as writer:
             off = 0
