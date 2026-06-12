@@ -35,7 +35,7 @@ import _common as _c
 import numpy as np
 
 import colstore
-from colstore import _gather, config
+from colstore import _gather, config, testing
 from colstore import reader as reader_mod
 
 LAYOUTS = ((1_000, 20_000), (10_000, 2_000), (100_000, 200))
@@ -94,12 +94,10 @@ class _force_baseline:
 
 
 def _build_store(directory: Path, n_records: int, rows: int):
-    rng = np.random.default_rng(0)
-    full = rng.standard_normal(n_records * rows)
+    total = n_records * rows
+    full = testing.make_columns(total, 1, names=("value",), seed=0)["value"]
     path = directory / f"r{n_records}.cstore"
-    with colstore.create(path) as writer:
-        for r in range(n_records):
-            writer.write({"value": full[r * rows : (r + 1) * rows]})
+    testing.write_columns(path, {"value": full}, records=n_records).close()
     return path, full
 
 

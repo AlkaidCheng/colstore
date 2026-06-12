@@ -36,6 +36,7 @@ import numpy as np
 
 import colstore
 from colstore import reader as reader_mod
+from colstore import testing
 
 
 class _force_generic:
@@ -50,13 +51,10 @@ class _force_generic:
 
 
 def _build_store(directory: Path, n_records: int, rows: int, n_columns: int):
-    rng = np.random.default_rng(0)
     total = n_records * rows
-    full = {f"c{i}": rng.standard_normal(total) for i in range(n_columns)}
+    full = testing.make_columns(total, n_columns, seed=0)
     path = directory / f"r{n_records}.cstore"
-    with colstore.create(path) as writer:
-        for r in range(n_records):
-            writer.write({k: v[r * rows : (r + 1) * rows] for k, v in full.items()})
+    testing.write_columns(path, full, records=n_records).close()
     return path, full
 
 
