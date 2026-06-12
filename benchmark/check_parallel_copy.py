@@ -17,6 +17,7 @@ Run with PYTHONPATH=src and an extension built into src/colstore/.
 
 from __future__ import annotations
 
+import argparse
 import os
 import tempfile
 from pathlib import Path
@@ -27,11 +28,18 @@ import numpy as np
 import colstore
 from colstore import config
 
+_REPEAT, _WARMUP = 5, 2
 
-def bench(label, fn, n_iter=5, *, n_warmup=2, drop_cache_paths=None):
-    """Label-first adapter over _common.bench (keeps existing call sites)."""
-    return _c.bench(
-        fn, label=label, n_iter=n_iter, n_warmup=n_warmup, drop_cache_paths=drop_cache_paths
+
+def bench(label, fn, *, repeat=None, warmup=None, drop_cache_paths=None):
+    """Profile one variant via the public profiler; cold runs evict per iter."""
+    setup = (lambda: _c.drop_pagecache(drop_cache_paths)) if drop_cache_paths else None
+    return _c.profile(
+        fn,
+        repeat=_REPEAT if repeat is None else repeat,
+        warmup=_WARMUP if warmup is None else warmup,
+        setup=setup,
+        label=label,
     )
 
 
@@ -49,16 +57,23 @@ def banner(s):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    _c.add_common_args(parser, repeat=5, warmup=2, scale=True)
+    args = parser.parse_args()
+    global _REPEAT, _WARMUP
+    _REPEAT, _WARMUP = args.repeat, args.warmup
+
     print("Environment:")
     print(f"  os.cpu_count()              = {os.cpu_count()}")
     print(f"  config.get_max_workers()    = {config.get_max_workers()}")
     print(f"  config.get_gather_thread_cap() = {config.get_gather_thread_cap()}")
 
     with tempfile.TemporaryDirectory() as td:
-        # --- Scenario A: 1 big column (~80 MB). The sweet spot for parallel
-        #     copy: no column-pool concurrency, just a single big memcpy.
-        single = make_store(td, "single.cstore", 10_000_000, 1, np.float64)
-        col_bytes = 10_000_000 * 8
+        # --- Scenario A: 1 big column (~80 MB at scale=1). The sweet spot for
+        #     parallel copy: no column-pool concurrency, just a single big memcpy.
+        single_rows = _c.scaled_rows(10_000_000, args)
+        single = make_store(td, "single.cstore", single_rows, 1, np.float64)
+        col_bytes = single_rows * 8
         banner(f"SINGLE COLUMN, {col_bytes/1e6:.0f} MB (warm cache)")
         ds = colstore.open(str(single))
         results = [
@@ -79,8 +94,8 @@ def main():
             bench(
                 "ds.dict()                              (cold)",
                 lambda: ds.dict(),
-                n_warmup=0,
-                n_iter=3,
+                warmup=0,
+                repeat=3,
                 drop_cache_paths=[single],
             ),
         ]
@@ -91,9 +106,10 @@ def main():
         # --- Scenario B: many columns (~50 cols x ~20 MB each = 1 GB).
         #     This is the regime where the column pool dominates and per-column
         #     parallel-copy is most likely to harm rather than help.
-        many = make_store(td, "many.cstore", 2_500_000, 50, np.float64)
-        total = 2_500_000 * 50 * 8
-        per_col = 2_500_000 * 8
+        many_rows = _c.scaled_rows(2_500_000, args)
+        many = make_store(td, "many.cstore", many_rows, 50, np.float64)
+        total = many_rows * 50 * 8
+        per_col = many_rows * 8
         banner(f"MANY COLUMNS, 50 x {per_col/1e6:.0f} MB = {total/1e9:.1f} GB (warm)")
         ds = colstore.open(str(many))
         results = [
@@ -107,9 +123,10 @@ def main():
 
         # --- Scenario C: a really wide store (200 small cols).
         #     Mimics shape of the user's 198-col workload at smaller scale.
-        wide = make_store(td, "wide.cstore", 200_000, 200, np.float64)
-        total = 200_000 * 200 * 8
-        per_col = 200_000 * 8
+        wide_rows = _c.scaled_rows(200_000, args)
+        wide = make_store(td, "wide.cstore", wide_rows, 200, np.float64)
+        total = wide_rows * 200 * 8
+        per_col = wide_rows * 8
         banner(f"WIDE STORE, 200 x {per_col/1e6:.1f} MB = {total/1e6:.0f} MB (warm)")
         ds = colstore.open(str(wide))
         results = [
@@ -125,21 +142,23 @@ def main():
         #     threshold -- strided reads now take the same row-range split as
         #     contiguous ones. The ::16 line stays below the threshold to show
         #     the serial fallback is intact for small strided reads.
-        big_slice = make_store(td, "slice.cstore", 16_000_000, 1, np.float64)
-        col_bytes = 16_000_000 * 8
+        slice_rows = _c.scaled_rows(16_000_000, args)
+        big_slice = make_store(td, "slice.cstore", slice_rows, 1, np.float64)
+        col_bytes = slice_rows * 8
+        lo, hi = slice_rows // 160, slice_rows - slice_rows // 160
         banner(f"SLICE READS, {col_bytes/1e6:.0f} MB column (warm)")
         ds = colstore.open(str(big_slice))
         results = [
             bench(
-                "ds[100_000:15_900_000, 'c0'].array()  (~121 MiB step-1)",
-                lambda: ds[100_000:15_900_000, "c0"].array(),
+                f"ds[{lo}:{hi}, 'c0'].array()  (step-1, {(hi - lo) * 8 / 2**20:.0f} MiB)",
+                lambda: ds[lo:hi, "c0"].array(),
             ),
             bench(
-                "ds[::2, 'c0'].array()                  (64 MiB step-2, now parallel)",
+                f"ds[::2, 'c0'].array()        (step-2, {slice_rows // 2 * 8 / 2**20:.0f} MiB)",
                 lambda: ds[::2, "c0"].array(),
             ),
             bench(
-                "ds[::16, 'c0'].array()                 (8 MiB step-16, sub-threshold)",
+                f"ds[::16, 'c0'].array()       (step-16, {slice_rows // 16 * 8 / 2**20:.0f} MiB)",
                 lambda: ds[::16, "c0"].array(),
             ),
         ]
