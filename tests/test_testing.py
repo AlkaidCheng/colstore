@@ -122,3 +122,44 @@ def test_make_store_accepts_str_path(tmp_path):
     path = str(tmp_path / "strpath.cstore")
     with testing.make_store(path, rows=128, cols=2, seed=9) as ds:
         assert ds.shape == (128, 2)
+
+
+def test_write_columns_writes_given_arrays(tmp_path):
+    cols = {
+        "a": np.arange(600, dtype=np.float64),
+        "b": (np.arange(600) * 2).astype(np.int32),
+    }
+    with testing.write_columns(tmp_path / "w.cstore", cols, records=4) as ds:
+        assert ds.shape[0] == 600
+        for name, values in cols.items():
+            assert np.array_equal(ds[:, name].array(), values), name
+
+
+def test_write_columns_explicit_record_split(tmp_path):
+    cols = {"x": np.arange(100, dtype=np.float64)}
+    with testing.write_columns(tmp_path / "w.cstore", cols, records=[10, 40, 50]) as ds:
+        assert ds.shape[0] == 100
+        assert np.array_equal(ds[:, "x"].array(), cols["x"])
+
+
+def test_write_columns_validates():
+    with pytest.raises(ValueError):
+        testing.write_columns("ignored", {})  # empty
+    with pytest.raises(ValueError):
+        testing.write_columns("ignored", {"a": np.arange(10), "b": np.arange(11)})  # ragged
+    with pytest.raises(ValueError):
+        testing.write_columns("ignored", {"a": np.arange(10)}, records=[3, 3])  # sum != 10
+
+
+def test_make_store_delegates_to_write_columns(tmp_path):
+    # make_store == make_columns + write_columns: the store must match a
+    # manual write of the same generated columns.
+    expected = testing.make_columns(500, 2, dtype=("f8", "i4"), seed=11)
+    with (
+        testing.make_store(
+            tmp_path / "s.cstore", rows=500, cols=2, dtype=("f8", "i4"), seed=11
+        ) as a,
+        testing.write_columns(tmp_path / "w.cstore", expected) as b,
+    ):
+        for name in expected:
+            assert np.array_equal(a[:, name].array(), b[:, name].array()), name
