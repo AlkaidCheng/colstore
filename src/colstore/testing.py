@@ -40,6 +40,7 @@ __all__ = [
     "make_columns",
     "make_store",
     "uniform_record_rows",
+    "write_columns",
 ]
 
 
@@ -102,6 +103,47 @@ def uniform_record_rows(total: int, records: int) -> list[int]:
     return rows
 
 
+def _resolve_records(records: int | Sequence[int], total: int) -> list[int]:
+    """Resolve ``records`` to a per-record row-count list summing to ``total``."""
+    if isinstance(records, int):
+        return uniform_record_rows(total, records)
+    rows_per_record = list(records)
+    if any(n < 0 for n in rows_per_record):
+        raise ValueError("record row counts must be >= 0")
+    if sum(rows_per_record) != total:
+        raise ValueError(f"records sum to {sum(rows_per_record)}, expected {total}")
+    return rows_per_record
+
+
+def write_columns(
+    path: Path | str,
+    columns: dict[str, NDArray[Any]],
+    *,
+    records: int | Sequence[int] = 1,
+) -> ColStoreReader:
+    """Write caller-provided ``columns`` as a multi-record store; return a reader.
+
+    Unlike :func:`make_store` (which *generates* the data), this writes the
+    arrays you pass -- use it for crafted or non-random layouts. All columns
+    must share a length; ``records`` is a record *count* (rows split uniformly
+    via :func:`uniform_record_rows`) or an explicit per-record row-count
+    sequence summing to that length. The caller owns the returned reader.
+    """
+    if not columns:
+        raise ValueError("columns must be non-empty")
+    lengths = {len(column) for column in columns.values()}
+    if len(lengths) != 1:
+        raise ValueError(f"all columns must share a length; got {sorted(lengths)}")
+    rows_per_record = _resolve_records(records, lengths.pop())
+    target = Path(path)
+    offset = 0
+    with api.create(target) as writer:
+        for n in rows_per_record:
+            writer.write({name: column[offset : offset + n] for name, column in columns.items()})
+            offset += n
+    return api.open(target)
+
+
 def make_store(
     path: Path | str,
     *,
@@ -113,25 +155,11 @@ def make_store(
 ) -> ColStoreReader:
     """Write a multi-record store of synthetic data and return an open reader.
 
-    The columns are :func:`make_columns` ``(rows, cols, dtype, seed)``. ``records``
-    is either a record *count* (rows are split uniformly via
-    :func:`uniform_record_rows`) or an explicit sequence of per-record row
-    counts, which must sum to ``rows``. The caller owns the returned reader and
-    should close it (``with testing.make_store(...) as ds:``).
+    The columns are :func:`make_columns` ``(rows, cols, dtype, seed)``, written
+    via :func:`write_columns`. ``records`` is either a record *count* (rows
+    split uniformly via :func:`uniform_record_rows`) or an explicit sequence of
+    per-record row counts summing to ``rows``. The caller owns the returned
+    reader and should close it (``with testing.make_store(...) as ds:``).
     """
     columns = make_columns(rows, cols, dtype=dtype, seed=seed)
-    if isinstance(records, int):
-        rows_per_record = uniform_record_rows(rows, records)
-    else:
-        rows_per_record = list(records)
-        if any(n < 0 for n in rows_per_record):
-            raise ValueError("record row counts must be >= 0")
-        if sum(rows_per_record) != rows:
-            raise ValueError(f"records sum to {sum(rows_per_record)}, expected rows={rows}")
-    target = Path(path)
-    offset = 0
-    with api.create(target) as writer:
-        for n in rows_per_record:
-            writer.write({name: column[offset : offset + n] for name, column in columns.items()})
-            offset += n
-    return api.open(target)
+    return write_columns(path, columns, records=records)
