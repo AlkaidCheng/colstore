@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -49,13 +49,9 @@ from colstore.profiling import (
 __all__ = [
     "ProfileResult",
     "Result",
-    "RichResult",
-    "Run",
     "TimeStats",
     "add_common_args",
     "apply_runtime_config",
-    "bench",
-    "bench_interleaved",
     "best_time",
     "check_equal",
     "colstore",
@@ -63,7 +59,6 @@ __all__ = [
     "cpp_available",
     "drop_pagecache",
     "machine_fingerprint",
-    "make_parser",
     "make_store",
     "max_threads",
     "peak_thread_watcher",
@@ -73,8 +68,6 @@ __all__ = [
     "run_script",
     "scaled_rows",
     "standard_columns",
-    "thread_watcher",
-    "time_call",
     "time_stats",
     "uniform_rows",
     "write_multirecord",
@@ -146,21 +139,6 @@ def check_equal(got: np.ndarray, expected: np.ndarray, label: str, *, dtype: boo
 
 
 # ---- Argument parsing -------------------------------------------------------
-
-
-def make_parser(description: str) -> argparse.ArgumentParser:
-    """Standard benchmark options: ``--repeat``, ``--skip-*``, ``--json``, ``--scale``."""
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--repeat", type=int, default=10, help="timed runs per cell (default 10)")
-    parser.add_argument("--scale", type=float, default=1.0, help="multiply all row counts")
-    parser.add_argument(
-        "--skip-correctness", action="store_true", help="skip the per-cell correctness gate"
-    )
-    parser.add_argument("--skip-bench", action="store_true", help="run only the correctness gates")
-    parser.add_argument(
-        "--json", type=Path, default=None, metavar="PATH", help="write the JSON summary to PATH"
-    )
-    return parser
 
 
 def add_common_args(
@@ -439,46 +417,6 @@ def write_summary(path: Path, results: list[Result], *, meta: dict[str, Any] | N
 # module still imports on platforms without them.
 
 
-@dataclass
-class Run:
-    """One timed call with process metrics."""
-
-    wall_ms: float
-    cpu_ms: float
-    peak_threads: int
-    major_pf: int
-    minor_pf: int
-
-
-@dataclass
-class RichResult:
-    """A labelled set of :class:`Run` samples, summarized by :meth:`report`."""
-
-    label: str
-    runs: list[Run] = field(default_factory=list)
-
-    def report(self) -> str:
-        if not self.runs:
-            return f"  {self.label:<62}  (no runs)"
-        # Best-of-N for wall/cpu (lowest noise floor); medians for the rest.
-        best = min(self.runs, key=lambda r: r.wall_ms)
-        med_threads = statistics.median(r.peak_threads for r in self.runs)
-        med_major = statistics.median(r.major_pf for r in self.runs)
-        med_minor = statistics.median(r.minor_pf for r in self.runs)
-        ratio = best.cpu_ms / best.wall_ms if best.wall_ms > 0 else float("nan")
-        return (
-            f"  {self.label:<62} "
-            f"wall={best.wall_ms:8.2f}ms  cpu={best.cpu_ms:8.1f}ms  "
-            f"ratio={ratio:5.2f}x  threads={int(med_threads):2d}  "
-            f"pf={int(med_major)}/{int(med_minor)}"
-        )
-
-
-# The peak-thread watcher now lives in the public profiling API; alias it so
-# existing callers (and time_call below) keep one implementation.
-thread_watcher = peak_thread_watcher
-
-
 def drop_pagecache(paths: list[Path]) -> None:
     """Evict file pages via ``posix_fadvise(DONTNEED)`` (no root needed).
 
@@ -498,65 +436,6 @@ def drop_pagecache(paths: list[Path]) -> None:
                 libc.posix_fadvise(fd, 0, 0, posix_fadv_dontneed)
             finally:
                 os.close(fd)
-
-
-def time_call(fn: Callable[[], Any], *, drop_cache_paths: list[Path] | None = None) -> Run:
-    """One call of ``fn``, capturing wall/cpu time, peak threads, and faults."""
-    import resource
-
-    if drop_cache_paths:
-        drop_pagecache(drop_cache_paths)
-    ru_before = resource.getrusage(resource.RUSAGE_SELF)
-    cpu_before = time.process_time()
-    wall_before = time.perf_counter()
-    with thread_watcher() as peak_fn:
-        fn()
-        peak = peak_fn()
-    wall_ms = (time.perf_counter() - wall_before) * 1000.0
-    cpu_ms = (time.process_time() - cpu_before) * 1000.0
-    ru_after = resource.getrusage(resource.RUSAGE_SELF)
-    return Run(
-        wall_ms=wall_ms,
-        cpu_ms=cpu_ms,
-        peak_threads=peak,
-        major_pf=ru_after.ru_majflt - ru_before.ru_majflt,
-        minor_pf=ru_after.ru_minflt - ru_before.ru_minflt,
-    )
-
-
-def bench(
-    fn: Callable[[], Any],
-    *,
-    label: str = "",
-    n_iter: int = 5,
-    n_warmup: int = 2,
-    drop_cache_paths: list[Path] | None = None,
-) -> RichResult:
-    """Time ``fn`` over ``n_iter`` runs after ``n_warmup`` throwaways."""
-    result = RichResult(label=label)
-    for _ in range(n_warmup):
-        fn()
-    for _ in range(n_iter):
-        result.runs.append(time_call(fn, drop_cache_paths=drop_cache_paths))
-    return result
-
-
-def bench_interleaved(
-    labels: list[str], fns: list[Callable[[], Any]], *, n_iter: int = 5, n_warmup: int = 2
-) -> list[RichResult]:
-    """A/B/A/B-style timing of several functions; returns one result per fn.
-
-    Interleaving keeps page-cache and scheduler state comparable across the
-    variants; running A...A then B...B confounds the comparison.
-    """
-    results = [RichResult(label=label) for label in labels]
-    for fn in fns:
-        for _ in range(n_warmup):
-            fn()
-    for _ in range(n_iter):
-        for fn, result in zip(fns, results, strict=True):
-            result.runs.append(time_call(fn))
-    return results
 
 
 def compare(
