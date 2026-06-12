@@ -32,10 +32,6 @@ from colstore import _gather  # type: ignore[attr-defined]
 from colstore.kernels import cpp_available
 
 
-def _best(fn, repeat: int, warmup: int) -> float:
-    return _c.best_time(fn, repeat=repeat, warmup=warmup)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     _c.add_common_args(parser, repeat=15, rows=20_000_000, dtype="float32", skip_correctness=False)
@@ -59,12 +55,6 @@ def main() -> None:
 
     for pattern in ("sorted", "unsorted"):
         print(f"---- pattern = {pattern} ----")
-        header = (
-            f"{'n':>11}  {'np.take ms':>11}  {'gather ms':>11}  "
-            f"{'gather_bytes ms':>16}  {'g/np':>6}  {'gb/np':>6}"
-        )
-        print(header)
-        print("-" * len(header))
         for n in sizes:
             if n > args.rows:
                 continue
@@ -85,24 +75,22 @@ def main() -> None:
 
             if args.skip_bench:
                 continue
-            t_np = _best(
-                lambda s=source, i=indices, o=out_np: np.take(s, i, out=o),
-                args.repeat,
-                args.warmup,
-            )
-            t_g = _best(
-                lambda s=source, i=indices, o=out_g: _gather.gather(s, i, o, 1),
-                args.repeat,
-                args.warmup,
-            )
-            t_gb = _best(
-                lambda s=source, b=byte_offsets, o=out_gb: _gather.gather_bytes(s, b, o, 1),
-                args.repeat,
-                args.warmup,
-            )
-            print(
-                f"{n:>11,}  {t_np*1000:>11.3f}  {t_g*1000:>11.3f}  "
-                f"{t_gb*1000:>16.3f}  {t_g/t_np:>5.2f}x  {t_gb/t_np:>5.2f}x"
+            print(f"  n = {n:,}")
+            _c.compare(
+                [
+                    ("np.take(out=)", lambda s=source, i=indices, o=out_np: np.take(s, i, out=o)),
+                    (
+                        "gather cap=1",
+                        lambda s=source, i=indices, o=out_g: _gather.gather(s, i, o, 1),
+                    ),
+                    (
+                        "gather_bytes cap=1",
+                        lambda s=source, b=byte_offsets, o=out_gb: _gather.gather_bytes(s, b, o, 1),
+                    ),
+                ],
+                repeat=args.repeat,
+                warmup=args.warmup,
+                baseline=0,
             )
         print()
 

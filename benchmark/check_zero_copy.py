@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import sys
 import tempfile
-import time
 from pathlib import Path
 
 import numpy as np
@@ -61,22 +60,7 @@ def check_correctness() -> None:
     print("  ALL CORRECTNESS CHECKS PASSED (views == owning arrays; read-only; survive close)\n")
 
 
-def _best(f, repeat: int, warmup: int) -> float:
-    for _ in range(warmup):
-        f()
-    best = float("inf")
-    for _ in range(repeat):
-        start = time.perf_counter()
-        f()
-        best = min(best, time.perf_counter() - start)
-    return best
-
-
 def run_bench(repeat: int, warmup: int) -> None:
-    print(
-        f"{'rows':>12}{'call copy=True':>16}{'call copy=False':>17}"
-        f"{'sum copy=True':>15}{'sum copy=False':>16}"
-    )
     for n in SIZES:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / f"n{n}.cstore"
@@ -84,15 +68,19 @@ def run_bench(repeat: int, warmup: int) -> None:
                 writer.write({"a": testing.make_columns(n, 1, names=("a",), seed=1)["a"]})
             dataset = colstore.open(path)
             dataset["a"].array(copy=False).sum()  # warm page cache
-            t_call_copy = _best(lambda ds=dataset: ds["a"].array(), repeat, warmup)
-            t_call_view = _best(lambda ds=dataset: ds["a"].array(copy=False), repeat, warmup)
-            t_sum_copy = _best(lambda ds=dataset: ds["a"].array().sum(), repeat, warmup)
-            t_sum_view = _best(lambda ds=dataset: ds["a"].array(copy=False).sum(), repeat, warmup)
+            print(f"  rows = {n:,}")
+            _c.compare(
+                [
+                    ("call copy=True ", lambda ds=dataset: ds["a"].array()),
+                    ("call copy=False", lambda ds=dataset: ds["a"].array(copy=False)),
+                    ("sum  copy=True ", lambda ds=dataset: ds["a"].array().sum()),
+                    ("sum  copy=False", lambda ds=dataset: ds["a"].array(copy=False).sum()),
+                ],
+                repeat=repeat,
+                warmup=warmup,
+                baseline=0,
+            )
             dataset.close()
-        print(
-            f"{n:>12}{t_call_copy * 1e3:>14.2f}ms{t_call_view * 1e6:>14.1f}us"
-            f"{t_sum_copy * 1e3:>13.2f}ms{t_sum_view * 1e3:>14.2f}ms"
-        )
 
 
 def main() -> None:
