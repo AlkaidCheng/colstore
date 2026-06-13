@@ -52,7 +52,6 @@ __all__ = [
     "TimeStats",
     "add_common_args",
     "apply_runtime_config",
-    "best_time",
     "check_equal",
     "colstore",
     "compare",
@@ -63,7 +62,6 @@ __all__ = [
     "peak_thread_watcher",
     "profile",
     "profile_interleaved",
-    "run_script",
     "scaled_rows",
     "time_stats",
     "write_summary",
@@ -71,23 +69,6 @@ __all__ = [
 
 
 # ---- Timing -----------------------------------------------------------------
-
-
-def best_time(fn: Callable[[], Any], *, repeat: int, warmup: int = 3) -> float:
-    """Best (minimum) wall-clock seconds over ``repeat`` runs.
-
-    Minimum is the right summary for a like-for-like kernel comparison: it
-    is the run least perturbed by the OS. ``warmup`` runs are discarded so
-    page-cache fill and first-touch allocation are not timed.
-    """
-    for _ in range(warmup):
-        fn()
-    best = float("inf")
-    for _ in range(repeat):
-        start = time.perf_counter()
-        fn()
-        best = min(best, time.perf_counter() - start)
-    return best
 
 
 @dataclass
@@ -428,33 +409,3 @@ def compare(
                 tput = f"  {result.throughput(throughput_rows) / 1e6:7.1f}M rows/s"
             print(result.report() + speedup + tput)
     return results
-
-
-# ---- Script driver and store context managers -------------------------------
-
-
-def run_script(
-    *,
-    correctness: Callable[[], Any] | None = None,
-    bench: Callable[[int], Any] | None = None,
-    default_repeat: int = 5,
-    skip_correctness_flag: bool = False,
-    description: str = "",
-) -> None:
-    """Standard ``main()`` for a single-purpose check script.
-
-    Owns the ``--repeat`` / ``--skip-bench`` (and optional
-    ``--skip-correctness``) parser, runs the correctness gate, then the
-    benchmark unless skipped. Replaces the near-identical hand-written
-    ``main()`` in each ``check_*.py``.
-    """
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--repeat", type=int, default=default_repeat)
-    if skip_correctness_flag:
-        parser.add_argument("--skip-correctness", action="store_true")
-    parser.add_argument("--skip-bench", action="store_true")
-    args = parser.parse_args()
-    if correctness is not None and not getattr(args, "skip_correctness", False):
-        correctness()
-    if bench is not None and not args.skip_bench:
-        bench(args.repeat)
