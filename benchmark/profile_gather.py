@@ -275,7 +275,7 @@ def benchmark_thread_sweep(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--path", default="/tmp/profile_gather.cstore")
+    parser.add_argument("--store-path", default="/tmp/profile_gather.cstore")
     parser.add_argument("--rows", type=int, default=10_000_000)
     parser.add_argument("--cols", type=int, default=20)
     parser.add_argument("--indices", type=int, default=1_000_000)
@@ -319,8 +319,8 @@ def main() -> None:
         )
 
     bytes_per_elt = 4  # float32
-    make_store(args.path, args.rows, args.cols, np.float32)
-    file_size_gb = os.path.getsize(args.path) / 1e9
+    make_store(args.store_path, args.rows, args.cols, np.float32)
+    file_size_gb = os.path.getsize(args.store_path) / 1e9
     print(f"\nStore file: {file_size_gb:.2f} GB")
 
     if args.calibrate:
@@ -330,20 +330,22 @@ def main() -> None:
         calibrate(verbose=True)
 
     if args.cold:
-        if not drop_caches(args.path):
+        if not drop_caches(args.store_path):
             print(
                 "WARNING: cache eviction failed. Cold runs not meaningful "
                 "(need posix_fadvise support or root for drop_caches)."
             )
         else:
-            print(f"Page cache evicted for {args.path}.")
+            print(f"Page cache evicted for {args.store_path}.")
 
     if args.thread_sweep is not None:
         caps = args.thread_sweep or [1, 2, 4, 8, 16]
         caps = [c for c in caps if c <= max_threads()] or [1]
-        benchmark_thread_sweep(args.path, args.rows, args.indices, bytes_per_elt, caps)
+        benchmark_thread_sweep(args.store_path, args.rows, args.indices, bytes_per_elt, caps)
 
-    benchmark_workload(args.path, args.rows, args.cols, args.indices, bytes_per_elt, args.backends)
+    benchmark_workload(
+        args.store_path, args.rows, args.cols, args.indices, bytes_per_elt, args.backends
+    )
 
 
 if __name__ == "__main__":
