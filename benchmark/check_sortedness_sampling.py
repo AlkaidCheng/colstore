@@ -42,7 +42,7 @@ from colstore import testing
 
 
 def _full_check(indices: np.ndarray) -> bool:
-    """The pre-change gate, verbatim."""
+    """The full-scan sortedness gate -- the O(K) reference."""
     return bool(np.all(indices[1:] >= indices[:-1]))
 
 

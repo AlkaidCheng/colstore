@@ -9,9 +9,9 @@ arithmetically: no index array, no sortedness pass, no index-read bandwidth,
 and an O(K + R) monotone walk in either direction.
 
 This script checks the route end-to-end through the public reader API
-against ground truth and against the replaced route, then times both. The
+against ground truth and against the reference route, then times both. The
 baseline is reproduced exactly by monkeypatching the routing seam
-(``Reader._read_strided_range_multi_record``) with the pre-change logic:
+(``Reader._read_strided_range_multi_record``) with the reference logic:
 arange + sortedness check + sorted-or-unsorted fancy kernel.
 
 Run on the deployment hardware (quiet compute node):
@@ -19,7 +19,7 @@ Run on the deployment hardware (quiet compute node):
     python benchmark/check_strided_multirecord.py
     python benchmark/check_strided_multirecord.py --skip-bench
 
-Expected shape of the result: modest wins for positive steps (the replaced
+Expected shape of the result: modest wins for positive steps (the reference
 path was already kernel-bound; the savings are arange + sortedness check +
 index bandwidth) and large wins for negative steps (binary-search binning
 becomes a linear walk).
@@ -43,11 +43,11 @@ STEPS = (2, 10, 100, -1, -3)
 
 
 def _baseline_strided(self, start, stop, step, disk_dtype, native_dtype, col_prefix, thread_cap):
-    """The pre-change route for native-dtype strided slices, verbatim.
+    """The reference route for native-dtype strided slices.
 
     Materialize the indices, pay the sortedness check, dispatch to the
     sorted walk kernel (ascending) or the fused binary-search kernel
-    (descending) -- identical to the old ``_gather_one_multi_record`` flow.
+    (descending) -- the general ``_gather_one_multi_record`` flow.
     """
     indices = np.arange(start, stop, step, dtype=np.int64)
     n = indices.shape[0]
@@ -127,7 +127,7 @@ def check_correctness() -> None:
 
 
 def _read_baseline(dataset, s):
-    """One strided read forced through the pre-change arange route."""
+    """One strided read forced through the reference arange route."""
     with _force_baseline():
         return dataset[s, "value"].array()
 
