@@ -55,7 +55,7 @@ def check_correctness() -> None:
             via_kernel = dataset[indices, "value"].array()
             assert np.array_equal(via_kernel, full[indices]), size
         dataset.close()
-        # Forced partition pipeline (the pre-change path) must agree.
+        # Forced partition pipeline (the NumPy reference path) must agree.
         original = reader_mod._dtype_is_native
         reader_mod._dtype_is_native = lambda dtype: False  # type: ignore[assignment]
         try:
@@ -72,8 +72,8 @@ def check_correctness() -> None:
 
 
 def _read_pipeline(dataset, indices):
-    """One sorted read forced through the pre-change partition pipeline
-    (the non-native fallback, identical to the old path on a LE host)."""
+    """One sorted read forced through the NumPy partition pipeline
+    (the non-native fallback), used as the reference for native LE dtypes."""
     original = reader_mod._dtype_is_native
     reader_mod._dtype_is_native = lambda dtype: False  # type: ignore[assignment]
     try:
