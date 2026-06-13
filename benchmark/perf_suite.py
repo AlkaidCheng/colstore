@@ -6,7 +6,7 @@ A curated, deterministic, machine-readable benchmark intended for two uses:
    visible way. The summary table shows median time, min, and p95 for each
    workload; eyeballing it catches gross regressions.
 
-2. **Baseline comparison** -- capture a baseline with ``--output base.json``,
+2. **Baseline comparison** -- capture a baseline with ``--json base.json``,
    make a change, run again, and use ``--compare base.json`` to see the per-
    workload delta. Cells outside ``--noise-band`` (default 10%) are flagged.
 
@@ -25,7 +25,7 @@ What this suite does:
 * Captures a machine fingerprint (OS, CPU count, NumPy version, OpenMP max,
   current ``gather_thread_cap``) and the colstore git SHA if available, so
   comparisons stay honest across commits and across hardware.
-* Emits JSON to ``--output`` and a human-readable table to stdout.
+* Emits JSON to ``--json`` and a human-readable table to stdout.
 
 What it does NOT do:
 
@@ -415,13 +415,13 @@ def main() -> None:
         help="Path to (re)use for the synthetic store.",
     )
     parser.add_argument(
-        "--repeats",
+        "--repeat",
         type=int,
         default=7,
         help="Timed iterations per cell after one warmup (default 7).",
     )
     parser.add_argument("--dtype", default="float32", help="Source dtype (default float32).")
-    parser.add_argument("--output", help="Write structured JSON results to this path.")
+    parser.add_argument("--json", metavar="PATH", help="write the JSON summary to PATH")
     parser.add_argument(
         "--compare",
         metavar="BASELINE_JSON",
@@ -449,11 +449,11 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    result = run_suite(args.store_path, np.dtype(args.dtype), args.repeats, args.backends)
+    result = run_suite(args.store_path, np.dtype(args.dtype), args.repeat, args.backends)
     _print_table(result)
 
-    if args.output:
-        with open(args.output, "w") as f:
+    if args.json:
+        with open(args.json, "w") as f:
             json.dump(
                 {
                     "fingerprint": result.fingerprint,
@@ -462,7 +462,7 @@ def main() -> None:
                 f,
                 indent=2,
             )
-        print(f"\nWrote JSON results to {args.output}")
+        print(f"\nWrote JSON results to {args.json}")
 
     if args.compare:
         _compare(result, args.compare, args.noise_band)
