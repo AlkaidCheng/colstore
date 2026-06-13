@@ -696,8 +696,8 @@ void gather_multirecord_strided_typed(const std::uint8_t* COLSTORE_RESTRICT base
 }
 
 // Uniform-record fancy gather: the fused unsorted gather with the binary
-// search replaced by one integer division and the three per-element
-// metadata loads replaced by an affine formula. For a full record r,
+// search replaced by a constant-divisor reciprocal multiply and the three
+// per-element metadata loads replaced by an affine formula. For a full record r,
 //   offset(idx) = first_body_offset + r*stride + col_prefix*U
 //                 + (idx - r*U)*itemsize
 //               = full_base + r*per_record_step + idx*itemsize
@@ -753,13 +753,13 @@ void gather_multirecord_uniform_typed(const std::uint8_t* COLSTORE_RESTRICT base
   }
 }
 
-// Multi-column uniform pair. The bins variant pays the division once per
-// element across the whole read; the withbins variant's per-element work
-// is a sequential int32 read, one compare, one multiply-add, and the load
-// -- no division, no search, no per-record metadata. This dominates both
-// the generic bins route (search -> division for the first column;
+// Multi-column uniform pair. The bins variant pays the reciprocal divide
+// once per element across the whole read; the withbins variant's per-element
+// work is a sequential int32 read, one compare, one multiply-add, and the
+// load -- no divide, no search, no per-record metadata. This dominates both
+// the generic bins route (search -> reciprocal divide for the first column;
 // three metadata loads -> affine math for the rest) and per-column
-// arithmetic binning (division x C -> division x 1).
+// arithmetic binning (reciprocal divide x C -> x 1).
 template <typename T>
 void gather_multirecord_uniform_bins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                            const std::int64_t* COLSTORE_RESTRICT indices,
