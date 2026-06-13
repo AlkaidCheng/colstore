@@ -7,7 +7,7 @@ fused kernel: the searchsorted record-binning dominates (~75-90%), not the
 byte_offsets materialization (~7-11%), so the kernel folds the binning into
 the load rather than merely skipping the offset temporaries.
 
-The ``reader end-to-end`` row goes through the real reader, which now uses the
+The ``reader end-to-end`` row goes through the real reader, which uses the
 fused kernel -- so it is NOT the sum of the stages above it; the comparison
 shows directly how much of the replaced pipeline's cost the kernel removed.
 
