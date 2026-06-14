@@ -56,9 +56,9 @@ namespace colstore {
 // The kernel is memory-bandwidth-bound, so two rules:
 //   1. Below PARALLEL_THRESHOLD the fork/join cost dwarfs the work -> serial.
 //   2. Above it, scale roughly one thread per ELEMENTS_PER_THREAD elements,
-//      clamped to ``cap``. Bandwidth saturates at a small thread count well
-//      below core count, so the cap (typically <= 8) is the real limit; the
-//      work-proportional term just avoids the full cap for mid-sized gathers.
+//      bounded by MAX_PARALLEL_THREADS and the caller ``cap``. The gather is
+//      memory-latency-bound and saturates well below core count, so for large
+//      gathers the ceiling -- not the work term -- is the binding limit.
 // ``cap`` <= 0 means "use the OpenMP maximum" (no colstore-imposed limit).
 std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
 #ifdef _OPENMP
@@ -75,11 +75,15 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap) {
   // this point is past PARALLEL_THRESHOLD (the early return above), so it
   // benefits from at least two threads; floor division would silently
   // force mid-sized gathers back to serial and dead-code the threshold.
-  // The ramp matches the measured scaling knee (~1 thread per 1<<20
-  // elements; scaling stays near-linear to the cap on the
-  // bandwidth-limited gather).
+  // Measured scaling flattens well below core count (the gather is
+  // memory-latency-bound), so by_work is clamped to MAX_PARALLEL_THREADS;
+  // for large gathers that ceiling, not the work term, is the real limit.
   std::ptrdiff_t by_work =
       (n_indices + ELEMENTS_PER_THREAD - 1) / ELEMENTS_PER_THREAD;
+  // Clamp to the saturation ceiling: beyond it, more threads do not speed the
+  // memory-latency-bound gather and only add cross-node remote-DRAM stalls
+  // (see MAX_PARALLEL_THREADS in the header).
+  by_work = std::min<std::ptrdiff_t>(by_work, MAX_PARALLEL_THREADS);
   std::ptrdiff_t threads =
       std::min<std::ptrdiff_t>(effective_cap, std::max<std::ptrdiff_t>(2, by_work));
   return std::max<std::ptrdiff_t>(1, threads);

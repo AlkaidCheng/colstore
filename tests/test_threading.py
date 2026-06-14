@@ -12,6 +12,11 @@ import colstore
 from colstore import autotune, config
 from colstore.kernels import cpp_available
 
+# Mirrors MAX_PARALLEL_THREADS in include/colstore/gather.hpp: the saturation
+# ceiling on the work-proportional thread ramp for the memory-latency-bound
+# gather. Update both together.
+_MAX_PARALLEL_THREADS = 16
+
 
 def test_import_does_not_touch_global_threading_env(monkeypatch):
     # colstore must not set process-global OpenMP/BLAS env vars at import.
@@ -83,6 +88,15 @@ def test_thread_count_resolution_rules():
         # Work-proportional: a much larger gather resolves to at least as many
         # threads as a smaller one (more elements -> more threads, up to cap).
         assert _gather.thread_count_for(20_000_000, 32) >= _gather.thread_count_for(1_000_000, 32)
+        # Saturation ceiling: beyond MAX_PARALLEL_THREADS the work-proportional
+        # ramp is clamped, because the memory-latency-bound gather stops scaling
+        # well below core count (and wider spreads it across more NUMA nodes).
+        # A 256M-element gather implies ~244 threads by work; the clamp holds it
+        # at most to the ceiling regardless of how many cores are available.
+        assert _gather.thread_count_for(256_000_000, _gather.max_threads()) <= _MAX_PARALLEL_THREADS
+        if omp_max >= _MAX_PARALLEL_THREADS:
+            # With enough cores it pins exactly to the ceiling, not to by_work.
+            assert _gather.thread_count_for(256_000_000, omp_max) == _MAX_PARALLEL_THREADS
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
