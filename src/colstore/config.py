@@ -314,8 +314,8 @@ def set_numa_policy(policy: NumaPolicy) -> None:
     * ``"auto"`` (default) -- ``MPOL_INTERLEAVE`` on multi-node Linux so
       page-cache pages distribute across nodes as they fault in; no-op
       everywhere else (single-node Linux, macOS, Windows, blocked
-      syscall). Significant win on multi-socket / multi-NPS hardware
-      (see :mod:`colstore._numa` for measurements).
+      syscall). Effect on multi-socket / multi-NUMA-node hardware is
+      access-pattern dependent (see :mod:`colstore._numa`).
     * ``"interleave"`` -- force interleave even where ``"auto"`` would
       skip; mainly for testing.
     * ``"local"`` -- no-op; the kernel's default first-touch policy. Use

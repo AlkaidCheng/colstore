@@ -3,11 +3,11 @@
 Sets ``MPOL_INTERLEAVE`` on the page-aligned regions covering file-backed
 memmaps so that page-cache pages distribute across NUMA nodes as they
 fault in, instead of concentrating on whichever node first touched them
-(the kernel's default first-touch policy). On multi-socket / multi-NPS
-hardware the win is significant: measured on a dual-socket EPYC 7763
-(8 nodes, 256 cores), ``ds.dict()`` on a 1 GB / 50-column store improves
-1.79x and ``ds.frame()`` 1.55x, with process CPU time on the same gather
-dropping from 688 ms to 292 ms (~2.4x less time stalled on remote loads).
+(the kernel's default first-touch policy). On multi-socket /
+multi-NUMA-node hardware, page placement can change gather throughput
+substantially, but which policy wins depends on the access pattern and on
+whether pages are faulted cold or already resident -- so callers should
+measure on their own hardware rather than assume a fixed speedup.
 
 This module:
 
@@ -185,8 +185,8 @@ if _AVAILABLE:
 
         # Bitmask covering allowed nodes, sized to one ``unsigned long``
         # per 64 nodes. Most hardware has < 16 nodes so one word suffices,
-        # but cap it correctly so high-node-id machines (large 4-socket
-        # AMD parts, multi-rack POWER systems) still work.
+        # but cap it correctly so high-node-count systems (many sockets
+        # or many NUMA domains) still work.
         _max_allowed = max(_ALLOWED_NODES)
         _n_words = (_max_allowed // _BITS_PER_LONG) + 1
         _NodemaskType = ctypes.c_ulong * _n_words
