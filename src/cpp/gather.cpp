@@ -123,7 +123,7 @@ inline T load_unaligned(const std::uint8_t* address) {
 //
 // The uniform-record kernels recover a record index as ``idx / rows_per_record``
 // for every element. ``rows_per_record`` is invariant across the whole gather,
-// so a runtime 64-bit integer division (~20-40 cycles on the target EPYC) is
+// so a runtime 64-bit integer division (tens of cycles on current x86-64) is
 // pure waste: it loses to the generic route's branch-predicted binary search
 // over a cache-resident record table. Precomputing a magic reciprocal once
 // turns each division into a 64x64 high-multiply plus two shifts

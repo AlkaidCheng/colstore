@@ -43,11 +43,12 @@ _CALIBRATION_VERSION = 1
 _CANDIDATE_THREADS = (1, 2, 4, 8, 16)
 
 # Synthetic workload sizing. The gather is memory-latency-bound and its thread
-# scaling saturates at a size-dependent knee: a sweep on the EPYC 7763 (NPS4)
-# put the knee at ~4 threads for 4M indices but ~16 for >= 64M, so calibrating
-# at 4M sampled below the regime the cap actually governs and under-picked the
-# knee. Sample in the saturated regime so _pick_knee reflects production-scale
-# gathers (bounded by _CALIB_SOURCE_ROWS; raises one-time calibration cost).
+# scaling saturates at a size-dependent knee: a size x thread sweep on
+# multi-NUMA-node hardware put the knee at ~4 threads for 4M indices but
+# ~16 for >= 64M, so calibrating at 4M sampled below the regime the cap
+# actually governs and under-picked the knee. Sample in the saturated regime
+# so _pick_knee reflects production-scale gathers (bounded by
+# _CALIB_SOURCE_ROWS; raises one-time calibration cost).
 _CALIB_SOURCE_ROWS = 50_000_000
 _CALIB_N_INDICES = 32_000_000
 
