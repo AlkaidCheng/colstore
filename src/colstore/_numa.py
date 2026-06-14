@@ -9,6 +9,13 @@ substantially, but which policy wins depends on the access pattern and on
 whether pages are faulted cold or already resident -- so callers should
 measure on their own hardware rather than assume a fixed speedup.
 
+Scope: this module places *memory* only. The largest multi-node gather
+speedup additionally requires pinning the gather's threads to the node
+holding the data; colstore does not manage OpenMP thread affinity, so that
+co-location is done externally at process start (e.g. ``numactl
+--cpunodebind`` or ``OMP_PROC_BIND`` / ``OMP_PLACES``). See
+:func:`colstore.config.set_numa_policy` for the recipe.
+
 This module:
 
   * No-ops cleanly on non-Linux platforms and on single-node Linux hosts.

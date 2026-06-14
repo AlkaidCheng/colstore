@@ -511,16 +511,19 @@ class ColStoreReader:
                 memmap_view._mmap.madvise(flag)  # type: ignore[attr-defined]
 
     def _apply_numa_policy(self) -> None:
-        """Apply the configured NUMA policy to all file-backed memmaps.
+        """Apply the configured NUMA memory policy to all file-backed memmaps.
 
-        Called once at open time, before any access faults pages in.
-        The default ``"auto"`` policy applies ``MPOL_INTERLEAVE`` on
-        multi-node Linux and is a no-op everywhere else.
+        Called once at open time, before any access faults pages in. The
+        default ``"auto"`` policy applies ``MPOL_INTERLEAVE`` on multi-node
+        Linux (no-op elsewhere); ``"local"`` leaves the kernel's first-touch
+        policy in place, keeping a store's pages on one node.
 
-        ``"local"`` is the opt-out for low-concurrency workloads where
-        forced interleaving costs more than it saves (e.g. a single
-        consumer thread reading 1 GB ends up doing remote loads for
-        7/8 of the pages on an 8-node host).
+        This places memory only -- it does not pin the gather's threads, so
+        it cannot by itself co-locate threads with data. For latency-bound
+        scattered/conversion reads on multi-node hosts, node confinement
+        (store on one node plus threads pinned to it) is faster than
+        interleave; see :func:`colstore.config.set_numa_policy` for the
+        recipe.
         """
         policy = config.get_numa_policy()
         if policy == "local":
