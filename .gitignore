@@ -75,3 +75,6 @@ ENV/
 
 # Archive
 *.zip
+
+# Private
+collect_perf_reference.sh
