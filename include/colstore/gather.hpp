@@ -68,6 +68,17 @@ constexpr std::ptrdiff_t PARALLEL_THRESHOLD = 1 << 18;  // 262144
 // the cap). Keeps mid-sized gathers from spinning up the full cap.
 constexpr std::ptrdiff_t ELEMENTS_PER_THREAD = 1 << 20;  // 1048576
 
+// Saturation ceiling for the work-proportional ramp. The scattered gather is
+// memory-latency-bound: on a dual-socket EPYC 7763 (NPS4: 8 nodes x 16 cores)
+// a single-column unsorted gather's per-loop time flattens by ~8-16 threads,
+// and pushing wider only spreads the access set across more NUMA nodes whose
+// remote-DRAM latency it then stalls on -- confining the same work to one node
+// measured ~1.5x FASTER than interleaving it across all eight. So bound the
+// derived thread count near one node's worth of cores; the caller cap still
+// applies on top. Tunable; A/B-confirm the value per machine before relying
+// on it (256M-element gathers showed a small further gain past 16 threads).
+constexpr std::ptrdiff_t MAX_PARALLEL_THREADS = 16;
+
 // Resolve the OpenMP thread count for ``n_indices`` under a caller cap
 // (<= 0 means OpenMP maximum). Exposed for tests.
 std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap);
