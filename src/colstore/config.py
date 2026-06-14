@@ -309,18 +309,39 @@ def get_numa_policy() -> NumaPolicy:
 def set_numa_policy(policy: NumaPolicy) -> None:
     """Set the NUMA memory policy applied to file-backed memmaps at open time.
 
+    This controls *memory* placement only; it does not pin the gather's
+    OpenMP threads, so on its own it cannot co-locate threads with data
+    (see the performance note below).
+
     Policies:
 
     * ``"auto"`` (default) -- ``MPOL_INTERLEAVE`` on multi-node Linux so
-      page-cache pages distribute across nodes as they fault in; no-op
-      everywhere else (single-node Linux, macOS, Windows, blocked
-      syscall). Effect on multi-socket / multi-NUMA-node hardware is
-      access-pattern dependent (see :mod:`colstore._numa`).
+      page-cache pages spread across nodes' memory controllers as they
+      fault in; no-op everywhere else (single-node Linux, macOS, Windows,
+      blocked syscall). Spreading balances controller load and suits reads
+      whose threads are themselves spread across nodes (the common case),
+      but for latency-bound scattered and conversion gathers
+      (``dict``/``recarray``/``frame``) it makes most accesses remote and
+      measured slower than confining the data to a single node.
     * ``"interleave"`` -- force interleave even where ``"auto"`` would
       skip; mainly for testing.
-    * ``"local"`` -- no-op; the kernel's default first-touch policy. Use
-      for low-concurrency workloads (e.g. ``max_workers=1``) where forced
-      interleaving costs more remote-memory hops than it saves.
+    * ``"local"`` -- no-op; the kernel's default first-touch policy, so a
+      freshly written store's pages stay on the writing node instead of
+      spreading. Use it for low-concurrency single-consumer reads, and as
+      the placement half of node-confined reads (see the note).
+
+    Performance note (multi-node hosts): the large speedup comes from
+    *co-locating the gather's threads with the data*, not from the memory
+    policy alone -- colstore places memory but not threads. To get node-
+    confined reads today, keep the store on one node (write/read under
+    ``"local"``, or place it with ``numactl`` at write time) and confine
+    the reader's threads to that node at process start, e.g.
+    ``numactl --cpunodebind=N --membind=N python ...`` (or ``OMP_PLACES`` /
+    ``OMP_PROC_BIND``). This measured ~1.3-1.7x faster than the interleaved
+    default for warm ``dict``/``recarray``/``frame`` at scale; confirm on
+    your own hardware. In-library thread/data co-location is planned but not
+    yet implemented, which is why the default is left at ``"auto"`` rather
+    than flipped to ``"local"``.
     """
     if policy not in ("auto", "interleave", "local"):
         raise ValueError(f"numa policy must be 'auto', 'interleave', or 'local'; got {policy!r}.")

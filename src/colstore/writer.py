@@ -291,13 +291,15 @@ class ColStoreWriter:
         # Wrap the body writes in MPOL_INTERLEAVE on multi-node Linux so
         # the kernel distributes page-cache pages across NUMA nodes as
         # they're allocated by write(). On the default
-        # config.set_numa_policy("auto") this delivers the actual NUMA
-        # win: pages are placed correctly at write time, and every
-        # subsequent reader of the file (this process or any other) sees
-        # the distributed layout without any reader-side migration --
-        # which mbind on a MAP_SHARED read mapping cannot do. No-op on
-        # single-node hosts, non-Linux, "local" policy, or when the
-        # syscall fails.
+        # config.set_numa_policy("auto") this spreads the file's pages
+        # across nodes at write time, so every subsequent reader (this
+        # process or any other) sees the distributed layout without any
+        # reader-side migration -- which mbind on a MAP_SHARED read
+        # mapping cannot do. Spreading balances controller load for
+        # readers whose threads span nodes; for node-confined reads,
+        # write under "local" so the pages stay together (see
+        # config.set_numa_policy). No-op on single-node hosts, non-Linux,
+        # "local" policy, or when the syscall fails.
         with _numa.writer_policy_scope():
             # Append a record at the current file position (end-of-file
             # in update mode after the constructor seek, or right past
