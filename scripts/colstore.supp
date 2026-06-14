@@ -1,0 +1,157 @@
+# Valgrind/Memcheck suppressions for leak-checking colstore.
+#
+# Two kinds of entry, with different safety arguments:
+#
+#  (1) Runtime/dependency machinery that legitimately holds memory for the life
+#      of the process (OpenMP thread pool, NumPy SIMD caches, the dynamic
+#      loader). These suppress only `reachable`/`possible` -- never `definite`
+#      or `indirect` -- so a real colstore leak is never hidden.
+#
+#  (2) CPython import & interpreter startup (the section at the bottom). On a
+#      Python NOT built --with-valgrind (conda, most system Pythons), the
+#      importer deserialises .pyc code objects and the interpreter interns
+#      strings at startup that are never freed before exit. The OS reclaims
+#      them, so they are not real leaks, but Memcheck reports them as
+#      definitely/indirectly lost in their thousands. These stanzas DO suppress
+#      `definite`/`indirect`, which is safe ONLY because each is anchored on a
+#      frame that can never sit above colstore's own code (see that section).
+#
+# PYTHONMALLOC=malloc (set by run_valgrind.sh) avoids the bulk of pymalloc-arena
+# false positives up front; it does not help with (2), which are genuine
+# malloc'd objects the interpreter simply never frees.
+
+# ---- OpenMP runtime (libgomp / Intel libomp) -------------------------------
+# The thread pool, per-thread stacks, and TLS are allocated on the first
+# parallel region and live until exit -- reachable, not leaked.
+{
+   colstore-openmp-libgomp-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   obj:*/libgomp.so.*
+}
+{
+   colstore-openmp-libomp-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   obj:*/libomp.so*
+}
+{
+   colstore-openmp-gomp-thread-start
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   fun:malloc
+   ...
+   fun:gomp_*
+}
+{
+   colstore-openmp-kmp-thread-start
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   fun:*alloc
+   ...
+   fun:__kmp_*
+}
+
+# ---- NumPy (CPU-feature detection, SIMD dispatch caches) -------------------
+{
+   colstore-numpy-cpu-feature-cache
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   obj:*/numpy/*.so
+}
+{
+   colstore-numpy-multiarray-init
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:PyInit__multiarray_umath
+}
+
+# ---- Dynamic loader / TLS (dlopen of the extensions) -----------------------
+{
+   colstore-ld-dlopen-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:_dl_open
+}
+{
+   colstore-ld-tls-allocate
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:_dl_allocate_tls
+}
+{
+   colstore-ld-init-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   obj:*/ld-*.so
+}
+
+# ---- CPython interpreter state held for the process lifetime ---------------
+# Belt-and-suspenders for the small amount that survives PYTHONMALLOC=malloc
+# (interned strings, type objects, the small-int cache).
+{
+   colstore-cpython-pymain-init
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:_PyRuntime*
+}
+{
+   colstore-cpython-interned-reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:PyUnicode_InternInPlace
+}
+
+# ---- CPython import & interpreter startup (definite/indirect, one-time) -----
+# See note (2) at the top. Each stanza is anchored ONLY on a frame that runs
+# before, and independently of, any gather/reader/writer call, so a real
+# colstore leak can never match it:
+#
+#   * r_object / marshal_loads -- the marshal reader; only ever deserialising a
+#     .pyc. colstore C code is never called from it. This covers the dominant
+#     family (the bulk of the import-time records).
+#   * init_interp_main / Py_InitializeFromConfig -- interpreter core init, which
+#     completes before the workload imports colstore.
+#
+# Broader import frames (PyModule_ExecDef, _imp_exec_builtin, _imp_create_dynamic,
+# PyImport_ImportModuleLevelObject) are deliberately NOT used: colstore's own
+# extension init runs under them, so anchoring there could mask a genuine
+# import-time leak. Residual stdlib/NumPy C-module-init noise these do not catch
+# is left for run_valgrind.sh, which judges only leaks attributable to colstore.
+{
+   cpython-marshal-read-object
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:r_object
+}
+{
+   cpython-marshal-loads
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:marshal_loads
+}
+{
+   cpython-interp-core-init
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:init_interp_main
+}
+{
+   cpython-initialize-from-config
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect,possible
+   ...
+   fun:Py_InitializeFromConfig
+}
