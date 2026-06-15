@@ -575,3 +575,81 @@ def thread_binding_report() -> dict[str, object]:
         "omp_proc_bind": os.environ.get("OMP_PROC_BIND"),
         "sample": distinct[:4],
     }
+
+
+# ---- Startup binding policy + per-gather gate ------------------------------
+#
+# The parts of the binding decision that depend only on the host -- is spread
+# binding applicable, and what is the aggregate-L3 threshold -- are resolved
+# once and cached. The per-gather part (does *this* gather's working set exceed
+# the threshold) is cheap and evaluated per call. Spreading threads needs more
+# than one memory domain to spread across, so a single-NUMA-node host (and the
+# single-core / virtualized hosts that report one node) is never applicable --
+# binding there was measured neutral-to-harmful, so the gate skips it.
+
+
+class BindingPolicy(NamedTuple):
+    """Host-level inputs to the spread-binding gate, resolved once per process.
+
+    ``applicable`` is the hardware precondition (Linux, multiple NUMA nodes);
+    the per-call gate additionally consults the config knob and working set,
+    and the actual pin (:func:`bind_gather_threads`) re-checks ``OMP_PROC_BIND``
+    and extension availability.
+    """
+
+    applicable: bool
+    aggregate_llc_bytes: int
+    numa_nodes: int
+
+
+_BINDING_POLICY: BindingPolicy | None = None
+
+
+def binding_policy() -> BindingPolicy:
+    """Resolve (and cache) the host-level binding policy.
+
+    Computed on first use from the NUMA topology and cache hierarchy, then
+    memoized for the process. ``applicable`` is ``True`` only on Linux with at
+    least two NUMA nodes that have online CPUs -- the precondition for spread
+    binding to place threads on distinct memory controllers.
+    """
+    global _BINDING_POLICY
+    if _BINDING_POLICY is None:
+        from . import autotune  # local import: autotune imports config which imports _numa
+
+        nodes = len(_cpu_nodes()) if _PLATFORM_IS_LINUX else 0
+        _BINDING_POLICY = BindingPolicy(
+            applicable=_PLATFORM_IS_LINUX and nodes >= 2,
+            aggregate_llc_bytes=autotune.aggregate_llc_bytes(),
+            numa_nodes=nodes,
+        )
+    return _BINDING_POLICY
+
+
+def _reset_binding_policy() -> None:
+    """Clear the cached policy so the next call re-resolves it (tests only)."""
+    global _BINDING_POLICY
+    _BINDING_POLICY = None
+
+
+def maybe_bind_for_gather(working_set_bytes: int, cap: int | None = None) -> int | None:
+    """Pin the gather pool for a DRAM-bound gather, or return ``None``.
+
+    Binds (via :func:`bind_gather_threads`) only when all hold: the optimization
+    is enabled (:func:`colstore.config.get_gather_binding`); the host policy is
+    applicable (Linux, multiple NUMA nodes); and ``working_set_bytes`` exceeds
+    ``margin * aggregate_llc_bytes`` (the resident-vs-DRAM boundary). Returns
+    the number of workers pinned, or ``None`` when the gate declines or binding
+    is unavailable. Idempotent and cheap to call on every gather.
+    """
+    from . import config  # local import: _numa is imported by reader/config
+
+    if not config.get_gather_binding():
+        return None
+    policy = binding_policy()
+    if not policy.applicable:
+        return None
+    threshold = config.get_gather_bind_llc_margin() * policy.aggregate_llc_bytes
+    if working_set_bytes <= threshold:
+        return None
+    return bind_gather_threads(cap)
