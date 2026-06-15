@@ -40,7 +40,12 @@ from . import config
 _CALIBRATION_VERSION = 1
 
 # Candidate thread counts to sweep. Capped to the OpenMP max at runtime.
-_CANDIDATE_THREADS = (1, 2, 4, 8, 16)
+# Extends past 16 so the saturation knee is bracketed, not clipped, on wide
+# multi-socket hosts: a chosen cap landing on the top candidate signals the
+# true optimum was never measured (a size x thread sweep on a dual-socket host
+# put the large-gather knee right at the 16 boundary). _pick_knee still prefers
+# the smallest cap within tolerance, so narrower hosts are unaffected.
+_CANDIDATE_THREADS = (1, 2, 4, 8, 16, 32)
 
 # Synthetic workload sizing. The gather is memory-latency-bound and its thread
 # scaling saturates at a size-dependent knee: a size x thread sweep on

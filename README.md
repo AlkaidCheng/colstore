@@ -136,6 +136,23 @@ set_default_madvise("sequential") # OS read-ahead hint for sorted-index reads
 set_default_backend("cpp")        # gather kernel: cpp | numpy | numba
 ```
 
+## How reads parallelize
+
+A gather's thread count is decided in two stages. A single-column read runs at
+the full gather thread cap; a multi-column read (`dict` / `recarray` / `frame`)
+either splits the cap across a per-column pool or runs the columns sequentially
+at the full cap, depending on the route taken. Either way the kernel's
+`resolve_thread_count` has the final say: it scales the actual thread count with
+the number of indices and clamps it to the cap, so small reads stay serial and
+only large ones spend the whole budget.
+
+![Gather thread decision flow](docs/gather_thread_decision.svg)
+
+The cap itself defaults to half the physical cores, bounded by a per-socket
+allowance so multi-socket hosts (with more memory channels) get a higher
+default; `colstore.autotune` refines it per host by measuring the saturation
+knee directly.
+
 ## On-disk format
 
 ```

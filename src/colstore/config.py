@@ -5,6 +5,7 @@ when constructing :class:`~colstore.ColStoreReader` instances; per-instance over
 take precedence over these globals.
 """
 
+import glob
 import os
 from typing import Literal
 
@@ -21,12 +22,41 @@ MadviseOption = Literal["normal", "sequential", "random", "willneed", "dontneed"
 GatherBackend = Literal["cpp", "numpy", "numba"]
 NumaPolicy = Literal["auto", "interleave", "local"]
 
-# Hard ceiling on gather threads. The kernel is memory-bandwidth-bound, so
-# throughput saturates at a small thread count well below the core count on
-# essentially all single-socket hardware; beyond ~8 threads extra parallelism
-# buys nothing and the fork/join + contention cost dominates (the difference
-# between 8 and 244 threads was measured at ~40x slower).
-_GATHER_THREAD_CEILING = 8
+# Per-socket ceiling on gather threads. The kernel is memory-bandwidth-bound,
+# so throughput saturates once the memory channels are busy -- a small count
+# well below the core count -- and beyond that, extra threads only add fork/join
+# and contention (8 vs 244 threads was measured ~40x slower). The saturation
+# point tracks the number of memory channels, which is not portably readable;
+# socket count is the best available proxy (channels per socket are roughly
+# fixed within a CPU generation, ~8 on server parts, and -- unlike NUMA node
+# count, which a NUMA-per-socket BIOS setting inflates -- stable for fixed
+# hardware). Allow this many gather threads per socket, so a dual-socket host
+# reaches ~16 while a single-socket desktop stays ~8.
+_GATHER_THREADS_PER_SOCKET = 8
+
+
+def _socket_count() -> int:
+    """Number of physical CPU sockets, best effort (always ``>= 1``).
+
+    Counts distinct ``physical_package_id`` values under
+    ``/sys/devices/system/cpu``. Falls back to ``1`` where sysfs is unreadable
+    (non-Linux, restricted containers), which keeps the ceiling at the
+    single-socket default.
+    """
+    ids: set[str] = set()
+    for path in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id"):
+        try:
+            with open(path) as handle:
+                ids.add(handle.read().strip())
+        except OSError:
+            continue
+    return max(1, len(ids))
+
+
+# Effective ceiling for this host: the per-socket allowance times the socket
+# count. A coarse hardware proxy -- ``colstore.autotune`` measures the true
+# saturation knee per host and overrides it when run.
+_GATHER_THREAD_CEILING = _GATHER_THREADS_PER_SOCKET * _socket_count()
 
 # Default software-prefetch look-ahead for the gather kernels, in elements.
 # Mirrors ``DEFAULT_PREFETCH_DISTANCE`` in ``include/colstore/gather.hpp``,
@@ -47,8 +77,10 @@ def _default_gather_thread_cap() -> int:
     """Derive a near-optimal default gather thread cap from the hardware.
 
     Half the physical cores is a robust proxy for the memory-bandwidth
-    saturation point, clamped to ``[1, _GATHER_THREAD_CEILING]``. Uses physical
-    (not logical) cores because hyperthreads share memory ports and do not add
+    saturation point, clamped to ``[1, _GATHER_THREAD_CEILING]`` -- a per-socket
+    allowance times the socket count, so a multi-socket host (more memory
+    channels) gets a higher cap than a single-socket box. Uses physical (not
+    logical) cores because hyperthreads share memory ports and do not add
     bandwidth. A cached autotuned value, if present, overrides this; see
     :mod:`colstore.autotune`.
     """

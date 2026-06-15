@@ -43,6 +43,33 @@ def test_default_thread_cap_is_within_ceiling():
     assert 1 <= cap <= config._GATHER_THREAD_CEILING
 
 
+def test_ceiling_scales_with_socket_count(monkeypatch):
+    # The per-socket allowance times the socket count is the cap ceiling, so a
+    # dual-socket host admits twice the single-socket default.
+    monkeypatch.setattr(config, "_physical_cores", 128)
+    monkeypatch.setattr(config, "_GATHER_THREADS_PER_SOCKET", 8)
+    monkeypatch.setattr(config, "_socket_count", lambda: 2)
+    monkeypatch.setattr(config, "_GATHER_THREAD_CEILING", 8 * config._socket_count())
+    assert config._default_gather_thread_cap() == 16  # min(16, 128 // 2)
+    monkeypatch.setattr(config, "_socket_count", lambda: 1)
+    monkeypatch.setattr(config, "_GATHER_THREAD_CEILING", 8 * config._socket_count())
+    assert config._default_gather_thread_cap() == 8  # min(8, 64)
+    # A small single-socket box is still bounded by half its physical cores.
+    monkeypatch.setattr(config, "_physical_cores", 8)
+    assert config._default_gather_thread_cap() == 4  # min(8, 4)
+
+
+def test_socket_count_is_at_least_one():
+    assert config._socket_count() >= 1
+
+
+def test_candidate_thread_sweep_brackets_past_16():
+    # The sweep must extend beyond 16 so a knee at or above 16 is bracketed
+    # rather than clipped at the top candidate.
+    assert max(autotune._CANDIDATE_THREADS) > 16
+    assert 16 in autotune._CANDIDATE_THREADS
+
+
 def test_set_gather_thread_cap_roundtrips():
     original = config.get_gather_thread_cap()
     try:
