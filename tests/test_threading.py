@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -418,3 +420,112 @@ def test_parallel_copy_strided_source_is_byte_identical():
     expected = np.array(strided, copy=True)
     assert np.array_equal(out, expected)
     assert out.base is None  # owns its data, not a view of base
+
+
+# ---- Runtime thread binding (spread-across-cores) -------------------------
+# The topology and orchestration are pure Python and testable without the
+# extension; the actual sched_setaffinity bind is gated on a Linux build.
+
+from colstore import _numa  # noqa: E402
+
+
+def test_spread_cpu_order_interleaves_nodes(monkeypatch):
+    # Two nodes, two physical cores each -> round-robin one core per node.
+    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0, 1])
+    monkeypatch.setattr(_numa, "_node_core_cpus", lambda node: {0: [0, 2], 1: [4, 6]}[node])
+    assert _numa.spread_cpu_order(4) == [0, 4, 2, 6]
+    # Truncates to n, keeping the interleave order.
+    assert _numa.spread_cpu_order(3) == [0, 4, 2]
+    assert _numa.spread_cpu_order(1) == [0]
+    assert _numa.spread_cpu_order(0) == []
+    # Past the available cores: returns all, no padding/repeat.
+    assert _numa.spread_cpu_order(99) == [0, 4, 2, 6]
+
+
+def test_spread_cpu_order_uneven_nodes(monkeypatch):
+    # A node with fewer cores drops out of later rounds.
+    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0, 1])
+    monkeypatch.setattr(_numa, "_node_core_cpus", lambda node: {0: [0, 1, 2], 1: [8]}[node])
+    assert _numa.spread_cpu_order(10) == [0, 8, 1, 2]
+
+
+def test_spread_cpu_order_empty_topology(monkeypatch):
+    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [])
+    assert _numa.spread_cpu_order(8) == []
+
+
+def test_node_core_cpus_dedupes_hyperthread_siblings(monkeypatch, tmp_path):
+    # cpu0/cpu64 are siblings of one core; cpu1/cpu65 another. Keep the lows.
+    node_dir = tmp_path / "node0"
+    node_dir.mkdir()
+    (node_dir / "cpulist").write_text("0-1,64-65\n")
+    cpu_root = tmp_path / "cpu"
+    for cpu, sib in {0: "0,64", 1: "1,65", 64: "0,64", 65: "1,65"}.items():
+        top = cpu_root / f"cpu{cpu}" / "topology"
+        top.mkdir(parents=True)
+        (top / "thread_siblings_list").write_text(sib + "\n")
+    monkeypatch.setattr(_numa, "_SYS_NODE", tmp_path)
+    monkeypatch.setattr(_numa, "_SYS_CPU", cpu_root)
+    assert _numa._node_core_cpus(0) == [0, 1]
+
+
+def test_bind_gather_threads_respects_env(monkeypatch):
+    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
+    monkeypatch.setenv("OMP_PROC_BIND", "spread")
+    # An explicit launch-time policy wins: the helper declines to re-pin.
+    assert _numa.bind_gather_threads(8, force=True) is None
+
+
+def test_bind_gather_threads_non_linux(monkeypatch):
+    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", False)
+    assert _numa.bind_gather_threads(8, force=True) is None
+
+
+def test_bind_gather_threads_calls_primitive_and_is_idempotent(monkeypatch):
+    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
+    monkeypatch.delenv("OMP_PROC_BIND", raising=False)
+    monkeypatch.setattr(_numa, "spread_cpu_order", lambda n: [0, 1, 2, 3][:n])
+    monkeypatch.setattr(_numa, "_LAST_BOUND", None)
+
+    calls: list[list[int]] = []
+
+    fake = types.ModuleType("colstore._gather")
+
+    def fake_bind(arr):
+        calls.append(list(arr))
+        return len(arr)
+
+    fake.bind_threads_to_cpus = fake_bind  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "colstore._gather", fake)
+
+    assert _numa.bind_gather_threads(4) == 4
+    assert calls == [[0, 1, 2, 3]]
+    # Same cap: cached, no second native call.
+    assert _numa.bind_gather_threads(4) == 4
+    assert calls == [[0, 1, 2, 3]]
+    # force re-pins.
+    assert _numa.bind_gather_threads(4, force=True) == 4
+    assert len(calls) == 2
+
+
+def test_thread_binding_report_shape():
+    report = _numa.thread_binding_report()
+    if report:  # populated on Linux
+        assert set(report) == {"n_threads", "distinct_masks", "omp_proc_bind", "sample"}
+        assert report["n_threads"] >= 1
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
+def test_bind_threads_to_cpus_primitive(monkeypatch):
+    # Smoke-test the native primitive: binding to CPU 0 reports a non-negative
+    # count on Linux (-1 only where unsupported). Output of a later gather must
+    # still be correct, i.e. binding does not corrupt the pool.
+    from colstore import _gather, kernels
+
+    bound = _gather.bind_threads_to_cpus(np.array([0], dtype=np.intc))
+    assert bound in (-1, 0, 1)
+    source = np.arange(1000, dtype=np.float64)
+    out = kernels.gather(
+        source, np.array([999, 0, 500], dtype=np.int64), source.dtype, backend="cpp", thread_cap=4
+    )
+    assert out.tolist() == [999.0, 0.0, 500.0]

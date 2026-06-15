@@ -294,4 +294,16 @@ int colstore_gather_multirecord_mask(
     std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
     std::ptrdiff_t prefetch_distance);
 
+// Pin OpenMP worker threads to specific CPUs at runtime. In a parallel region
+// of ``n`` threads, worker ``t`` is pinned to ``cpus[t]`` via
+// ``sched_setaffinity``. This replicates ``OMP_PROC_BIND``/``OMP_PLACES`` --
+// which libgomp reads only at OpenMP initialization, too early for a library
+// to set once numpy/BLAS has started the runtime -- but applies it at runtime;
+// the binding persists for libgomp's reused thread pool. A negative ``cpus[t]``
+// leaves worker ``t`` unpinned. Returns the number of workers successfully
+// pinned, 0 for ``n <= 0``, or -1 where unsupported (non-Linux, or built
+// without OpenMP). Best-effort: a worker whose ``sched_setaffinity`` fails is
+// simply not counted.
+int colstore_bind_threads_to_cpus(const int* cpus, int n);
+
 }  // extern "C"

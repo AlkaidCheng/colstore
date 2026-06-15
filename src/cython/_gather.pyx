@@ -89,6 +89,7 @@ cdef extern from "colstore/gather.hpp" nogil:
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
         int, int, ptrdiff_t)
     int colstore_max_threads()
+    int colstore_bind_threads_to_cpus(const int*, int)
 
 
 cdef extern from "colstore/gather.hpp" namespace "colstore" nogil:
@@ -99,6 +100,28 @@ cdef extern from "colstore/gather.hpp" namespace "colstore" nogil:
 def max_threads() -> int:
     """Return OpenMP's max thread count (or 1 if OpenMP is disabled)."""
     return colstore_max_threads()
+
+
+def bind_threads_to_cpus(cnp.ndarray cpus) -> int:
+    """Pin libgomp's worker pool: worker ``t`` -> ``cpus[t]`` (one CPU each).
+
+    ``cpus`` is a 1D array of CPU ids (cast to C ``int``); its length is the
+    number of workers to pin. A negative entry leaves that worker unpinned.
+    Returns the number of workers pinned, 0 for an empty request, or -1 where
+    unsupported (non-Linux, or built without OpenMP). Best-effort: a worker
+    whose ``sched_setaffinity`` fails is simply not counted.
+    """
+    if cpus.ndim != 1:
+        raise ValueError("cpus must be a 1D array.")
+    cdef cnp.ndarray c = np.ascontiguousarray(cpus, dtype=np.intc)
+    cdef int n = c.shape[0]
+    if n == 0:
+        return 0
+    cdef const int* ptr = <const int*>cnp.PyArray_DATA(c)
+    cdef int bound
+    with nogil:
+        bound = colstore_bind_threads_to_cpus(ptr, n)
+    return bound
 
 
 def thread_count_for(Py_ssize_t n_indices, int cap) -> int:
