@@ -173,13 +173,12 @@ def _print_policy(per_row: int) -> tuple[_numa.BindingPolicy, float]:
 
 
 def _decision_table(policy: _numa.BindingPolicy, threshold: float, per_row: int) -> None:
-    print("\n# decision boundary (would the gate bind?)")
+    print("\n# decision boundary (does the gate's geometry fire? knob state is in the header)")
     print(f"   {'indices':>12}  {'working set':>12}  {'ws/thresh':>9}  bind")
-    enabled = config.get_gather_binding()
     for mult in _DECISION_MULTIPLES:
         n = _indices_for_working_set(mult * threshold, per_row)
         ws = n * per_row
-        would_bind = enabled and policy.applicable and ws > threshold
+        would_bind = policy.applicable and ws > threshold
         ratio = ws / threshold if threshold else float("inf")
         print(
             f"   {n:>12,}  {ws / _MIB:>9.0f} MiB  {ratio:>9.2f}  " f"{'Y' if would_bind else 'N'}"

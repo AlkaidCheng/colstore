@@ -630,14 +630,14 @@ def test_maybe_bind_for_gather_respects_knob_and_policy(monkeypatch):
 
 
 def test_gather_binding_config_roundtrip():
-    assert config.get_gather_binding() is True  # default on
+    assert config.get_gather_binding() is False  # ships off
     try:
-        config.set_gather_binding(False)
-        assert config.get_gather_binding() is False
+        config.set_gather_binding(True)
+        assert config.get_gather_binding() is True
         config.set_gather_bind_llc_margin(0.5)
         assert config.get_gather_bind_llc_margin() == 0.5
         with pytest.raises(ValueError):
             config.set_gather_bind_llc_margin(0)
     finally:
-        config.set_gather_binding(True)
+        config.set_gather_binding(False)
         config.set_gather_bind_llc_margin(1.0)
