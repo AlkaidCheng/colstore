@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -41,6 +40,33 @@ def test_use_passive_openmp_wait_is_opt_in(monkeypatch):
 def test_default_thread_cap_is_within_ceiling():
     cap = config.get_gather_thread_cap()
     assert 1 <= cap <= config._GATHER_THREAD_CEILING
+
+
+def test_ceiling_scales_with_socket_count(monkeypatch):
+    # The per-socket allowance times the socket count is the cap ceiling, so a
+    # dual-socket host admits twice the single-socket default.
+    monkeypatch.setattr(config, "_physical_cores", 128)
+    monkeypatch.setattr(config, "_GATHER_THREADS_PER_SOCKET", 8)
+    monkeypatch.setattr(config, "_socket_count", lambda: 2)
+    monkeypatch.setattr(config, "_GATHER_THREAD_CEILING", 8 * config._socket_count())
+    assert config._default_gather_thread_cap() == 16  # min(16, 128 // 2)
+    monkeypatch.setattr(config, "_socket_count", lambda: 1)
+    monkeypatch.setattr(config, "_GATHER_THREAD_CEILING", 8 * config._socket_count())
+    assert config._default_gather_thread_cap() == 8  # min(8, 64)
+    # A small single-socket box is still bounded by half its physical cores.
+    monkeypatch.setattr(config, "_physical_cores", 8)
+    assert config._default_gather_thread_cap() == 4  # min(8, 4)
+
+
+def test_socket_count_is_at_least_one():
+    assert config._socket_count() >= 1
+
+
+def test_candidate_thread_sweep_brackets_past_16():
+    # The sweep must extend beyond 16 so a knee at or above 16 is bracketed
+    # rather than clipped at the top candidate.
+    assert max(autotune._CANDIDATE_THREADS) > 16
+    assert 16 in autotune._CANDIDATE_THREADS
 
 
 def test_set_gather_thread_cap_roundtrips():
@@ -419,225 +445,3 @@ def test_parallel_copy_strided_source_is_byte_identical():
     expected = np.array(strided, copy=True)
     assert np.array_equal(out, expected)
     assert out.base is None  # owns its data, not a view of base
-
-
-# ---- Runtime thread binding (spread-across-cores) -------------------------
-# The topology and orchestration are pure Python and testable without the
-# extension; the actual sched_setaffinity bind is gated on a Linux build.
-
-from colstore import _numa  # noqa: E402
-
-
-def test_spread_cpu_order_interleaves_nodes(monkeypatch):
-    # Two nodes, two physical cores each -> round-robin one core per node.
-    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0, 1])
-    monkeypatch.setattr(_numa, "_node_core_cpus", lambda node: {0: [0, 2], 1: [4, 6]}[node])
-    assert _numa.spread_cpu_order(4) == [0, 4, 2, 6]
-    # Truncates to n, keeping the interleave order.
-    assert _numa.spread_cpu_order(3) == [0, 4, 2]
-    assert _numa.spread_cpu_order(1) == [0]
-    assert _numa.spread_cpu_order(0) == []
-    # Past the available cores: returns all, no padding/repeat.
-    assert _numa.spread_cpu_order(99) == [0, 4, 2, 6]
-
-
-def test_spread_cpu_order_uneven_nodes(monkeypatch):
-    # A node with fewer cores drops out of later rounds.
-    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0, 1])
-    monkeypatch.setattr(_numa, "_node_core_cpus", lambda node: {0: [0, 1, 2], 1: [8]}[node])
-    assert _numa.spread_cpu_order(10) == [0, 8, 1, 2]
-
-
-def test_spread_cpu_order_empty_topology(monkeypatch):
-    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [])
-    assert _numa.spread_cpu_order(8) == []
-
-
-def test_node_core_cpus_dedupes_hyperthread_siblings(monkeypatch, tmp_path):
-    # cpu0/cpu64 are siblings of one core; cpu1/cpu65 another. Keep the lows.
-    node_dir = tmp_path / "node0"
-    node_dir.mkdir()
-    (node_dir / "cpulist").write_text("0-1,64-65\n")
-    cpu_root = tmp_path / "cpu"
-    for cpu, sib in {0: "0,64", 1: "1,65", 64: "0,64", 65: "1,65"}.items():
-        top = cpu_root / f"cpu{cpu}" / "topology"
-        top.mkdir(parents=True)
-        (top / "thread_siblings_list").write_text(sib + "\n")
-    monkeypatch.setattr(_numa, "_SYS_NODE", tmp_path)
-    monkeypatch.setattr(_numa, "_SYS_CPU", cpu_root)
-    assert _numa._node_core_cpus(0) == [0, 1]
-
-
-def test_bind_gather_threads_respects_env(monkeypatch):
-    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
-    monkeypatch.setenv("OMP_PROC_BIND", "spread")
-    # An explicit launch-time policy wins: the helper declines to re-pin.
-    assert _numa.bind_gather_threads(8, force=True) is None
-
-
-def test_bind_gather_threads_non_linux(monkeypatch):
-    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", False)
-    assert _numa.bind_gather_threads(8, force=True) is None
-
-
-def test_bind_gather_threads_calls_primitive_and_is_idempotent(monkeypatch):
-    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
-    monkeypatch.delenv("OMP_PROC_BIND", raising=False)
-    monkeypatch.setattr(_numa, "spread_cpu_order", lambda n: [0, 1, 2, 3][:n])
-    monkeypatch.setattr(_numa, "_LAST_BOUND", None)
-
-    calls: list[list[int]] = []
-
-    def fake_bind(order):
-        calls.append(list(order))
-        return len(order)
-
-    # Patch the in-module seam over the extension, so this exercises the
-    # orchestration without depending on the compiled primitive or on
-    # `from . import _gather` resolution.
-    monkeypatch.setattr(_numa, "_native_bind_to_cpus", fake_bind)
-
-    assert _numa.bind_gather_threads(4) == 4
-    assert calls == [[0, 1, 2, 3]]
-    # Same cap: cached, no second native call.
-    assert _numa.bind_gather_threads(4) == 4
-    assert calls == [[0, 1, 2, 3]]
-    # force re-pins.
-    assert _numa.bind_gather_threads(4, force=True) == 4
-    assert len(calls) == 2
-
-
-def test_bind_gather_threads_returns_none_when_primitive_unavailable(monkeypatch):
-    # A -1 from the primitive (no extension / unsupported platform) surfaces as
-    # None, and nothing is cached.
-    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
-    monkeypatch.delenv("OMP_PROC_BIND", raising=False)
-    monkeypatch.setattr(_numa, "spread_cpu_order", lambda n: [0, 1])
-    monkeypatch.setattr(_numa, "_LAST_BOUND", None)
-    monkeypatch.setattr(_numa, "_native_bind_to_cpus", lambda order: -1)
-    assert _numa.bind_gather_threads(4) is None
-    assert _numa._LAST_BOUND is None
-
-
-def test_thread_binding_report_shape():
-    report = _numa.thread_binding_report()
-    if report:  # populated on Linux
-        assert set(report) == {"n_threads", "distinct_masks", "omp_proc_bind", "sample"}
-        assert report["n_threads"] >= 1
-
-
-@pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
-def test_bind_threads_to_cpus_primitive(monkeypatch):
-    # Smoke-test the native primitive: binding to CPU 0 reports a non-negative
-    # count on Linux (-1 only where unsupported). Output of a later gather must
-    # still be correct, i.e. binding does not corrupt the pool.
-    from colstore import _gather, kernels
-
-    bound = _gather.bind_threads_to_cpus(np.array([0], dtype=np.intc))
-    assert bound in (-1, 0, 1)
-    source = np.arange(1000, dtype=np.float64)
-    out = kernels.gather(
-        source, np.array([999, 0, 500], dtype=np.int64), source.dtype, backend="cpp", thread_cap=4
-    )
-    assert out.tolist() == [999.0, 0.0, 500.0]
-
-
-def test_aggregate_llc_sums_distinct_domains(monkeypatch, tmp_path):
-    # Two distinct L3 domains of 32 MiB each -> 64 MiB aggregate; a third entry
-    # sharing a domain mask must not be double-counted.
-    cpu_root = tmp_path / "cpu"
-    layout = {
-        "cpu0/cache/index3": ("3", "32M", "0-7"),
-        "cpu8/cache/index3": ("3", "32M", "8-15"),
-        "cpu1/cache/index3": ("3", "32M", "0-7"),  # same domain as cpu0
-        "cpu0/cache/index0": ("1", "32K", "0"),  # lower level, ignored
-    }
-    for rel, (level, size, shared) in layout.items():
-        d = cpu_root / rel
-        d.mkdir(parents=True)
-        (d / "level").write_text(level)
-        (d / "size").write_text(size)
-        (d / "shared_cpu_list").write_text(shared)
-    monkeypatch.setattr(
-        autotune, "Path", lambda p: cpu_root if "devices/system/cpu" in p else Path(p)
-    )
-    assert autotune.aggregate_llc_bytes() == 64 * 1024 * 1024
-
-
-def test_binding_policy_requires_multiple_numa_nodes(monkeypatch):
-    from colstore import _numa
-
-    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
-    monkeypatch.setattr(autotune, "aggregate_llc_bytes", lambda: 512 * 1024 * 1024)
-
-    _numa._reset_binding_policy()
-    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0, 1, 2, 3])
-    pol = _numa.binding_policy()
-    assert pol.applicable is True
-    assert pol.numa_nodes == 4
-    assert pol.aggregate_llc_bytes == 512 * 1024 * 1024
-    # Cached: a later topology change is not re-read until reset.
-    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0])
-    assert _numa.binding_policy().numa_nodes == 4
-
-    _numa._reset_binding_policy()
-    assert _numa.binding_policy().applicable is False  # single node now
-
-
-def test_maybe_bind_for_gather_gates_on_working_set(monkeypatch):
-    from colstore import _numa
-
-    calls: list[int | None] = []
-    monkeypatch.setattr(_numa, "bind_gather_threads", lambda cap=None: calls.append(cap) or 16)
-    monkeypatch.setattr(
-        _numa, "binding_policy", lambda: _numa.BindingPolicy(True, 256 * 1024 * 1024, 8)
-    )
-    monkeypatch.setattr(config, "get_gather_binding", lambda: True)
-    monkeypatch.setattr(config, "get_gather_bind_llc_margin", lambda: 1.0)
-
-    # Below threshold: skip, no native call.
-    assert _numa.maybe_bind_for_gather(200 * 1024 * 1024, 16) is None
-    assert calls == []
-    # Above threshold: bind with the given cap.
-    assert _numa.maybe_bind_for_gather(512 * 1024 * 1024, 16) == 16
-    assert calls == [16]
-
-
-def test_maybe_bind_for_gather_respects_knob_and_policy(monkeypatch):
-    from colstore import _numa
-
-    monkeypatch.setattr(
-        _numa,
-        "bind_gather_threads",
-        lambda cap=None: (_ for _ in ()).throw(AssertionError("bound")),
-    )
-    monkeypatch.setattr(config, "get_gather_bind_llc_margin", lambda: 1.0)
-
-    # Disabled by the knob: never binds, even for a huge working set.
-    monkeypatch.setattr(config, "get_gather_binding", lambda: True)
-    monkeypatch.setattr(
-        _numa, "binding_policy", lambda: _numa.BindingPolicy(True, 32 * 1024 * 1024, 8)
-    )
-    monkeypatch.setattr(config, "get_gather_binding", lambda: False)
-    assert _numa.maybe_bind_for_gather(1 << 40, 16) is None
-
-    # Enabled but policy not applicable (single-node / non-Linux host): skip.
-    monkeypatch.setattr(config, "get_gather_binding", lambda: True)
-    monkeypatch.setattr(
-        _numa, "binding_policy", lambda: _numa.BindingPolicy(False, 32 * 1024 * 1024, 1)
-    )
-    assert _numa.maybe_bind_for_gather(1 << 40, 16) is None
-
-
-def test_gather_binding_config_roundtrip():
-    assert config.get_gather_binding() is False  # ships off
-    try:
-        config.set_gather_binding(True)
-        assert config.get_gather_binding() is True
-        config.set_gather_bind_llc_margin(0.5)
-        assert config.get_gather_bind_llc_margin() == 0.5
-        with pytest.raises(ValueError):
-            config.set_gather_bind_llc_margin(0)
-    finally:
-        config.set_gather_binding(False)
-        config.set_gather_bind_llc_margin(1.0)

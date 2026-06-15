@@ -5,6 +5,7 @@ when constructing :class:`~colstore.ColStoreReader` instances; per-instance over
 take precedence over these globals.
 """
 
+import glob
 import os
 from typing import Literal
 
@@ -21,12 +22,41 @@ MadviseOption = Literal["normal", "sequential", "random", "willneed", "dontneed"
 GatherBackend = Literal["cpp", "numpy", "numba"]
 NumaPolicy = Literal["auto", "interleave", "local"]
 
-# Hard ceiling on gather threads. The kernel is memory-bandwidth-bound, so
-# throughput saturates at a small thread count well below the core count on
-# essentially all single-socket hardware; beyond ~8 threads extra parallelism
-# buys nothing and the fork/join + contention cost dominates (the difference
-# between 8 and 244 threads was measured at ~40x slower).
-_GATHER_THREAD_CEILING = 8
+# Per-socket ceiling on gather threads. The kernel is memory-bandwidth-bound,
+# so throughput saturates once the memory channels are busy -- a small count
+# well below the core count -- and beyond that, extra threads only add fork/join
+# and contention (8 vs 244 threads was measured ~40x slower). The saturation
+# point tracks the number of memory channels, which is not portably readable;
+# socket count is the best available proxy (channels per socket are roughly
+# fixed within a CPU generation, ~8 on server parts, and -- unlike NUMA node
+# count, which a NUMA-per-socket BIOS setting inflates -- stable for fixed
+# hardware). Allow this many gather threads per socket, so a dual-socket host
+# reaches ~16 while a single-socket desktop stays ~8.
+_GATHER_THREADS_PER_SOCKET = 8
+
+
+def _socket_count() -> int:
+    """Number of physical CPU sockets, best effort (always ``>= 1``).
+
+    Counts distinct ``physical_package_id`` values under
+    ``/sys/devices/system/cpu``. Falls back to ``1`` where sysfs is unreadable
+    (non-Linux, restricted containers), which keeps the ceiling at the
+    single-socket default.
+    """
+    ids: set[str] = set()
+    for path in glob.glob("/sys/devices/system/cpu/cpu[0-9]*/topology/physical_package_id"):
+        try:
+            with open(path) as handle:
+                ids.add(handle.read().strip())
+        except OSError:
+            continue
+    return max(1, len(ids))
+
+
+# Effective ceiling for this host: the per-socket allowance times the socket
+# count. A coarse hardware proxy -- ``colstore.autotune`` measures the true
+# saturation knee per host and overrides it when run.
+_GATHER_THREAD_CEILING = _GATHER_THREADS_PER_SOCKET * _socket_count()
 
 # Default software-prefetch look-ahead for the gather kernels, in elements.
 # Mirrors ``DEFAULT_PREFETCH_DISTANCE`` in ``include/colstore/gather.hpp``,
@@ -47,8 +77,10 @@ def _default_gather_thread_cap() -> int:
     """Derive a near-optimal default gather thread cap from the hardware.
 
     Half the physical cores is a robust proxy for the memory-bandwidth
-    saturation point, clamped to ``[1, _GATHER_THREAD_CEILING]``. Uses physical
-    (not logical) cores because hyperthreads share memory ports and do not add
+    saturation point, clamped to ``[1, _GATHER_THREAD_CEILING]`` -- a per-socket
+    allowance times the socket count, so a multi-socket host (more memory
+    channels) gets a higher cap than a single-socket box. Uses physical (not
+    logical) cores because hyperthreads share memory ports and do not add
     bandwidth. A cached autotuned value, if present, overrides this; see
     :mod:`colstore.autotune`.
     """
@@ -65,20 +97,6 @@ _default_backend: GatherBackend = "cpp"
 _gather_thread_cap: int = _default_gather_thread_cap()
 _numa_policy: NumaPolicy = "auto"
 _prefetch_distance: int | Literal["auto"] = "auto"
-
-# Reader-side spread thread-binding. The gate (see ``_numa.maybe_bind_for_gather``)
-# pins the OpenMP pool spread across cores for a gather whose working set exceeds
-# ``_gather_bind_llc_margin`` times the host's aggregate last-level cache, on hosts
-# with multiple NUMA nodes. It ships *off*: a placement x binding x cap sweep on
-# 2- and 8-node hardware found spread binding regresses the large random-scatter
-# conversions in every cell (24-51% slower than the unbound pool), independent of
-# whether the data is node-local or interleaved -- for a random gather a thread's
-# accesses are scattered across all nodes regardless, so spreading only adds
-# remote-access and cross-node coherence cost. The mechanism is retained, gated,
-# and exposed so a host or access pattern that does show a measured win can opt in
-# without a rebuild; the margin tunes the resident-vs-DRAM boundary when it does.
-_gather_binding: bool = False
-_gather_bind_llc_margin: float = 1.0
 
 # Lazily-loaded per-regime distance table for "auto" mode, populated either
 # from the autotune cache (first resolution) or directly by
@@ -126,54 +144,6 @@ def set_gather_thread_cap(n: int) -> None:
     if n < 1:
         raise ValueError(f"gather_thread_cap must be >= 1, got {n}.")
     _gather_thread_cap = int(n)
-
-
-def get_gather_binding() -> bool:
-    """Return whether reader-side spread thread-binding is enabled.
-
-    Ships ``False``: spread binding regressed the large random-scatter
-    conversions on multi-node hardware (see :func:`set_gather_binding`). When
-    enabled, large DRAM-bound gathers pin the OpenMP pool spread across cores.
-    """
-    return _gather_binding
-
-
-def set_gather_binding(enabled: bool) -> None:
-    """Enable or disable reader-side spread thread-binding.
-
-    Off by default. A placement x binding x cap sweep on 2- and 8-node hosts
-    found spread binding slower than the unbound pool in every cell for the
-    large random-scatter conversions (``dict``/``recarray``/``frame``),
-    independent of NUMA data placement -- a random gather touches all nodes
-    regardless, so pinning threads one-per-node only adds remote-access and
-    cross-node coherence cost. The gate is retained and exposed so a host or
-    access pattern that shows a measured win can opt in; when enabled, binding
-    is still gated per gather on working set versus aggregate last-level cache
-    and on the host having multiple NUMA nodes, so it stays a no-op on
-    single-node and cache-resident workloads.
-    """
-    global _gather_binding
-    _gather_binding = bool(enabled)
-
-
-def get_gather_bind_llc_margin() -> float:
-    """Return the working-set/aggregate-L3 multiplier that gates binding."""
-    return _gather_bind_llc_margin
-
-
-def set_gather_bind_llc_margin(margin: float) -> None:
-    """Set the working-set threshold for binding, as a multiple of aggregate L3.
-
-    A gather binds only when ``n_indices * n_cols * itemsize`` exceeds
-    ``margin * aggregate_llc_bytes``. The default ``1.0`` binds once the gather
-    spills aggregate cache (measured the clean win regime on multi-node
-    hardware); lower it toward the per-socket fraction to engage binding
-    sooner, raise it to be more conservative.
-    """
-    global _gather_bind_llc_margin
-    if margin <= 0:
-        raise ValueError(f"gather_bind_llc_margin must be > 0, got {margin}.")
-    _gather_bind_llc_margin = float(margin)
 
 
 def get_prefetch_distance() -> int | Literal["auto"]:
