@@ -361,6 +361,44 @@ def llc_bytes() -> int:
     return best or _LLC_FALLBACK_BYTES
 
 
+def aggregate_llc_bytes() -> int:
+    """Summed last-level cache across all distinct cache domains, best effort.
+
+    Where :func:`llc_bytes` reports one socket/domain, this sums the largest-
+    level cache of every distinct sharing group under
+    ``/sys/devices/system/cpu``. On a chiplet or multi-socket host (one L3 per
+    core-complex, or per socket), that total is the cache a gather whose
+    threads are spread across the machine can actually draw on, so it -- not a
+    single domain -- is the resident-vs-DRAM boundary for the spread-binding
+    gate. Falls back to :func:`llc_bytes` where the per-cpu hierarchy is
+    unreadable (non-Linux, restricted sysfs).
+    """
+    best_level = -1
+    caches: dict[str, int] = {}
+    cpu_root = Path("/sys/devices/system/cpu")
+    try:
+        for index_dir in cpu_root.glob("cpu[0-9]*/cache/index*"):
+            try:
+                level = int((index_dir / "level").read_text())
+                raw = (index_dir / "size").read_text().strip()
+                shared = (index_dir / "shared_cpu_list").read_text().strip()
+            except (OSError, ValueError):
+                continue
+            if raw.endswith("K"):
+                size = int(raw[:-1]) * 1024
+            elif raw.endswith("M"):
+                size = int(raw[:-1]) * 1024 * 1024
+            else:
+                size = int(raw)
+            if level > best_level:
+                best_level, caches = level, {}
+            if level == best_level:
+                caches[shared] = size  # one entry per distinct sharing group
+    except OSError:
+        pass
+    return sum(caches.values()) or llc_bytes()
+
+
 def load_cached_prefetch() -> dict[str, int] | None:
     """Return the cached per-regime prefetch table, or ``None`` if absent.
 
