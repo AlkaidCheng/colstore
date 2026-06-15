@@ -26,7 +26,9 @@ saves and restores the fd's offset around the lock call.
 from __future__ import annotations
 
 import contextlib
+import errno
 import sys
+import warnings
 
 if sys.platform == "win32":
     import msvcrt
@@ -66,9 +68,39 @@ if sys.platform == "win32":
 else:
     import fcntl
 
+    # Some network / parallel filesystems (Lustre, GPFS, certain NFS mounts) do
+    # not implement flock and report it as one of these errnos. ENOTSUPP (524)
+    # is a kernel-internal code with no errno-module name that leaks to
+    # userspace from exactly these mounts; EOPNOTSUPP and ENOLCK are the
+    # POSIX-named variants. On such a mount advisory locking is unavailable to
+    # every process, so there is no lock to contend for: proceeding without one
+    # is the only option and loses no guarantee that was achievable there.
+    _ENOTSUPP = 524
+    _LOCK_UNSUPPORTED = frozenset({errno.ENOLCK, errno.EOPNOTSUPP, _ENOTSUPP})
+
     def lock_exclusive_nonblocking(fd: int) -> None:
-        """Acquire an exclusive non-blocking lock; raise BlockingIOError if held."""
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        """Acquire an exclusive non-blocking lock; raise BlockingIOError if held.
+
+        On a filesystem that does not implement flock, advisory locking is
+        unavailable to all processes, so this proceeds without a lock (emitting
+        a one-time warning) rather than failing the write -- there is no lock to
+        contend for. Genuine contention (another holder) still raises
+        BlockingIOError, which the caller turns into an actionable error.
+        """
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise  # a real holder; not the filesystem refusing to lock
+        except OSError as e:
+            if e.errno not in _LOCK_UNSUPPORTED:
+                raise
+            warnings.warn(
+                "advisory file locking is not supported on this filesystem; "
+                "proceeding without a writer lock (concurrent writers to the "
+                "same file will not be detected)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     def unlock(fd: int) -> None:
         """Release a previously-acquired lock. Idempotent: errors are suppressed."""
