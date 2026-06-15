@@ -66,13 +66,18 @@ _gather_thread_cap: int = _default_gather_thread_cap()
 _numa_policy: NumaPolicy = "auto"
 _prefetch_distance: int | Literal["auto"] = "auto"
 
-# Reader-side spread thread-binding. When enabled (the default), a gather whose
-# working set exceeds ``_gather_bind_llc_margin`` times the host's aggregate
-# last-level cache pins the OpenMP pool spread across cores (see
-# ``_numa.maybe_bind_for_gather``); cache-resident gathers and hosts without
-# multiple NUMA nodes are left unbound. The margin is exposed so the
-# resident-vs-DRAM boundary can be tuned per host without a rebuild.
-_gather_binding: bool = True
+# Reader-side spread thread-binding. The gate (see ``_numa.maybe_bind_for_gather``)
+# pins the OpenMP pool spread across cores for a gather whose working set exceeds
+# ``_gather_bind_llc_margin`` times the host's aggregate last-level cache, on hosts
+# with multiple NUMA nodes. It ships *off*: a placement x binding x cap sweep on
+# 2- and 8-node hardware found spread binding regresses the large random-scatter
+# conversions in every cell (24-51% slower than the unbound pool), independent of
+# whether the data is node-local or interleaved -- for a random gather a thread's
+# accesses are scattered across all nodes regardless, so spreading only adds
+# remote-access and cross-node coherence cost. The mechanism is retained, gated,
+# and exposed so a host or access pattern that does show a measured win can opt in
+# without a rebuild; the margin tunes the resident-vs-DRAM boundary when it does.
+_gather_binding: bool = False
 _gather_bind_llc_margin: float = 1.0
 
 # Lazily-loaded per-regime distance table for "auto" mode, populated either
@@ -126,8 +131,9 @@ def set_gather_thread_cap(n: int) -> None:
 def get_gather_binding() -> bool:
     """Return whether reader-side spread thread-binding is enabled.
 
-    When ``True`` (the default), large DRAM-bound gathers pin the OpenMP pool
-    spread across cores; see :func:`set_gather_binding`.
+    Ships ``False``: spread binding regressed the large random-scatter
+    conversions on multi-node hardware (see :func:`set_gather_binding`). When
+    enabled, large DRAM-bound gathers pin the OpenMP pool spread across cores.
     """
     return _gather_binding
 
@@ -135,11 +141,16 @@ def get_gather_binding() -> bool:
 def set_gather_binding(enabled: bool) -> None:
     """Enable or disable reader-side spread thread-binding.
 
-    Binding is gated per gather on working set versus aggregate last-level
-    cache and on the host having multiple NUMA nodes, so leaving it on is safe
-    on single-node and cache-resident workloads (it simply does not engage).
-    Disable it to fall back to the unbound OpenMP pool unconditionally, or when
-    an external ``OMP_PROC_BIND`` policy already governs affinity.
+    Off by default. A placement x binding x cap sweep on 2- and 8-node hosts
+    found spread binding slower than the unbound pool in every cell for the
+    large random-scatter conversions (``dict``/``recarray``/``frame``),
+    independent of NUMA data placement -- a random gather touches all nodes
+    regardless, so pinning threads one-per-node only adds remote-access and
+    cross-node coherence cost. The gate is retained and exposed so a host or
+    access pattern that shows a measured win can opt in; when enabled, binding
+    is still gated per gather on working set versus aggregate last-level cache
+    and on the host having multiple NUMA nodes, so it stays a no-op on
+    single-node and cache-resident workloads.
     """
     global _gather_binding
     _gather_binding = bool(enabled)
