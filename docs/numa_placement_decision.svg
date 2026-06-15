@@ -4,19 +4,15 @@
 <style>
   .box { fill: #F1EFE8; stroke: #888780; stroke-width: 0.75; }
   .kbox { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.75; }
-  .dash { fill: #FBF1DE; stroke: #B9852B; stroke-width: 0.9; stroke-dasharray: 5 4; }
   .t { fill: #2C2C2A; font-size: 14px; font-weight: 500; }
   .ts { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
   .kt { fill: #04342C; font-size: 14px; font-weight: 500; }
   .kts { fill: #0F6E56; font-size: 12px; font-weight: 400; }
-  .at { fill: #6B4A12; font-size: 14px; font-weight: 500; }
-  .ats { fill: #8A6320; font-size: 12px; font-weight: 400; }
   .lbl { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
   .arr { stroke: #73726C; stroke-width: 1.25; fill: none; }
   @media (prefers-color-scheme: dark) {
     .box { fill: #2C2C2A; stroke: #888780; } .t { fill: #F1EFE8; } .ts { fill: #D3D1C7; }
     .kbox { fill: #04342C; stroke: #1D9E75; } .kt { fill: #E1F5EE; } .kts { fill: #9FE1CB; }
-    .dash { fill: #2E2613; stroke: #C9972F; } .at { fill: #F0D9A6; } .ats { fill: #D9B871; }
     .lbl { fill: #B4B2A9; } .arr { stroke: #B4B2A9; }
   }
 </style>
@@ -51,7 +47,7 @@
 
 <line class="arr" x1="340" y1="300" x2="340" y2="336" marker-end="url(#ar)"/>
 
-<rect class="dash" x="140" y="336" width="400" height="64" rx="10"/>
-<text class="at" x="340" y="361" text-anchor="middle">Per-pattern cold-read placement</text>
-<text class="ats" x="340" y="381" text-anchor="middle">does the winner flip by access pattern? &#8212; measuring (this PR)</text>
+<rect class="kbox" x="140" y="336" width="400" height="64" rx="10"/>
+<text class="kt" x="340" y="361" text-anchor="middle">Per-pattern cold placement: not needed</text>
+<text class="kts" x="340" y="381" text-anchor="middle">measured &#8212; interleave wins or ties every pattern</text>
 </svg>

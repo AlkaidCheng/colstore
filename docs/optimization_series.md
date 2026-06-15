@@ -651,6 +651,13 @@ caches.
   into a segfault class on a read-only mapping. (Stage 11)
 * **Silent copy fallback for `copy=False`** — voids the memory guarantee
   the flag exists for; unsupported cases raise with the remedy. (Stage 11)
+* **Per-pattern cold-read NUMA placement** — the warm sweep never covered
+  cold reads, so a cold A/B of `local` vs `interleave` across contiguous,
+  sorted-fancy, and random-scatter selectors on a multi-node host tested
+  whether the best placement flips by pattern. Interleave was at least as fast
+  for every pattern (1.10x contiguous, ~1.0x within noise otherwise) and never
+  slower; no flip, so the single `auto` default (interleave on multi-node)
+  stands and no per-pattern mechanism is warranted. (`check_cold_read_placement`)
 
 # Open / deferred items (recorded reasons)
 
@@ -680,6 +687,7 @@ caches.
   0.0 (route on at every density); calibration exists to raise or disable
   the gate on hosts where sparse masks lose, e.g. single-core
   environments.
-* **NUMA follow-ups** — benchmark `auto` vs `local` policies for
-  single-threaded readers; writer-side interleave scope on real Lustre
-  paths.
+* **NUMA follow-ups** — the cold `auto` vs `local` comparison across access
+  patterns is resolved (see rejected alternatives: interleave wins or ties,
+  no per-pattern flip). Still open: a strict single-threaded-reader variant,
+  and writer-side interleave scope on real Lustre paths.

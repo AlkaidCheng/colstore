@@ -164,10 +164,14 @@ is placed according to the policy.
 
 ![NUMA placement decision](docs/numa_placement_decision.svg)
 
-Whether the best cold-read placement depends on the access pattern — a
-sequential scan may prefer `local`, a many-threaded scatter `interleave` — is an
-open question; `benchmark/check_cold_read_placement.py` measures it, and a
-per-pattern mechanism will follow only if the winner turns out to flip.
+Whether the best cold-read placement depends on the access pattern was the one
+case the warm sweep never covered. `benchmark/check_cold_read_placement.py`
+measured it on a multi-node host: cold, across contiguous, sorted-fancy, and
+random-scatter selectors, interleave was at least as fast as local for every
+pattern (1.10× on the contiguous scan, within noise otherwise) and never
+slower. The winner never flips to local, so there is nothing for a per-pattern
+mechanism to exploit and the single `auto` default stands. Revisit only if a
+host or access pattern is found where local beats interleave for cold reads.
 
 Pinning the gather threads (rather than placing pages) is a separate, opt-in
 lever that ships **off**: a placement × binding × cap sweep measured spread
