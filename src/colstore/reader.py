@@ -97,6 +97,31 @@ def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     return bool(np.all(indices[1:] >= indices[:-1]))
 
 
+def _selector_row_count(row_indexer: Any, n_rows: int) -> int:
+    """Best-effort count of rows a selector will gather, for the binding gate.
+
+    Used only to size the working set against last-level cache, so an exact
+    count is unnecessary -- but the common selector shapes are cheap to count
+    precisely (a boolean mask's popcount, a fancy array's length, a slice's
+    span). Unknown shapes fall back to ``n_rows`` (treat as a full read), which
+    biases the gate toward binding rather than skipping a large gather.
+    """
+    if row_indexer is None:
+        return n_rows
+    if isinstance(row_indexer, (int, np.integer)):
+        return 1
+    if isinstance(row_indexer, slice):
+        return len(range(*row_indexer.indices(n_rows)))
+    if isinstance(row_indexer, np.ndarray):
+        if row_indexer.dtype == np.bool_:
+            return int(np.count_nonzero(row_indexer))
+        return int(row_indexer.shape[0])
+    try:
+        return len(row_indexer)
+    except TypeError:
+        return n_rows
+
+
 # ---- Parallel contiguous copy ------------------------------------------
 #
 # A contiguous column read is one memcpy from the memmap into an owning
@@ -1112,6 +1137,14 @@ class ColStoreReader:
         comes from the column pool (the regime where that is most efficient);
         with few columns each kernel still gets a meaningful share of the cap.
         """
+        # Pin the OpenMP pool spread across cores for DRAM-bound multi-column
+        # gathers (the conversion path) before any sub-route runs its kernels.
+        # The gate (working set vs aggregate L3, multi-node host, enabled) lives
+        # in _numa; this is a cheap, idempotent no-op when it declines.
+        working_set = _selector_row_count(row_indexer, self._n_rows) * sum(
+            self._column_dtypes[name].itemsize for name in column_names
+        )
+        _numa.maybe_bind_for_gather(working_set, config.get_gather_thread_cap())
         mask_route = self._gather_many_mask(column_names, row_indexer)
         if mask_route is not None:
             return mask_route

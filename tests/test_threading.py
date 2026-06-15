@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -539,3 +540,104 @@ def test_bind_threads_to_cpus_primitive(monkeypatch):
         source, np.array([999, 0, 500], dtype=np.int64), source.dtype, backend="cpp", thread_cap=4
     )
     assert out.tolist() == [999.0, 0.0, 500.0]
+
+
+def test_aggregate_llc_sums_distinct_domains(monkeypatch, tmp_path):
+    # Two distinct L3 domains of 32 MiB each -> 64 MiB aggregate; a third entry
+    # sharing a domain mask must not be double-counted.
+    cpu_root = tmp_path / "cpu"
+    layout = {
+        "cpu0/cache/index3": ("3", "32M", "0-7"),
+        "cpu8/cache/index3": ("3", "32M", "8-15"),
+        "cpu1/cache/index3": ("3", "32M", "0-7"),  # same domain as cpu0
+        "cpu0/cache/index0": ("1", "32K", "0"),  # lower level, ignored
+    }
+    for rel, (level, size, shared) in layout.items():
+        d = cpu_root / rel
+        d.mkdir(parents=True)
+        (d / "level").write_text(level)
+        (d / "size").write_text(size)
+        (d / "shared_cpu_list").write_text(shared)
+    monkeypatch.setattr(
+        autotune, "Path", lambda p: cpu_root if "devices/system/cpu" in p else Path(p)
+    )
+    assert autotune.aggregate_llc_bytes() == 64 * 1024 * 1024
+
+
+def test_binding_policy_requires_multiple_numa_nodes(monkeypatch):
+    from colstore import _numa
+
+    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
+    monkeypatch.setattr(autotune, "aggregate_llc_bytes", lambda: 512 * 1024 * 1024)
+
+    _numa._reset_binding_policy()
+    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0, 1, 2, 3])
+    pol = _numa.binding_policy()
+    assert pol.applicable is True
+    assert pol.numa_nodes == 4
+    assert pol.aggregate_llc_bytes == 512 * 1024 * 1024
+    # Cached: a later topology change is not re-read until reset.
+    monkeypatch.setattr(_numa, "_cpu_nodes", lambda: [0])
+    assert _numa.binding_policy().numa_nodes == 4
+
+    _numa._reset_binding_policy()
+    assert _numa.binding_policy().applicable is False  # single node now
+
+
+def test_maybe_bind_for_gather_gates_on_working_set(monkeypatch):
+    from colstore import _numa
+
+    calls: list[int | None] = []
+    monkeypatch.setattr(_numa, "bind_gather_threads", lambda cap=None: calls.append(cap) or 16)
+    monkeypatch.setattr(
+        _numa, "binding_policy", lambda: _numa.BindingPolicy(True, 256 * 1024 * 1024, 8)
+    )
+    monkeypatch.setattr(config, "get_gather_binding", lambda: True)
+    monkeypatch.setattr(config, "get_gather_bind_llc_margin", lambda: 1.0)
+
+    # Below threshold: skip, no native call.
+    assert _numa.maybe_bind_for_gather(200 * 1024 * 1024, 16) is None
+    assert calls == []
+    # Above threshold: bind with the given cap.
+    assert _numa.maybe_bind_for_gather(512 * 1024 * 1024, 16) == 16
+    assert calls == [16]
+
+
+def test_maybe_bind_for_gather_respects_knob_and_policy(monkeypatch):
+    from colstore import _numa
+
+    monkeypatch.setattr(
+        _numa,
+        "bind_gather_threads",
+        lambda cap=None: (_ for _ in ()).throw(AssertionError("bound")),
+    )
+    monkeypatch.setattr(config, "get_gather_bind_llc_margin", lambda: 1.0)
+
+    # Disabled by the knob: never binds, even for a huge working set.
+    monkeypatch.setattr(config, "get_gather_binding", lambda: True)
+    monkeypatch.setattr(
+        _numa, "binding_policy", lambda: _numa.BindingPolicy(True, 32 * 1024 * 1024, 8)
+    )
+    monkeypatch.setattr(config, "get_gather_binding", lambda: False)
+    assert _numa.maybe_bind_for_gather(1 << 40, 16) is None
+
+    # Enabled but policy not applicable (single-node / non-Linux host): skip.
+    monkeypatch.setattr(config, "get_gather_binding", lambda: True)
+    monkeypatch.setattr(
+        _numa, "binding_policy", lambda: _numa.BindingPolicy(False, 32 * 1024 * 1024, 1)
+    )
+    assert _numa.maybe_bind_for_gather(1 << 40, 16) is None
+
+
+def test_gather_binding_config_roundtrip():
+    assert config.get_gather_binding() is True  # default on
+    try:
+        config.set_gather_binding(False)
+        assert config.get_gather_binding() is False
+        config.set_gather_bind_llc_margin(0.5)
+        assert config.get_gather_bind_llc_margin() == 0.5
+        with pytest.raises(ValueError):
+            config.set_gather_bind_llc_margin(0)
+    finally:
+        config.set_gather_binding(True)
+        config.set_gather_bind_llc_margin(1.0)
