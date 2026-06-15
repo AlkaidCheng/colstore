@@ -153,6 +153,29 @@ allowance so multi-socket hosts (with more memory channels) get a higher
 default; `colstore.autotune` refines it per host by measuring the saturation
 knee directly.
 
+## NUMA placement
+
+On a multi-node (multi-socket) Linux host, the default `auto` policy interleaves
+a store's pages across nodes so the memory controllers share the load; on a
+single-node host, or under `local`, it leaves the kernel's first-touch placement
+that keeps pages near the reading thread. Placement is decided at the first page
+fault, so warm pages cannot be moved — only a cold read (pages not yet resident)
+is placed according to the policy.
+
+![NUMA placement decision](docs/numa_placement_decision.svg)
+
+Whether the best cold-read placement depends on the access pattern — a
+sequential scan may prefer `local`, a many-threaded scatter `interleave` — is an
+open question; `benchmark/check_cold_read_placement.py` measures it, and a
+per-pattern mechanism will follow only if the winner turns out to flip.
+
+Pinning the gather threads (rather than placing pages) is a separate, opt-in
+lever that ships **off**: a placement × binding × cap sweep measured spread
+binding 24–51% slower on a multi-node host, so `gather_binding` defaults to off
+and the realized path is the unbound default pool.
+
+![Gather thread binding status](docs/gather_thread_binding_status.svg)
+
 ## On-disk format
 
 ```

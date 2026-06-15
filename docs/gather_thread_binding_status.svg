@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="372" viewBox="0 0 680 372" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Gather thread binding (shipped off)</title>
+<desc>Reader-side spread thread binding ships disabled. The realized path for every gather is the default pool with no binding. Enabling the opt-in knob routes through a gate (two or more NUMA nodes, working set above aggregate last-level cache) before binding threads spread across cores. A placement, binding, and cap sweep measured spread binding 24 to 51 percent slower on a multi-node host, so it is retained only as a measured opt-in lever.</desc>
+<style>
+  .box { fill: #F1EFE8; stroke: #888780; stroke-width: 0.75; }
+  .kbox { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.75; }
+  .abox { fill: #FBF1DE; stroke: #B9852B; stroke-width: 0.75; }
+  .t { fill: #2C2C2A; font-size: 14px; font-weight: 500; }
+  .ts { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
+  .kt { fill: #04342C; font-size: 14px; font-weight: 500; }
+  .kts { fill: #0F6E56; font-size: 12px; font-weight: 400; }
+  .at { fill: #6B4A12; font-size: 14px; font-weight: 500; }
+  .ats { fill: #8A6320; font-size: 12px; font-weight: 400; }
+  .lbl { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
+  .arr { stroke: #73726C; stroke-width: 1.25; fill: none; }
+  @media (prefers-color-scheme: dark) {
+    .box { fill: #2C2C2A; stroke: #888780; } .t { fill: #F1EFE8; } .ts { fill: #D3D1C7; }
+    .kbox { fill: #04342C; stroke: #1D9E75; } .kt { fill: #E1F5EE; } .kts { fill: #9FE1CB; }
+    .abox { fill: #2E2613; stroke: #C9972F; } .at { fill: #F0D9A6; } .ats { fill: #D9B871; }
+    .lbl { fill: #B4B2A9; } .arr { stroke: #B4B2A9; }
+  }
+</style>
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<rect class="box" x="215" y="30" width="250" height="56" rx="8"/>
+<text class="t" x="340" y="54" text-anchor="middle">gather_binding</text>
+<text class="ts" x="340" y="72" text-anchor="middle">default: off</text>
+
+<line class="arr" x1="320" y1="86" x2="200" y2="148" marker-end="url(#ar)"/>
+<line class="arr" x1="360" y1="86" x2="480" y2="148" marker-end="url(#ar)"/>
+<text class="lbl" x="226" y="120" text-anchor="middle">enabled (opt-in)</text>
+<text class="lbl" x="455" y="120" text-anchor="middle">off (default)</text>
+
+<rect class="abox" x="55" y="150" width="250" height="56" rx="8"/>
+<text class="at" x="180" y="174" text-anchor="middle">Gate, then bind spread</text>
+<text class="ats" x="180" y="192" text-anchor="middle">&#8805; 2 nodes, ws &gt; agg L3</text>
+
+<rect class="kbox" x="375" y="150" width="250" height="56" rx="8"/>
+<text class="kt" x="500" y="174" text-anchor="middle">Default pool</text>
+<text class="kts" x="500" y="192" text-anchor="middle">no binding &#183; the realized path</text>
+
+<line class="arr" x1="180" y1="206" x2="180" y2="256" marker-end="url(#ar)"/>
+<line class="arr" x1="500" y1="206" x2="500" y2="256" marker-end="url(#ar)"/>
+
+<rect class="box" x="55" y="256" width="570" height="64" rx="8"/>
+<text class="ts" x="340" y="281" text-anchor="middle">Shipped off: a placement &#215; binding &#215; cap sweep measured spread binding</text>
+<text class="ts" x="340" y="301" text-anchor="middle">24&#8211;51% slower on a multi-node host. Kept as a measured opt-in lever.</text>
+</svg>
