@@ -2,14 +2,14 @@
 
 The static default from :func:`colstore.config._default_gather_thread_cap`
 (physical cores // 2, clamped to a small ceiling) lands within ~10-20% of
-optimal on most machines. :func:`calibrate` closes the gap by measuring
-the gather kernel at a range of thread counts on a synthetic scatter,
-picking the smallest count within a tolerance of the best, and caching
-the result keyed by a hardware fingerprint at
-``$XDG_CACHE_HOME/colstore/threads.json`` (falling back to ``~/.cache``).
-The cache is consulted once, lazily; calibration itself runs only on an
-explicit :func:`calibrate` / :func:`ensure_calibrated` call, so import
-stays fast and no benchmark runs behind the user's back.
+optimal on most machines. :func:`calibrate` closes the gap by measuring a
+real multi-column ``dict()`` conversion at a range of thread counts (the
+conversions are what the cap governs), picking the smallest count within a
+tolerance of the best, and caching the result keyed by a hardware
+fingerprint at ``$XDG_CACHE_HOME/colstore/threads.json`` (falling back to
+``~/.cache``). The cache is consulted once, lazily; calibration itself runs
+only on an explicit :func:`calibrate` / :func:`ensure_calibrated` call, so
+import stays fast and no benchmark runs behind the user's back.
 
 The same pattern covers the prefetch distance: :func:`calibrate_prefetch`
 sweeps it over four access regimes ({cache-resident, DRAM-bound} x
@@ -36,21 +36,31 @@ import numpy as np
 from . import config
 
 # Bump when the calibration procedure changes in a way that invalidates old
-# cached results (e.g. different workload shape or scoring rule).
-_CALIBRATION_VERSION = 1
+# cached results (e.g. different workload shape or scoring rule). v2: the thread
+# cap is calibrated against a multi-column conversion rather than a
+# single-column scatter, which moves the selected knee (see ``calibrate``).
+_CALIBRATION_VERSION = 2
 
-# Candidate thread counts to sweep. Capped to the OpenMP max at runtime.
-_CANDIDATE_THREADS = (1, 2, 4, 8, 16)
+# Candidate thread counts to sweep. Capped to the OpenMP max at runtime. Goes
+# past the expected ~16 knee so _pick_knee brackets it on merit (confirming the
+# next step up buys nothing) rather than being silently capped at the top
+# candidate.
+_CANDIDATE_THREADS = (1, 2, 4, 8, 16, 32)
 
 # Synthetic workload sizing. The gather is memory-latency-bound and its thread
-# scaling saturates at a size-dependent knee: a size x thread sweep on
-# multi-NUMA-node hardware put the knee at ~4 threads for 4M indices but
-# ~16 for >= 64M, so calibrating at 4M sampled below the regime the cap
-# actually governs and under-picked the knee. Sample in the saturated regime
-# so _pick_knee reflects production-scale gathers (bounded by
-# _CALIB_SOURCE_ROWS; raises one-time calibration cost).
+# scaling saturates at a size-dependent knee. The cap governs the multi-column
+# conversions, whose per-column pool divides the cap across several independent
+# memory streams (see ``ColStoreReader._gather_many``); calibration therefore
+# times a real ``dict()`` conversion over ``_CALIB_N_COLS`` columns so the knee
+# reflects production-scale conversions rather than a single-column scatter
+# (which saturates lower and under-picks the cap). Sample in the saturated
+# regime; the synthetic store is ``_CALIB_SOURCE_ROWS x _CALIB_N_COLS`` float32
+# on disk (~1.6 GB at the defaults), written once to a temp dir honoring
+# ``TMPDIR``, so calibration cost rises accordingly.
 _CALIB_SOURCE_ROWS = 50_000_000
 _CALIB_N_INDICES = 32_000_000
+_CALIB_N_COLS = 8
+_CALIB_RECORDS = 16
 
 # Timing rounds shared by every calibration target. Each round measures every
 # candidate once (interleaved), so slow drift in background load -- the
@@ -214,16 +224,28 @@ def _warn_if_unstable(
 def calibrate(*, persist: bool = True, verbose: bool = False, rounds: int = _CALIB_ROUNDS) -> int:
     """Measure and select a near-optimal gather thread cap for this machine.
 
-    Sweeps a range of thread counts on a synthetic scatter -- every candidate
-    timed once per round, interleaved, with the median over ``rounds`` rounds
-    as the statistic (see :data:`_CALIB_ROUNDS`) -- picks the smallest count
-    within :data:`_KNEE_TOLERANCE` of the best throughput, applies it via
+    Sweeps a range of thread counts against a real multi-column ``dict()``
+    conversion on a synthetic store -- every candidate timed once per round,
+    interleaved, with the median over ``rounds`` rounds as the statistic (see
+    :data:`_CALIB_ROUNDS`) -- picks the smallest count within
+    :data:`_KNEE_TOLERANCE` of the best throughput, applies it via
     :func:`colstore.config.set_gather_thread_cap`, and (by default) caches it.
     A half-vs-half pick disagreement emits a stability warning.
 
+    The conversion (rather than a single-column scatter) is the calibration
+    target because the cap is a *total* budget that the per-column pool divides
+    across concurrent gathers on independent memory streams (see
+    :meth:`ColStoreReader._gather_many`); that structure is what shifts the
+    saturation knee upward, so a single-column workload under-picks the cap.
+
+    Writes a ``_CALIB_SOURCE_ROWS x _CALIB_N_COLS`` float32 store to a temp dir
+    (honoring ``TMPDIR``; ~1.6 GB at the defaults) for the duration of the call.
     Requires the compiled C++ extension; raises :class:`RuntimeError` if it is
     unavailable. Returns the chosen cap.
     """
+    import tempfile
+
+    from . import testing
     from .kernels import cpp_available, max_threads
 
     if not cpp_available():
@@ -236,24 +258,36 @@ def calibrate(*, persist: bool = True, verbose: bool = False, rounds: int = _CAL
     candidates = sorted({c for c in _CANDIDATE_THREADS if c <= omp_max} | {1})
 
     rng = np.random.default_rng(0)
-    source = rng.standard_normal(_CALIB_SOURCE_ROWS).astype(np.float32)
     n_indices = min(_CALIB_N_INDICES, _CALIB_SOURCE_ROWS)
     indices = rng.permutation(_CALIB_SOURCE_ROWS)[:n_indices].astype(np.int64)
-    output = np.empty(n_indices, dtype=np.float32)
+    bytes_moved = n_indices * _CALIB_N_COLS * np.dtype(np.float32).itemsize
 
-    # Warm the page cache and the kernel once before timing.
-    from . import _gather  # type: ignore[attr-defined]
+    saved_cap = config.get_gather_thread_cap()
+    with tempfile.TemporaryDirectory(prefix="colstore-calib-") as tmp:
+        reader = testing.make_store(
+            Path(tmp) / "calib.cstore",
+            rows=_CALIB_SOURCE_ROWS,
+            cols=_CALIB_N_COLS,
+            records=_CALIB_RECORDS,
+            dtype="float32",
+            seed=0,
+        )
+        try:
+            reader[indices].dict()  # warm the page cache and the kernels once
 
-    _gather.gather(source, indices, output, 1)
+            def _time_once(cap: int) -> float:
+                config.set_gather_thread_cap(cap)
+                start = time.perf_counter()
+                reader[indices].dict()
+                return time.perf_counter() - start
 
-    def _time_once(cap: int) -> float:
-        start = time.perf_counter()
-        _gather.gather(source, indices, output, cap)
-        return time.perf_counter() - start
+            samples = _interleaved_samples_ms(candidates, _time_once, rounds)
+        finally:
+            reader.close()  # before the temp dir is removed
+            config.set_gather_thread_cap(saved_cap)  # undo the per-candidate writes
 
-    samples = _interleaved_samples_ms(candidates, _time_once, rounds)
     times_ms = _median_ms(samples)
-    measurements = {cap: output.nbytes / (t / 1e3) / 1e9 for cap, t in times_ms.items()}
+    measurements = {cap: bytes_moved / (t / 1e3) / 1e9 for cap, t in times_ms.items()}
     chosen = _pick_knee(times_ms)
     if verbose:
         for cap in candidates:

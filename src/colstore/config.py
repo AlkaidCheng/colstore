@@ -22,11 +22,16 @@ GatherBackend = Literal["cpp", "numpy", "numba"]
 NumaPolicy = Literal["auto", "interleave", "local"]
 
 # Hard ceiling on gather threads. The kernel is memory-bandwidth-bound, so
-# throughput saturates at a small thread count well below the core count on
-# essentially all single-socket hardware; beyond ~8 threads extra parallelism
-# buys nothing and the fork/join + contention cost dominates (the difference
-# between 8 and 244 threads was measured at ~40x slower).
-_GATHER_THREAD_CEILING = 8
+# throughput saturates at a small thread count well below the core count, and
+# beyond the knee the fork/join + memory-controller contention cost dominates
+# (a far-past-the-knee count was measured at tens of times slower). The knee
+# depends on the workload: a single-column scatter saturates at ~8 threads, but
+# the multi-column conversions (``dict``/``recarray``/``frame``) spread the cap
+# across a per-column pool (see ``ColStoreReader._gather_many``), so the same
+# total budget feeds several independent memory streams and saturates higher,
+# around ~16. The cap governs those conversions, so the ceiling tracks their
+# knee; ``autotune.calibrate`` refines it per host against the real conversion.
+_GATHER_THREAD_CEILING = 16
 
 # Default software-prefetch look-ahead for the gather kernels, in elements.
 # Mirrors ``DEFAULT_PREFETCH_DISTANCE`` in ``include/colstore/gather.hpp``,
@@ -49,8 +54,9 @@ def _default_gather_thread_cap() -> int:
     Half the physical cores is a robust proxy for the memory-bandwidth
     saturation point, clamped to ``[1, _GATHER_THREAD_CEILING]``. Uses physical
     (not logical) cores because hyperthreads share memory ports and do not add
-    bandwidth. A cached autotuned value, if present, overrides this; see
-    :mod:`colstore.autotune`.
+    bandwidth. The ceiling tracks the multi-column conversion knee (~16), the
+    regime the cap actually governs. A cached autotuned value, if present,
+    overrides this; see :mod:`colstore.autotune`.
     """
     physical = _physical_cores if _physical_cores else (os.cpu_count() or 1)
     return max(1, min(_GATHER_THREAD_CEILING, physical // 2))
