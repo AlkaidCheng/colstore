@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
-import types
 
 import numpy as np
 import pytest
@@ -489,14 +487,14 @@ def test_bind_gather_threads_calls_primitive_and_is_idempotent(monkeypatch):
 
     calls: list[list[int]] = []
 
-    fake = types.ModuleType("colstore._gather")
+    def fake_bind(order):
+        calls.append(list(order))
+        return len(order)
 
-    def fake_bind(arr):
-        calls.append(list(arr))
-        return len(arr)
-
-    fake.bind_threads_to_cpus = fake_bind  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "colstore._gather", fake)
+    # Patch the in-module seam over the extension, so this exercises the
+    # orchestration without depending on the compiled primitive or on
+    # `from . import _gather` resolution.
+    monkeypatch.setattr(_numa, "_native_bind_to_cpus", fake_bind)
 
     assert _numa.bind_gather_threads(4) == 4
     assert calls == [[0, 1, 2, 3]]
@@ -506,6 +504,18 @@ def test_bind_gather_threads_calls_primitive_and_is_idempotent(monkeypatch):
     # force re-pins.
     assert _numa.bind_gather_threads(4, force=True) == 4
     assert len(calls) == 2
+
+
+def test_bind_gather_threads_returns_none_when_primitive_unavailable(monkeypatch):
+    # A -1 from the primitive (no extension / unsupported platform) surfaces as
+    # None, and nothing is cached.
+    monkeypatch.setattr(_numa, "_PLATFORM_IS_LINUX", True)
+    monkeypatch.delenv("OMP_PROC_BIND", raising=False)
+    monkeypatch.setattr(_numa, "spread_cpu_order", lambda n: [0, 1])
+    monkeypatch.setattr(_numa, "_LAST_BOUND", None)
+    monkeypatch.setattr(_numa, "_native_bind_to_cpus", lambda order: -1)
+    assert _numa.bind_gather_threads(4) is None
+    assert _numa._LAST_BOUND is None
 
 
 def test_thread_binding_report_shape():

@@ -490,17 +490,35 @@ def spread_cpu_order(n: int) -> list[int]:
 _LAST_BOUND: tuple[int, int] | None = None
 
 
+def _native_bind_to_cpus(order: list[int]) -> int:
+    """Call the native pin primitive for ``order``; ``-1`` if unavailable.
+
+    Isolated so the binding orchestration has a single, directly patchable seam
+    over the compiled extension (tests replace this rather than reaching through
+    ``from . import _gather``). Returns the count pinned, or ``-1`` when the
+    extension is missing or the platform is unsupported.
+    """
+    try:
+        import numpy as np
+
+        from . import _gather  # type: ignore[attr-defined]
+    except ImportError:
+        return -1
+    return int(_gather.bind_threads_to_cpus(np.asarray(order, dtype=np.intc)))
+
+
 def bind_gather_threads(cap: int | None = None, *, force: bool = False) -> int | None:
     """Pin the OpenMP gather pool ``spread`` across cores at runtime.
 
     Sizes the binding to ``cap`` workers (default: the configured gather thread
     cap) and pins worker ``t`` to ``spread_cpu_order(cap)[t]``. Returns the
-    number of workers pinned, or ``None`` when binding is skipped:
+    number of workers pinned, or ``None`` when binding is skipped or impossible:
 
       * off Linux, or where the ``/sys`` topology is unreadable;
       * when ``OMP_PROC_BIND`` is set in the environment -- an explicit
         launch-time policy wins, and re-pinning would fight it;
-      * when the compiled extension is unavailable.
+      * when the compiled extension is unavailable or the platform is
+        unsupported (the native primitive returns ``-1``).
 
     Idempotent: re-pinning for an unchanged ``cap`` returns the prior count
     without touching affinities unless ``force=True``. Note this pins libgomp's
@@ -522,15 +540,10 @@ def bind_gather_threads(cap: int | None = None, *, force: bool = False) -> int |
     order = spread_cpu_order(cap)
     if not order:
         return None
-    try:
-        import numpy as np
-
-        from . import _gather  # type: ignore[attr-defined]
-    except ImportError:
+    bound = _native_bind_to_cpus(order)
+    if bound < 0:
         return None
-    bound = int(_gather.bind_threads_to_cpus(np.asarray(order, dtype=np.intc)))
-    if bound >= 0:
-        _LAST_BOUND = (cap, bound)
+    _LAST_BOUND = (cap, bound)
     return bound
 
 
