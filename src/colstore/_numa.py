@@ -9,12 +9,15 @@ substantially, but which policy wins depends on the access pattern and on
 whether pages are faulted cold or already resident -- so callers should
 measure on their own hardware rather than assume a fixed speedup.
 
-Scope: this module places *memory* only. The largest multi-node gather
-speedup additionally requires pinning the gather's threads to the node
-holding the data; colstore does not manage OpenMP thread affinity, so that
-co-location is done externally at process start (e.g. ``numactl
---cpunodebind`` or ``OMP_PROC_BIND`` / ``OMP_PLACES``). See
-:func:`colstore.config.set_numa_policy` for the recipe.
+Scope: this module places *memory*, and (via the runtime thread-binding
+helpers at the end) can pin the gather's OpenMP pool to cores. The largest
+multi-node gather speedup comes from binding the gather's threads, which was
+measured to dominate data placement; :func:`bind_gather_threads` applies that
+at runtime (``OMP_PROC_BIND``/``OMP_PLACES`` are read too early in import to
+set from a library). It is an opt-in primitive -- nothing here calls it
+automatically -- so the equivalent can still be done externally at process
+start (e.g. ``numactl --cpunodebind`` or ``OMP_PROC_BIND`` / ``OMP_PLACES``).
+See :func:`colstore.config.set_numa_policy` for the recipe.
 
 This module:
 
@@ -128,6 +131,10 @@ def _detect_allowed_nodes() -> list[int]:
 _PLATFORM_IS_LINUX = platform.system() == "Linux"
 _SYSCALLS: _NumaSyscalls | None = _NUMA_SYSCALLS.get(platform.machine())
 _ALLOWED_NODES: list[int] = _detect_allowed_nodes() if _PLATFORM_IS_LINUX else []
+
+# /sys topology roots, used by the thread-binding helpers below.
+_SYS_NODE = Path("/sys/devices/system/node")
+_SYS_CPU = Path("/sys/devices/system/cpu")
 
 # Treat the host as "NUMA-capable for our purposes" only when there's
 # more than one allowed node. On single-node systems interleave is
@@ -402,3 +409,169 @@ def writer_policy_scope() -> contextlib.AbstractContextManager[bool]:
     if config.get_numa_policy() == "local" or not is_available():
         return contextlib.nullcontext(False)
     return interleave_thread_policy()
+
+
+# ---- Runtime thread binding (reader-side) ----------------------------------
+#
+# OMP_PROC_BIND / OMP_PLACES are read once, at OpenMP initialization, which
+# numpy/BLAS typically trigger during import -- too early for a library to set
+# them and have the runtime notice. These helpers instead pin libgomp's worker
+# pool at runtime, from inside a parallel region (see
+# ``_gather.bind_threads_to_cpus``), reproducing ``OMP_PROC_BIND=spread`` with
+# ``OMP_PLACES=cores``. Binding threads to cores (independent of NUMA data
+# placement) was measured ~1.3x faster for the conversion gathers at scale;
+# confirm on the target host. Pure no-op off Linux or without the extension.
+
+
+def _read_list_file(path: Path) -> list[int]:
+    """Parse a ``/sys`` cpulist/nodelist file; ``[]`` if unreadable."""
+    try:
+        return _parse_cpu_or_node_list(path.read_text())
+    except OSError:
+        return []
+
+
+def _cpu_nodes() -> list[int]:
+    """Sorted NUMA node ids that have at least one online CPU."""
+    if not _SYS_NODE.is_dir():
+        return []
+    nodes: list[int] = []
+    for entry in _SYS_NODE.glob("node[0-9]*"):
+        try:
+            num = int(entry.name[len("node") :])
+        except ValueError:
+            continue
+        if _read_list_file(entry / "cpulist"):
+            nodes.append(num)
+    return sorted(nodes)
+
+
+def _node_core_cpus(node: int) -> list[int]:
+    """One logical CPU per physical core on ``node``, in ascending order.
+
+    Hyperthread siblings are collapsed to their lowest-numbered CPU so the
+    spread targets distinct physical cores, matching ``OMP_PLACES=cores``
+    (siblings share memory ports and add no bandwidth).
+    """
+    seen: set[int] = set()
+    cores: list[int] = []
+    for cpu in _read_list_file(_SYS_NODE / f"node{node}" / "cpulist"):
+        siblings = _read_list_file(_SYS_CPU / f"cpu{cpu}" / "topology" / "thread_siblings_list")
+        representative = min(siblings) if siblings else cpu
+        if representative not in seen:
+            seen.add(representative)
+            cores.append(representative)
+    return cores
+
+
+def spread_cpu_order(n: int) -> list[int]:
+    """Up to ``n`` CPU ids interleaved one-per-node across physical cores.
+
+    Replicates ``OMP_PROC_BIND=spread`` + ``OMP_PLACES=cores``: round-robin one
+    physical core from each NUMA node in turn (node0 core0, node1 core0, ...,
+    then node0 core1, ...), so consecutive workers land on different memory
+    controllers. Returns ``[]`` where the topology is unreadable (non-Linux,
+    minimal containers); callers treat that as "binding not applicable".
+    """
+    if n <= 0:
+        return []
+    per_node = [_node_core_cpus(node) for node in _cpu_nodes()]
+    order: list[int] = []
+    depth = max((len(cores) for cores in per_node), default=0)
+    for level in range(depth):
+        for cores in per_node:
+            if level < len(cores):
+                order.append(cores[level])
+                if len(order) >= n:
+                    return order
+    return order
+
+
+_LAST_BOUND: tuple[int, int] | None = None
+
+
+def _native_bind_to_cpus(order: list[int]) -> int:
+    """Call the native pin primitive for ``order``; ``-1`` if unavailable.
+
+    Isolated so the binding orchestration has a single, directly patchable seam
+    over the compiled extension (tests replace this rather than reaching through
+    ``from . import _gather``). Returns the count pinned, or ``-1`` when the
+    extension is missing or the platform is unsupported.
+    """
+    try:
+        import numpy as np
+
+        from . import _gather  # type: ignore[attr-defined]
+    except ImportError:
+        return -1
+    return int(_gather.bind_threads_to_cpus(np.asarray(order, dtype=np.intc)))
+
+
+def bind_gather_threads(cap: int | None = None, *, force: bool = False) -> int | None:
+    """Pin the OpenMP gather pool ``spread`` across cores at runtime.
+
+    Sizes the binding to ``cap`` workers (default: the configured gather thread
+    cap) and pins worker ``t`` to ``spread_cpu_order(cap)[t]``. Returns the
+    number of workers pinned, or ``None`` when binding is skipped or impossible:
+
+      * off Linux, or where the ``/sys`` topology is unreadable;
+      * when ``OMP_PROC_BIND`` is set in the environment -- an explicit
+        launch-time policy wins, and re-pinning would fight it;
+      * when the compiled extension is unavailable or the platform is
+        unsupported (the native primitive returns ``-1``).
+
+    Idempotent: re-pinning for an unchanged ``cap`` returns the prior count
+    without touching affinities unless ``force=True``. Note this pins libgomp's
+    *shared* pool, so it also governs other OpenMP work in the process; that is
+    the same global scope as setting ``OMP_PROC_BIND`` at launch.
+    """
+    global _LAST_BOUND
+    if not _PLATFORM_IS_LINUX or os.environ.get("OMP_PROC_BIND"):
+        return None
+    if cap is None:
+        from . import config  # local import: _numa is imported by reader/config
+
+        cap = config.get_gather_thread_cap()
+    cap = int(cap)
+    if cap <= 0:
+        return None
+    if not force and _LAST_BOUND is not None and _LAST_BOUND[0] == cap:
+        return _LAST_BOUND[1]
+    order = spread_cpu_order(cap)
+    if not order:
+        return None
+    bound = _native_bind_to_cpus(order)
+    if bound < 0:
+        return None
+    _LAST_BOUND = (cap, bound)
+    return bound
+
+
+def thread_binding_report() -> dict[str, object]:
+    """Snapshot the process's per-thread CPU affinities, for verification.
+
+    Returns a dict with the number of OS threads, how many *distinct* CPU
+    masks they hold (``1`` means every thread shares one mask -- an unbound
+    pool), whether ``OMP_PROC_BIND`` is set, and a small sample of masks.
+    Pure inspection of ``/proc/self/task``; empty dict off Linux.
+    """
+    task = Path("/proc/self/task")
+    if not task.is_dir():
+        return {}
+    masks: list[str] = []
+    for status in task.glob("*/status"):
+        try:
+            text = status.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.startswith("Cpus_allowed_list:"):
+                masks.append(line.split(":", 1)[1].strip())
+                break
+    distinct = sorted(set(masks))
+    return {
+        "n_threads": len(masks),
+        "distinct_masks": len(distinct),
+        "omp_proc_bind": os.environ.get("OMP_PROC_BIND"),
+        "sample": distinct[:4],
+    }

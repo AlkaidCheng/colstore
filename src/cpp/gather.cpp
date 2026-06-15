@@ -38,6 +38,14 @@
 //    are direct ``T`` stores into the library-allocated, aligned NumPy
 //    buffer.
 
+// sched_setaffinity / cpu_set_t (used by colstore_bind_threads_to_cpus) need
+// _GNU_SOURCE defined before any system header. GNU dialects define it on the
+// command line already; this guard covers strict -std=c++NN builds. Must
+// precede the first include.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include "colstore/gather.hpp"
 
 #ifdef _OPENMP
@@ -45,10 +53,15 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace colstore {
 
@@ -1192,6 +1205,35 @@ int colstore_max_threads() {
   return omp_get_max_threads();
 #else
   return 1;
+#endif
+}
+
+int colstore_bind_threads_to_cpus(const int* cpus, int n) {
+#if defined(_OPENMP) && defined(__linux__)
+  if (n <= 0) {
+    return 0;
+  }
+  std::atomic<int> bound{0};
+  // Force a team of exactly ``n`` workers so each index maps to one CPU. The
+  // binding sticks because libgomp reuses its pool across parallel regions, so
+  // subsequent gather kernels run on these now-pinned threads.
+#pragma omp parallel num_threads(n)
+  {
+    const int t = omp_get_thread_num();
+    if (t < n && cpus[t] >= 0) {
+      cpu_set_t set;
+      CPU_ZERO(&set);
+      CPU_SET(cpus[t], &set);
+      if (sched_setaffinity(0, sizeof(set), &set) == 0) {
+        bound.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+  return bound.load(std::memory_order_relaxed);
+#else
+  (void)cpus;
+  (void)n;
+  return -1;
 #endif
 }
 
