@@ -43,7 +43,6 @@ callers always see native-order arrays.
 
 import json
 import os
-import re
 import struct
 import sys
 import time
@@ -53,6 +52,7 @@ from typing import IO, Any
 import numpy as np
 
 from . import _numa
+from ._sizes import parse_byte_size
 from .progress import progress_bar
 
 FILE_EXTENSION = ".cstore"
@@ -535,9 +535,9 @@ def normalize_columns(
 #     For datasets under _AUTO_MIN_TOTAL_FOR_BATCHING bytes, auto
 #     degrades to single-pass because batching overhead dominates.
 #
-# All multipliers in size strings are binary (1 KB = 1024 B, 1 MB = 2**20 B,
-# etc.). This matches what ``ls -lh`` and ``du -h`` display, which is what
-# most users mean when they write "100 MB" in a file-size context.
+# Size strings follow IEC 80000-13 units (see colstore._sizes): decimal
+# ``kB``/``MB``/``GB`` are powers of 1000 and binary ``KiB``/``MiB``/``GiB``
+# are powers of 1024, so "1 MB" is 1,000,000 B and "1 MiB" is 1,048,576 B.
 
 # Below this total size, auto goes single-pass -- batching overhead is
 # bigger than the I/O savings.
@@ -572,51 +572,6 @@ _AUTO_GROWTH_RATE = 2.0
 # with the smoothed history -- adapts quickly during ramp-up while still
 # damping transient spikes once in steady state.
 _AUTO_EMA_ALPHA = 0.5
-
-_BYTE_UNITS: dict[str, int] = {
-    "": 1,
-    "B": 1,
-    "K": 1024,
-    "KB": 1024,
-    "KIB": 1024,
-    "M": 1024**2,
-    "MB": 1024**2,
-    "MIB": 1024**2,
-    "G": 1024**3,
-    "GB": 1024**3,
-    "GIB": 1024**3,
-    "T": 1024**4,
-    "TB": 1024**4,
-    "TIB": 1024**4,
-}
-
-_BYTE_SIZE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]*)\s*$")
-
-
-def _parse_byte_size(size: str) -> int:
-    """Parse a size string like ``"100 MB"`` or ``"1.5 GiB"`` to bytes.
-
-    Binary multipliers throughout: ``MB`` is treated as ``MiB`` (1024**2),
-    matching the convention used by ``ls -lh`` / ``du -h``.
-    """
-    match = _BYTE_SIZE_PATTERN.match(size)
-    if not match:
-        raise ValueError(
-            f"Cannot parse byte size {size!r}; expected a number with optional unit "
-            f"(e.g., '100 MB', '1.5 GiB', '4 KB')."
-        )
-    value = float(match.group(1))
-    unit = match.group(2).upper()
-    if unit not in _BYTE_UNITS:
-        supported = sorted({u for u in _BYTE_UNITS if u})
-        raise ValueError(
-            f"Unknown unit {match.group(2)!r} in byte size {size!r}; "
-            f"expected one of {supported}."
-        )
-    result = int(value * _BYTE_UNITS[unit])
-    if result < 1:
-        raise ValueError(f"Byte size must be at least 1 byte; {size!r} resolves to {result}.")
-    return result
 
 
 def _resolve_rows_per_step(
@@ -654,7 +609,7 @@ def _resolve_rows_per_step(
         return [rows_per_step] * n_columns
 
     # str (caller has already filtered out "auto")
-    bytes_per_step = _parse_byte_size(batch_size.strip())
+    bytes_per_step = parse_byte_size(batch_size.strip())
     # Per-column rows-per-step: each column gets enough rows to fill roughly
     # ``bytes_per_step`` bytes, so a wide-dtype column does fewer rows per
     # step than a narrow-dtype one. Uniform byte granularity across columns.
