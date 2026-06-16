@@ -30,7 +30,17 @@ reader = root_to_colstore("events.root", "events.cstore")
 The source may be a path to a `.root` file, a `{treename: files}` mapping with
 exactly one entry, or an existing `RDataFrame`. For a bare path the file's sole
 tree is detected automatically; pass `treename=` when a file holds more than one
-tree (auto-detection raises rather than guessing).
+tree (auto-detection raises rather than guessing). A string path may also embed
+the tree directly, following the uproot convention:
+
+```python
+reader = root_to_colstore("events.root:Events", "events.cstore")
+```
+
+URL-scheme and Windows-drive colons (`root://…`, `C:\…`) are not treated as
+separators, and the tree name is taken after the last colon. To read a file
+whose name genuinely contains a colon, pass it as a `pathlib.Path` (never split)
+or use the `{treename: files}` mapping.
 
 Rows are read in batches and each batch is written as one record, so peak memory
 stays near one batch rather than the whole file. `batch_size` is the budget per

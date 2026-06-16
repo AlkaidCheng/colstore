@@ -16,6 +16,7 @@ round-trips through ``numpy``.
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from collections.abc import Iterator
 from types import ModuleType
@@ -216,6 +217,36 @@ def _inherits_from_tree(root: ModuleType, key: Any) -> bool:
     return bool(cls) and bool(cls.InheritsFrom("TTree"))
 
 
+# Leading URL scheme ("root://", "https://", ...) whose "://" colon is not a
+# file/object separator.
+_URL_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*://")
+# Leading Windows drive letter ("C:\" or "C:/") whose colon is part of the path.
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _split_path_and_tree(spec: str) -> tuple[str, str | None]:
+    """Split ``"file.root:tree"`` into ``("file.root", "tree")``.
+
+    Follows the uproot convention: the object path is whatever follows the last
+    colon, except that a colon belonging to a URL scheme (``root://``,
+    ``https://``) or a Windows drive letter (``C:\\``) is not a separator. A
+    file whose name genuinely contains a colon should be passed as a
+    :class:`pathlib.Path` (never split) or via the ``{treename: files}`` form.
+    Returns ``(spec, None)`` when no object path is present.
+    """
+    prefix = ""
+    rest = spec
+    scheme = _URL_SCHEME.match(rest)
+    if scheme:
+        prefix, rest = scheme.group(0), rest[scheme.end() :]
+    if _WINDOWS_DRIVE.match(rest):
+        prefix, rest = prefix + rest[:2], rest[2:]
+    if ":" in rest:
+        path_part, tree_part = rest.rsplit(":", 1)
+        return prefix + path_part, tree_part or None
+    return prefix + rest, None
+
+
 def _as_rdataframe(source: RootSource, treename: str | None) -> ROOT.RDF.RNode:
     """Build (or pass through) an RDataFrame from a path, a mapping, or an RDF."""
     if not isinstance(source, (str, os.PathLike, dict)):
@@ -228,8 +259,22 @@ def _as_rdataframe(source: RootSource, treename: str | None) -> ROOT.RDF.RNode:
             )
         ((tree, files),) = source.items()
         return root.RDataFrame(tree, files)
-    resolved_tree = _resolve_tree_name(root, source, treename)
-    return root.RDataFrame(resolved_tree, os.fspath(source))
+
+    # A str may carry an embedded ":tree"; an os.PathLike is strictly a path.
+    if isinstance(source, str):
+        file_path, embedded_tree = _split_path_and_tree(source)
+    else:
+        file_path, embedded_tree = os.fspath(source), None
+
+    if embedded_tree is not None:
+        if treename is not None and treename != embedded_tree:
+            raise ValueError(
+                f"Conflicting tree names: treename={treename!r} but the path names "
+                f"{embedded_tree!r}; pass only one."
+            )
+        return root.RDataFrame(embedded_tree, file_path)
+    resolved_tree = _resolve_tree_name(root, file_path, treename)
+    return root.RDataFrame(resolved_tree, file_path)
 
 
 def _ingest_batches(
@@ -270,12 +315,18 @@ def root_to_colstore(
     source : ROOT.RDataFrame, str, os.PathLike, or dict
         An existing ``RDataFrame``; a path to a ``.root`` file (its single tree
         is used, or ``treename`` selects one); or a ``{treename: files}``
-        mapping with exactly one entry (``files`` may be a path or a list).
+        mapping with exactly one entry (``files`` may be a path or a list). A
+        ``str`` path may embed the tree as ``"file.root:treename"`` (the uproot
+        convention; URL-scheme and Windows-drive colons are not separators). To
+        read a file whose name contains a colon, pass it as a
+        :class:`pathlib.Path` (never split) or use the mapping form.
     path : str or os.PathLike
         Destination ``.cstore`` file.
     treename : str or None, optional
         Tree to read when ``source`` is a bare ``.root`` path. ``None``
-        auto-detects the file's sole tree and errors if there are several.
+        auto-detects the file's sole tree and errors if there are several. It is
+        an error to pass a ``treename`` that disagrees with an embedded
+        ``"file.root:treename"``.
     columns : list[str] or None, optional
         Columns to store. ``None`` stores every fixed-size scalar column and
         skips the rest with a warning; naming a non-storable column is an error.

@@ -336,6 +336,66 @@ def test_resolve_tree_no_tree_errors():
 
 
 # --------------------------------------------------------------------------- #
+# "file.root:tree" path syntax
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("events.root", ("events.root", None)),
+        ("events.root:Events", ("events.root", "Events")),
+        ("dir/sub/file.root:tdir/tree", ("dir/sub/file.root", "tdir/tree")),
+        ("root://srv//eos/file.root:Events", ("root://srv//eos/file.root", "Events")),
+        ("root://srv//eos/file.root", ("root://srv//eos/file.root", None)),
+        ("https://user:pw@host/f.root:Events", ("https://user:pw@host/f.root", "Events")),
+        ("C:/data/file.root:Events", ("C:/data/file.root", "Events")),
+        ("C:\\data\\file.root", ("C:\\data\\file.root", None)),
+        ("file.root:", ("file.root", None)),
+    ],
+)
+def test_split_path_and_tree(spec, expected):
+    assert root_parser._split_path_and_tree(spec) == expected
+
+
+def _root_with_rdataframe_recorder():
+    fake = _FakeROOT()
+    fake.built = []
+    original = fake.RDataFrame
+
+    def record(tree, path):
+        fake.built.append((tree, path))
+        return original(tree, path)
+
+    fake.RDataFrame = record  # type: ignore[method-assign]
+    return fake
+
+
+def test_as_rdataframe_embedded_tree_skips_probe(monkeypatch):
+    fake = _root_with_rdataframe_recorder()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake)
+    root_parser._as_rdataframe("events.root:Events", None)
+    assert fake.built == [("Events", "events.root")]
+
+
+def test_as_rdataframe_pathlike_never_split(monkeypatch):
+    import pathlib
+
+    fake = _root_with_rdataframe_recorder()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake)
+    # The colon here is part of the (odd) filename; with a Path it must not split.
+    root_parser._as_rdataframe(pathlib.Path("weird:name.root"), "t")
+    assert fake.built == [("t", "weird:name.root")]
+
+
+def test_as_rdataframe_conflicting_tree_names_error(monkeypatch):
+    fake = _root_with_rdataframe_recorder()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake)
+    with pytest.raises(ValueError, match="Conflicting tree names"):
+        root_parser._as_rdataframe("events.root:Events", "Other")
+
+
+# --------------------------------------------------------------------------- #
 # Parser class surface
 # --------------------------------------------------------------------------- #
 
