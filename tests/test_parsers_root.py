@@ -325,6 +325,60 @@ def test_export_valid_names_do_not_warn(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Column selection (export)
+# --------------------------------------------------------------------------- #
+
+
+def test_export_columns_subset_in_requested_order(tmp_path, monkeypatch):
+    data = {
+        "a": np.arange(6, dtype=np.int32),
+        "b": np.arange(6, dtype=np.float64),
+        "c": np.arange(6, dtype=np.int16),
+    }
+    path = tmp_path / "src.cstore"
+    colstore.store(data, path, show_progress=False)
+
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+    to_root(path, tmp_path / "out.root", columns=["b", "a"], show_progress=False)
+
+    written = fake_root.snapshots[0]
+    assert written["columns"] == ["b", "a"]
+    assert set(written["data"]) == {"a", "b"}
+
+
+def test_export_columns_unknown_is_error(tmp_path, monkeypatch):
+    path = tmp_path / "src.cstore"
+    colstore.store({"a": np.arange(3, dtype=np.int32)}, path, show_progress=False)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: _FakeROOT())
+    with pytest.raises(ValueError, match="not found in the colstore file"):
+        to_root(path, tmp_path / "out.root", columns=["a", "nope"], show_progress=False)
+
+
+def test_export_columns_empty_is_error(tmp_path, monkeypatch):
+    path = tmp_path / "src.cstore"
+    colstore.store({"a": np.arange(3, dtype=np.int32)}, path, show_progress=False)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: _FakeROOT())
+    with pytest.raises(ValueError, match="at least one column"):
+        to_root(path, tmp_path / "out.root", columns=[], show_progress=False)
+
+
+def test_export_columns_subset_with_sanitization(tmp_path, monkeypatch):
+    data = {
+        "mg_xsec [fb]": np.linspace(0, 1, 5, dtype=np.float32),
+        "ok": np.arange(5, dtype=np.int64),
+    }
+    path = tmp_path / "src.cstore"
+    colstore.store(data, path, show_progress=False)
+
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+    with pytest.warns(RuntimeWarning, match="mg_xsec"):
+        to_root(path, tmp_path / "out.root", columns=["mg_xsec [fb]"], show_progress=False)
+    assert fake_root.snapshots[0]["columns"] == ["mg_xsec_fb"]
+
+
+# --------------------------------------------------------------------------- #
 # Tree-name resolution (decision (a): auto-detect the sole tree)
 # --------------------------------------------------------------------------- #
 
@@ -472,3 +526,13 @@ def test_parser_class_delegates(tmp_path, monkeypatch):
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
     result = parser.write(reader, tmp_path / "p.root", treename="t", show_progress=False)
     assert result == ("FakeRDF", "t", str(tmp_path / "p.root"))
+
+
+def test_top_level_exposure_without_importing_root():
+    import sys
+
+    assert colstore.to_root is to_root
+    assert colstore.from_root is from_root
+    assert colstore.parsers.RootParser is RootParser
+    # Importing colstore must not pull in ROOT; it stays lazy until a call runs.
+    assert "ROOT" not in sys.modules

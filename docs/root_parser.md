@@ -5,6 +5,11 @@ both directions, going through ROOT's `RDataFrame`. It is part of the
 `colstore.parsers` package, where each external format lives in its own module
 behind a common `Parser` contract.
 
+The two conversion functions are also re-exported at the top level, so
+`colstore.from_root` / `colstore.to_root` work after a plain `import colstore`
+(equivalent to importing them from `colstore.parsers`). Importing colstore does
+not import ROOT — that stays lazy until a conversion runs.
+
 ROOT (PyROOT) is **not** a pip dependency and is **imported lazily** — importing
 `colstore.parsers` pulls in nothing heavy, and ROOT is loaded only the first
 time a conversion actually runs. Install ROOT separately (for example
@@ -60,6 +65,9 @@ from colstore.parsers import to_root
 
 rdf = to_root("events.cstore", "events.root", treename="events")
 ```
+
+`columns` selects which columns to write (in the given order), like an
+`RDataFrame.Snapshot` column list; the default writes every column.
 
 The output path is required. The store is read and snapshotted in row chunks —
 the first chunk recreates the tree and later chunks append to it — so memory
