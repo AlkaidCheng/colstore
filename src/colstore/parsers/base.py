@@ -44,12 +44,12 @@ class Parser(ABC):
     format_name: ClassVar[str]
 
     @abstractmethod
-    def to_colstore(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
-        """Convert ``source`` into a ``.cstore`` file at ``path`` and open it."""
+    def read(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
+        """Read the external ``source`` into a ``.cstore`` file at ``path`` and open it."""
 
     @abstractmethod
-    def from_colstore(self, source: ColStoreReader | StrPath, path: StrPath, **kwargs: Any) -> Any:
-        """Convert the ``.cstore`` file ``source`` into the external format at ``path``."""
+    def write(self, source: ColStoreReader | StrPath, path: StrPath, **kwargs: Any) -> Any:
+        """Write the ``.cstore`` ``source`` out to the external format at ``path``."""
 
 
 def resolve_batch_rows(

@@ -76,6 +76,6 @@ over formats uniformly:
 from colstore.parsers import RootParser
 
 parser = RootParser()              # parser.format_name == "root"
-reader = parser.to_colstore("events.root", "events.cstore")
-rdf = parser.from_colstore(reader, "roundtrip.root")
+reader = parser.read("events.root", "events.cstore")
+rdf = parser.write(reader, "roundtrip.root")
 ```

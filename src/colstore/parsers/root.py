@@ -455,17 +455,16 @@ class RootParser(Parser):
     """Two-way parser between ROOT files and colstore.
 
     Thin object wrapper over :func:`from_root` and :func:`to_root`, which carry
-    the full typed signatures. The generic ``Parser`` directions map to the
-    format-named functions: ``to_colstore`` (anything into colstore) is
-    ``from_root``, and ``from_colstore`` (colstore back out) is ``to_root``.
+    the full typed signatures: :meth:`read` parses a ROOT file (``from_root``)
+    and :meth:`write` emits one (``to_root``).
     """
 
     format_name = "root"
 
-    def to_colstore(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
+    def read(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
         return from_root(source, path, **kwargs)
 
-    def from_colstore(
+    def write(
         self, source: ColStoreReader | StrPath, path: StrPath, **kwargs: Any
     ) -> ROOT.RDataFrame:
         return to_root(source, path, **kwargs)

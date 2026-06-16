@@ -400,8 +400,14 @@ def test_as_rdataframe_conflicting_tree_names_error(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_parser_class_delegates(tmp_path):
+def test_parser_class_delegates(tmp_path, monkeypatch):
     parser = RootParser()
     assert parser.format_name == "root"
-    reader = parser.to_colstore(_make_rnode(100), tmp_path / "p.cstore", show_progress=False)
+
+    reader = parser.read(_make_rnode(100), tmp_path / "p.cstore", show_progress=False)
     assert reader.n_rows == 100
+
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+    result = parser.write(reader, tmp_path / "p.root", treename="t", show_progress=False)
+    assert result == ("FakeRDF", "t", str(tmp_path / "p.root"))
