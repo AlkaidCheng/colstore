@@ -61,6 +61,9 @@ from colstore.parsers import to_root
 rdf = to_root("events.cstore", "events.root", treename="events")
 ```
 
+`columns` selects which columns to write (in the given order), like an
+`RDataFrame.Snapshot` column list; the default writes every column.
+
 The output path is required. The store is read and snapshotted in row chunks —
 the first chunk recreates the tree and later chunks append to it — so memory
 stays bounded by `batch_size` regardless of file size. An `RDataFrame` over the

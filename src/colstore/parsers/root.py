@@ -411,11 +411,25 @@ def _relabel(chunk: ColumnBatch, name_map: dict[str, str]) -> ColumnBatch:
     return {name_map[name]: column for name, column in chunk.items()}
 
 
+def _resolve_columns(reader: ColStoreReader, requested: list[str] | None) -> list[str]:
+    """Return the columns to write, validated against the store's schema."""
+    if requested is None:
+        return reader.columns
+    if not requested:
+        raise ValueError("columns must name at least one column.")
+    available = set(reader.columns)
+    missing = [name for name in requested if name not in available]
+    if missing:
+        raise ValueError(f"Column(s) not found in the colstore file: {', '.join(missing)}.")
+    return list(requested)
+
+
 def to_root(
     source: ColStoreReader | StrPath,
     path: StrPath,
     *,
     treename: str = _DEFAULT_TREE_NAME,
+    columns: list[str] | None = None,
     batch_size: int | str | None = _DEFAULT_BATCH_SIZE,
     show_progress: bool = True,
 ) -> ROOT.RDataFrame:
@@ -438,6 +452,9 @@ def to_root(
         Destination ``.root`` file (required).
     treename : str, optional
         Name of the tree to write. Defaults to ``"events"``.
+    columns : list[str] or None, optional
+        Columns to write, in this order. ``None`` (default) writes every column.
+        Naming a column absent from the store is an error.
     batch_size : int, str, or None, optional
         Memory budget per chunk. ``None`` writes in one pass; an ``int`` is
         rows per chunk; a ``str`` (default ``"512 MiB"``) is a byte budget.
@@ -451,11 +468,11 @@ def to_root(
     """
     root = _import_root()
     reader = source if isinstance(source, ColStoreReader) else api.open(source)
-    column_names = reader.columns
+    selected = _resolve_columns(reader, columns)
     total_rows = reader.n_rows
     out_path = os.fspath(path)
 
-    name_map = _sanitized_name_map(column_names)
+    name_map = _sanitized_name_map(selected)
     renamed = {old: new for old, new in name_map.items() if old != new}
     if renamed:
         detail = ", ".join(f"{old!r} -> {new!r}" for old, new in renamed.items())
@@ -466,7 +483,7 @@ def to_root(
         )
 
     if isinstance(batch_size, str):
-        bytes_per_row = sum(reader.dtypes[name].itemsize for name in column_names) or 1
+        bytes_per_row = sum(reader.dtypes[name].itemsize for name in selected) or 1
         rows_per_chunk = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
     else:
         rows_per_chunk = resolve_batch_rows(batch_size)
@@ -482,14 +499,14 @@ def to_root(
         if total_rows == 0:
             _snapshot_chunk(
                 root,
-                _relabel(reader[0:0].dict(copy=False), name_map),
+                _relabel(reader[0:0, selected].dict(copy=False), name_map),
                 treename,
                 out_path,
                 first=True,
             )
         for start in range(0, total_rows, step):
             end = min(start + step, total_rows)
-            chunk = _relabel(reader[start:end].dict(copy=False), name_map)
+            chunk = _relabel(reader[start:end, selected].dict(copy=False), name_map)
             _snapshot_chunk(root, chunk, treename, out_path, first=start == 0)
             bar.update(end - start)
 
