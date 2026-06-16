@@ -86,6 +86,42 @@ other symbols, such as `"mg_xsec [fb]"`) are reduced to word characters
 (`mg_xsec_fb`) before writing, with a warning that names each change. Names that
 collide after sanitizing are disambiguated with a numeric suffix.
 
+### Output options
+
+The Snapshot that writes the output file is configured from a few options that
+map onto `RSnapshotOptions`:
+
+```python
+to_root(
+    "events.cstore",
+    "events.root",
+    compression_level=4,          # RSnapshotOptions.fCompressionLevel
+    compression_algorithm="zstd", # "zlib" | "lzma" | "lz4" | "zstd"
+    output_format="rntuple",      # "default" | "ttree" | "rntuple"
+)
+```
+
+`compression_level` defaults to `0` (uncompressed) rather than ROOT's own
+Snapshot default of `5`, since colstore already holds materialized fixed-width
+columns and the common case writes them straight through. `compression_algorithm`
+and `output_format` accept the string aliases above (case-insensitive); any
+non-string value is passed to ROOT unchanged, so a ROOT enum member
+(`ROOT.RCompressionSetting.EAlgorithm.kZSTD`,
+`ROOT.RDF.ESnapshotOutputFormat.kRNTuple`) may be given directly. Leaving the
+algorithm or format unset keeps ROOT's own choice. In the chunked path these
+options apply only to the merged output; the transient chunk files are always
+written uncompressed because they are read back and deleted immediately.
+
+### Multithreading
+
+`multithreading` controls ROOT implicit multithreading for the write and is on
+by default to speed up the Snapshot event loop. `True` enables it with all
+cores, an `int` enables it with that many threads (`0` means all cores), and
+`False` disables it. Whatever the process's prior implicit-MT state was, it is
+restored when the write finishes, including on error. Because ROOT may reorder
+the rows of a Snapshot when MT is enabled, pass `multithreading=False` when the
+output row order must match the colstore file.
+
 ## Object interface
 
 The module functions carry the full typed signatures and are the recommended

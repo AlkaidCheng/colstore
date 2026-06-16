@@ -15,6 +15,7 @@ round-trips through ``numpy``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
@@ -86,6 +87,25 @@ _INVALID_BRANCH_CHARS = re.compile(r"[^0-9A-Za-z_]+")
 
 _DEFAULT_BATCH_SIZE = "512 MiB"
 _DEFAULT_TREE_NAME = "events"
+
+# colstore stores already-materialized fixed-width columns, so the common case
+# is to write them straight through without paying compression cost; ROOT's own
+# Snapshot default is level 5. Override to uncompressed here.
+_DEFAULT_COMPRESSION_LEVEL = 0
+
+# Multithreading is on by default to speed up the Snapshot event loop.
+_DEFAULT_MULTITHREADING = True
+
+# Output-format and compression-algorithm string aliases mapped to the ROOT
+# enum members they name. Non-string values are passed through unchanged, so a
+# caller may also hand in a ROOT enum value directly.
+_OUTPUT_FORMAT_ALIASES = {"default": "kDefault", "ttree": "kTTree", "rntuple": "kRNTuple"}
+_COMPRESSION_ALGORITHM_ALIASES = {
+    "zlib": "kZLIB",
+    "lzma": "kLZMA",
+    "lz4": "kLZ4",
+    "zstd": "kZSTD",
+}
 
 # Prefix for the per-chunk scratch directory used by the bounded-memory export.
 _TMP_DIR_PREFIX = ".colstore_to_root_"
@@ -436,6 +456,10 @@ def to_root(
     treename: str = _DEFAULT_TREE_NAME,
     columns: list[str] | None = None,
     batch_size: int | str | None = _DEFAULT_BATCH_SIZE,
+    compression_level: int = _DEFAULT_COMPRESSION_LEVEL,
+    compression_algorithm: str | int | None = None,
+    output_format: str | int | None = None,
+    multithreading: bool | int = _DEFAULT_MULTITHREADING,
     show_progress: bool = True,
 ) -> ROOT.RDataFrame:
     """Write a ``.cstore`` file to a ROOT file and return an RDataFrame over it.
@@ -455,7 +479,16 @@ def to_root(
       regardless of file size. The temporary files are removed afterward, even
       on failure.
 
-    Row order is preserved when ROOT implicit multithreading is off.
+    The Snapshot that writes ``path`` (the single direct write, or the merge of
+    the chunk files) is configured from ``compression_level``,
+    ``compression_algorithm``, and ``output_format``; the transient chunk files
+    are always written uncompressed since they are read back and deleted
+    immediately. The whole write runs inside the requested implicit-MT state,
+    which is restored afterward.
+
+    Row order is preserved when implicit multithreading is off. ROOT may reorder
+    rows of a Snapshot when MT is enabled, which is the default here for speed;
+    pass ``multithreading=False`` when the row order must be preserved.
 
     Column names that are not valid ROOT branch names (containing spaces,
     brackets, or other symbols) are reduced to word characters before writing,
@@ -477,6 +510,23 @@ def to_root(
         Per-chunk memory budget for stores larger than one chunk: an ``int`` is
         rows per chunk; a ``str`` (default ``"512 MiB"``) is a byte budget;
         ``None`` forces a single Snapshot (no temporary files).
+    compression_level : int, optional
+        ``RSnapshotOptions.fCompressionLevel`` for the output. Defaults to ``0``
+        (uncompressed); ROOT's own Snapshot default is ``5``.
+    compression_algorithm : str, int, or None, optional
+        ``RSnapshotOptions.fCompressionAlgorithm``. A string names a ROOT
+        algorithm (``"zlib"``, ``"lzma"``, ``"lz4"``, ``"zstd"``); any other
+        value is passed through, so a ROOT enum member may be given directly.
+        ``None`` (default) leaves ROOT's choice in place.
+    output_format : str, int, or None, optional
+        ``RSnapshotOptions.fOutputFormat``. A string names a ROOT output format
+        (``"default"``, ``"ttree"``, ``"rntuple"``); any other value is passed
+        through. ``None`` (default) leaves ROOT's choice in place.
+    multithreading : bool or int, optional
+        Implicit-MT setting for the write, restored to its prior state on
+        return. ``True`` (default) enables MT with all cores, an ``int`` enables
+        MT with that many threads (``0`` means all cores), and ``False`` disables
+        it.
     show_progress : bool, optional
         Whether to display a progress bar. Defaults to True.
 
@@ -504,17 +554,27 @@ def to_root(
     row_nbytes = sum(reader.dtypes[name].itemsize for name in selected)
     total_bytes = total_rows * row_nbytes
     rows_per_chunk = _resolve_chunk_rows(batch_size, row_nbytes)
+    options = _build_options(
+        root,
+        fMode="RECREATE",
+        compression_level=compression_level,
+        compression_algorithm=compression_algorithm,
+        output_format=output_format,
+    )
 
-    with progress_bar(
-        total=total_bytes,
-        desc=f"{out_path} <- colstore",
-        unit="B",
-        unit_scale=True,
-        enabled=show_progress,
-    ) as bar:
+    with (
+        _implicit_mt(root, multithreading),
+        progress_bar(
+            total=total_bytes,
+            desc=f"{out_path} <- colstore",
+            unit="B",
+            unit_scale=True,
+            enabled=show_progress,
+        ) as bar,
+    ):
         if rows_per_chunk is None or total_rows <= rows_per_chunk:
             data = _relabel(reader[:, selected].dict(copy=False), name_map)
-            _snapshot(root, data, treename, out_path)
+            _snapshot(root, data, treename, out_path, options)
             bar.update(total_bytes)
         else:
             _write_chunked(
@@ -526,10 +586,100 @@ def to_root(
                 out_path,
                 rows_per_chunk,
                 row_nbytes,
+                options,
                 bar,
             )
 
     return root.RDataFrame(treename, out_path)
+
+
+def _compression_algorithm_value(root: ModuleType, value: str | int) -> Any:
+    """Resolve a compression-algorithm alias to a ROOT enum member.
+
+    A string is looked up in the alias table and mapped to the matching
+    ``RCompressionSetting.EAlgorithm`` member; any other value is returned
+    unchanged so a ROOT enum may be passed directly.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        member = _COMPRESSION_ALGORITHM_ALIASES[value.strip().lower()]
+    except KeyError:
+        valid = ", ".join(sorted(_COMPRESSION_ALGORITHM_ALIASES))
+        raise ValueError(
+            f"Unknown compression_algorithm {value!r}; expected one of {valid}, "
+            "or a ROOT RCompressionSetting.EAlgorithm value."
+        ) from None
+    return getattr(root.RCompressionSetting.EAlgorithm, member)
+
+
+def _output_format_value(root: ModuleType, value: str | int) -> Any:
+    """Resolve an output-format alias to a ROOT ``ESnapshotOutputFormat`` member.
+
+    A string is mapped through the alias table; any other value is returned
+    unchanged so a ROOT enum may be passed directly.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        member = _OUTPUT_FORMAT_ALIASES[value.strip().lower()]
+    except KeyError:
+        valid = ", ".join(sorted(_OUTPUT_FORMAT_ALIASES))
+        raise ValueError(
+            f"Unknown output_format {value!r}; expected one of {valid}, "
+            "or a ROOT RDF.ESnapshotOutputFormat value."
+        ) from None
+    return getattr(root.RDF.ESnapshotOutputFormat, member)
+
+
+def _build_options(
+    root: ModuleType,
+    *,
+    fMode: str,
+    compression_level: int,
+    compression_algorithm: str | int | None,
+    output_format: str | int | None,
+) -> Any:
+    """Build an ``RSnapshotOptions`` from the export's options."""
+    options = root.RDF.RSnapshotOptions()
+    options.fMode = fMode
+    options.fCompressionLevel = compression_level
+    if compression_algorithm is not None:
+        options.fCompressionAlgorithm = _compression_algorithm_value(root, compression_algorithm)
+    if output_format is not None:
+        options.fOutputFormat = _output_format_value(root, output_format)
+    return options
+
+
+def _apply_implicit_mt(root: ModuleType, setting: bool | int) -> None:
+    """Apply an implicit-MT ``setting`` (bool toggles, int sets the thread count)."""
+    if setting is True:
+        root.EnableImplicitMT()
+    elif setting is False:
+        root.DisableImplicitMT()
+    elif isinstance(setting, int):
+        root.EnableImplicitMT(setting)
+    else:
+        raise TypeError(f"multithreading must be a bool or int, got {type(setting).__name__}.")
+
+
+@contextlib.contextmanager
+def _implicit_mt(root: ModuleType, setting: bool | int) -> Iterator[None]:
+    """Apply ``setting`` for the duration of the block, then restore ROOT's state.
+
+    The prior implicit-MT state (and its thread-pool size, when enabled) is
+    captured up front and put back on exit, so the export does not leak a global
+    MT change into the caller's process.
+    """
+    was_enabled = root.IsImplicitMTEnabled()
+    previous_threads = root.GetThreadPoolSize() if was_enabled else 0
+    _apply_implicit_mt(root, setting)
+    try:
+        yield
+    finally:
+        root.DisableImplicitMT()
+        if was_enabled:
+            root.EnableImplicitMT(previous_threads)
 
 
 def _resolve_chunk_rows(batch_size: int | str | None, row_nbytes: int) -> int | None:
@@ -539,10 +689,10 @@ def _resolve_chunk_rows(batch_size: int | str | None, row_nbytes: int) -> int | 
     return resolve_batch_rows(batch_size)
 
 
-def _snapshot(root: ModuleType, data: ColumnBatch, treename: str, out_path: str) -> None:
-    """Write ``data`` as a single tree, recreating the output file."""
-    options = root.RDF.RSnapshotOptions()
-    options.fMode = "RECREATE"
+def _snapshot(
+    root: ModuleType, data: ColumnBatch, treename: str, out_path: str, options: Any
+) -> None:
+    """Write ``data`` as a single tree with the given Snapshot ``options``."""
     root.RDF.FromNumpy(data).Snapshot(treename, out_path, list(data), options)
 
 
@@ -555,17 +705,27 @@ def _write_chunked(
     out_path: str,
     rows_per_chunk: int,
     row_nbytes: int,
+    options: Any,
     bar: Any,
 ) -> None:
     """Snapshot each row-chunk to a temporary file, then merge them into out_path.
 
     Each chunk is one valid single-tree Snapshot; the chunk files are read back
-    as one RDataframe (a TChain) and snapshotted into the final tree. The
-    scratch directory is created beside the output (same filesystem) and removed
-    afterward whether or not the merge succeeds.
+    as one RDataframe (a TChain) and snapshotted into the final tree with the
+    caller's ``options``. The chunk files are transient and so are written
+    uncompressed in the default format. The scratch directory is created beside
+    the output (same filesystem) and removed afterward whether or not the merge
+    succeeds.
     """
     total_rows = reader.n_rows
     branch_names = [name_map[name] for name in selected]
+    chunk_options = _build_options(
+        root,
+        fMode="RECREATE",
+        compression_level=0,
+        compression_algorithm=None,
+        output_format=None,
+    )
     scratch_dir = tempfile.mkdtemp(prefix=_TMP_DIR_PREFIX, dir=os.path.dirname(out_path) or ".")
     try:
         chunk_paths: list[str] = []
@@ -573,12 +733,10 @@ def _write_chunked(
             end = min(start + rows_per_chunk, total_rows)
             chunk = _relabel(reader[start:end, selected].dict(copy=False), name_map)
             chunk_path = os.path.join(scratch_dir, f"chunk_{index:06d}.root")
-            _snapshot(root, chunk, treename, chunk_path)
+            _snapshot(root, chunk, treename, chunk_path, chunk_options)
             chunk_paths.append(chunk_path)
             bar.update((end - start) * row_nbytes)
 
-        options = root.RDF.RSnapshotOptions()
-        options.fMode = "RECREATE"
         root.RDataFrame(treename, chunk_paths).Snapshot(treename, out_path, branch_names, options)
     finally:
         shutil.rmtree(scratch_dir, ignore_errors=True)
