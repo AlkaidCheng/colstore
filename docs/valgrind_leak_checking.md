@@ -1,13 +1,12 @@
-# Developer scripts
+# Valgrind leak checking
 
-Tooling that supports development but is not part of the installed package.
+Developer tooling for the native gather extension — not part of the installed
+package; it lives under `scripts/` and is run from a source checkout.
 
-## Valgrind leak check
-
-A Memcheck harness for the native gather extension. It exercises every gather
-path under Valgrind, then judges the result on leaks **attributable to
-colstore's own code** — so the benign interpreter/dependency teardown that any
-Python process produces does not drown out a real leak.
+A Memcheck harness exercises every gather path under Valgrind, then judges the
+result on leaks **attributable to colstore's own code** — so the benign
+interpreter/dependency teardown that any Python process produces does not drown
+out a real leak.
 
 Three pieces plus a suppression file:
 
@@ -18,7 +17,7 @@ Three pieces plus a suppression file:
 | `analyze_valgrind.py` | Parses the (large) log, categorises leak records by origin, writes a summary, extracts colstore-attributable records, sets the exit code. |
 | `colstore.supp` | Suppressions for known-benign OpenMP/NumPy/loader and CPython import noise. Loaded automatically. |
 
-### Requirements
+## Requirements
 
 - **Valgrind** on `PATH` (`module load valgrind` on Perlmutter, or
   `conda install -c conda-forge valgrind`).
@@ -26,7 +25,7 @@ Three pieces plus a suppression file:
   source lines instead of `???`. The `--build` flag below does this
   (`RelWithDebInfo`); otherwise build it yourself first.
 
-### Quick start
+## Quick start
 
 From the repository root:
 
@@ -43,7 +42,7 @@ small (100k rows × 4 cols × 8 records, 3 iterations). The run ends with a
 categorised verdict; it exits `1` if — and only if — a leak is attributable to
 colstore.
 
-### What it writes
+## What it writes
 
 For a log `valgrind-colstore-<timestamp>.log`, the run produces:
 
@@ -55,7 +54,7 @@ For a log `valgrind-colstore-<timestamp>.log`, the run produces:
 - `…-<timestamp>.log.gz` — the raw Valgrind log, gzip-compressed (kept only as
   evidence; you should rarely need it).
 
-### Options
+## Options
 
 ```
 --build               build the package (RelWithDebInfo) before running
@@ -83,7 +82,7 @@ A heavier pass with threaded kernels:
 scripts/run_valgrind.sh --iterations 5 --threads 4 --track-origins
 ```
 
-### Analysing an existing log
+## Analysing an existing log
 
 The analyzer runs standalone on any saved log, plain or `.gz`:
 
@@ -95,7 +94,7 @@ scripts/analyze_valgrind.py some-run.log.gz --top 20
 It writes the same `*.summary.txt` / `*.colstore-leaks.txt` files and exits `1`
 iff colstore is implicated.
 
-### Why a clean run still reports thousands of "leaks"
+## Why a clean run still reports thousands of "leaks"
 
 On a Python **not built `--with-valgrind`** (conda, most system Pythons), the
 interpreter deserialises `.pyc` code objects and interns strings at import and
@@ -110,7 +109,7 @@ none pass through colstore code. A clean run therefore looks like:
  5368 definite/indirect record(s) are interpreter/dependency teardown …
 ```
 
-### Use in CI
+## Use in CI
 
 The non-zero exit on a colstore-attributable leak makes the driver usable as a
 gate:
