@@ -17,19 +17,22 @@ deeper.
 - **[Optimization series](optimization_series.md)** — the cumulative engineering
   record: every optimization stage across three rounds, each with the
   measurement that justified it and the alternatives that were rejected.
+- **[ROOT parser](root_parser.md)** — convert ROOT files to and from colstore
+  through `RDataFrame`, via the extensible `colstore.parsers` package.
 - **[Valgrind leak checking](valgrind_leak_checking.md)** — the developer
   Memcheck harness under `scripts/` that leak-checks the native gather extension
   and reports only leaks attributable to colstore's own code.
 
 ## Diagrams
 
-The guides embed these; each also stands alone.
+Diagram sources live in [`assets/`](assets/). The guides embed these; each also
+stands alone.
 
 | Diagram | Shows |
 |---|---|
-| [file_format.svg](file_format.svg) | The on-disk `.cstore` header and record layout. |
-| [record_layout.svg](record_layout.svg) | Single-record vs multi-record column layout, and what `compact()` does. |
-| [kernel_dispatch.svg](kernel_dispatch.svg) | How a single-column read picks its kernel, in priority order. |
-| [gather_thread_decision.svg](gather_thread_decision.svg) | How the gather thread count is decided for single- and multi-column reads. |
-| [numa_placement_decision.svg](numa_placement_decision.svg) | The `auto` NUMA page-placement decision and the cold-read verdict. |
-| [gather_thread_binding_status.svg](gather_thread_binding_status.svg) | Why reader-side thread binding ships off. |
+| [file_format.svg](assets/file_format.svg) | The on-disk `.cstore` header and record layout. |
+| [record_layout.svg](assets/record_layout.svg) | Single-record vs multi-record column layout, and what `compact()` does. |
+| [kernel_dispatch.svg](assets/kernel_dispatch.svg) | How a single-column read picks its kernel, in priority order. |
+| [gather_thread_decision.svg](assets/gather_thread_decision.svg) | How the gather thread count is decided for single- and multi-column reads. |
+| [numa_placement_decision.svg](assets/numa_placement_decision.svg) | The `auto` NUMA page-placement decision and the cold-read verdict. |
+| [gather_thread_binding_status.svg](assets/gather_thread_binding_status.svg) | Why reader-side thread binding ships off. |
