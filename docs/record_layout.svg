@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="372" viewBox="0 0 680 372" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Single-record vs multi-record column layout</title>
+<desc>A streamed file is multi-record: each write appends one record holding a slice of every column, so on disk a logical column is split into one run per record, interleaved with the other columns, and a read must stitch the runs across record boundaries. Running compact collapses every record into one, producing a single-record file in which each logical column is a single contiguous run. That contiguous layout is what makes whole-store reads fastest and zero-copy views possible.</desc>
+<style>
+  .colA { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.75; } .colAt { fill: #04342C; font-size: 12px; font-weight: 500; }
+  .colB { fill: #FBF1DE; stroke: #B9852B; stroke-width: 0.75; } .colBt { fill: #6B4A12; font-size: 12px; font-weight: 500; }
+  .colC { fill: #E6EEF4; stroke: #3F6E9E; stroke-width: 0.75; } .colCt { fill: #234567; font-size: 12px; font-weight: 500; }
+  .sep { stroke: #5F5E5A; stroke-width: 1.5; }
+  .arr { stroke: #73726C; stroke-width: 1.25; fill: none; }
+  .hd { fill: #2C2C2A; font-size: 13px; font-weight: 600; }
+  .lbl { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
+  @media (prefers-color-scheme: dark) {
+    .colA { fill: #04342C; stroke: #1D9E75; } .colAt { fill: #9FE1CB; }
+    .colB { fill: #2E2613; stroke: #C9972F; } .colBt { fill: #F0D9A6; }
+    .colC { fill: #1B2A38; stroke: #5E8CBF; } .colCt { fill: #BBD2EA; }
+    .sep { stroke: #B4B2A9; } .arr { stroke: #B4B2A9; } .hd { fill: #F1EFE8; } .lbl { fill: #B4B2A9; }
+  }
+</style>
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<text class="hd" x="40" y="28">Multi-record &#8212; appended over time, one record per write()</text>
+
+<!-- record 0 -->
+<rect class="colA" x="40"  y="42" width="66" height="44"/>
+<text class="colAt" x="73"  y="68" text-anchor="middle">A0</text>
+<rect class="colB" x="106" y="42" width="67" height="44"/>
+<text class="colBt" x="139" y="68" text-anchor="middle">B0</text>
+<rect class="colC" x="173" y="42" width="67" height="44"/>
+<text class="colCt" x="206" y="68" text-anchor="middle">C0</text>
+<!-- record 1 -->
+<rect class="colA" x="240" y="42" width="66" height="44"/>
+<text class="colAt" x="273" y="68" text-anchor="middle">A1</text>
+<rect class="colB" x="306" y="42" width="67" height="44"/>
+<text class="colBt" x="339" y="68" text-anchor="middle">B1</text>
+<rect class="colC" x="373" y="42" width="67" height="44"/>
+<text class="colCt" x="406" y="68" text-anchor="middle">C1</text>
+<!-- record 2 -->
+<rect class="colA" x="440" y="42" width="66" height="44"/>
+<text class="colAt" x="473" y="68" text-anchor="middle">A2</text>
+<rect class="colB" x="506" y="42" width="67" height="44"/>
+<text class="colBt" x="539" y="68" text-anchor="middle">B2</text>
+<rect class="colC" x="573" y="42" width="67" height="44"/>
+<text class="colCt" x="606" y="68" text-anchor="middle">C2</text>
+<!-- record boundaries -->
+<line class="sep" x1="240" y1="38" x2="240" y2="90"/>
+<line class="sep" x1="440" y1="38" x2="440" y2="90"/>
+<text class="lbl" x="140" y="104" text-anchor="middle">record 0</text>
+<text class="lbl" x="340" y="104" text-anchor="middle">record 1</text>
+<text class="lbl" x="540" y="104" text-anchor="middle">record 2</text>
+
+<text class="lbl" x="40" y="130">column A = A0 &#8853; A1 &#8853; A2, interleaved with B and C &#8212; the reader stitches runs across records</text>
+
+<line class="arr" x1="340" y1="142" x2="340" y2="180" marker-end="url(#ar)"/>
+<text class="lbl" x="352" y="166">compact() &#8212; collapse all records into one</text>
+
+<text class="hd" x="40" y="206">Single-record &#8212; one-shot write, or after compact()</text>
+
+<rect class="colA" x="40"  y="220" width="200" height="44"/>
+<text class="colAt" x="140" y="246" text-anchor="middle">column A</text>
+<rect class="colB" x="240" y="220" width="200" height="44"/>
+<text class="colBt" x="340" y="246" text-anchor="middle">column B</text>
+<rect class="colC" x="440" y="220" width="200" height="44"/>
+<text class="colCt" x="540" y="246" text-anchor="middle">column C</text>
+
+<text class="lbl" x="40" y="290">each logical column is one contiguous run &#8594; whole-store fast path and zero-copy views</text>
+</svg>

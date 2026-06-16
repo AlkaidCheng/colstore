@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="556" viewBox="0 0 680 556" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>The .cstore on-disk format</title>
+<desc>A .cstore file begins with a fixed-position header: an 8-byte magic constant, a 32-byte counters block (the only mutable region, carrying the record and row counts plus its own CRC, rewritten atomically on close), an 8-byte manifest length, the immutable JSON manifest holding the schema and its CRC, and zero-padding to a 64-byte boundary. The record region follows: one 32-byte record header plus a body per write call, repeating as records are appended. Inside a body the columns are stored back-to-back column-major with no inter-column padding, and the body is padded to an 8-byte boundary.</desc>
+<style>
+  .box { fill: #F1EFE8; stroke: #888780; stroke-width: 0.75; }
+  .kbox { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.75; }
+  .dash { fill: none; stroke: #B4B2A9; stroke-width: 0.75; stroke-dasharray: 4 4; }
+  .cell { fill: #FBF1DE; stroke: #B9852B; stroke-width: 0.75; }
+  .t { fill: #2C2C2A; font-size: 14px; font-weight: 500; }
+  .ts { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
+  .kt { fill: #04342C; font-size: 14px; font-weight: 500; }
+  .kts { fill: #0F6E56; font-size: 12px; font-weight: 400; }
+  .at { fill: #6B4A12; font-size: 12px; font-weight: 500; }
+  .lbl { fill: #5F5E5A; font-size: 12px; font-weight: 400; }
+  .hd { fill: #2C2C2A; font-size: 13px; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    .box { fill: #2C2C2A; stroke: #888780; } .t { fill: #F1EFE8; } .ts { fill: #D3D1C7; }
+    .kbox { fill: #04342C; stroke: #1D9E75; } .kt { fill: #E1F5EE; } .kts { fill: #9FE1CB; }
+    .cell { fill: #2E2613; stroke: #C9972F; } .at { fill: #F0D9A6; }
+    .dash { stroke: #5F5E5A; } .lbl { fill: #B4B2A9; } .hd { fill: #F1EFE8; }
+  }
+</style>
+
+<text class="hd" x="40" y="34">File header &#8212; written once, fixed position</text>
+
+<rect class="box" x="40" y="48" width="320" height="32" rx="6"/>
+<text class="t" x="56" y="68">magic</text>
+<text class="lbl" x="344" y="68" text-anchor="end">8 B</text>
+
+<rect class="kbox" x="40" y="86" width="320" height="46" rx="6"/>
+<text class="kt" x="56" y="106">counters</text>
+<text class="kts" x="56" y="124">mutable &#183; own CRC &#183; atomic commit point</text>
+<text class="lbl" x="344" y="106" text-anchor="end">32 B</text>
+
+<rect class="box" x="40" y="138" width="320" height="32" rx="6"/>
+<text class="t" x="56" y="158">manifest_len</text>
+<text class="lbl" x="344" y="158" text-anchor="end">8 B</text>
+
+<rect class="box" x="40" y="176" width="320" height="46" rx="6"/>
+<text class="t" x="56" y="196">manifest (JSON)</text>
+<text class="ts" x="56" y="214">version &#183; columns &#183; CRC &#8212; immutable</text>
+<text class="lbl" x="344" y="196" text-anchor="end">var</text>
+
+<rect class="dash" x="40" y="228" width="320" height="28" rx="6"/>
+<text class="ts" x="200" y="246" text-anchor="middle">zero-pad &#8594; 64 B alignment</text>
+
+<text class="hd" x="40" y="300">Records &#8212; one [header + body] per write(), repeating</text>
+
+<rect class="box" x="40" y="314" width="320" height="30" rx="6"/>
+<text class="t" x="56" y="334">record 0 &#183; header</text>
+<text class="lbl" x="344" y="334" text-anchor="end">32 B</text>
+
+<rect class="box" x="40" y="350" width="320" height="44" rx="6"/>
+<text class="t" x="56" y="370">record 0 &#183; body</text>
+<text class="ts" x="56" y="387">columns packed &#183; padded to 8 B</text>
+<text class="lbl" x="344" y="370" text-anchor="end">var</text>
+
+<rect class="box" x="40" y="400" width="320" height="30" rx="6"/>
+<text class="t" x="56" y="420">record 1 &#183; header</text>
+<text class="lbl" x="344" y="420" text-anchor="end">32 B</text>
+
+<rect class="box" x="40" y="436" width="320" height="44" rx="6"/>
+<text class="t" x="56" y="456">record 1 &#183; body</text>
+<text class="lbl" x="344" y="456" text-anchor="end">var</text>
+
+<text class="lbl" x="200" y="502" text-anchor="middle">&#8942;  more records appended on each write()</text>
+
+<line class="dash" x1="360" y1="350" x2="408" y2="338"/>
+<line class="dash" x1="360" y1="394" x2="408" y2="446"/>
+
+<rect class="kbox" x="408" y="338" width="232" height="108" rx="10"/>
+<text class="kt" x="524" y="362" text-anchor="middle">Inside a record body</text>
+<rect class="cell" x="424" y="376" width="64" height="28" rx="4"/>
+<text class="at" x="456" y="394" text-anchor="middle">col A</text>
+<rect class="cell" x="492" y="376" width="64" height="28" rx="4"/>
+<text class="at" x="524" y="394" text-anchor="middle">col B</text>
+<rect class="cell" x="560" y="376" width="64" height="28" rx="4"/>
+<text class="at" x="592" y="394" text-anchor="middle">col C</text>
+<text class="kts" x="524" y="428" text-anchor="middle">column-major &#183; no inter-column padding</text>
+</svg>
