@@ -15,6 +15,8 @@ append) actually appends correctly -- is integration-deferred to a ROOT host.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -71,10 +73,42 @@ def _make_rnode(n_rows: int = 1000, *, with_jagged: bool = False) -> _FakeRNode:
     return _FakeRNode(data, types)
 
 
+class _FakeEnumMember:
+    """A non-string sentinel standing in for a ROOT enum member."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"<{self.name}>"
+
+
+class _FakeEnum:
+    """A namespace whose attributes are sentinel members named like ROOT enums."""
+
+    def __init__(self, members: list[str]) -> None:
+        for name in members:
+            setattr(self, name, _FakeEnumMember(name))
+
+
 class _FakeSnapshotOptions:
     def __init__(self) -> None:
         self.fMode = ""
         self.fAppend = False
+        self.fCompressionLevel = -1
+        self.fCompressionAlgorithm = None
+        self.fOutputFormat = None
+
+
+def _record_snapshot(options: _FakeSnapshotOptions) -> dict:
+    """The option fields recorded on every fake Snapshot, for assertions."""
+    return {
+        "mode": options.fMode,
+        "append": options.fAppend,
+        "compression_level": options.fCompressionLevel,
+        "compression_algorithm": options.fCompressionAlgorithm,
+        "output_format": options.fOutputFormat,
+    }
 
 
 class _FakeSnapshotRDF:
@@ -88,8 +122,7 @@ class _FakeSnapshotRDF:
                 "treename": treename,
                 "path": path,
                 "columns": list(columns),
-                "mode": options.fMode,
-                "append": options.fAppend,
+                **_record_snapshot(options),
                 "data": {name: np.array(values) for name, values in self._data.items()},
             }
         )
@@ -98,6 +131,7 @@ class _FakeSnapshotRDF:
 class _FakeRDFNamespace:
     def __init__(self, sink: list) -> None:
         self._sink = sink
+        self.ESnapshotOutputFormat = _FakeEnum(["kDefault", "kTTree", "kRNTuple"])
 
     def FromNumpy(self, data: dict[str, np.ndarray]) -> _FakeSnapshotRDF:
         return _FakeSnapshotRDF(data, self._sink)
@@ -128,8 +162,7 @@ class _FakeMergeRDF:
                 "treename": treename,
                 "path": path,
                 "columns": list(columns),
-                "mode": options.fMode,
-                "append": options.fAppend,
+                **_record_snapshot(options),
                 "data": merged,
                 "merged_from": list(self._file_paths),
             }
@@ -137,17 +170,41 @@ class _FakeMergeRDF:
 
 
 class _FakeROOT:
-    def __init__(self, *, merge_raises: bool = False) -> None:
+    def __init__(
+        self, *, merge_raises: bool = False, mt_enabled: bool = False, thread_pool_size: int = 0
+    ) -> None:
         self.snapshots: list = []
         self.opened: list = []
         self.RDF = _FakeRDFNamespace(self.snapshots)
+        self.RCompressionSetting = SimpleNamespace(
+            EAlgorithm=_FakeEnum(["kZLIB", "kLZMA", "kLZ4", "kZSTD"])
+        )
         self._merge_raises = merge_raises
+        self._mt_enabled = mt_enabled
+        self._thread_pool_size = thread_pool_size
+        self.mt_calls: list = []
 
     def RDataFrame(self, treename: str, source):
         if isinstance(source, (list, tuple)):
             return _FakeMergeRDF(treename, list(source), self.snapshots, raises=self._merge_raises)
         self.opened.append((treename, source))
         return ("FakeRDF", treename, source)
+
+    def IsImplicitMTEnabled(self) -> bool:
+        return self._mt_enabled
+
+    def EnableImplicitMT(self, nthreads: int = 0) -> None:
+        self._mt_enabled = True
+        self._thread_pool_size = nthreads
+        self.mt_calls.append(("enable", nthreads))
+
+    def DisableImplicitMT(self) -> None:
+        self._mt_enabled = False
+        self._thread_pool_size = 0
+        self.mt_calls.append(("disable",))
+
+    def GetThreadPoolSize(self) -> int:
+        return self._thread_pool_size
 
 
 # --------------------------------------------------------------------------- #
@@ -318,6 +375,183 @@ def test_export_zero_rows_writes_one_recreate(tmp_path, monkeypatch):
     assert len(fake_root.snapshots) == 1
     assert fake_root.snapshots[0]["mode"] == "RECREATE"
     assert "merged_from" not in fake_root.snapshots[0]
+
+
+# --------------------------------------------------------------------------- #
+# Snapshot options
+# --------------------------------------------------------------------------- #
+
+
+def test_export_defaults_to_uncompressed(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", show_progress=False)
+
+    written = fake_root.snapshots[0]
+    # Compression level is forced to 0, unlike ROOT's own Snapshot default of 5.
+    assert written["compression_level"] == 0
+    # No algorithm or format is set, so ROOT's own choice is left in place.
+    assert written["compression_algorithm"] is None
+    assert written["output_format"] is None
+
+
+def test_export_applies_compression_options(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(
+        path,
+        tmp_path / "out.root",
+        compression_level=4,
+        compression_algorithm="zstd",
+        output_format="rntuple",
+        show_progress=False,
+    )
+
+    written = fake_root.snapshots[0]
+    assert written["compression_level"] == 4
+    assert written["compression_algorithm"] == fake_root.RCompressionSetting.EAlgorithm.kZSTD
+    assert written["output_format"] == fake_root.RDF.ESnapshotOutputFormat.kRNTuple
+
+
+def test_export_compression_algorithm_aliases_are_case_insensitive(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", compression_algorithm="ZLib", show_progress=False)
+    assert (
+        fake_root.snapshots[0]["compression_algorithm"]
+        == fake_root.RCompressionSetting.EAlgorithm.kZLIB
+    )
+
+
+def test_export_passes_through_non_string_option_values(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    algo = fake_root.RCompressionSetting.EAlgorithm.kLZ4
+    fmt = fake_root.RDF.ESnapshotOutputFormat.kTTree
+    to_root(
+        path,
+        tmp_path / "out.root",
+        compression_algorithm=algo,
+        output_format=fmt,
+        show_progress=False,
+    )
+
+    written = fake_root.snapshots[0]
+    assert written["compression_algorithm"] == algo
+    assert written["output_format"] == fmt
+
+
+def test_export_rejects_unknown_option_aliases(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: _FakeROOT())
+
+    with pytest.raises(ValueError, match="Unknown compression_algorithm"):
+        to_root(path, tmp_path / "a.root", compression_algorithm="snappy", show_progress=False)
+    with pytest.raises(ValueError, match="Unknown output_format"):
+        to_root(path, tmp_path / "b.root", output_format="parquet", show_progress=False)
+
+
+def test_export_chunk_files_uncompressed_final_honors_options(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(
+        path,
+        tmp_path / "out.root",
+        batch_size=300,
+        compression_level=7,
+        show_progress=False,
+    )
+
+    chunk_writes = [s for s in fake_root.snapshots if "merged_from" not in s]
+    merge = next(s for s in fake_root.snapshots if "merged_from" in s)
+    # Transient chunk files stay uncompressed; only the merged output is compressed.
+    assert all(s["compression_level"] == 0 for s in chunk_writes)
+    assert merge["compression_level"] == 7
+
+
+# --------------------------------------------------------------------------- #
+# Multithreading
+# --------------------------------------------------------------------------- #
+
+
+def test_export_enables_multithreading_by_default(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT(mt_enabled=False)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", show_progress=False)
+
+    # MT is turned on for the write, then restored to its original disabled state.
+    assert ("enable", 0) in fake_root.mt_calls
+    assert fake_root.mt_calls[-1] == ("disable",)
+    assert fake_root.IsImplicitMTEnabled() is False
+
+
+def test_export_multithreading_thread_count(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT(mt_enabled=False)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", multithreading=4, show_progress=False)
+    assert ("enable", 4) in fake_root.mt_calls
+    assert fake_root.IsImplicitMTEnabled() is False
+
+
+def test_export_multithreading_false_disables(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT(mt_enabled=False)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", multithreading=False, show_progress=False)
+    # An already-disabled state means no enable happened.
+    assert ("enable", 0) not in fake_root.mt_calls
+    assert not any(call[0] == "enable" for call in fake_root.mt_calls)
+    assert fake_root.IsImplicitMTEnabled() is False
+
+
+def test_export_restores_prior_multithreading_state(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    # ROOT already had MT enabled with 8 threads before the call.
+    fake_root = _FakeROOT(mt_enabled=True, thread_pool_size=8)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", multithreading=2, show_progress=False)
+
+    # The prior state is restored: MT on, with the original 8-thread pool.
+    assert fake_root.IsImplicitMTEnabled() is True
+    assert fake_root.GetThreadPoolSize() == 8
+    # The final restore re-enables with the captured thread count.
+    assert fake_root.mt_calls[-1] == ("enable", 8)
+
+
+def test_export_restores_multithreading_on_error(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT(merge_raises=True, mt_enabled=False)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    with pytest.raises(RuntimeError, match="simulated merge failure"):
+        to_root(path, tmp_path / "out.root", batch_size=300, show_progress=False)
+    # MT state is restored even though the merge raised.
+    assert fake_root.IsImplicitMTEnabled() is False
+    assert fake_root.mt_calls[-1] == ("disable",)
+
+
+def test_export_rejects_non_int_multithreading(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: _FakeROOT())
+
+    with pytest.raises(TypeError, match="multithreading must be a bool or int"):
+        to_root(path, tmp_path / "out.root", multithreading="yes", show_progress=False)
 
 
 # --------------------------------------------------------------------------- #
