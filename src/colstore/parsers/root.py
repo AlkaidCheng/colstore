@@ -76,6 +76,12 @@ _STORABLE_ROOT_TYPES: frozenset[str] = frozenset(
 # AsNumpy returns as object arrays that colstore cannot store.
 _NON_SCALAR_MARKERS: tuple[str, ...] = ("<", ">", "[", "]", "*", "vector", "RVec")
 
+# Any run of characters that is illegal in a ROOT branch/leaf name. ROOT's leaf
+# list grammar gives "/", "[", "]", ":", and whitespace special meaning, and a
+# branch name with them makes Snapshot abort (and can crash the process), so a
+# colstore column name is reduced to word characters before it is written.
+_INVALID_BRANCH_CHARS = re.compile(r"[^0-9A-Za-z_]+")
+
 _DEFAULT_BATCH_SIZE = "512 MiB"
 _DEFAULT_TREE_NAME = "events"
 
@@ -370,6 +376,41 @@ def from_root(
     )
 
 
+def _sanitize_branch_name(name: str) -> str:
+    """Reduce a column name to a valid ROOT branch name (word characters only)."""
+    sanitized = _INVALID_BRANCH_CHARS.sub("_", name).strip("_")
+    if not sanitized:
+        sanitized = "branch"
+    if sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized
+
+
+def _sanitized_name_map(names: list[str]) -> dict[str, str]:
+    """Map each column name to a unique valid ROOT branch name, preserving order.
+
+    Names that collide after sanitizing (``"a b"`` and ``"a-b"`` both reduce to
+    ``"a_b"``) get a numeric suffix so every branch name stays distinct.
+    """
+    used: set[str] = set()
+    mapping: dict[str, str] = {}
+    for name in names:
+        base = _sanitize_branch_name(name)
+        candidate = base
+        suffix = 2
+        while candidate in used:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        used.add(candidate)
+        mapping[name] = candidate
+    return mapping
+
+
+def _relabel(chunk: ColumnBatch, name_map: dict[str, str]) -> ColumnBatch:
+    """Return ``chunk`` with its keys renamed through ``name_map``."""
+    return {name_map[name]: column for name, column in chunk.items()}
+
+
 def to_root(
     source: ColStoreReader | StrPath,
     path: StrPath,
@@ -383,6 +424,11 @@ def to_root(
     The store is read and snapshotted in row chunks so peak memory stays near
     one batch rather than the whole file: the first chunk recreates the tree
     and later chunks append to it.
+
+    Column names that are not valid ROOT branch names (containing spaces,
+    brackets, or other symbols) are reduced to word characters before writing,
+    with a warning naming each change; colliding results are disambiguated with
+    a numeric suffix.
 
     Parameters
     ----------
@@ -409,6 +455,16 @@ def to_root(
     total_rows = reader.n_rows
     out_path = os.fspath(path)
 
+    name_map = _sanitized_name_map(column_names)
+    renamed = {old: new for old, new in name_map.items() if old != new}
+    if renamed:
+        detail = ", ".join(f"{old!r} -> {new!r}" for old, new in renamed.items())
+        warnings.warn(
+            f"Sanitized colstore column name(s) to valid ROOT branch names: {detail}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
     if isinstance(batch_size, str):
         bytes_per_row = sum(reader.dtypes[name].itemsize for name in column_names) or 1
         rows_per_chunk = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
@@ -424,12 +480,17 @@ def to_root(
         enabled=show_progress,
     ) as bar:
         if total_rows == 0:
-            _snapshot_chunk(root, reader[0:0].dict(copy=False), treename, out_path, first=True)
+            _snapshot_chunk(
+                root,
+                _relabel(reader[0:0].dict(copy=False), name_map),
+                treename,
+                out_path,
+                first=True,
+            )
         for start in range(0, total_rows, step):
             end = min(start + step, total_rows)
-            _snapshot_chunk(
-                root, reader[start:end].dict(copy=False), treename, out_path, first=start == 0
-            )
+            chunk = _relabel(reader[start:end].dict(copy=False), name_map)
+            _snapshot_chunk(root, chunk, treename, out_path, first=start == 0)
             bar.update(end - start)
 
     return root.RDataFrame(treename, out_path)

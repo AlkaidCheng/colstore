@@ -264,6 +264,67 @@ def test_export_zero_rows_writes_one_recreate(tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Branch-name sanitization (export)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("good_name", "good_name"),
+        ("mg_xsec [fb]", "mg_xsec_fb"),
+        ("a/b:c", "a_b_c"),
+        ("123abc", "_123abc"),
+        ("", "branch"),
+        ("   ", "branch"),
+        ("%$#", "branch"),
+    ],
+)
+def test_sanitize_branch_name(name, expected):
+    assert root_parser._sanitize_branch_name(name) == expected
+
+
+def test_sanitized_name_map_disambiguates_collisions():
+    mapping = root_parser._sanitized_name_map(["a b", "a-b", "ok"])
+    assert mapping == {"a b": "a_b", "a-b": "a_b_2", "ok": "ok"}
+
+
+def test_export_sanitizes_illegal_names_and_warns(tmp_path, monkeypatch):
+    n = 8
+    data = {
+        "mg_xsec [fb]": np.linspace(0, 1, n, dtype=np.float32),
+        "ok": np.arange(n, dtype=np.int64),
+    }
+    path = tmp_path / "src.cstore"
+    colstore.store(data, path, show_progress=False)
+
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+    with pytest.warns(RuntimeWarning, match="mg_xsec"):
+        to_root(path, tmp_path / "out.root", treename="t", show_progress=False)
+
+    written = fake_root.snapshots[0]
+    assert written["columns"] == ["mg_xsec_fb", "ok"]
+    assert np.allclose(written["data"]["mg_xsec_fb"], data["mg_xsec [fb]"])
+    assert np.array_equal(written["data"]["ok"], data["ok"])
+
+
+def test_export_valid_names_do_not_warn(tmp_path, monkeypatch):
+    data = {"px": np.arange(4, dtype=np.float64), "n": np.arange(4, dtype=np.int32)}
+    path = tmp_path / "clean.cstore"
+    colstore.store(data, path, show_progress=False)
+
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning fails the test
+        to_root(path, tmp_path / "out.root", show_progress=False)
+    assert fake_root.snapshots[0]["columns"] == ["px", "n"]
+
+
+# --------------------------------------------------------------------------- #
 # Tree-name resolution (decision (a): auto-detect the sole tree)
 # --------------------------------------------------------------------------- #
 

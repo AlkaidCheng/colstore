@@ -66,6 +66,11 @@ the first chunk recreates the tree and later chunks append to it — so memory
 stays bounded by `batch_size` regardless of file size. An `RDataFrame` over the
 freshly written file is returned for immediate use.
 
+Colstore column names that are not valid ROOT branch names (spaces, brackets, or
+other symbols, such as `"mg_xsec [fb]"`) are reduced to word characters
+(`mg_xsec_fb`) before writing, with a warning that names each change. Names that
+collide after sanitizing are disambiguated with a numeric suffix.
+
 ## Object interface
 
 The module functions carry the full typed signatures and are the recommended
