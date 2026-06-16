@@ -91,6 +91,13 @@ The writer commits records atomically on `close()` by rewriting a 32-byte
 counters block. A reader opening the file mid-write sees only what the
 last successful close committed.
 
+The streaming writers (`create` / `recreate` / `update`) and `compact` take an
+advisory `flock` for the duration of the write, so a second writer on the same
+file fails fast with a clear error instead of corrupting it. On filesystems that
+don't implement `flock` (some Lustre, GPFS, and NFS mounts), the lock is skipped
+with a one-time warning and the write proceeds — there is no lock to contend for
+on such a mount, so concurrent-writer detection is simply unavailable there.
+
 ## Compaction
 
 A streaming write produces one record per `write()` call. Reads of
@@ -129,11 +136,21 @@ scanned), so they're cheap on multi-GB files.
 ## Configuration
 
 ```python
-from colstore import set_max_workers, set_default_madvise, set_default_backend
+from colstore import (
+    set_max_workers,
+    set_default_madvise,
+    set_default_backend,
+    set_gather_thread_cap,
+    calibrate,
+)
+from colstore import config
 
-set_max_workers(8)                # parallel gathers across columns
-set_default_madvise("sequential") # OS read-ahead hint for sorted-index reads
-set_default_backend("cpp")        # gather kernel: cpp | numpy | numba
+set_max_workers(8)                 # parallel gathers across columns
+set_default_madvise("sequential")  # OS read-ahead hint for sorted-index reads
+set_default_backend("cpp")         # gather kernel: cpp | numpy | numba
+set_gather_thread_cap(16)          # threads per gather (default scales with socket count)
+config.set_numa_policy("auto")     # page placement: auto (interleave on multi-node) | local
+calibrate()                        # one-time: measure the thread/prefetch knees for this host
 ```
 
 ## How reads parallelize
