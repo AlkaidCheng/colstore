@@ -32,7 +32,7 @@ class Parser(ABC):
     Concrete subclasses live one per module in :mod:`colstore.parsers` and set
     :attr:`format_name`. The typed, format-specific entry points are the
     module-level functions each parser exposes (for example
-    :func:`colstore.parsers.root_to_colstore`); the methods here give those a
+    :func:`colstore.parsers.from_root`); the methods here give those a
     uniform object surface for programmatic dispatch.
 
     Attributes
@@ -44,12 +44,12 @@ class Parser(ABC):
     format_name: ClassVar[str]
 
     @abstractmethod
-    def to_colstore(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
-        """Convert ``source`` into a ``.cstore`` file at ``path`` and open it."""
+    def read(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
+        """Read the external ``source`` into a ``.cstore`` file at ``path`` and open it."""
 
     @abstractmethod
-    def from_colstore(self, source: ColStoreReader | StrPath, path: StrPath, **kwargs: Any) -> Any:
-        """Convert the ``.cstore`` file ``source`` into the external format at ``path``."""
+    def write(self, source: ColStoreReader | StrPath, path: StrPath, **kwargs: Any) -> Any:
+        """Write the ``.cstore`` ``source`` out to the external format at ``path``."""
 
 
 def resolve_batch_rows(

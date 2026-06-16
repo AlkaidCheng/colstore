@@ -7,12 +7,12 @@ first time a conversion runs.
 
 Examples
 --------
->>> from colstore.parsers import root_to_colstore, colstore_to_root
->>> reader = root_to_colstore("events.root", "events.cstore")  # doctest: +SKIP
->>> rdf = colstore_to_root(reader, "roundtrip.root")  # doctest: +SKIP
+>>> from colstore.parsers import from_root, to_root
+>>> reader = from_root("events.root", "events.cstore")  # doctest: +SKIP
+>>> rdf = to_root(reader, "roundtrip.root")  # doctest: +SKIP
 """
 
 from .base import Parser
-from .root import RootParser, colstore_to_root, root_to_colstore
+from .root import RootParser, from_root, to_root
 
-__all__ = ["Parser", "RootParser", "colstore_to_root", "root_to_colstore"]
+__all__ = ["Parser", "RootParser", "from_root", "to_root"]

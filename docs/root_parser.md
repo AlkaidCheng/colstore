@@ -22,9 +22,9 @@ through `numpy`.
 ## ROOT to colstore
 
 ```python
-from colstore.parsers import root_to_colstore
+from colstore.parsers import from_root
 
-reader = root_to_colstore("events.root", "events.cstore")
+reader = from_root("events.root", "events.cstore")
 ```
 
 The source may be a path to a `.root` file, a `{treename: files}` mapping with
@@ -34,7 +34,7 @@ tree (auto-detection raises rather than guessing). A string path may also embed
 the tree directly, following the uproot convention:
 
 ```python
-reader = root_to_colstore("events.root:Events", "events.cstore")
+reader = from_root("events.root:Events", "events.cstore")
 ```
 
 URL-scheme and Windows-drive colons (`root://…`, `C:\…`) are not treated as
@@ -56,9 +56,9 @@ multithreading, so disable `ROOT.EnableImplicitMT()` before a chunked ingest.
 ## colstore to ROOT
 
 ```python
-from colstore.parsers import colstore_to_root
+from colstore.parsers import to_root
 
-rdf = colstore_to_root("events.cstore", "events.root", treename="events")
+rdf = to_root("events.cstore", "events.root", treename="events")
 ```
 
 The output path is required. The store is read and snapshotted in row chunks —
@@ -76,6 +76,6 @@ over formats uniformly:
 from colstore.parsers import RootParser
 
 parser = RootParser()              # parser.format_name == "root"
-reader = parser.to_colstore("events.root", "events.cstore")
-rdf = parser.from_colstore(reader, "roundtrip.root")
+reader = parser.read("events.root", "events.cstore")
+rdf = parser.write(reader, "roundtrip.root")
 ```
