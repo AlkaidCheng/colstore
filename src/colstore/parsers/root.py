@@ -30,7 +30,7 @@ from .base import ColumnBatch, Parser, StrPath, resolve_batch_rows, write_column
 if TYPE_CHECKING:
     import ROOT
 
-#: A ROOT source accepted by :func:`root_to_colstore`.
+#: A ROOT source accepted by :func:`from_root`.
 RootSource: TypeAlias = "ROOT.RDataFrame | str | os.PathLike[str] | dict[str, str | list[str]]"
 
 # Fixed-size scalar ROOT/C++ types that AsNumpy materializes as fixed-width
@@ -297,7 +297,7 @@ def _ingest_batches(
         yield rdf.Range(start, end).AsNumpy(columns=columns)
 
 
-def root_to_colstore(
+def from_root(
     source: RootSource,
     path: StrPath,
     *,
@@ -370,7 +370,7 @@ def root_to_colstore(
     )
 
 
-def colstore_to_root(
+def to_root(
     source: ColStoreReader | StrPath,
     path: StrPath,
     *,
@@ -454,16 +454,18 @@ def _snapshot_chunk(
 class RootParser(Parser):
     """Two-way parser between ROOT files and colstore.
 
-    Thin object wrapper over :func:`root_to_colstore` and
-    :func:`colstore_to_root`, which carry the full typed signatures.
+    Thin object wrapper over :func:`from_root` and :func:`to_root`, which carry
+    the full typed signatures. The generic ``Parser`` directions map to the
+    format-named functions: ``to_colstore`` (anything into colstore) is
+    ``from_root``, and ``from_colstore`` (colstore back out) is ``to_root``.
     """
 
     format_name = "root"
 
     def to_colstore(self, source: Any, path: StrPath, **kwargs: Any) -> ColStoreReader:
-        return root_to_colstore(source, path, **kwargs)
+        return from_root(source, path, **kwargs)
 
     def from_colstore(
         self, source: ColStoreReader | StrPath, path: StrPath, **kwargs: Any
     ) -> ROOT.RDataFrame:
-        return colstore_to_root(source, path, **kwargs)
+        return to_root(source, path, **kwargs)

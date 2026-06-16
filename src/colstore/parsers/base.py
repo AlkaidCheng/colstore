@@ -32,7 +32,7 @@ class Parser(ABC):
     Concrete subclasses live one per module in :mod:`colstore.parsers` and set
     :attr:`format_name`. The typed, format-specific entry points are the
     module-level functions each parser exposes (for example
-    :func:`colstore.parsers.root_to_colstore`); the methods here give those a
+    :func:`colstore.parsers.from_root`); the methods here give those a
     uniform object surface for programmatic dispatch.
 
     Attributes

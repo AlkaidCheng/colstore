@@ -2,10 +2,10 @@
 
 ROOT is not importable in CI, so these tests drive the parser through fakes:
 
-* the ingest path (root_to_colstore) takes a duck-typed fake RNode as its
+* the ingest path (from_root) takes a duck-typed fake RNode as its
   source and runs against the real colstore writer/reader, so the column gate,
   batch math, record mapping, and compaction are all exercised for real;
-* the export path (colstore_to_root) reads a real .cstore file and writes
+* the export path (to_root) reads a real .cstore file and writes
   through a fake ROOT module (monkeypatched _import_root), so the chunking and
   the snapshot call sequence are checked without a ROOT build.
 
@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore.parsers import RootParser, colstore_to_root, root_to_colstore
+from colstore.parsers import RootParser, from_root, to_root
 from colstore.parsers import root as root_parser
 
 # --------------------------------------------------------------------------- #
@@ -142,7 +142,7 @@ def test_no_storable_columns_is_error():
 
 
 # --------------------------------------------------------------------------- #
-# Ingest: root_to_colstore (fake RNode + real colstore)
+# Ingest: from_root (fake RNode + real colstore)
 # --------------------------------------------------------------------------- #
 
 
@@ -150,7 +150,7 @@ def test_no_storable_columns_is_error():
 def test_ingest_roundtrip(tmp_path, batch_size):
     rnode = _make_rnode(1000)
     out = tmp_path / "events.cstore"
-    reader = root_to_colstore(rnode, out, batch_size=batch_size, show_progress=False)
+    reader = from_root(rnode, out, batch_size=batch_size, show_progress=False)
     assert reader.n_rows == 1000
     assert sorted(reader.columns) == ["n", "px"]
     assert np.array_equal(reader[:, "n"].array(), np.arange(1000, dtype=np.int32))
@@ -161,18 +161,18 @@ def test_ingest_skips_jagged_and_stores_the_rest(tmp_path):
     rnode = _make_rnode(500, with_jagged=True)
     out = tmp_path / "events.cstore"
     with pytest.warns(RuntimeWarning):
-        reader = root_to_colstore(rnode, out, batch_size=128, show_progress=False)
+        reader = from_root(rnode, out, batch_size=128, show_progress=False)
     assert sorted(reader.columns) == ["n", "px"]
     assert reader.n_rows == 500
 
 
 def test_ingest_compacts_by_default(tmp_path):
     rnode = _make_rnode(1000)
-    compacted = root_to_colstore(rnode, tmp_path / "c.cstore", batch_size=100, show_progress=False)
+    compacted = from_root(rnode, tmp_path / "c.cstore", batch_size=100, show_progress=False)
     assert colstore.info(tmp_path / "c.cstore").n_records == 1
     assert compacted.n_rows == 1000
 
-    streamed = root_to_colstore(
+    streamed = from_root(
         rnode, tmp_path / "s.cstore", batch_size=100, compact=False, show_progress=False
     )
     assert colstore.info(tmp_path / "s.cstore").n_records == 10
@@ -185,7 +185,7 @@ def test_ingest_zero_rows_keeps_schema(tmp_path):
         {"px": "Double_t", "n": "Int_t"},
     )
     out = tmp_path / "empty.cstore"
-    reader = root_to_colstore(rnode, out, show_progress=False)
+    reader = from_root(rnode, out, show_progress=False)
     assert reader.n_rows == 0
     assert sorted(reader.columns) == ["n", "px"]
 
@@ -193,12 +193,12 @@ def test_ingest_zero_rows_keeps_schema(tmp_path):
 def test_ingest_explicit_columns_subset(tmp_path):
     rnode = _make_rnode(200)
     out = tmp_path / "subset.cstore"
-    reader = root_to_colstore(rnode, out, columns=["px"], show_progress=False)
+    reader = from_root(rnode, out, columns=["px"], show_progress=False)
     assert reader.columns == ["px"]
 
 
 # --------------------------------------------------------------------------- #
-# Export: colstore_to_root (real colstore + fake ROOT)
+# Export: to_root (real colstore + fake ROOT)
 # --------------------------------------------------------------------------- #
 
 
@@ -217,7 +217,7 @@ def test_export_chunks_recreate_then_append(tmp_path, monkeypatch):
     fake_root = _FakeROOT()
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
 
-    result = colstore_to_root(
+    result = to_root(
         colstore.open(path),
         tmp_path / "out.root",
         treename="t",
@@ -245,7 +245,7 @@ def test_export_single_pass_when_batch_none(tmp_path, monkeypatch):
     fake_root = _FakeROOT()
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
 
-    colstore_to_root(path, tmp_path / "out.root", batch_size=None, show_progress=False)
+    to_root(path, tmp_path / "out.root", batch_size=None, show_progress=False)
     assert len(fake_root.snapshots) == 1
     assert fake_root.snapshots[0]["mode"] == "RECREATE"
     assert np.array_equal(fake_root.snapshots[0]["data"]["n"], data["n"])
@@ -258,7 +258,7 @@ def test_export_zero_rows_writes_one_recreate(tmp_path, monkeypatch):
     fake_root = _FakeROOT()
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
 
-    colstore_to_root(path, tmp_path / "out.root", show_progress=False)
+    to_root(path, tmp_path / "out.root", show_progress=False)
     assert len(fake_root.snapshots) == 1
     assert fake_root.snapshots[0]["mode"] == "RECREATE"
 
