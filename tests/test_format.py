@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import FILE_EXTENSION, ColStoreReader, FormatError
+from colstore import FILE_EXTENSION, ColStoreReader, FormatError, _sizes
 from colstore import format as fmt
 from colstore.format import (
     align_up,
@@ -333,9 +333,9 @@ def test_string_batch_size_matches_int_byte_equivalent(tmp_path):
     assert a.read_bytes() == b.read_bytes()
 
 
-@pytest.mark.parametrize("batch_size", ["1 KB", "1 KiB", "1024 B", "1024"])
+@pytest.mark.parametrize("batch_size", ["1 kB", "1 KiB", "2 MiB", "1024 B", "1024"])
 def test_string_batch_size_accepts_various_units(tmp_path, batch_size):
-    """All these should mean exactly 1024 bytes per batch."""
+    """Assorted accepted unit spellings (decimal and binary) all write a valid file."""
     columns = {"x": np.arange(2000, dtype=np.int32)}  # 8 KB total
     path = tmp_path / "x.cstore"
     write_dataset(columns, path, batch_size=batch_size, show_progress=False)
@@ -435,20 +435,29 @@ def test_string_batch_size_rejects_unknown_unit(tmp_path):
 
 
 def test_parse_byte_size_basic_units():
-    assert fmt._parse_byte_size("100") == 100
-    assert fmt._parse_byte_size("100 B") == 100
-    assert fmt._parse_byte_size("1 KB") == 1024
-    assert fmt._parse_byte_size("1 KiB") == 1024
-    assert fmt._parse_byte_size("1 MB") == 1024**2
-    assert fmt._parse_byte_size("1 MiB") == 1024**2
-    assert fmt._parse_byte_size("1 GB") == 1024**3
-    assert fmt._parse_byte_size("1.5 MB") == int(1.5 * 1024**2)
+    assert _sizes.parse_byte_size("100") == 100
+    assert _sizes.parse_byte_size("100 B") == 100
+    assert _sizes.parse_byte_size("1 KB") == 1000
+    assert _sizes.parse_byte_size("1 KiB") == 1024
+    assert _sizes.parse_byte_size("1 MB") == 1000**2
+    assert _sizes.parse_byte_size("1 MiB") == 1024**2
+    assert _sizes.parse_byte_size("1 GB") == 1000**3
+    assert _sizes.parse_byte_size("1.5 MB") == int(1.5 * 1000**2)
+
+
+def test_parse_byte_size_decimal_and_binary_differ():
+    """IEC 80000-13: SI prefixes are powers of 1000, IEC prefixes powers of 1024."""
+    assert _sizes.parse_byte_size("1 MB") == 1_000_000
+    assert _sizes.parse_byte_size("1 MiB") == 1_048_576
+    assert _sizes.parse_byte_size("1 GB") == 1_000_000_000
+    assert _sizes.parse_byte_size("1 GiB") == 1_073_741_824
 
 
 def test_parse_byte_size_whitespace_and_case():
-    assert fmt._parse_byte_size("  100mb  ") == 100 * 1024**2
-    assert fmt._parse_byte_size("100MIB") == 100 * 1024**2
-    assert fmt._parse_byte_size("100m") == 100 * 1024**2
+    # Case-insensitive; the presence of an 'i' selects the binary interpretation.
+    assert _sizes.parse_byte_size("  100mb  ") == 100 * 1000**2
+    assert _sizes.parse_byte_size("100MIB") == 100 * 1024**2
+    assert _sizes.parse_byte_size("100m") == 100 * 1000**2  # bare prefix is decimal
 
 
 def test_resolve_rows_per_step_returns_per_column_list():

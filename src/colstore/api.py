@@ -91,8 +91,9 @@ def store(
         * ``int N`` -- rows x columns per logical batch
           (``batch_size=100_000`` with 5 columns: 20 000-row writes).
         * ``str`` like ``"100 MB"``, ``"1.5 GiB"`` -- bytes per batch.
-          Binary multipliers throughout: ``MB`` ≡ ``MiB`` = 1024² bytes
-          (the ``ls -lh`` / ``du -h`` convention).
+          Units follow IEC 80000-13: decimal ``kB``/``MB``/``GB`` are powers
+          of 1000 and binary ``KiB``/``MiB``/``GiB`` are powers of 1024, so
+          ``"1 MB"`` is 1,000,000 bytes and ``"1 MiB"`` is 1,048,576.
 
     show_progress : bool, default ``True``
         Whether to display a tqdm progress bar. The bar's postfix shows
