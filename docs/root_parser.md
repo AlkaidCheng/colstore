@@ -69,10 +69,17 @@ rdf = to_root("events.cstore", "events.root", treename="events")
 `columns` selects which columns to write (in the given order), like an
 `RDataFrame.Snapshot` column list; the default writes every column.
 
-The output path is required. The store is read and snapshotted in row chunks —
-the first chunk recreates the tree and later chunks append to it — so memory
-stays bounded by `batch_size` regardless of file size. An `RDataFrame` over the
-freshly written file is returned for immediate use.
+The output path is required and recreated if it exists. `RDataFrame` writes one
+complete tree per Snapshot with no supported way to append entries to an
+existing tree, so the write follows one of two paths. When the selection fits in
+one `batch_size` (or `batch_size=None`), it is written in a single Snapshot;
+because a colstore reader is memory-mapped, the columns are handed to ROOT as
+zero-copy views and streamed to disk. When it is larger, each row-chunk is
+written to a temporary ROOT file and the chunk files are then merged into the
+output by one Snapshot over an `RDataFrame` built from all of them, so peak
+memory stays near one chunk regardless of file size; the temporary files are
+removed afterward, even on failure. An `RDataFrame` over the freshly written
+file is returned for immediate use.
 
 Colstore column names that are not valid ROOT branch names (spaces, brackets, or
 other symbols, such as `"mg_xsec [fb]"`) are reduced to word characters
