@@ -199,6 +199,8 @@ and the realized path is the unbound default pool.
 
 ## On-disk format
 
+![The .cstore on-disk format](docs/file_format.svg)
+
 ```
 [magic 8B = b"CSTORE\x00\x01"]
 [counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
@@ -218,6 +220,8 @@ that reads via a per-column memmap fast path; a streamed write produces a
 multi-record file with per-pattern dispatch (contiguous range, sorted
 fancy, unsorted fancy).
 
+![Single-record vs multi-record column layout](docs/record_layout.svg)
+
 ## Supported dtypes
 
 All fixed-size NumPy dtypes are supported: `float32`/`float64`,
@@ -226,6 +230,22 @@ and fixed-width strings (`S` bytes and `U` unicode, with the width baked
 into the dtype, e.g. `S16` or `U8`). Object dtype (variable-length
 strings, Python objects) is rejected at write time — the design point is
 zero-copy random access, which requires a fixed stride per row.
+
+## Documentation
+
+In-depth guides live in [`docs/`](docs/):
+
+- [Performance &amp; internals](docs/performance.md) — the file layout, the kernel
+  behind each access pattern, how reads parallelize, NUMA placement, and
+  zero-copy.
+- [Gather diagnostics](docs/gather_diagnostics.md) — re-measure the thread,
+  binding, and placement knobs on your own hardware.
+- [Optimization series](docs/optimization_series.md) — the cumulative record of
+  every optimization and the measurement behind it.
+- [Valgrind leak checking](docs/valgrind_leak_checking.md) — the native-leak
+  Memcheck harness under `scripts/`.
+
+The [docs index](docs/README.md) lists everything, including the diagrams.
 
 ## License
 

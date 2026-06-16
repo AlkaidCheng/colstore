@@ -35,6 +35,8 @@ A `.cstore` file opens with a validated header — an 8-byte magic constant
 column **manifest** (names, dtypes, reserved encoding/nullable keys) and the
 **record bodies**.
 
+![The .cstore on-disk format](file_format.svg)
+
 A *record* is a batch of rows. Inside a record, the columns are laid out
 **column-major and packed**: all of column 0's values for that record, then all
 of column 1's, and so on, with **no inter-column padding**. A file written in one
@@ -43,6 +45,8 @@ logical column is one contiguous run on disk, which is what makes whole-store
 reads and zero-copy possible. A file appended to over time is **multi-record**:
 the same logical column is split into one run per record, interleaved on disk
 with the other columns, and the reader stitches across record boundaries.
+
+![Single-record vs multi-record column layout](record_layout.svg)
 
 ```python
 import numpy as np
@@ -197,6 +201,8 @@ fancy index, unsorted, native, uniform layout  -> uniform fast-path kernel
 fancy index, unsorted, native, irregular       -> branchless search kernel
 non-native byte order  (any of the above)      -> NumPy correctness fallback
 ```
+
+![How a single-column read picks its kernel](kernel_dispatch.svg)
 
 Each native kernel takes the metadata arrays from §3 plus the column's
 `col_prefix_bytes` and `itemsize`, runs OpenMP across its output, and writes
@@ -544,6 +550,10 @@ colstore calibration clear
 The same machinery tunes the **thread cap** and the **mask density gate** (§5.6) —
 each resolving in the order *explicit setting → fingerprint-matched cache →
 compiled default*, so you can always override by hand.
+
+To re-derive the thread, binding, and placement answers from fresh measurements
+on a specific host — and to compare against the reference findings — use the
+[gather diagnostics harness](gather_diagnostics.md).
 
 ---
 
