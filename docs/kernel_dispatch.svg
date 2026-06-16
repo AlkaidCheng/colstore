@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="566" viewBox="0 0 680 566" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>How a single-column read picks its kernel</title>
+<desc>For a single-column read the reader tests the selector against a fixed priority order and dispatches to a native kernel for the matching shape. A dense boolean mask takes the mask-native kernel; a sparse mask is lowered to integer indices and falls through. A unit-step slice takes the range-copy kernel; a strided slice takes the strided-walk kernel. A sorted fancy index takes the sorted-walk kernel; an unsorted fancy index takes the uniform fast-path kernel when every record is the same size and the branchless search kernel otherwise. Any column whose on-disk byte order is non-native takes the NumPy correctness fallback. All native kernels assume a native dtype.</desc>
+<style>
+  .box { fill: #F1EFE8; stroke: #888780; stroke-width: 0.75; }
+  .kbox { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.75; }
+  .abox { fill: #FBF1DE; stroke: #B9852B; stroke-width: 0.75; }
+  .t { fill: #2C2C2A; font-size: 13px; font-weight: 500; }
+  .ts { fill: #5F5E5A; font-size: 11px; font-weight: 400; }
+  .kt { fill: #04342C; font-size: 13px; font-weight: 500; }
+  .kts { fill: #0F6E56; font-size: 11px; font-weight: 400; }
+  .at { fill: #6B4A12; font-size: 13px; font-weight: 500; }
+  .ats { fill: #8A6320; font-size: 11px; font-weight: 400; }
+  .lbl { fill: #5F5E5A; font-size: 11px; font-weight: 400; }
+  .arr { stroke: #73726C; stroke-width: 1.25; fill: none; }
+  @media (prefers-color-scheme: dark) {
+    .box { fill: #2C2C2A; stroke: #888780; } .t { fill: #F1EFE8; } .ts { fill: #D3D1C7; }
+    .kbox { fill: #04342C; stroke: #1D9E75; } .kt { fill: #E1F5EE; } .kts { fill: #9FE1CB; }
+    .abox { fill: #2E2613; stroke: #C9972F; } .at { fill: #F0D9A6; } .ats { fill: #D9B871; }
+    .lbl { fill: #B4B2A9; } .arr { stroke: #B4B2A9; }
+  }
+</style>
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<rect class="box" x="40" y="30" width="290" height="44" rx="8"/>
+<text class="t" x="185" y="50" text-anchor="middle">Selector for one column</text>
+<text class="ts" x="185" y="66" text-anchor="middle">native dtype assumed &#8226; tested in priority order</text>
+
+<!-- spine entry -->
+<line class="arr" x1="80" y1="74" x2="80" y2="104" marker-end="url(#ar)"/>
+
+<!-- r1: dense mask -->
+<rect class="box" x="40" y="104" width="290" height="46" rx="8"/>
+<text class="t" x="56" y="124">boolean mask, dense</text>
+<text class="ts" x="56" y="140">density &#8805; calibrated gate</text>
+<line class="arr" x1="330" y1="127" x2="372" y2="127" marker-end="url(#ar)"/>
+<rect class="kbox" x="372" y="104" width="268" height="46" rx="8"/>
+<text class="kt" x="388" y="124">mask-native kernel</text>
+<text class="kts" x="388" y="140">scan mask word-at-a-time</text>
+<line class="arr" x1="80" y1="150" x2="80" y2="172" marker-end="url(#ar)"/>
+<text class="lbl" x="92" y="166">else &#8212; sparse mask lowers to indices</text>
+
+<!-- r2: unit slice -->
+<rect class="box" x="40" y="172" width="290" height="40" rx="8"/>
+<text class="t" x="56" y="196">unit-step slice</text>
+<line class="arr" x1="330" y1="192" x2="372" y2="192" marker-end="url(#ar)"/>
+<rect class="kbox" x="372" y="172" width="268" height="40" rx="8"/>
+<text class="kt" x="388" y="190">range-copy kernel</text>
+<text class="kts" x="388" y="204">one memcpy per record</text>
+<line class="arr" x1="80" y1="212" x2="80" y2="232" marker-end="url(#ar)"/>
+<text class="lbl" x="92" y="227">else</text>
+
+<!-- r3: strided -->
+<rect class="box" x="40" y="232" width="290" height="40" rx="8"/>
+<text class="t" x="56" y="256">strided slice (step &#8800; 1)</text>
+<line class="arr" x1="330" y1="252" x2="372" y2="252" marker-end="url(#ar)"/>
+<rect class="kbox" x="372" y="232" width="268" height="40" rx="8"/>
+<text class="kt" x="388" y="250">strided-walk kernel</text>
+<text class="kts" x="388" y="264">synthesized row stream</text>
+<line class="arr" x1="80" y1="272" x2="80" y2="292" marker-end="url(#ar)"/>
+<text class="lbl" x="92" y="287">else</text>
+
+<!-- r4: sorted fancy -->
+<rect class="box" x="40" y="292" width="290" height="40" rx="8"/>
+<text class="t" x="56" y="316">sorted fancy index</text>
+<line class="arr" x1="330" y1="312" x2="372" y2="312" marker-end="url(#ar)"/>
+<rect class="kbox" x="372" y="292" width="268" height="40" rx="8"/>
+<text class="kt" x="388" y="310">sorted-walk kernel</text>
+<text class="kts" x="388" y="324">cursor walk, O(rows+records)</text>
+<line class="arr" x1="80" y1="332" x2="80" y2="352" marker-end="url(#ar)"/>
+<text class="lbl" x="92" y="347">else</text>
+
+<!-- r5: unsorted uniform -->
+<rect class="box" x="40" y="352" width="290" height="46" rx="8"/>
+<text class="t" x="56" y="372">unsorted fancy, uniform layout</text>
+<text class="ts" x="56" y="388">every record the same size</text>
+<line class="arr" x1="330" y1="375" x2="372" y2="375" marker-end="url(#ar)"/>
+<rect class="kbox" x="372" y="352" width="268" height="46" rx="8"/>
+<text class="kt" x="388" y="372">uniform fast-path</text>
+<text class="kts" x="388" y="388">reciprocal divide, no search</text>
+<line class="arr" x1="80" y1="398" x2="80" y2="418" marker-end="url(#ar)"/>
+<text class="lbl" x="92" y="413">else</text>
+
+<!-- r6: unsorted irregular -->
+<rect class="box" x="40" y="418" width="290" height="40" rx="8"/>
+<text class="t" x="56" y="442">unsorted fancy, irregular</text>
+<line class="arr" x1="330" y1="438" x2="372" y2="438" marker-end="url(#ar)"/>
+<rect class="kbox" x="372" y="418" width="268" height="40" rx="8"/>
+<text class="kt" x="388" y="436">branchless search kernel</text>
+<text class="kts" x="388" y="450">cmov binary search</text>
+
+<!-- fallback -->
+<line class="arr" x1="80" y1="458" x2="80" y2="500" marker-end="url(#ar)"/>
+<text class="lbl" x="92" y="480">non-native byte order, at any branch</text>
+<rect class="abox" x="40" y="500" width="600" height="44" rx="8"/>
+<text class="at" x="340" y="520" text-anchor="middle">NumPy correctness fallback</text>
+<text class="ats" x="340" y="536" text-anchor="middle">always correct &#8212; only speed depends on hitting a native kernel</text>
+</svg>
