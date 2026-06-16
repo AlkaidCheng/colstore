@@ -82,16 +82,21 @@ or refute, not as ground truth** — rerun the harness on your target.
    work-proportional ramp over-provisions for memory-bound work). The
    single-column scatter the original cap was tuned on saturated lower (~8), but
    conversions move ~8× the bytes and want ~2× the threads.
-2. **Binding helps; `spread` wins.** `OMP_PROC_BIND=spread, OMP_PLACES=cores`
-   (one thread per node, bound to a core) was consistently fastest — ~1.3× over
-   unbound, and faster than `close` (packing onto adjacent cores). A memory-bound
-   gather wants threads spread across as many memory controllers as possible.
-3. **Data placement does *not* matter once threads are bound.** A store forced
-   entirely onto one node read no faster than the interleaved store, at equal
-   thread count and binding. The earlier "node-local is ~1.5× faster" result was
-   an artifact of (a) a higher thread cap and (b) thread binding — not data
-   locality. Reader-side `mbind` migration of warm pages is also a no-op, so the
-   placement machinery contributed nothing.
+2. **Binding does *not* help — it regresses.** An early sweep suggested
+   `OMP_PROC_BIND=spread` was ~1.3× faster, but a fuller placement × binding ×
+   cap matrix (binding applied at runtime, the only way the library can) found
+   spread binding **24–51% slower** across every placement and cap on the
+   multi-node node: for a random-scatter gather you cannot co-locate a thread
+   with its data, so spreading only adds remote-access and coherence cost.
+   `gather_binding` ships **off** and is retained only as an opt-in lever.
+3. **Placement *is* the lever — interleave wins.** With binding off, where the
+   pages sit dominates: the best cell was an interleaved store read unbound, and
+   the same gather confined to a single node was markedly slower. A separate
+   cold-read A/B across contiguous, sorted, and scattered patterns confirmed
+   interleave is at least as fast as local for every pattern and never slower.
+   The earlier "placement doesn't matter once threads are bound" reading was an
+   artifact of binding itself; on the realized (unbound) path, interleave is the
+   win. This is the shipped `auto` default.
 4. **The library cannot set `OMP_PROC_BIND` at import** on a numpy/BLAS stack
    (all threads showed one full-width mask). Binding must be applied at runtime
    from inside a parallel region, or exported in the environment before launch.
@@ -99,12 +104,15 @@ or refute, not as ground truth** — rerun the harness on your target.
 ### What the reference findings imply for the code
 
 - Raise the default gather thread cap toward the measured knee for multi-column
-  conversions (calibrate per host rather than hard-coding).
-- Bind the gather's threads (`spread` across cores). Since the env cannot be set
-  at import, do it at runtime, and keep it scoped/overridable.
-- The NUMA *data*-placement path (single-node binding, `MPOL_BIND`/`MPOL_MF_MOVE`)
-  earns nothing measurable and can be removed; the win is the thread cap plus
-  thread binding, both of which help single-node hosts too.
+  conversions (calibrate per host rather than hard-coding). *Done:* the default
+  scales with socket count to reach ~16 on a dual-socket host, and `calibrate()`
+  brackets the sweep to 32 in case a wider host's knee is higher.
+- Do **not** bind the gather's threads. The fuller placement × binding × cap
+  matrix reversed the early binding result (24–51% slower on multi-node), so
+  `gather_binding` ships off and is kept only as an opt-in lever.
+- **Keep** the NUMA interleave placement path — once binding is off it is the
+  win, not removable. The `auto` default interleaves on multi-node (writer-side
+  at write time, reader-side at open for cold reads) and is a no-op elsewhere.
 
 If a rerun on new hardware contradicts any of these, the `CONCLUSIONS` block will
 report the divergence — investigate before assuming the old defaults still hold.

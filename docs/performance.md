@@ -156,8 +156,13 @@ default is right on a laptop and a 256-core node alike.
 (1 048 576). Below the threshold a gather runs serially — fork/join would cost
 more than the work. Above it, the thread count is roughly `ceil(n /
 ELEMENTS_PER_THREAD)`, clamped to a cap. The cap defaults to `physical_cores //
-2`, limited to a small ceiling (8), because the bandwidth-bound gather saturates
-there regardless of core count.
+2`, bounded by a per-socket allowance — 8 threads per socket, the point a single
+socket's memory channels saturate — so a single-socket host stays near 8 while a
+dual-socket host reaches ~16. (Socket count, not NUMA-node count, sets the
+ceiling: a NUMA-per-socket BIOS setting inflates the node count for unchanged
+memory hardware.) `calibrate()` measures the true knee per host — sweeping up to
+32 so a wide host's optimum is bracketed, not clipped — and overrides the
+default.
 
 **Splitting the budget across columns.** A multi-column read runs columns
 concurrently on a thread pool *and* threads each column's kernel. To avoid
@@ -502,7 +507,10 @@ files it didn't write (`mbind` cannot move already-resident warm pages on a
 respectively). On the reference hardware this cuts CPU time on a wide whole-store
 read by up to ~2× — the signature of eliminated remote-memory stalls. It is on by
 default and a no-op on single-node hosts; a purely single-threaded reader that
-would prefer all-local memory can opt out.
+would prefer all-local memory can opt out. A cold-read A/B across contiguous,
+sorted, and scattered access patterns confirmed interleave is at least as fast as
+local for every pattern and never slower, so the single `auto` default needs no
+per-pattern refinement.
 
 ```python
 from colstore import config

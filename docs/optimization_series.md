@@ -1,6 +1,6 @@
 # colstore Performance Optimization Series: Reference Summary
 
-This document summarizes two rounds of performance engineering on
+This document summarizes three rounds of performance engineering on
 `colstore`, a memory-mapped columnar binary format (C++ gather kernels,
 Cython bindings, Python reader/writer). Each stage was delivered as an
 independently revertable change set, premise-verified by profiling or a
@@ -18,8 +18,12 @@ native end-to-end and fixed the writer's syscall pattern. Round 2 (Stages
 7–12) removed the remaining selector-side overheads — index materialization,
 sortedness checks, record binning where the layout permits — added a
 zero-copy read API, and rejected one proposed optimization on measured
-grounds. The test suite grew from 311 tests before Round 1 to 407 after it
-and 600 after Round 2, passing in both single-thread and
+grounds. Round 3 tuned the parallelism defaults (the gather thread cap now
+scales with socket count), closed the NUMA placement investigation (interleave
+confirmed for cold reads across access patterns; spread thread binding shelved
+as a measured regression), and made writes portable to filesystems that lack
+`flock`. The test suite grew from 311 tests before Round 1 to 407 after it,
+600 after Round 2, and 735 after Round 3, passing in both single-thread and
 `OMP_NUM_THREADS=8` regimes at every stage (the deployment node collects a
 handful of additional host-conditional tests).
 
@@ -595,6 +599,63 @@ default gate is now 0.0 — see the open-items register.)
 
 ---
 
+# Round 3 — Defaults, placement validation, and filesystem portability
+
+This round tuned defaults and closed the NUMA investigation rather than adding
+kernels; the Round 1–2 gather kernels are untouched.
+
+## Socket-scaled gather thread cap
+
+**Branch:** `perf/gather-thread-cap-by-socket`
+
+**Problem.** The default cap was `physical_cores // 2` clamped to a flat ceiling
+of 8 — a single-socket saturation figure that left a dual-socket host at half
+the throughput-optimal thread count. A placement × cap sweep measured the large
+multi-column conversions ~1.1× faster at 16 threads than at 8.
+
+**Change.** The ceiling becomes a per-socket allowance (8) times the socket
+count, read from sysfs `physical_package_id` (fallback 1 socket). Socket count
+is used rather than NUMA-node count, which a NUMA-per-socket BIOS setting
+inflates for unchanged memory hardware. A single-socket host is unchanged; a
+dual-socket host defaults to ~16. The autotune candidate sweep also extends past
+16 to 32, so the saturation knee is bracketed rather than clipped (the sweep's
+optimum had sat exactly on the old top candidate). The cap remains a coarse
+hardware proxy that `calibrate()` refines per host by measuring the knee.
+
+## NUMA placement validation — cold reads
+
+**Branch:** `bench/cold-read-placement`
+
+**Problem.** The warm sweep never covered cold reads, where placement is set at
+the first fault by the reader-side policy. Whether the best cold-read placement
+flips by access pattern — which a per-pattern mechanism could exploit — was
+untested.
+
+**Change.** A cold-cache A/B of `local` vs `interleave` across contiguous,
+sorted-fancy, and random-scatter selectors (`benchmark/check_cold_read_placement.py`)
+measured it on a multi-node host: interleave was at least as fast for every
+pattern (1.10× contiguous, ~1.0× within noise otherwise) and never slower. No
+flip, so the single `auto` default (interleave on multi-node) stands and no
+per-pattern mechanism is warranted. The verdict and its reopen condition are
+recorded under rejected alternatives.
+
+## Graceful degradation when the filesystem lacks flock
+
+**Branch:** `fix/flock-unsupported-filesystem`
+
+**Problem.** The writer's advisory lock called `flock` unconditionally. Network
+and parallel filesystems that do not implement it (Lustre, GPFS, some NFS
+mounts) report `ENOTSUPP` (524), `EOPNOTSUPP`, or `ENOLCK`, which surfaced as an
+opaque "Unknown error 524" and blocked every streaming write there.
+
+**Change.** Those errnos are treated as "advisory locking unavailable on this
+filesystem": the write proceeds without a lock and emits a one-time warning,
+since a mount that cannot provide the lock to any process has none to contend
+for. Genuine contention (`BlockingIOError` from a real holder) and unexpected
+errnos still propagate, so a conflicting writer remains an actionable error. The
+one-shot `store()` path was unaffected — it writes via `write_dataset`, which
+never took the lock.
+
 # Net effect
 
 For the motivating workload — multi-column selection-driven reads over
@@ -651,6 +712,12 @@ caches.
   into a segfault class on a read-only mapping. (Stage 11)
 * **Silent copy fallback for `copy=False`** — voids the memory guarantee
   the flag exists for; unsupported cases raise with the remedy. (Stage 11)
+* **Reader-side spread thread binding** — an early sweep suggested
+  `OMP_PROC_BIND=spread` was ~1.3x faster, but a fuller placement × binding ×
+  cap matrix measured spread binding 24–51% slower across every placement and
+  cap on a multi-node host: a scatter gather cannot co-locate a thread with its
+  data, so spreading only adds remote-access and coherence cost. Shipped off
+  (`gather_binding` defaults False), retained as an opt-in lever. (Round 3)
 * **Per-pattern cold-read NUMA placement** — the warm sweep never covered
   cold reads, so a cold A/B of `local` vs `interleave` across contiguous,
   sorted-fancy, and random-scatter selectors on a multi-node host tested
