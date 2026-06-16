@@ -56,7 +56,7 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from . import profiling, testing
+from . import parsers, profiling, testing
 from .api import (
     ColStoreInfo,
     compact,
@@ -85,6 +85,7 @@ from .config import (
 )
 from .format import FILE_EXTENSION, FormatError
 from .kernels import cpp_available, max_threads, numba_available
+from .parsers import from_root, to_root
 from .reader import ColStoreReader
 from .view import ColumnView, TableView
 from .writer import ColStoreWriter
@@ -105,6 +106,7 @@ __all__ = [
     "cpp_available",
     "create",
     "ensure_calibrated",
+    "from_root",
     "get_default_backend",
     "get_default_madvise",
     "get_gather_thread_cap",
@@ -113,6 +115,7 @@ __all__ = [
     "max_threads",
     "numba_available",
     "open",
+    "parsers",
     "profiling",
     "recreate",
     "schema",
@@ -122,6 +125,7 @@ __all__ = [
     "set_max_workers",
     "store",
     "testing",
+    "to_root",
     "update",
     "use_passive_openmp_wait",
 ]

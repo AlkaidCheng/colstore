@@ -526,3 +526,13 @@ def test_parser_class_delegates(tmp_path, monkeypatch):
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
     result = parser.write(reader, tmp_path / "p.root", treename="t", show_progress=False)
     assert result == ("FakeRDF", "t", str(tmp_path / "p.root"))
+
+
+def test_top_level_exposure_without_importing_root():
+    import sys
+
+    assert colstore.to_root is to_root
+    assert colstore.from_root is from_root
+    assert colstore.parsers.RootParser is RootParser
+    # Importing colstore must not pull in ROOT; it stays lazy until a call runs.
+    assert "ROOT" not in sys.modules
