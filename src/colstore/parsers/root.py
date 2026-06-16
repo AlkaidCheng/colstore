@@ -501,34 +501,41 @@ def to_root(
             stacklevel=2,
         )
 
-    rows_per_chunk = _resolve_chunk_rows(reader, selected, batch_size)
+    row_nbytes = sum(reader.dtypes[name].itemsize for name in selected)
+    total_bytes = total_rows * row_nbytes
+    rows_per_chunk = _resolve_chunk_rows(batch_size, row_nbytes)
 
     with progress_bar(
-        total=total_rows,
+        total=total_bytes,
         desc=f"{out_path} <- colstore",
-        unit="row",
+        unit="B",
         unit_scale=True,
         enabled=show_progress,
     ) as bar:
         if rows_per_chunk is None or total_rows <= rows_per_chunk:
             data = _relabel(reader[:, selected].dict(copy=False), name_map)
             _snapshot(root, data, treename, out_path)
-            bar.update(total_rows)
+            bar.update(total_bytes)
         else:
             _write_chunked(
-                root, reader, selected, name_map, treename, out_path, rows_per_chunk, bar
+                root,
+                reader,
+                selected,
+                name_map,
+                treename,
+                out_path,
+                rows_per_chunk,
+                row_nbytes,
+                bar,
             )
 
     return root.RDataFrame(treename, out_path)
 
 
-def _resolve_chunk_rows(
-    reader: ColStoreReader, selected: list[str], batch_size: int | str | None
-) -> int | None:
+def _resolve_chunk_rows(batch_size: int | str | None, row_nbytes: int) -> int | None:
     """Resolve ``batch_size`` to rows per chunk (``None`` means a single Snapshot)."""
     if isinstance(batch_size, str):
-        bytes_per_row = sum(reader.dtypes[name].itemsize for name in selected) or 1
-        return resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
+        return resolve_batch_rows(batch_size, bytes_per_row=row_nbytes or 1)
     return resolve_batch_rows(batch_size)
 
 
@@ -547,6 +554,7 @@ def _write_chunked(
     treename: str,
     out_path: str,
     rows_per_chunk: int,
+    row_nbytes: int,
     bar: Any,
 ) -> None:
     """Snapshot each row-chunk to a temporary file, then merge them into out_path.
@@ -567,7 +575,7 @@ def _write_chunked(
             chunk_path = os.path.join(scratch_dir, f"chunk_{index:06d}.root")
             _snapshot(root, chunk, treename, chunk_path)
             chunk_paths.append(chunk_path)
-            bar.update(end - start)
+            bar.update((end - start) * row_nbytes)
 
         options = root.RDF.RSnapshotOptions()
         options.fMode = "RECREATE"
