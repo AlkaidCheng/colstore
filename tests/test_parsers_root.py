@@ -106,15 +106,48 @@ class _FakeRDFNamespace:
         return _FakeSnapshotOptions()
 
 
+class _FakeMergeRDF:
+    """Stand-in for an RDataFrame built over several chunk files; merges on Snapshot."""
+
+    def __init__(self, treename: str, file_paths: list[str], sink: list, *, raises: bool) -> None:
+        self._file_paths = file_paths
+        self._sink = sink
+        self._raises = raises
+
+    def Snapshot(self, treename: str, path: str, columns, options: _FakeSnapshotOptions) -> None:
+        if self._raises:
+            raise RuntimeError("simulated merge failure")
+        wanted = set(self._file_paths)
+        by_path = {snap["path"]: snap for snap in self._sink if snap["path"] in wanted}
+        ordered = [by_path[p] for p in self._file_paths]
+        merged = {
+            name: np.concatenate([chunk["data"][name] for chunk in ordered]) for name in columns
+        }
+        self._sink.append(
+            {
+                "treename": treename,
+                "path": path,
+                "columns": list(columns),
+                "mode": options.fMode,
+                "append": options.fAppend,
+                "data": merged,
+                "merged_from": list(self._file_paths),
+            }
+        )
+
+
 class _FakeROOT:
-    def __init__(self) -> None:
+    def __init__(self, *, merge_raises: bool = False) -> None:
         self.snapshots: list = []
         self.opened: list = []
         self.RDF = _FakeRDFNamespace(self.snapshots)
+        self._merge_raises = merge_raises
 
-    def RDataFrame(self, treename: str, path: str):
-        self.opened.append((treename, path))
-        return ("FakeRDF", treename, path)
+    def RDataFrame(self, treename: str, source):
+        if isinstance(source, (list, tuple)):
+            return _FakeMergeRDF(treename, list(source), self.snapshots, raises=self._merge_raises)
+        self.opened.append((treename, source))
+        return ("FakeRDF", treename, source)
 
 
 # --------------------------------------------------------------------------- #
@@ -212,43 +245,66 @@ def _store_sample(tmp_path, n_rows: int = 1000):
     return path, data
 
 
-def test_export_chunks_recreate_then_append(tmp_path, monkeypatch):
+def test_export_single_snapshot_when_fits_one_chunk(tmp_path, monkeypatch):
     path, data = _store_sample(tmp_path, 1000)
     fake_root = _FakeROOT()
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
 
-    result = to_root(
-        colstore.open(path),
-        tmp_path / "out.root",
-        treename="t",
-        batch_size=300,
-        show_progress=False,
-    )
+    # Default batch_size, but the data is tiny -> one direct Snapshot, no temp files.
+    result = to_root(colstore.open(path), tmp_path / "out.root", treename="t", show_progress=False)
 
-    # 1000 rows / 300 per chunk -> 4 chunks: first RECREATE, rest UPDATE+append.
-    modes = [snap["mode"] for snap in fake_root.snapshots]
-    appends = [snap["append"] for snap in fake_root.snapshots]
-    assert modes == ["RECREATE", "UPDATE", "UPDATE", "UPDATE"]
-    assert appends == [False, True, True, True]
-    assert all(snap["treename"] == "t" for snap in fake_root.snapshots)
-
-    # The concatenated chunks reproduce the source columns in order.
-    stitched_n = np.concatenate([snap["data"]["n"] for snap in fake_root.snapshots])
-    stitched_px = np.concatenate([snap["data"]["px"] for snap in fake_root.snapshots])
-    assert np.array_equal(stitched_n, data["n"])
-    assert np.allclose(stitched_px, data["px"])
+    assert len(fake_root.snapshots) == 1
+    written = fake_root.snapshots[0]
+    assert written["mode"] == "RECREATE"
+    assert written["append"] is False
+    assert "merged_from" not in written
+    assert np.array_equal(written["data"]["n"], data["n"])
+    assert np.allclose(written["data"]["px"], data["px"])
     assert result == ("FakeRDF", "t", str(tmp_path / "out.root"))
+    assert not list(tmp_path.glob(f"{root_parser._TMP_DIR_PREFIX}*"))
 
 
-def test_export_single_pass_when_batch_none(tmp_path, monkeypatch):
-    path, data = _store_sample(tmp_path, 50)
+def test_export_batch_none_forces_single_snapshot(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
     fake_root = _FakeROOT()
     monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
 
     to_root(path, tmp_path / "out.root", batch_size=None, show_progress=False)
     assert len(fake_root.snapshots) == 1
-    assert fake_root.snapshots[0]["mode"] == "RECREATE"
-    assert np.array_equal(fake_root.snapshots[0]["data"]["n"], data["n"])
+    assert "merged_from" not in fake_root.snapshots[0]
+    assert not list(tmp_path.glob(f"{root_parser._TMP_DIR_PREFIX}*"))
+
+
+def test_export_chunked_via_temp_files_then_merge(tmp_path, monkeypatch):
+    path, data = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT()
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    to_root(path, tmp_path / "out.root", treename="t", batch_size=300, show_progress=False)
+
+    chunk_writes = [s for s in fake_root.snapshots if "merged_from" not in s]
+    merges = [s for s in fake_root.snapshots if "merged_from" in s]
+    assert len(chunk_writes) == 4  # 1000 rows / 300 per chunk
+    assert len(merges) == 1
+    merged = merges[0]
+    assert merged["treename"] == "t"
+    assert merged["path"] == str(tmp_path / "out.root")
+    # The merge reconstructs the full columns, in row order, from the chunk files.
+    assert np.array_equal(merged["data"]["n"], data["n"])
+    assert np.allclose(merged["data"]["px"], data["px"])
+    # Temporary chunk directory is cleaned up.
+    assert not list(tmp_path.glob(f"{root_parser._TMP_DIR_PREFIX}*"))
+
+
+def test_export_chunk_scratch_cleaned_up_on_merge_error(tmp_path, monkeypatch):
+    path, _ = _store_sample(tmp_path, 1000)
+    fake_root = _FakeROOT(merge_raises=True)
+    monkeypatch.setattr(root_parser, "_import_root", lambda: fake_root)
+
+    with pytest.raises(RuntimeError, match="simulated merge failure"):
+        to_root(path, tmp_path / "out.root", batch_size=300, show_progress=False)
+    # The scratch directory must be removed even though the merge failed.
+    assert not list(tmp_path.glob(f"{root_parser._TMP_DIR_PREFIX}*"))
 
 
 def test_export_zero_rows_writes_one_recreate(tmp_path, monkeypatch):
@@ -261,6 +317,7 @@ def test_export_zero_rows_writes_one_recreate(tmp_path, monkeypatch):
     to_root(path, tmp_path / "out.root", show_progress=False)
     assert len(fake_root.snapshots) == 1
     assert fake_root.snapshots[0]["mode"] == "RECREATE"
+    assert "merged_from" not in fake_root.snapshots[0]
 
 
 # --------------------------------------------------------------------------- #

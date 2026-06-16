@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import tempfile
 import warnings
 from collections.abc import Iterator
 from types import ModuleType
@@ -84,6 +86,9 @@ _INVALID_BRANCH_CHARS = re.compile(r"[^0-9A-Za-z_]+")
 
 _DEFAULT_BATCH_SIZE = "512 MiB"
 _DEFAULT_TREE_NAME = "events"
+
+# Prefix for the per-chunk scratch directory used by the bounded-memory export.
+_TMP_DIR_PREFIX = ".colstore_to_root_"
 
 
 def _import_root() -> ModuleType:
@@ -435,9 +440,22 @@ def to_root(
 ) -> ROOT.RDataFrame:
     """Write a ``.cstore`` file to a ROOT file and return an RDataFrame over it.
 
-    The store is read and snapshotted in row chunks so peak memory stays near
-    one batch rather than the whole file: the first chunk recreates the tree
-    and later chunks append to it.
+    RDataFrame writes one complete tree per Snapshot and has no supported way to
+    append entries to an existing tree, so a store that does not fit in memory
+    cannot be written with a single streaming Snapshot. Two paths handle this:
+
+    * When the whole selection fits in one ``batch_size`` (or ``batch_size`` is
+      ``None``), the columns are written in a single Snapshot. A colstore reader
+      is memory-mapped, so the column arrays are handed to ROOT as zero-copy
+      views and Snapshot streams them to disk; for a single-record store peak
+      memory stays bounded by the page cache.
+    * Otherwise each row-chunk is written to a temporary ROOT file and the chunk
+      files are then merged into ``path`` by a single Snapshot over an
+      RDataFrame built from all of them, so peak memory stays near one chunk
+      regardless of file size. The temporary files are removed afterward, even
+      on failure.
+
+    Row order is preserved when ROOT implicit multithreading is off.
 
     Column names that are not valid ROOT branch names (containing spaces,
     brackets, or other symbols) are reduced to word characters before writing,
@@ -449,15 +467,16 @@ def to_root(
     source : colstore.ColStoreReader, str, or os.PathLike
         An opened reader, or a path to a ``.cstore`` file.
     path : str or os.PathLike
-        Destination ``.root`` file (required).
+        Destination ``.root`` file; recreated if it already exists.
     treename : str, optional
         Name of the tree to write. Defaults to ``"events"``.
     columns : list[str] or None, optional
         Columns to write, in this order. ``None`` (default) writes every column.
         Naming a column absent from the store is an error.
     batch_size : int, str, or None, optional
-        Memory budget per chunk. ``None`` writes in one pass; an ``int`` is
-        rows per chunk; a ``str`` (default ``"512 MiB"``) is a byte budget.
+        Per-chunk memory budget for stores larger than one chunk: an ``int`` is
+        rows per chunk; a ``str`` (default ``"512 MiB"``) is a byte budget;
+        ``None`` forces a single Snapshot (no temporary files).
     show_progress : bool, optional
         Whether to display a progress bar. Defaults to True.
 
@@ -469,8 +488,8 @@ def to_root(
     root = _import_root()
     reader = source if isinstance(source, ColStoreReader) else api.open(source)
     selected = _resolve_columns(reader, columns)
-    total_rows = reader.n_rows
     out_path = os.fspath(path)
+    total_rows = reader.n_rows
 
     name_map = _sanitized_name_map(selected)
     renamed = {old: new for old, new in name_map.items() if old != new}
@@ -482,12 +501,7 @@ def to_root(
             stacklevel=2,
         )
 
-    if isinstance(batch_size, str):
-        bytes_per_row = sum(reader.dtypes[name].itemsize for name in selected) or 1
-        rows_per_chunk = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
-    else:
-        rows_per_chunk = resolve_batch_rows(batch_size)
-    step = rows_per_chunk or max(total_rows, 1)
+    rows_per_chunk = _resolve_chunk_rows(reader, selected, batch_size)
 
     with progress_bar(
         total=total_rows,
@@ -496,37 +510,70 @@ def to_root(
         unit_scale=True,
         enabled=show_progress,
     ) as bar:
-        if total_rows == 0:
-            _snapshot_chunk(
-                root,
-                _relabel(reader[0:0, selected].dict(copy=False), name_map),
-                treename,
-                out_path,
-                first=True,
+        if rows_per_chunk is None or total_rows <= rows_per_chunk:
+            data = _relabel(reader[:, selected].dict(copy=False), name_map)
+            _snapshot(root, data, treename, out_path)
+            bar.update(total_rows)
+        else:
+            _write_chunked(
+                root, reader, selected, name_map, treename, out_path, rows_per_chunk, bar
             )
-        for start in range(0, total_rows, step):
-            end = min(start + step, total_rows)
-            chunk = _relabel(reader[start:end, selected].dict(copy=False), name_map)
-            _snapshot_chunk(root, chunk, treename, out_path, first=start == 0)
-            bar.update(end - start)
 
     return root.RDataFrame(treename, out_path)
 
 
-def _snapshot_chunk(
+def _resolve_chunk_rows(
+    reader: ColStoreReader, selected: list[str], batch_size: int | str | None
+) -> int | None:
+    """Resolve ``batch_size`` to rows per chunk (``None`` means a single Snapshot)."""
+    if isinstance(batch_size, str):
+        bytes_per_row = sum(reader.dtypes[name].itemsize for name in selected) or 1
+        return resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
+    return resolve_batch_rows(batch_size)
+
+
+def _snapshot(root: ModuleType, data: ColumnBatch, treename: str, out_path: str) -> None:
+    """Write ``data`` as a single tree, recreating the output file."""
+    options = root.RDF.RSnapshotOptions()
+    options.fMode = "RECREATE"
+    root.RDF.FromNumpy(data).Snapshot(treename, out_path, list(data), options)
+
+
+def _write_chunked(
     root: ModuleType,
-    chunk: ColumnBatch,
+    reader: ColStoreReader,
+    selected: list[str],
+    name_map: dict[str, str],
     treename: str,
     out_path: str,
-    *,
-    first: bool,
+    rows_per_chunk: int,
+    bar: Any,
 ) -> None:
-    """Append one column-dict chunk to the output tree via RDF.FromNumpy.Snapshot."""
-    options = root.RDF.RSnapshotOptions()
-    options.fMode = "RECREATE" if first else "UPDATE"
-    if not first:
-        options.fAppend = True
-    root.RDF.FromNumpy(chunk).Snapshot(treename, out_path, list(chunk), options)
+    """Snapshot each row-chunk to a temporary file, then merge them into out_path.
+
+    Each chunk is one valid single-tree Snapshot; the chunk files are read back
+    as one RDataframe (a TChain) and snapshotted into the final tree. The
+    scratch directory is created beside the output (same filesystem) and removed
+    afterward whether or not the merge succeeds.
+    """
+    total_rows = reader.n_rows
+    branch_names = [name_map[name] for name in selected]
+    scratch_dir = tempfile.mkdtemp(prefix=_TMP_DIR_PREFIX, dir=os.path.dirname(out_path) or ".")
+    try:
+        chunk_paths: list[str] = []
+        for index, start in enumerate(range(0, total_rows, rows_per_chunk)):
+            end = min(start + rows_per_chunk, total_rows)
+            chunk = _relabel(reader[start:end, selected].dict(copy=False), name_map)
+            chunk_path = os.path.join(scratch_dir, f"chunk_{index:06d}.root")
+            _snapshot(root, chunk, treename, chunk_path)
+            chunk_paths.append(chunk_path)
+            bar.update(end - start)
+
+        options = root.RDF.RSnapshotOptions()
+        options.fMode = "RECREATE"
+        root.RDataFrame(treename, chunk_paths).Snapshot(treename, out_path, branch_names, options)
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 class RootParser(Parser):
