@@ -192,7 +192,7 @@ at the full cap, depending on the route taken. Either way the kernel's
 the number of indices and clamps it to the cap, so small reads stay serial and
 only large ones spend the whole budget.
 
-![Gather thread decision flow](docs/gather_thread_decision.svg)
+![Gather thread decision flow](docs/assets/gather_thread_decision.svg)
 
 The cap itself defaults to half the physical cores, bounded by a per-socket
 allowance so multi-socket hosts (with more memory channels) get a higher
@@ -208,7 +208,7 @@ that keeps pages near the reading thread. Placement is decided at the first page
 fault, so warm pages cannot be moved — only a cold read (pages not yet resident)
 is placed according to the policy.
 
-![NUMA placement decision](docs/numa_placement_decision.svg)
+![NUMA placement decision](docs/assets/numa_placement_decision.svg)
 
 Whether the best cold-read placement depends on the access pattern was the one
 case the warm sweep never covered. `benchmark/check_cold_read_placement.py`
@@ -224,11 +224,11 @@ lever that ships **off**: a placement × binding × cap sweep measured spread
 binding 24–51% slower on a multi-node host, so `gather_binding` defaults to off
 and the realized path is the unbound default pool.
 
-![Gather thread binding status](docs/gather_thread_binding_status.svg)
+![Gather thread binding status](docs/assets/gather_thread_binding_status.svg)
 
 ## On-disk format
 
-![The .cstore on-disk format](docs/file_format.svg)
+![The .cstore on-disk format](docs/assets/file_format.svg)
 
 ```
 [magic 8B = b"CSTORE\x00\x01"]
@@ -249,7 +249,7 @@ that reads via a per-column memmap fast path; a streamed write produces a
 multi-record file with per-pattern dispatch (contiguous range, sorted
 fancy, unsorted fancy).
 
-![Single-record vs multi-record column layout](docs/record_layout.svg)
+![Single-record vs multi-record column layout](docs/assets/record_layout.svg)
 
 ## Supported dtypes
 
