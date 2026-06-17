@@ -20,7 +20,7 @@ import numpy as np
 if TYPE_CHECKING:
     import pandas as pd
 
-    from .reader import ColStoreReader
+    from ._base import _ReaderBase
 
 _RowIndexer = int | slice | np.ndarray | None
 
@@ -35,7 +35,7 @@ class _BaseView:
 
     __slots__ = ("_row_part", "_store")
 
-    def __init__(self, store: ColStoreReader, row_part: Any) -> None:
+    def __init__(self, store: _ReaderBase, row_part: Any) -> None:
         self._store = store
         self._row_part = row_part
 
@@ -132,7 +132,7 @@ class ColumnView(_BaseView):
 
     def __init__(
         self,
-        store: ColStoreReader,
+        store: _ReaderBase,
         row_part: Any,
         column_name: str,
     ) -> None:
@@ -195,7 +195,7 @@ class TableView(_BaseView):
 
     def __init__(
         self,
-        store: ColStoreReader,
+        store: _ReaderBase,
         row_part: Any,
         column_names: list[str],
     ) -> None:
