@@ -60,6 +60,7 @@ from . import parsers, profiling, testing
 from .api import (
     ColStoreInfo,
     compact,
+    concat,
     create,
     info,
     open,
@@ -107,6 +108,7 @@ __all__ = [
     "__version__",
     "calibrate",
     "compact",
+    "concat",
     "cpp_available",
     "create",
     "ensure_calibrated",
