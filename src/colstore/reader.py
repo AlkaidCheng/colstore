@@ -32,6 +32,8 @@ from .view import ColumnView, TableView
 if TYPE_CHECKING:
     import pandas as pd
 
+    from .frame import ColStoreFrame
+
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
     "sequential": getattr(mmap, "MADV_SEQUENTIAL", 2),
@@ -1452,3 +1454,16 @@ class ColStoreReader:
             rationale and details.
         """
         return _make_dataframe_no_consolidate(self.dict())
+
+    def edit(self) -> ColStoreFrame:
+        """Open a deferred editing frame over this store's columns.
+
+        Returns a :class:`~colstore.ColStoreFrame` seeded with this store's
+        columns as native-passthrough leaves. Column updates, additions,
+        removals, renames, and elementwise transforms are deferred and written
+        to a new file by :meth:`ColStoreFrame.write`; this store is not
+        modified.
+        """
+        from .frame import ColStoreFrame
+
+        return ColStoreFrame(self)
