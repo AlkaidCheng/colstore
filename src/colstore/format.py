@@ -41,18 +41,21 @@ cross-host portability; big-endian hosts byte-swap on write and read, so
 callers always see native-order arrays.
 """
 
+import contextlib
 import json
 import os
 import struct
 import sys
+import tempfile
 import time
 import zlib
 from typing import IO, Any
 
 import numpy as np
 
-from . import _numa
+from . import _numa, config
 from ._sizes import parse_byte_size
+from .frame import Expr, evaluate, validate_length
 from .progress import progress_bar
 
 FILE_EXTENSION = ".cstore"
@@ -808,3 +811,171 @@ def write_dataset(
         pad = align_up(body_bytes, _RECORD_BODY_ALIGNMENT) - body_bytes
         if pad:
             output_file.write(b"\x00" * pad)
+
+
+def _resolve_streaming_layout(
+    specs: dict[str, Expr],
+) -> tuple[list[dict[str, Any]], dict[str, np.dtype[Any]], int]:
+    """Resolve the on-disk schema and per-row byte cost for a streaming write.
+
+    Runs one zero-length pass over every column expression through a *shared*
+    memo, exactly as a real batch does. That yields, for free and without
+    reading data, each column's output dtype and -- because the shared memo
+    holds one entry per distinct node materialized across all columns -- the
+    total bytes a single batch row occupies in RAM (the sum of every distinct
+    node's itemsize, since the per-batch memo keeps each computed array live
+    until the batch ends). Returns ``(columns_meta, on_disk_dtypes,
+    bytes_per_row)``.
+    """
+    probe_memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
+    columns_meta: list[dict[str, Any]] = []
+    on_disk_dtypes: dict[str, np.dtype[Any]] = {}
+    for name, spec in specs.items():
+        root = evaluate(spec, 0, 0, probe_memo)
+        kind = root.dtype.kind
+        if kind == "O":
+            raise TypeError(
+                f"Column {name!r} resolves to object dtype; only fixed-size dtypes "
+                f"are supported."
+            )
+        if kind not in _SUPPORTED_KINDS:
+            raise TypeError(
+                f"Column {name!r} resolves to unsupported dtype kind {kind!r} "
+                f"({root.dtype}); supported kinds are {sorted(_SUPPORTED_KINDS)}."
+            )
+        disk_dtype = _to_little_endian(root).dtype
+        on_disk_dtypes[name] = disk_dtype
+        columns_meta.append(
+            {
+                "name": name,
+                "dtype": disk_dtype.str,
+                "encoding": _DEFAULT_ENCODING,
+                "nullable": _DEFAULT_NULLABLE,
+            }
+        )
+    bytes_per_row = sum(int(array.itemsize) for array in probe_memo.values())
+    return columns_meta, on_disk_dtypes, bytes_per_row
+
+
+def _fill_streaming(
+    tmp_path: str,
+    specs: dict[str, Expr],
+    names: list[str],
+    on_disk_dtypes: dict[str, np.dtype[Any]],
+    body_offset: int,
+    n_rows: int,
+    batch_rows: int,
+) -> None:
+    """Fill a preallocated file body via per-column memmaps, one batch at a time.
+
+    Each batch opens a fresh memo shared across all columns, so a subexpression
+    used by several columns is computed once for the batch and released when the
+    batch ends. Writes are scattered across the column-contiguous regions; the
+    file is preallocated, so each column lands at its fixed offset. Byte order
+    is normalized to little-endian on assignment into the on-disk-typed view (a
+    no-op on a little-endian host).
+    """
+    views: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
+    offset = body_offset
+    try:
+        for name in names:
+            dtype = on_disk_dtypes[name]
+            views[name] = np.memmap(
+                tmp_path, dtype=dtype, mode="r+", offset=offset, shape=(n_rows,)
+            )
+            offset += n_rows * dtype.itemsize
+        for start in range(0, n_rows, batch_rows):
+            stop = min(start + batch_rows, n_rows)
+            memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
+            for name in names:
+                views[name][start:stop] = evaluate(specs[name], start, stop, memo)
+        for name in names:
+            views[name].flush()
+    finally:
+        # Release the mappings before the caller renames the file: an open
+        # mapping blocks the rename on Windows and pins pages everywhere.
+        for view in views.values():
+            mmap_obj = getattr(view, "_mmap", None)
+            if mmap_obj is not None:
+                mmap_obj.close()
+        views.clear()
+
+
+def write_dataset_streaming(
+    specs: dict[str, Expr],
+    n_rows: int,
+    path: PathLike,
+    *,
+    memory_budget: int | None = None,
+) -> None:
+    """Serialize lazily-produced columns to a single-record ``.cstore`` file.
+
+    Unlike :func:`write_dataset`, which copies fully-materialized arrays, this
+    sink evaluates each output column one row range at a time and writes the
+    result straight into a memory-mapped, preallocated file, so the whole
+    dataset is never resident at once. Peak RAM is bounded by ``memory_budget``
+    (bytes; ``None`` uses :func:`colstore.config.get_default_memory_budget`):
+    the batch row count is chosen so the live arrays for one row-range pass over
+    all columns fit the budget. The memory-mapped output is file-backed and is
+    not counted against it.
+
+    ``specs`` maps each output column name to an expression (see
+    :mod:`colstore.frame`); insertion order is the on-disk column order. Every
+    column must produce exactly ``n_rows`` rows -- constant/scalar columns adopt
+    ``n_rows``, sized columns must match it (checked before any byte is
+    written). The file is built at a sibling temporary path and atomically
+    renamed into place on success, so a failure part-way through -- including an
+    error raised while evaluating a transform -- leaves any existing destination
+    untouched.
+    """
+    if not specs:
+        raise ValueError("Cannot write an empty column mapping.")
+    if n_rows < 0:
+        raise ValueError(f"n_rows must be >= 0, got {n_rows}.")
+
+    names = list(specs)
+    for name in names:
+        validate_length(specs[name], n_rows)
+
+    columns_meta, on_disk_dtypes, bytes_per_row = _resolve_streaming_layout(specs)
+
+    budget = config.get_default_memory_budget() if memory_budget is None else int(memory_budget)
+    if budget < 1:
+        raise ValueError(f"memory_budget must be >= 1 byte, got {budget}.")
+    # bytes_per_row is >= 1 (every column has at least one leaf of itemsize
+    # >= 1), so the floor division below never divides by zero.
+    batch_rows = max(1, min(n_rows, budget // bytes_per_row)) if n_rows else 0
+
+    target = os.fspath(path)
+    directory = os.path.dirname(target) or "."
+    fd, tmp_path = tempfile.mkstemp(
+        dir=directory, prefix=f".{os.path.basename(target)}.", suffix=".tmp"
+    )
+    os.close(fd)
+    try:
+        with open(tmp_path, "wb") as output_file:
+            write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
+            write_record_header(output_file, record_index=0, n_rows=n_rows)
+            body_offset = output_file.tell()
+            itemsizes = [on_disk_dtypes[name].itemsize for name in names]
+            total_size = body_offset + record_body_size(n_rows, itemsizes)
+            output_file.truncate(total_size)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+
+        if n_rows:
+            # MPOL_INTERLEAVE on multi-node Linux while the body pages are
+            # faulted in by the memmap writes -- same policy as write_dataset
+            # and ColStoreWriter, via the shared gate in _numa.
+            with _numa.writer_policy_scope():
+                _fill_streaming(
+                    tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows
+                )
+
+        with open(tmp_path, "rb") as written:
+            os.fsync(written.fileno())
+        os.replace(tmp_path, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
