@@ -83,6 +83,7 @@ from .config import (
     set_gather_thread_cap,
     set_max_workers,
 )
+from .dataset import ColStoreDataset
 from .format import FILE_EXTENSION, FormatError
 from .frame import ColStoreFrame
 from .kernels import cpp_available, max_threads, numba_available
@@ -95,6 +96,7 @@ apply_cached_cap_if_present()
 
 __all__ = [
     "FILE_EXTENSION",
+    "ColStoreDataset",
     "ColStoreFrame",
     "ColStoreInfo",
     "ColStoreReader",

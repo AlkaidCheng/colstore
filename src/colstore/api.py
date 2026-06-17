@@ -9,26 +9,42 @@ one obvious thing.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 import numpy as np
 
 from . import format as fmt
 from .compaction import compact_file
+from .dataset import ColStoreDataset
 from .reader import ColStoreReader
 from .writer import ColStoreWriter
 
 
-def open(path: str | os.PathLike[str], **kwargs: Any) -> ColStoreReader:
-    """Open an existing ``.cstore`` file for read.
+@overload
+def open(path: str | os.PathLike[str], **kwargs: Any) -> ColStoreReader: ...
+@overload
+def open(path: Sequence[str | os.PathLike[str]], **kwargs: Any) -> ColStoreDataset: ...
+def open(
+    path: str | os.PathLike[str] | Sequence[str | os.PathLike[str]], **kwargs: Any
+) -> ColStoreReader | ColStoreDataset:
+    """Open an existing ``.cstore`` file, or several as one logical dataset.
 
-    Equivalent to ``ColStoreReader(path, **kwargs)``. The file must exist and be
-    a valid colstore file; otherwise :class:`FileNotFoundError` or
-    :class:`FormatError` propagates.
+    A single path (``str`` or ``os.PathLike``) returns a
+    :class:`~colstore.reader.ColStoreReader`, equivalent to
+    ``ColStoreReader(path, **kwargs)``. A list or tuple of paths returns a
+    :class:`~colstore.dataset.ColStoreDataset` spanning the files in order (all
+    must share one schema), including for a one-element list (a single-file
+    dataset) and an empty list (an empty dataset, which can be grown later). The
+    dataset owns the files it opened and closes them on :meth:`close`. Each file
+    must exist and be valid; otherwise :class:`FileNotFoundError` or
+    :class:`~colstore.FormatError` propagates.
     """
-    return ColStoreReader(path, **kwargs)
+    if isinstance(path, (str, os.PathLike)):
+        return ColStoreReader(path, **kwargs)
+    return ColStoreDataset(path, **kwargs)
 
 
 def create(path: str | os.PathLike[str]) -> ColStoreWriter:

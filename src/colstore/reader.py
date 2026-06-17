@@ -17,21 +17,21 @@ import ctypes.util
 import mmap
 import os
 import warnings
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import _numa, config, format, kernels
-from .view import ColumnView, TableView
+from ._base import _ReaderBase
 
 if TYPE_CHECKING:
     import pandas as pd
 
+    from .dataset import ColStoreDataset
     from .frame import ColStoreFrame
 
 _MADVISE_FLAGS: dict[str, int] = {
@@ -242,7 +242,7 @@ def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataF
         return pd.DataFrame(columns)
 
 
-class ColStoreReader:
+class ColStoreReader(_ReaderBase):
     """Memory-mapped columnar store with lazy, NumPy-style indexing.
 
     Opening a store reads its header, creates one ``np.memmap`` per column,
@@ -389,21 +389,6 @@ class ColStoreReader:
         return self._n_rows
 
     @property
-    def columns(self) -> list[str]:
-        """Column names in on-disk order."""
-        return list(self._column_dtypes)
-
-    @property
-    def dtypes(self) -> dict[str, np.dtype]:
-        """Map of column name to NumPy dtype, in the host's native byte order."""
-        return {name: dtype.newbyteorder("=") for name, dtype in self._column_dtypes.items()}
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        """``(n_rows, n_columns)`` tuple, mirroring ``DataFrame.shape``."""
-        return self.n_rows, len(self._column_dtypes)
-
-    @property
     def backend(self) -> str:
         """Effective gather backend on this instance.
 
@@ -419,32 +404,6 @@ class ColStoreReader:
             return self._max_workers_override
         return config.get_max_workers()
 
-    # ---- Container protocol --------------------------------------------
-
-    def __len__(self) -> int:
-        return self.n_rows
-
-    def __contains__(self, column_name: object) -> bool:
-        return isinstance(column_name, str) and column_name in self._column_dtypes
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(self.columns)
-
-    @overload
-    def __getitem__(self, key: str) -> ColumnView: ...
-    @overload
-    def __getitem__(self, key: tuple[Any, str]) -> ColumnView: ...
-    @overload
-    def __getitem__(self, key: int | slice | list[Any] | NDArray[Any]) -> TableView: ...
-    @overload
-    def __getitem__(self, key: tuple[Any, list[str] | tuple[str, ...]]) -> TableView: ...
-
-    def __getitem__(self, key: Any) -> ColumnView | TableView:
-        row_part, column_names, is_single_column = self._parse_key(key)
-        if is_single_column:
-            return ColumnView(self, row_part, column_names[0])
-        return TableView(self, row_part, column_names)
-
     def __repr__(self) -> str:
         column_preview = self.columns[:5]
         suffix = "..." if len(self._column_dtypes) > len(column_preview) else ""
@@ -452,6 +411,26 @@ class ColStoreReader:
             f"ColStoreReader(path={self._path.name!r}, "
             f"shape={self.shape}, columns={column_preview}{suffix})"
         )
+
+    # ---- Combination ---------------------------------------------------
+
+    def __or__(self, other: object) -> ColStoreDataset:
+        """Combine this reader with another reader/dataset: ``r1 | r2``.
+
+        Returns a :class:`~colstore.dataset.ColStoreDataset` spanning both
+        operands in order. Chains flatten (``r1 | r2 | r3`` nests nothing),
+        schemas are validated on combine, and the result *borrows* its
+        operands -- it does not close them, so keep them alive for its
+        lifetime. Combining with a path goes through :func:`colstore.open`.
+        """
+        from .dataset import _combine_readers
+
+        return _combine_readers(self, other)
+
+    def __ror__(self, other: object) -> ColStoreDataset:
+        from .dataset import _combine_readers
+
+        return _combine_readers(other, self)
 
     # ---- Lifecycle -----------------------------------------------------
 
@@ -478,48 +457,6 @@ class ColStoreReader:
         traceback: TracebackType | None,
     ) -> None:
         self.close()
-
-    # ---- Indexing helpers ----------------------------------------------
-
-    def _parse_key(self, key: Any) -> tuple[Any, list[str], bool]:
-        """Split a ``__getitem__`` key into row part, column names, singular flag."""
-        if isinstance(key, tuple):
-            if len(key) != 2:
-                raise IndexError(f"Expected at most 2 elements in indexing tuple; got {len(key)}.")
-            row_part, column_part = key
-        elif self._looks_like_column_spec(key):
-            row_part, column_part = None, key
-        else:
-            row_part, column_part = key, None
-
-        if column_part is None:
-            column_names = list(self._column_dtypes)
-            is_single_column = False
-        elif isinstance(column_part, str):
-            column_names = [column_part]
-            is_single_column = True
-        elif isinstance(column_part, (list, tuple)):
-            column_names = list(column_part)
-            is_single_column = False
-        else:
-            raise IndexError(
-                f"Column selector must be a string or list/tuple of strings; "
-                f"got {type(column_part).__name__}."
-            )
-
-        unknown = [name for name in column_names if name not in self._column_dtypes]
-        if unknown:
-            raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
-        return row_part, column_names, is_single_column
-
-    @staticmethod
-    def _looks_like_column_spec(value: Any) -> bool:
-        """Heuristic distinguishing column specs from row specs in a single key."""
-        if isinstance(value, str):
-            return True
-        if isinstance(value, (list, tuple)) and value:
-            return all(isinstance(item, str) for item in value)
-        return False
 
     # ---- madvise / mlock -----------------------------------------------
 
