@@ -369,6 +369,59 @@ def test_recarray_and_frame(tmp_path):
         np.testing.assert_array_equal(frame["y"].to_numpy(), oy)
 
 
+def test_empty_dataset_recarray_and_frame():
+    ds = ColStoreDataset()
+    rec = ds.recarray()
+    assert rec.shape == (0,)
+    assert rec.dtype.names == ()
+    frame = ds.frame()
+    assert frame.shape == (0, 0)
+    ds.close()
+
+
+# ---- edit() over a dataset ---------------------------------------------
+
+
+def test_edit_returns_frame_over_all_files(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [4, 6])
+    with colstore.open(paths) as ds:
+        frame = ds.edit()
+        assert frame.n_rows == len(ox)
+        np.testing.assert_array_equal(frame["x"].compute(), ox)
+
+
+def test_edit_passthrough_concatenates_files(tmp_path):
+    paths, ox, oy = _build_files(tmp_path, [4, 0, 6])
+    out = tmp_path / "combined.cstore"
+    with colstore.open(paths) as ds:
+        reader = ds.edit().write(out)  # no edits -> the files written end to end
+    with reader:
+        np.testing.assert_array_equal(reader["x"].array(), ox)
+        np.testing.assert_array_equal(reader["y"].array(), oy)
+        assert reader.n_rows == len(ox)
+
+
+def test_edit_transform_across_files(tmp_path):
+    paths, ox, oy = _build_files(tmp_path, [4, 6])
+    out = tmp_path / "derived.cstore"
+    with colstore.open(paths) as ds:
+        frame = ds.edit()
+        reader = frame.assign(x2=frame["x"] * 2).write(out)
+    with reader:
+        np.testing.assert_array_equal(reader["x"].array(), ox)
+        np.testing.assert_array_equal(reader["y"].array(), oy)
+        np.testing.assert_array_equal(reader["x2"].array(), ox * 2)
+
+
+def test_edit_single_file_dataset_matches_reader(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [8])
+    out = tmp_path / "single.cstore"
+    with colstore.open(paths) as ds:  # one-file dataset (short-circuits to child)
+        reader = ds.edit().assign(x2=ds.edit()["x"] * 2).write(out)
+    with reader:
+        np.testing.assert_array_equal(reader["x2"].array(), ox * 2)
+
+
 # ---- Schema validation -------------------------------------------------
 
 

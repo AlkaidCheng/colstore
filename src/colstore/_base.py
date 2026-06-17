@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import abc
 from collections.abc import Iterator
-from typing import Any, overload
+from typing import TYPE_CHECKING, Any, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 from .view import ColumnView, TableView
+
+if TYPE_CHECKING:
+    from .frame import ColStoreFrame
 
 
 class _ReaderBase(abc.ABC):
@@ -144,3 +147,18 @@ class _ReaderBase(abc.ABC):
         if isinstance(value, (list, tuple)) and value:
             return all(isinstance(item, str) for item in value)
         return False
+
+    def edit(self) -> ColStoreFrame:
+        """Open a deferred editing frame over this store's columns.
+
+        Returns a :class:`~colstore.frame.ColStoreFrame` seeded with this store's
+        columns as native-passthrough leaves. Column updates, additions,
+        removals, renames, and elementwise transforms are deferred and written to
+        a new file by :meth:`~colstore.frame.ColStoreFrame.write`; this store is
+        not modified. Over a multi-file dataset the leaves read through the
+        dataset's gather seam, so a written result is the combined, transformed
+        data in one file.
+        """
+        from .frame import ColStoreFrame
+
+        return ColStoreFrame(self)
