@@ -35,7 +35,7 @@ A `.cstore` file opens with a validated header — an 8-byte magic constant
 column **manifest** (names, dtypes, reserved encoding/nullable keys) and the
 **record bodies**.
 
-![The .cstore on-disk format](file_format.svg)
+![The .cstore on-disk format](assets/file_format.svg)
 
 A *record* is a batch of rows. Inside a record, the columns are laid out
 **column-major and packed**: all of column 0's values for that record, then all
@@ -46,7 +46,7 @@ reads and zero-copy possible. A file appended to over time is **multi-record**:
 the same logical column is split into one run per record, interleaved on disk
 with the other columns, and the reader stitches across record boundaries.
 
-![Single-record vs multi-record column layout](record_layout.svg)
+![Single-record vs multi-record column layout](assets/record_layout.svg)
 
 ```python
 import numpy as np
@@ -202,7 +202,7 @@ fancy index, unsorted, native, irregular       -> branchless search kernel
 non-native byte order  (any of the above)      -> NumPy correctness fallback
 ```
 
-![How a single-column read picks its kernel](kernel_dispatch.svg)
+![How a single-column read picks its kernel](assets/kernel_dispatch.svg)
 
 Each native kernel takes the metadata arrays from §3 plus the column's
 `col_prefix_bytes` and `itemsize`, runs OpenMP across its output, and writes
