@@ -72,6 +72,14 @@ _DEFAULT_PREFETCH_DISTANCE = 8
 # larger value is almost certainly a typo (e.g. bytes instead of elements).
 _PREFETCH_DISTANCE_CEILING = 1 << 14
 
+# Per-commit in-RAM working-set budget (bytes) for the streaming write path
+# (see ``format.write_dataset_streaming``). The writer sizes each batch so the
+# live arrays for one row-range pass over all output columns stay within this
+# budget; the memory-mapped output is file-backed and is not counted against it.
+# 128 MiB keeps small edits single-batch while bounding peak RAM on wide schemas
+# or deep expression graphs.
+_DEFAULT_MEMORY_BUDGET = 128 * 1024 * 1024
+
 
 def _default_gather_thread_cap() -> int:
     """Derive a near-optimal default gather thread cap from the hardware.
@@ -97,6 +105,7 @@ _default_backend: GatherBackend = "cpp"
 _gather_thread_cap: int = _default_gather_thread_cap()
 _numa_policy: NumaPolicy = "auto"
 _prefetch_distance: int | Literal["auto"] = "auto"
+_default_memory_budget: int = _DEFAULT_MEMORY_BUDGET
 
 # Reader-side spread thread-binding. The gate (see ``_numa.maybe_bind_for_gather``)
 # pins the OpenMP pool spread across cores for a gather whose working set exceeds
@@ -158,6 +167,27 @@ def set_gather_thread_cap(n: int) -> None:
     if n < 1:
         raise ValueError(f"gather_thread_cap must be >= 1, got {n}.")
     _gather_thread_cap = int(n)
+
+
+def get_default_memory_budget() -> int:
+    """Return the per-commit in-RAM working-set budget (bytes) for the streaming
+    write path."""
+    return _default_memory_budget
+
+
+def set_default_memory_budget(n_bytes: int) -> None:
+    """Set the per-commit in-RAM working-set budget (bytes) for the streaming
+    write path (``>= 1``).
+
+    The streaming writer sizes each batch so the live arrays for one row-range
+    pass over all output columns fit within this budget. Lower trades fewer rows
+    per batch (more passes) for a smaller peak; the memory-mapped output is
+    file-backed and is not counted against it.
+    """
+    global _default_memory_budget
+    if n_bytes < 1:
+        raise ValueError(f"memory_budget must be >= 1 byte, got {n_bytes}.")
+    _default_memory_budget = int(n_bytes)
 
 
 def get_gather_binding() -> bool:
