@@ -972,7 +972,13 @@ def write_dataset_streaming(
                     tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows
                 )
 
-        with open(tmp_path, "rb") as written:
+        # Reopen read/write (not read-only) for the durability fsync: on Windows
+        # os.fsync maps to _commit(), which fails with EBADF on a read-only
+        # descriptor. The body was flushed through the memmaps and the header
+        # through the writable handle above; this covers the whole file before
+        # the atomic rename. All handles are closed before os.replace, which
+        # Windows requires.
+        with open(tmp_path, "r+b") as written:
             os.fsync(written.fileno())
         os.replace(tmp_path, target)
     except BaseException:
