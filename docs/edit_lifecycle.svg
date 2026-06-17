@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="280" viewBox="0 0 720 280" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>The edit lifecycle: ds.edit, ColStoreFrame, write</title>
+<desc>An opened source store is read-only. ds.edit() returns a ColStoreFrame, an ordered mapping of output column name to an expression, seeded with one native-passthrough leaf per source column; assigning, transforming, renaming, and dropping columns edit that mapping and read or write nothing. write(path) evaluates every column one row range at a time, streams the result into a new .cstore file, and returns a reader for it. The source store is never modified.</desc>
+<style>
+  .colA { fill:#E1F5EE; stroke:#0F6E56; stroke-width:0.75; } .colAt { fill:#04342C; font-size:12px; font-weight:500; }
+  .colB { fill:#FBF1DE; stroke:#B9852B; stroke-width:0.75; } .colBt { fill:#6B4A12; font-size:11px; font-weight:500; }
+  .colC { fill:#E6EEF4; stroke:#3F6E9E; stroke-width:0.75; } .colCt { fill:#234567; font-size:11px; font-weight:500; }
+  .box  { fill:#F4F2EC; stroke:#5F5E5A; stroke-width:1; } .boxt { fill:#2C2C2A; font-size:11px; font-weight:500; }
+  .arr  { stroke:#73726C; stroke-width:1.25; fill:none; }
+  .hd   { fill:#2C2C2A; font-size:13px; font-weight:600; }
+  .lbl  { fill:#5F5E5A; font-size:12px; font-weight:400; }
+  .mono { fill:#5F5E5A; font-size:11px; font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace; }
+  @media (prefers-color-scheme: dark) {
+    .colA { fill:#04342C; stroke:#1D9E75; } .colAt { fill:#9FE1CB; }
+    .colB { fill:#2E2613; stroke:#C9972F; } .colBt { fill:#F0D9A6; }
+    .colC { fill:#1B2A38; stroke:#5E8CBF; } .colCt { fill:#BBD2EA; }
+    .box  { fill:#26251F; stroke:#B4B2A9; } .boxt { fill:#F1EFE8; }
+    .arr { stroke:#B4B2A9; } .hd { fill:#F1EFE8; } .lbl { fill:#B4B2A9; } .mono { fill:#B4B2A9; }
+  }
+</style>
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<text class="hd" x="40" y="28">The edit lifecycle &#8212; deferred, committed to a new file</text>
+
+<!-- source -->
+<rect class="colC" x="40" y="74" width="140" height="58"/>
+<text class="colCt" x="110" y="100" text-anchor="middle" font-size="12">Source .cstore</text>
+<text class="colCt" x="110" y="118" text-anchor="middle">opened read-only</text>
+
+<!-- ds.edit() -->
+<path class="arr" d="M180 103 H258" marker-end="url(#ar)"/>
+<text class="mono" x="219" y="95" text-anchor="middle">ds.edit()</text>
+
+<!-- frame -->
+<rect class="box" x="262" y="58" width="208" height="160"/>
+<text class="hd" x="272" y="78" font-size="12">ColStoreFrame</text>
+<rect class="colC" x="272" y="88" width="188" height="26"/>
+<text class="colCt" x="280" y="105">price &#8594; NativeColumn</text>
+<rect class="colB" x="272" y="118" width="188" height="26"/>
+<text class="colBt" x="280" y="135">ret &#8594; log(close / open)</text>
+<rect class="box" x="272" y="148" width="188" height="26"/>
+<text class="boxt" x="280" y="165">flag &#8594; 1</text>
+<text class="lbl" x="272" y="190" font-size="11">ordered name &#8594; expression;</text>
+<text class="lbl" x="272" y="205" font-size="11">nothing read or written yet</text>
+
+<!-- write() -->
+<path class="arr" d="M470 103 H548" marker-end="url(#ar)"/>
+<text class="mono" x="509" y="95" text-anchor="middle">write(path)</text>
+
+<!-- new file -->
+<rect class="colA" x="552" y="74" width="140" height="58"/>
+<text class="colAt" x="622" y="100" text-anchor="middle" font-size="12">New .cstore</text>
+<text class="colAt" x="622" y="118" text-anchor="middle" font-size="11">+ open reader</text>
+
+<!-- note -->
+<text class="lbl" x="40" y="252">The source store is never modified; write() streams each column one row range at a time into the new file.</text>
+</svg>
