@@ -34,6 +34,7 @@ value-dependent surprises.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from .reader import ColStoreReader
 
 __all__ = [
+    "ColStoreFrame",
     "ConstColumn",
     "Expr",
     "MemoryColumn",
@@ -321,6 +323,20 @@ class Expr:
             node = UFunc(np.minimum, (node, high))
         return node
 
+    def compute(self, n_rows: int | None = None) -> NDArray[Any]:
+        """Eagerly materialize this column as a NumPy array.
+
+        Evaluates the expression over its full length with a fresh memo --
+        useful for inspecting a column mid-edit without writing a file.
+        ``n_rows`` is needed only for an all-constant expression, whose length
+        is otherwise indeterminate; for any expression with a sized leaf the
+        length is inferred.
+        """
+        length = declared_length(self) if n_rows is None else n_rows
+        if length is None:
+            raise ValueError("cannot infer the length of an all-constant column; pass n_rows.")
+        return evaluate(self, 0, length, {})
+
 
 class _Leaf(Expr):
     """A graph leaf: a named data source materialized by row range.
@@ -563,3 +579,133 @@ def as_expr(value: Any, *, copy: bool = False) -> Expr:
     if array.ndim == 0:
         return ConstColumn(array)
     return MemoryColumn(array, copy=copy)
+
+
+class ColStoreFrame:
+    """A mutable, deferred editing view over an opened store's columns.
+
+    Created by :meth:`colstore.ColStoreReader.edit`. A frame holds an ordered
+    mapping of output column name to an expression (:class:`Expr`); opening one
+    seeds it with a native-passthrough leaf per source column. Indexing returns
+    the expression for a column, which composes with operators and whitelisted
+    NumPy ufuncs to build transformations; assignment, deletion, and renaming
+    edit the mapping. Nothing is read or written until :meth:`write`, which
+    streams the result to a new file and returns a reader for it. The source
+    store is never modified.
+
+    Assignment holds arrays by reference; pass ``copy=True`` to :meth:`assign`
+    to snapshot them instead. A column length is checked eagerly on assignment
+    against the frame's fixed row count.
+    """
+
+    __slots__ = ("_columns", "_n_rows", "_store")
+
+    def __init__(self, store: ColStoreReader) -> None:
+        self._store = store
+        self._n_rows = store.n_rows
+        self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in store.columns}
+
+    @property
+    def n_rows(self) -> int:
+        """Fixed row count this frame writes, inherited from the source store."""
+        return self._n_rows
+
+    @property
+    def columns(self) -> list[str]:
+        """Output column names, in order."""
+        return list(self._columns)
+
+    def __len__(self) -> int:
+        return len(self._columns)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._columns)
+
+    def __contains__(self, name: object) -> bool:
+        return name in self._columns
+
+    def __getitem__(self, name: str) -> Expr:
+        try:
+            return self._columns[name]
+        except KeyError:
+            raise KeyError(
+                f"column {name!r} is not in the frame; have {list(self._columns)}."
+            ) from None
+
+    def __setitem__(self, name: str, value: Any) -> None:
+        self._columns[name] = self._coerce(value, copy=False)
+
+    def __delitem__(self, name: str) -> None:
+        try:
+            del self._columns[name]
+        except KeyError:
+            raise KeyError(
+                f"column {name!r} is not in the frame; have {list(self._columns)}."
+            ) from None
+
+    def _coerce(self, value: Any, *, copy: bool) -> Expr:
+        expr = as_expr(value, copy=copy)
+        validate_length(expr, self._n_rows)
+        return expr
+
+    def assign(self, *, copy: bool = False, **new_columns: Any) -> ColStoreFrame:
+        """Add or replace columns from keyword arguments; returns ``self``.
+
+        Each value may be an expression, array, or scalar. Arrays are held by
+        reference unless ``copy=True``. (A column literally named ``copy`` must
+        be set with ``frame[name] = ...`` instead.)
+        """
+        coerced = {name: self._coerce(value, copy=copy) for name, value in new_columns.items()}
+        self._columns.update(coerced)
+        return self
+
+    def with_columns(self, *, copy: bool = False, **new_columns: Any) -> ColStoreFrame:
+        """Alias for :meth:`assign`, under a polars-style name."""
+        return self.assign(copy=copy, **new_columns)
+
+    def drop(self, *names: str) -> ColStoreFrame:
+        """Remove one or more columns; returns ``self``."""
+        for name in names:
+            del self[name]
+        return self
+
+    def rename(self, columns: dict[str, str]) -> ColStoreFrame:
+        """Rename columns, resolving all mappings simultaneously; returns ``self``.
+
+        A swap such as ``{"a": "b", "b": "a"}`` exchanges the two names in one
+        step. Renames change output names only -- the underlying data, and any
+        expression already referencing a column, are unaffected. Raises if a
+        source name is missing or the result would contain duplicate names.
+        """
+        missing = [src for src in columns if src not in self._columns]
+        if missing:
+            raise KeyError(f"cannot rename columns that are not in the frame: {missing}.")
+        renamed: dict[str, Expr] = {}
+        for name, expr in self._columns.items():
+            target = columns.get(name, name)
+            if target in renamed:
+                raise ValueError(f"rename produces a duplicate column name {target!r}.")
+            renamed[target] = expr
+        self._columns = renamed
+        return self
+
+    def compute(self, name: str) -> NDArray[Any]:
+        """Eagerly materialize one column as an array, without writing a file."""
+        return self[name].compute(self._n_rows)
+
+    def write(
+        self, path: str | os.PathLike[str], *, memory_budget: int | None = None
+    ) -> ColStoreReader:
+        """Stream the edited columns to a new ``.cstore`` and return a reader.
+
+        Evaluates every column one row range at a time into a new file (see
+        :func:`colstore.format.write_dataset_streaming`); peak memory is bounded
+        by ``memory_budget`` (bytes; ``None`` uses the configured default). The
+        source store is not modified. Writing a frame with no columns is an
+        error.
+        """
+        from .api import open as open_store
+        from .format import write_dataset_streaming
+
+        write_dataset_streaming(self._columns, self._n_rows, path, memory_budget=memory_budget)
+        return open_store(path)

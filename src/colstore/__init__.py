@@ -84,6 +84,7 @@ from .config import (
     set_max_workers,
 )
 from .format import FILE_EXTENSION, FormatError
+from .frame import ColStoreFrame
 from .kernels import cpp_available, max_threads, numba_available
 from .parsers import from_root, to_root
 from .reader import ColStoreReader
@@ -94,6 +95,7 @@ apply_cached_cap_if_present()
 
 __all__ = [
     "FILE_EXTENSION",
+    "ColStoreFrame",
     "ColStoreInfo",
     "ColStoreReader",
     "ColStoreWriter",
