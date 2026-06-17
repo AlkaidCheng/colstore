@@ -648,3 +648,78 @@ def test_unknown_column_raises_key_error(tmp_path):
     paths, _, _ = _build_files(tmp_path, [4, 6])
     with colstore.open(paths) as ds, pytest.raises(KeyError, match="Unknown column"):
         ds["nope"].array()
+
+
+# ---- concat(): lazy dataset or eager written file ----------------------
+
+
+def test_concat_out_none_returns_dataset(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [4, 6])
+    with colstore.concat(paths) as ds:
+        assert isinstance(ds, ColStoreDataset)
+        np.testing.assert_array_equal(ds["x"].array(), ox)
+
+
+def test_concat_writes_combined_file(tmp_path):
+    paths, ox, oy = _build_files(tmp_path, [4, 0, 6])
+    out = tmp_path / "all.cstore"
+    reader = colstore.concat(paths, out=out)
+    with reader:
+        assert isinstance(reader, ColStoreReader)
+        assert reader.n_rows == len(ox)
+        assert reader.columns == ["x", "y"]
+        np.testing.assert_array_equal(reader["x"].array(), ox)
+        np.testing.assert_array_equal(reader["y"].array(), oy)
+
+
+def test_concat_accepts_open_readers_and_leaves_them_open(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [4, 6])
+    left = colstore.open(paths[0])
+    right = colstore.open(paths[1])
+    out = tmp_path / "combined.cstore"
+    reader = colstore.concat([left, right], out=out)
+    with reader:
+        np.testing.assert_array_equal(reader["x"].array(), ox)
+    assert left._closed is False  # borrowed sources are left open
+    assert right._closed is False
+    left.close()
+    right.close()
+
+
+def test_concat_single_source_copies(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [7])
+    out = tmp_path / "copy.cstore"
+    with colstore.concat(paths, out=out) as reader:
+        np.testing.assert_array_equal(reader["x"].array(), ox)
+
+
+def test_concat_streams_under_tight_memory_budget(tmp_path):
+    paths, ox, oy = _build_files(tmp_path, [5, 5, 5])
+    out = tmp_path / "streamed.cstore"
+    with colstore.concat(paths, out=out, memory_budget=64) as reader:
+        np.testing.assert_array_equal(reader["x"].array(), ox)
+        np.testing.assert_array_equal(reader["y"].array(), oy)
+
+
+def test_concat_out_equal_to_source_raises(tmp_path):
+    paths, _, _ = _build_files(tmp_path, [4, 6])
+    with pytest.raises(ValueError, match="also one of the sources"):
+        colstore.concat(paths, out=paths[0])
+
+
+def test_concat_zero_sources_to_file_raises(tmp_path):
+    out = tmp_path / "empty.cstore"
+    with pytest.raises(ValueError, match="at least one source"):
+        colstore.concat([], out=out)
+
+
+def test_concat_schema_mismatch_raises(tmp_path):
+    good, _, _ = _build_files(tmp_path, [4])
+    narrow = _store_one(
+        tmp_path,
+        "narrow.cstore",
+        {"x": np.arange(3, dtype=np.int32), "y": np.arange(3, dtype=np.float64)},
+    )
+    out = tmp_path / "bad.cstore"
+    with pytest.raises(ValueError, match="Schema mismatch"):
+        colstore.concat([good[0], narrow], out=out)

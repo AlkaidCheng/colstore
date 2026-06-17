@@ -12,7 +12,7 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, TypeAlias, overload
 
 import numpy as np
 
@@ -233,6 +233,85 @@ def compact(
     reading the unlinked inode after the rename).
     """
     return compact_file(path, out, show_progress=show_progress)
+
+
+# ---- Concatenation: many files as one (lazy or written) ----------------
+
+
+_ConcatSource: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
+
+
+@overload
+def concat(
+    sources: Sequence[_ConcatSource],
+    *,
+    out: None = None,
+    memory_budget: int | None = None,
+    **reader_kwargs: Any,
+) -> ColStoreDataset: ...
+@overload
+def concat(
+    sources: Sequence[_ConcatSource],
+    *,
+    out: str | os.PathLike[str],
+    memory_budget: int | None = None,
+    **reader_kwargs: Any,
+) -> ColStoreReader: ...
+def concat(
+    sources: Sequence[_ConcatSource],
+    *,
+    out: str | os.PathLike[str] | None = None,
+    memory_budget: int | None = None,
+    **reader_kwargs: Any,
+) -> ColStoreReader | ColStoreDataset:
+    """Combine several same-schema sources, lazily or into one written file.
+
+    ``sources`` is a list or tuple mixing file paths and already-open readers or
+    datasets; all must share one schema. Paths are opened (and owned by the
+    result); readers and datasets are borrowed and left open.
+
+    Parameters
+    ----------
+    sources : sequence of path or reader or dataset
+        The inputs, combined in the given order.
+    out : str or os.PathLike, optional
+        Destination. If ``None`` (the default), returns a lazy
+        :class:`~colstore.dataset.ColStoreDataset` spanning the sources without
+        copying -- equivalent to :func:`open` of the same list. If given, streams
+        the combined data to a new ``.cstore`` at ``out`` in bounded memory and
+        returns a :class:`~colstore.reader.ColStoreReader` opened on it; ``out``
+        must be a new path, not one of the sources.
+    memory_budget : int, optional
+        Peak bytes for the streaming write (``out`` given only); ``None`` uses
+        the configured default.
+    **reader_kwargs
+        Forwarded to :class:`~colstore.reader.ColStoreReader` when opening any
+        source paths.
+
+    Returns
+    -------
+    ColStoreDataset or ColStoreReader
+        The lazy dataset when ``out`` is ``None``; otherwise a reader on the
+        written file.
+    """
+    dataset = ColStoreDataset(sources, **reader_kwargs)
+    if out is None:
+        return dataset
+    try:
+        if not dataset.columns:
+            raise ValueError(
+                "concat() needs at least one source with columns to write an "
+                "output file; got nothing to write."
+            )
+        out_resolved = Path(out).resolve()
+        if any(Path(source).resolve() == out_resolved for source in dataset.path):
+            raise ValueError(
+                f"concat() out={os.fspath(out)!r} is also one of the sources; "
+                f"write to a new path."
+            )
+        return dataset.edit().write(out, memory_budget=memory_budget)
+    finally:
+        dataset.close()
 
 
 # ---- Introspection: info / schema --------------------------------------
