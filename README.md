@@ -98,54 +98,6 @@ don't implement `flock` (some Lustre, GPFS, and NFS mounts), the lock is skipped
 with a one-time warning and the write proceeds — there is no lock to contend for
 on such a mount, so concurrent-writer detection is simply unavailable there.
 
-## Editing (lazy column transforms)
-
-`ds.edit()` opens a `ColStoreFrame`: a deferred view over an opened store's
-columns. Updating, adding, removing, and renaming columns — and building
-elementwise transforms with NumPy operators and ufuncs — edit an ordered
-name-to-expression mapping and read or write nothing. `write()` evaluates every
-column one row range at a time, streams the result into a new `.cstore`, and
-returns a reader for it. The source store is never modified.
-
-![The edit lifecycle](docs/edit_lifecycle.svg)
-
-```python
-import numpy as np
-
-ds = colstore.open("data.cstore")
-cf = ds.edit()                       # ColStoreFrame; nothing read yet
-
-cf["ret"] = np.log(cf["close"] / cf["open"])   # add a transformed column
-cf["close"] = cf["close"] * 1.0                # replace a column in place
-cf["flag"] = 1                                 # scalar broadcasts to n_rows
-cf.rename({"qty": "quantity"})                 # rename (resolved all at once)
-cf.drop("scratch")                             # remove a column
-
-cf["ret"].compute()                  # materialize one column eagerly to inspect
-
-out = cf.write("derived.cstore")     # stream to a new file; returns a reader
-```
-
-Assignment holds arrays by reference; pass `copy=True` to `assign()` to snapshot
-them. Column lengths are checked eagerly against the frame's row count, and only
-true scalars broadcast.
-
-Each output column is an expression over leaves — native columns from the
-source, assigned in-memory arrays, and constants — combined by operators and
-whitelisted ufuncs. When several columns reuse the same subexpression it is a
-single node with several parents, computed once per row range and reused.
-
-![Columns are expressions; shared subexpressions run once](docs/edit_expression_graph.svg)
-
-The commit never holds the whole dataset in memory. It preallocates a
-column-contiguous file and fills it row range by row range, evaluating each
-column through one shared per-range memo and scattering the results into the
-column regions. Peak working memory is bounded by a budget (bytes); the batch
-row count is `budget // bytes_per_row`. Pass `memory_budget=` to `write()` to
-override the default.
-
-![Row-major streaming commit](docs/edit_streaming_commit.svg)
-
 ## Compaction
 
 A streaming write produces one record per `write()` call. Reads of
@@ -211,7 +163,7 @@ at the full cap, depending on the route taken. Either way the kernel's
 the number of indices and clamps it to the cap, so small reads stay serial and
 only large ones spend the whole budget.
 
-![Gather thread decision flow](docs/gather_thread_decision.svg)
+![Gather thread decision flow](docs/assets/gather_thread_decision.svg)
 
 The cap itself defaults to half the physical cores, bounded by a per-socket
 allowance so multi-socket hosts (with more memory channels) get a higher
@@ -227,7 +179,7 @@ that keeps pages near the reading thread. Placement is decided at the first page
 fault, so warm pages cannot be moved — only a cold read (pages not yet resident)
 is placed according to the policy.
 
-![NUMA placement decision](docs/numa_placement_decision.svg)
+![NUMA placement decision](docs/assets/numa_placement_decision.svg)
 
 Whether the best cold-read placement depends on the access pattern was the one
 case the warm sweep never covered. `benchmark/check_cold_read_placement.py`
@@ -243,11 +195,11 @@ lever that ships **off**: a placement × binding × cap sweep measured spread
 binding 24–51% slower on a multi-node host, so `gather_binding` defaults to off
 and the realized path is the unbound default pool.
 
-![Gather thread binding status](docs/gather_thread_binding_status.svg)
+![Gather thread binding status](docs/assets/gather_thread_binding_status.svg)
 
 ## On-disk format
 
-![The .cstore on-disk format](docs/file_format.svg)
+![The .cstore on-disk format](docs/assets/file_format.svg)
 
 ```
 [magic 8B = b"CSTORE\x00\x01"]
@@ -268,7 +220,7 @@ that reads via a per-column memmap fast path; a streamed write produces a
 multi-record file with per-pattern dispatch (contiguous range, sorted
 fancy, unsorted fancy).
 
-![Single-record vs multi-record column layout](docs/record_layout.svg)
+![Single-record vs multi-record column layout](docs/assets/record_layout.svg)
 
 ## Supported dtypes
 
