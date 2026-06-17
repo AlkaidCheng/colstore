@@ -489,28 +489,69 @@ def test_constructor_rejects_empty_then_grows():
     ds.close()
 
 
-# ---- Deferred selectors raise clear, intentional errors ----------------
+# ---- Cross-file fancy / boolean / negative-step vs the oracle ----------
 
 
-def test_multifile_fancy_index_not_implemented(tmp_path):
-    paths, _, _ = _build_files(tmp_path, [4, 6])
-    with colstore.open(paths) as ds, pytest.raises(NotImplementedError, match="Fancy"):
-        ds[[1, 3, 5], "x"].array()
-
-
-def test_multifile_boolean_mask_not_implemented(tmp_path):
-    paths, _, _ = _build_files(tmp_path, [4, 6])
+@pytest.mark.parametrize(
+    "idx",
+    [
+        [1, 3, 5],  # ascending across the boundary
+        [9, 0, 4, 4, 1],  # interleaved files, out of order, with a duplicate
+        [9, 8, 7, 6, 5, 4, 3, 2, 1, 0],  # full reversal
+        [3, 4],  # straddles the boundary
+        [],  # empty selection
+    ],
+)
+def test_multifile_fancy_matches_oracle(tmp_path, idx):
+    paths, ox, oy = _build_files(tmp_path, [4, 0, 6])
+    index = np.array(idx, dtype=np.int64)
     with colstore.open(paths) as ds:
-        mask = np.zeros(ds.n_rows, dtype=bool)
-        mask[::2] = True
-        with pytest.raises(NotImplementedError, match="Fancy"):
-            ds[mask, "x"].array()
+        np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+        both = ds[index, ["x", "y"]].dict()
+        np.testing.assert_array_equal(both["x"], ox[index])
+        np.testing.assert_array_equal(both["y"], oy[index])
 
 
-def test_multifile_negative_step_slice_not_implemented(tmp_path):
-    paths, _, _ = _build_files(tmp_path, [4, 6])
-    with colstore.open(paths) as ds, pytest.raises(NotImplementedError, match="negative step"):
-        ds[::-1, "x"].array()
+def test_multifile_fancy_preserves_order_and_position(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [5, 5])
+    # Indices deliberately jump back and forth across the boundary; the result
+    # must follow the requested order, not file or sorted order.
+    index = np.array([7, 0, 9, 4, 5, 1], dtype=np.int64)
+    with colstore.open(paths) as ds:
+        np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_multifile_boolean_mask_matches_oracle(tmp_path, seed):
+    paths, ox, oy = _build_files(tmp_path, [4, 0, 6])
+    rng = np.random.default_rng(seed)
+    mask = rng.random(len(ox)) < 0.5
+    with colstore.open(paths) as ds:
+        np.testing.assert_array_equal(ds[mask, "x"].array(), ox[mask])
+        both = ds[mask, ["x", "y"]].dict()
+        np.testing.assert_array_equal(both["x"], ox[mask])
+        np.testing.assert_array_equal(both["y"], oy[mask])
+
+
+def test_multifile_boolean_mask_all_and_none(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [4, 6])
+    with colstore.open(paths) as ds:
+        all_true = np.ones(ds.n_rows, dtype=bool)
+        np.testing.assert_array_equal(ds[all_true, "x"].array(), ox)
+        all_false = np.zeros(ds.n_rows, dtype=bool)
+        out = ds[all_false, "x"].array()
+        assert out.shape == (0,)
+        assert out.dtype == np.dtype("int64")
+
+
+@pytest.mark.parametrize("sl", [slice(None, None, -1), slice(8, 1, -2), slice(None, None, -3)])
+def test_multifile_negative_step_matches_oracle(tmp_path, sl):
+    paths, ox, oy = _build_files(tmp_path, [4, 0, 6])
+    with colstore.open(paths) as ds:
+        np.testing.assert_array_equal(ds[sl, "x"].array(), ox[sl])
+        both = ds[sl, ["x", "y"]].dict()
+        np.testing.assert_array_equal(both["x"], ox[sl])
+        np.testing.assert_array_equal(both["y"], oy[sl])
 
 
 # ---- Zero-copy seam rules ----------------------------------------------
@@ -539,6 +580,12 @@ def test_view_fancy_raises_value_error(tmp_path):
     paths, _, _ = _build_files(tmp_path, [4, 6])
     with colstore.open(paths) as ds, pytest.raises(ValueError, match="fancy and boolean"):
         ds[[1, 3], "x"].array(copy=False)
+
+
+def test_view_reversed_slice_raises(tmp_path):
+    paths, _, _ = _build_files(tmp_path, [4, 6])
+    with colstore.open(paths) as ds, pytest.raises(ValueError, match="reversed"):
+        ds[::-1, "x"].array(copy=False)
 
 
 # ---- Column errors -----------------------------------------------------

@@ -18,14 +18,20 @@ index and shuffled sampling, train/val/test splits, batch iteration -- are built
 on, because those are operations over the global row-index space and the read
 seam, both of which the dataset already owns.
 
-This first cut implements the contiguous read paths -- ``None`` (whole table), a
-scalar row, and a ``step >= 1`` slice -- across multiple files. A single-file
-dataset short-circuits straight to its child, so it matches the bare reader on
-the hot path and supports everything the reader does (including fancy and
-boolean selection). Genuinely cross-file fancy/boolean selection and
-negative-step slices raise :class:`NotImplementedError` for now and arrive in a
-follow-up; cross-file zero-copy reads raise :class:`ValueError`, which is the
-permanent contract (the files are not contiguous in memory).
+This module implements every read selector across multiple files. Contiguous
+selectors -- ``None`` (whole table), a scalar row, and a ``step >= 1`` slice --
+decompose against the children's cumulative row offsets. Fancy integer arrays
+and boolean masks decompose too: a fancy gather groups the requested rows by
+child, gathers each child's rows with one local call, and scatters the results
+back into the requested order; a boolean mask is split at the file boundaries
+and stitched in file order. A negative-step slice is order-bearing, so it routes
+through the same gather path. A single-file dataset short-circuits straight to
+its child, so it matches the bare reader on the hot path.
+
+Cross-file zero-copy reads remain unavailable and raise :class:`ValueError` --
+the permanent contract, since the files are not contiguous in memory: a whole
+multi-file view, a slice that spans files, a fancy/boolean selection, and a
+reversed selection all require a copying gather.
 """
 
 from __future__ import annotations
@@ -50,20 +56,13 @@ if TYPE_CHECKING:
 # (borrowed). The constructor and append() accept one of these or a sequence.
 _SourceLike: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
 
-_FANCY_GATHER_MESSAGE = (
-    "Fancy and boolean selection across multiple files is not yet implemented; "
-    "it arrives in a follow-up. Use a contiguous selector (None, an int, or a "
-    "slice with step >= 1), select within a single file, or compact the files "
-    "into one store first."
-)
-_NEGATIVE_STEP_MESSAGE = (
-    "Slices with a negative step across multiple files are not yet implemented; "
-    "they route through the fancy-index path, which arrives in a follow-up. Use "
-    "a step >= 1 for now, or select within a single file."
-)
 _VIEW_FANCY_MESSAGE = (
     "A zero-copy read is available only for contiguous selectors; fancy and "
     "boolean selection require a copying gather. Use copy=True."
+)
+_VIEW_REVERSED_MESSAGE = (
+    "A zero-copy view of a reversed (negative-step) selection is unavailable; it "
+    "requires a copying gather. Use copy=True, or select within a single file."
 )
 _VIEW_WHOLE_MESSAGE = (
     "A zero-copy view of a whole multi-file dataset is unavailable: the files "
@@ -258,14 +257,14 @@ class ColStoreDataset(_ReaderBase):
         return file_index, global_index - int(self._offsets[file_index])
 
     def _slice_parts(self, row_slice: slice) -> list[tuple[int, slice]]:
-        """Decompose a global slice into per-file local slices, in file order.
+        """Decompose a global ``step >= 1`` slice into per-file local slices.
 
         Each local slice preserves the global step *phase*, so concatenating the
         per-file reads in file order reproduces the global strided selection.
+        Negative-step slices are order-bearing and routed through the gather
+        path by the callers, so this method only ever sees ``step >= 1``.
         """
         start, stop, step = row_slice.indices(self._n_rows)
-        if step < 1:
-            raise NotImplementedError(_NEGATIVE_STEP_MESSAGE)
         parts: list[tuple[int, slice]] = []
         for file_index in range(len(self._children)):
             lo = int(self._offsets[file_index])
@@ -300,6 +299,73 @@ class ColStoreDataset(_ReaderBase):
         if unknown:
             raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
 
+    # ---- Fancy / boolean decomposition ---------------------------------
+
+    def _indices_by_file(
+        self, indices: NDArray[np.int64]
+    ) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
+        """For each global index, the owning file and the file order (argsort)."""
+        file_of = np.searchsorted(self._offsets[1:], indices, side="right")
+        return file_of, np.unique(file_of)
+
+    def _fancy_one(
+        self, column_name: str, indices: NDArray[np.int64], thread_cap: int | None
+    ) -> NDArray[Any]:
+        """Gather arbitrary global rows, preserving the requested order.
+
+        Group the indices by owning file, gather each file's rows with one local
+        call, and scatter the chunks back into the positions they were asked in.
+        """
+        out = np.empty(len(indices), dtype=self.dtypes[column_name])
+        file_of, files = self._indices_by_file(indices)
+        for file_index in files:
+            positions = np.flatnonzero(file_of == file_index)
+            local = indices[positions] - int(self._offsets[file_index])
+            out[positions] = self._children[file_index]._gather_one(column_name, local, thread_cap)
+        return out
+
+    def _fancy_many(
+        self, column_names: list[str], indices: NDArray[np.int64]
+    ) -> dict[str, NDArray[Any]]:
+        out = {name: np.empty(len(indices), dtype=self.dtypes[name]) for name in column_names}
+        file_of, files = self._indices_by_file(indices)
+        for file_index in files:
+            positions = np.flatnonzero(file_of == file_index)
+            local = indices[positions] - int(self._offsets[file_index])
+            chunk = self._children[file_index]._gather_many(column_names, local)
+            for name in column_names:
+                out[name][positions] = chunk[name]
+        return out
+
+    def _mask_parts(self, mask: NDArray[np.bool_]) -> list[tuple[int, NDArray[np.bool_]]]:
+        """Split a global boolean mask into per-file sub-masks, skipping empties."""
+        parts: list[tuple[int, NDArray[np.bool_]]] = []
+        for file_index in range(len(self._children)):
+            lo = int(self._offsets[file_index])
+            hi = int(self._offsets[file_index + 1])
+            sub = mask[lo:hi]
+            if sub.any():
+                parts.append((file_index, sub))
+        return parts
+
+    def _mask_one(
+        self, column_name: str, mask: NDArray[np.bool_], thread_cap: int | None
+    ) -> NDArray[Any]:
+        parts = [
+            self._children[file_index]._gather_one(column_name, sub, thread_cap)
+            for file_index, sub in self._mask_parts(mask)
+        ]
+        return self._concat_one(parts, column_name)
+
+    def _mask_many(
+        self, column_names: list[str], mask: NDArray[np.bool_]
+    ) -> dict[str, NDArray[Any]]:
+        per_file = [
+            self._children[file_index]._gather_many(column_names, sub)
+            for file_index, sub in self._mask_parts(mask)
+        ]
+        return self._concat_many(per_file, column_names)
+
     # ---- Copying seam --------------------------------------------------
 
     def _gather_one(
@@ -316,13 +382,21 @@ class ColStoreDataset(_ReaderBase):
             file_index, local = self._locate(int(row_indexer))
             return self._children[file_index]._gather_one(column_name, local, thread_cap)
         if isinstance(row_indexer, slice):
+            start, stop, step = row_indexer.indices(self._n_rows)
+            if step < 0:
+                indices = np.arange(start, stop, step, dtype=np.int64)
+                return self._fancy_one(column_name, indices, thread_cap)
             parts = [
                 self._children[file_index]._gather_one(column_name, sub, thread_cap)
                 for file_index, sub in self._slice_parts(row_indexer)
             ]
             return self._concat_one(parts, column_name)
         if isinstance(row_indexer, np.ndarray):
-            raise NotImplementedError(_FANCY_GATHER_MESSAGE)
+            if row_indexer.dtype == np.bool_:
+                return self._mask_one(column_name, row_indexer, thread_cap)
+            return self._fancy_one(
+                column_name, row_indexer.astype(np.int64, copy=False), thread_cap
+            )
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
@@ -337,13 +411,19 @@ class ColStoreDataset(_ReaderBase):
             file_index, local = self._locate(int(row_indexer))
             return self._children[file_index]._gather_many(column_names, local)
         if isinstance(row_indexer, slice):
+            start, stop, step = row_indexer.indices(self._n_rows)
+            if step < 0:
+                indices = np.arange(start, stop, step, dtype=np.int64)
+                return self._fancy_many(column_names, indices)
             per_file = [
                 self._children[file_index]._gather_many(column_names, sub)
                 for file_index, sub in self._slice_parts(row_indexer)
             ]
             return self._concat_many(per_file, column_names)
         if isinstance(row_indexer, np.ndarray):
-            raise NotImplementedError(_FANCY_GATHER_MESSAGE)
+            if row_indexer.dtype == np.bool_:
+                return self._mask_many(column_names, row_indexer)
+            return self._fancy_many(column_names, row_indexer.astype(np.int64, copy=False))
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
 
     # ---- Zero-copy seam ------------------------------------------------
@@ -361,6 +441,8 @@ class ColStoreDataset(_ReaderBase):
             file_index, local = self._locate(int(row_indexer))
             return self._children[file_index]._view_one(column_name, local)
         if isinstance(row_indexer, slice):
+            if row_indexer.indices(self._n_rows)[2] < 0:
+                raise ValueError(_VIEW_REVERSED_MESSAGE)
             parts = self._slice_parts(row_indexer)
             if not parts:
                 return self._children[0]._view_one(column_name, slice(0, 0))
