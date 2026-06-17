@@ -32,7 +32,6 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .dataset import ColStoreDataset
-    from .frame import ColStoreFrame
 
 _MADVISE_FLAGS: dict[str, int] = {
     "normal": getattr(mmap, "MADV_NORMAL", 0),
@@ -1391,16 +1390,3 @@ class ColStoreReader(_ReaderBase):
             rationale and details.
         """
         return _make_dataframe_no_consolidate(self.dict())
-
-    def edit(self) -> ColStoreFrame:
-        """Open a deferred editing frame over this store's columns.
-
-        Returns a :class:`~colstore.ColStoreFrame` seeded with this store's
-        columns as native-passthrough leaves. Column updates, additions,
-        removals, renames, and elementwise transforms are deferred and written
-        to a new file by :meth:`ColStoreFrame.write`; this store is not
-        modified.
-        """
-        from .frame import ColStoreFrame
-
-        return ColStoreFrame(self)

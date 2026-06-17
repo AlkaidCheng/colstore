@@ -42,6 +42,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
+    from ._base import _ReaderBase
     from .reader import ColStoreReader
 
 __all__ = [
@@ -373,7 +374,7 @@ class NativeColumn(_Leaf):
 
     __slots__ = ("_dtype", "_key", "_name", "_store")
 
-    def __init__(self, store: ColStoreReader, name: str) -> None:
+    def __init__(self, store: _ReaderBase, name: str) -> None:
         if name not in store.dtypes:
             raise KeyError(f"column {name!r} is not in the store; have {list(store.dtypes)}.")
         self._store = store
@@ -584,13 +585,13 @@ def as_expr(value: Any, *, copy: bool = False) -> Expr:
 class ColStoreFrame:
     """A mutable, deferred editing view over an opened store's columns.
 
-    Created by :meth:`colstore.ColStoreReader.edit`. A frame holds an ordered
-    mapping of output column name to an expression (:class:`Expr`); opening one
-    seeds it with a native-passthrough leaf per source column. Indexing returns
-    the expression for a column, which composes with operators and whitelisted
-    NumPy ufuncs to build transformations; assignment, deletion, and renaming
-    edit the mapping. Nothing is read or written until :meth:`write`, which
-    streams the result to a new file and returns a reader for it. The source
+    Created by :meth:`edit` on an opened reader or dataset. A frame holds an
+    ordered mapping of output column name to an expression (:class:`Expr`);
+    opening one seeds it with a native-passthrough leaf per source column.
+    Indexing returns the expression for a column, which composes with operators
+    and whitelisted NumPy ufuncs to build transformations; assignment, deletion,
+    and renaming edit the mapping. Nothing is read or written until :meth:`write`,
+    which streams the result to a new file and returns a reader for it. The source
     store is never modified.
 
     Assignment holds arrays by reference; pass ``copy=True`` to :meth:`assign`
@@ -600,7 +601,7 @@ class ColStoreFrame:
 
     __slots__ = ("_columns", "_n_rows", "_store")
 
-    def __init__(self, store: ColStoreReader) -> None:
+    def __init__(self, store: _ReaderBase) -> None:
         self._store = store
         self._n_rows = store.n_rows
         self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in store.columns}
