@@ -73,35 +73,6 @@ on disk by transforming its columns. Starting from raw arrays, reach for a write
 (or `store`); starting from a `.cstore` you want a modified copy of, reach for
 `edit()`, which gives you a frame.
 
-## Reader, writer, frame: which to use
-
-colstore has three objects, one per job. Most code only ever needs
-`ColStoreReader`.
-
-| | Job | Get one from | Output |
-|---|---|---|---|
-| **`ColStoreReader`** | Read an existing file | `colstore.open(path)` | NumPy arrays / DataFrames, in memory |
-| **`ColStoreWriter`** | Write a *new* file from data you hold | `colstore.create` / `recreate` / `update` (context manager) | a `.cstore` on disk |
-| **`ColStoreFrame`** | Derive a *new* file from an existing one | `reader.edit()` | a new `.cstore` on disk, plus a reader for it |
-
-- **`ColStoreReader`** is the read interface. `colstore.open(path)` returns one;
-  index it for lazy views (`ds[rows, cols]`) and materialize with `.array()`,
-  `.dict()`, `.recarray()`, or `.frame()`. This is what you use to get data out.
-- **`ColStoreWriter`** is the write interface for *new* data. You use it through
-  the `colstore.create` / `recreate` / `update` context managers to stream
-  records into a file. For a single in-memory dataset there is no need to touch
-  it directly — `colstore.store(data, path)` writes a dict, record array, or
-  DataFrame in one shot. (See **Writing**, below.)
-- **`ColStoreFrame`** is the edit interface. `reader.edit()` returns one; update,
-  add, drop, rename, or transform its columns and call `.write(path)` to stream
-  the result to a new file. It never modifies the source store.
-
-The distinction people miss is **writer vs. frame**: a writer persists data you
-are already holding in memory, while a frame derives a new file from one already
-on disk by transforming its columns. Starting from raw arrays, reach for a writer
-(or `store`); starting from a `.cstore` you want a modified copy of, reach for
-`edit()`, which gives you a frame.
-
 ## Writing
 
 `colstore.store(data, path)` is the one-shot path; it dispatches on the
