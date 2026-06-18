@@ -391,16 +391,72 @@ class ColStoreDataset(_ReaderBase):
                 blocks.append((file_index, lo, hi, local))
         return order, blocks
 
-    def _fancy_one(self, column_name: str, indices: NDArray[np.int64]) -> NDArray[Any]:
-        """Gather arbitrary global rows in parallel, preserving requested order.
+    def _native_segment_table(
+        self, column_name: str
+    ) -> tuple[NDArray[np.int64], NDArray[np.int64]] | None:
+        """Global segment table across all files for the native multi-file gather.
 
-        Sort the indices once to group them into one contiguous block per file,
-        fill each file's block of a sorted buffer concurrently (disjoint regions,
-        so no locking), then un-sort the buffer into the requested order with one
-        scatter.
+        Stitches each file's local table
+        (:meth:`ColStoreReader._column_segment_table`) into one global table by
+        folding the file's row offset into the segment start rows and bases, so
+        a global index reads at ``segment_base[s] + idx * itemsize``. Returns
+        ``None`` -- and the caller takes the portable sort-once path -- when the
+        kernel is unavailable, the element size is unsupported, or any file
+        cannot supply native segments (e.g. a non-native on-disk dtype).
+        """
+        from . import kernels
+
+        if not kernels.cpp_available():
+            return None
+        itemsize = self.dtypes[column_name].itemsize
+        if itemsize not in (1, 2, 4, 8):
+            return None
+        start_parts: list[NDArray[np.int64]] = []
+        base_parts: list[NDArray[np.int64]] = []
+        for file_index, child in enumerate(self._children):
+            if child.n_rows == 0:
+                continue
+            try:
+                local_starts, local_base = child._column_segment_table(column_name)
+            except (ValueError, AttributeError):
+                return None
+            offset = int(self._offsets[file_index])
+            start_parts.append(local_starts[:-1] + offset)
+            base_parts.append(local_base - offset * itemsize)
+        if not base_parts:
+            return None
+        starts = np.concatenate([*start_parts, np.array([self._n_rows], dtype=np.int64)])
+        return starts.astype(np.int64, copy=False), np.concatenate(base_parts)
+
+    def _native_gather(
+        self,
+        out: NDArray[Any],
+        indices: NDArray[np.int64],
+        table: tuple[NDArray[np.int64], NDArray[np.int64]],
+    ) -> None:
+        """Fill ``out`` with one fused pass of the native multi-file kernel."""
+        from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+        starts, segment_base = table
+        _cpp_module.gather_multifile(
+            indices, out, starts, segment_base, config.get_gather_thread_cap(), -1
+        )
+
+    def _fancy_one(self, column_name: str, indices: NDArray[np.int64]) -> NDArray[Any]:
+        """Gather arbitrary global rows across files, preserving requested order.
+
+        Uses the native fused multi-file kernel (one pass over the indices, each
+        binned to its file/record segment) when available. The portable fallback
+        sorts the indices once to group them into one contiguous block per file,
+        fills a sorted buffer concurrently (disjoint regions, no locking), then
+        un-sorts into the requested order with one scatter.
         """
         out = np.empty(len(indices), dtype=self.dtypes[column_name])
         if indices.size == 0:
+            return out
+        table = self._native_segment_table(column_name)
+        if table is not None:
+            self._native_gather(out, indices, table)
             return out
         order, blocks = self._sorted_blocks(indices)
         buffer = np.empty(len(indices), dtype=self.dtypes[column_name])
@@ -415,14 +471,21 @@ class ColStoreDataset(_ReaderBase):
     def _fancy_many(
         self, column_names: list[str], indices: NDArray[np.int64]
     ) -> dict[str, NDArray[Any]]:
-        """Multi-column :meth:`_fancy_one` sharing one sort across all columns.
+        """Multi-column :meth:`_fancy_one`.
 
-        The grouping is computed once; each column fills and un-sorts through a
-        single reused buffer, so peak memory stays at one column's worth rather
-        than scaling with the column count.
+        Takes the native path when every requested column can use it (mixing the
+        two paths within one read is avoided). The portable fallback shares one
+        sort across all columns and reuses a single per-column buffer, so peak
+        memory stays at one column's worth rather than scaling with the count.
         """
         out = {name: np.empty(len(indices), dtype=self.dtypes[name]) for name in column_names}
         if indices.size == 0:
+            return out
+        tables = [self._native_segment_table(name) for name in column_names]
+        if all(table is not None for table in tables):
+            for name, table in zip(column_names, tables, strict=True):
+                assert table is not None  # narrowed by the all() guard above
+                self._native_gather(out[name], indices, table)
             return out
         order, blocks = self._sorted_blocks(indices)
         for name in column_names:
