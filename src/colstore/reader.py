@@ -638,6 +638,47 @@ class ColStoreReader(_ReaderBase):
         """Zero-copy :meth:`_view_one` over multiple columns (all-or-nothing)."""
         return {name: self._view_one(name, row_indexer) for name in column_names}
 
+    def _column_segment_table(
+        self, column_name: str
+    ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
+        """Local segment table for one column, for the multi-file gather kernel.
+
+        Returns ``(start_rows, segment_base)`` where, for the segment ``s`` with
+        ``start_rows[s] <= idx < start_rows[s + 1]``, this column's value at
+        local row ``idx`` is the native-dtype element at byte address
+        ``segment_base[s] + idx * itemsize``. A single-record file is one
+        segment over its column memmap; a multi-record file is one segment per
+        record, each based in the shared file mapping with the column prefix and
+        the record's row-to-byte shift folded in. ``start_rows`` has
+        ``n_segments + 1`` entries; ``segment_base`` has ``n_segments``.
+
+        Raises ``ValueError`` for a non-native on-disk dtype, which the
+        raw-load kernel cannot byteswap (the caller falls back).
+        """
+        if self._closed:
+            raise ValueError("ColStoreReader is closed.")
+        disk_dtype = self._column_dtypes[column_name]
+        if not _dtype_is_native(disk_dtype):
+            raise ValueError(
+                f"Native multi-file gather requires native byte order; column "
+                f"{column_name!r} has dtype {disk_dtype}."
+            )
+        itemsize = disk_dtype.itemsize
+        if self._is_multi_record:
+            rsr = self._record_starts_rows
+            rsb = self._record_starts_bytes
+            nrr = self._n_rows_per_record
+            col_prefix = int(self._column_prefix_bytes[column_name])
+            base = self._file_mmap.ctypes.data
+            segment_base = base + rsb + col_prefix * nrr - rsr[:-1] * itemsize
+            return (
+                np.ascontiguousarray(rsr, dtype=np.int64),
+                np.ascontiguousarray(segment_base, dtype=np.int64),
+            )
+        base = self._memmaps[column_name].ctypes.data
+        start_rows = np.array([0, self._n_rows], dtype=np.int64)
+        return start_rows, np.array([base], dtype=np.int64)
+
     # ---- Multi-record read path -----------------------------------------
 
     def _detect_uniform_record_layout(self) -> tuple[int, int, int, int] | None:

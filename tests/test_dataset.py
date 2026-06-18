@@ -630,6 +630,51 @@ def test_multifile_fancy_sorted_grouping_matches_oracle(tmp_path):
         config.set_gather_thread_cap(previous)
 
 
+def test_multifile_fancy_native_matches_fallback_and_oracle(tmp_path, monkeypatch):
+    # A dataset mixing a single-record file and a multi-record one (built with
+    # several writes) exercises both branches of the segment-table builder. The
+    # native multi-file kernel and the portable sort-once fallback must each
+    # equal the oracle. The native path is asserted live so a builder bug can't
+    # hide behind a silent fallback.
+    from colstore import kernels
+
+    single = tmp_path / "single.cstore"
+    x0 = np.arange(30, dtype=np.int64)
+    colstore.store({"x": x0, "y": (x0 * 2.0)}, single, show_progress=False).close()
+
+    multi = tmp_path / "multi.cstore"
+    x_blocks, y_blocks = [x0], [x0 * 2.0]
+    with colstore.create(multi) as writer:
+        for i in range(3):
+            xb = np.arange(30 + 12 * i, 30 + 12 * (i + 1), dtype=np.int64)
+            writer.write({"x": xb, "y": xb * 2.0})
+            x_blocks.append(xb)
+            y_blocks.append(xb * 2.0)
+    ox = np.concatenate(x_blocks)
+    oy = np.concatenate(y_blocks)
+
+    rng = np.random.default_rng(0)
+    index = rng.integers(0, ox.size, size=400, dtype=np.int64)
+    index[::5] = index[0]  # duplicates
+
+    with colstore.open([single, multi]) as ds:
+        assert any(child._is_multi_record for child in ds._children)
+        assert ds._native_segment_table("x") is not None  # native path is taken
+        native_x = ds[index, "x"].array()
+        native_both = ds[index, ["x", "y"]].dict()
+
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)
+    with colstore.open([single, multi]) as ds:
+        fallback_x = ds[index, "x"].array()
+        fallback_both = ds[index, ["x", "y"]].dict()
+
+    for result in (native_x, fallback_x):
+        np.testing.assert_array_equal(result, ox[index])
+    for both in (native_both, fallback_both):
+        np.testing.assert_array_equal(both["x"], ox[index])
+        np.testing.assert_array_equal(both["y"], oy[index])
+
+
 # ---- Zero-copy seam rules ----------------------------------------------
 
 
