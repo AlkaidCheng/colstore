@@ -607,6 +607,29 @@ def test_multifile_negative_step_matches_oracle(tmp_path, sl):
         np.testing.assert_array_equal(both["y"], oy[sl])
 
 
+def test_multifile_fancy_sorted_grouping_matches_oracle(tmp_path):
+    # The fancy gather groups indices by file with one sort and un-sorts the
+    # gathered values back into requested order. Stress that grouping over many
+    # files (including an empty one) with duplicates and a forced concurrent
+    # budget, against the oracle.
+    from colstore import config
+
+    paths, ox, oy = _build_files(tmp_path, [30, 0, 50, 20, 40])
+    rng = np.random.default_rng(0)
+    index = rng.integers(0, len(ox), size=500, dtype=np.int64)
+    index[::7] = index[0]  # inject duplicates
+    previous = config.get_gather_thread_cap()
+    config.set_gather_thread_cap(4)
+    try:
+        with colstore.open(paths) as ds:
+            np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+            both = ds[index, ["x", "y"]].dict()
+            np.testing.assert_array_equal(both["x"], ox[index])
+            np.testing.assert_array_equal(both["y"], oy[index])
+    finally:
+        config.set_gather_thread_cap(previous)
+
+
 # ---- Zero-copy seam rules ----------------------------------------------
 
 
