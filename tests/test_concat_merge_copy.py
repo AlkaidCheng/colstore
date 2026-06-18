@@ -42,11 +42,14 @@ def _reference_concat(parts: list[Path], out: Path) -> None:
 
 @pytest.fixture(autouse=True)
 def _reset_strategy_override():
-    """Each test starts and ends with autodetected strategy selection."""
-    saved = fmt._MERGE_COPY_OVERRIDE
+    """Each test starts and ends with autodetected strategy and no chunking."""
+    saved_override = fmt._MERGE_COPY_OVERRIDE
+    saved_chunk = fmt._MERGE_COPY_CHUNK_BYTES
     fmt._MERGE_COPY_OVERRIDE = None
+    fmt._MERGE_COPY_CHUNK_BYTES = 0
     yield
-    fmt._MERGE_COPY_OVERRIDE = saved
+    fmt._MERGE_COPY_OVERRIDE = saved_override
+    fmt._MERGE_COPY_CHUNK_BYTES = saved_chunk
 
 
 # ---- Byte identity: the merge copy matches the materializing write ---------
@@ -67,6 +70,38 @@ def test_single_record_merge_is_byte_identical(tmp_path, strategy):
     colstore.concat(parts, out=merged).close()
 
     assert _digest(merged) == _digest(reference)
+
+
+def test_chunked_merge_is_byte_identical(tmp_path):
+    # Splitting runs into small chunks must not change the output: the sub-runs
+    # are disjoint and in order, so the body is filled identically.
+    parts = []
+    for i in range(3):
+        path = tmp_path / f"part_{i}.cstore"
+        testing.make_store(path, rows=5000, cols=3, dtype="float64", seed=i).close()
+        parts.append(path)
+
+    reference = tmp_path / "reference.cstore"
+    _reference_concat(parts, reference)
+    fmt._MERGE_COPY_CHUNK_BYTES = 4096  # forces many sub-runs per column
+    merged = tmp_path / "merged.cstore"
+    colstore.concat(parts, out=merged).close()
+
+    assert _digest(merged) == _digest(reference)
+
+
+def test_chunk_plan_splits_and_covers():
+    # A run larger than the chunk size splits into in-order, disjoint sub-runs
+    # whose offsets and sizes exactly tile the original; small runs pass through.
+    plan = [("a", 0, 100, 25), ("b", 1000, 200, 10)]
+    chunked = fmt._chunk_plan(plan, 10)
+    assert chunked == [
+        ("a", 0, 100, 10),
+        ("a", 10, 110, 10),
+        ("a", 20, 120, 5),
+        ("b", 1000, 200, 10),
+    ]
+    assert fmt._chunk_plan(plan, 0) == plan  # disabled: unchanged
 
 
 def test_multi_record_sources_merge_byte_identical(tmp_path):
