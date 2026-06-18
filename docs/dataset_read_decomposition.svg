@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="472" viewBox="0 0 680 472" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>How a multi-file dataset decomposes a read</title>
+<desc>A ColStoreDataset presents several same-schema files as one logical table. A row selector over the global row space is split at the file boundaries using the cumulative offset table (searchsorted picks the owning file for each row). Each file's portion is read by that file's own single-file gather kernel, unchanged. The per-file results are stitched back in file order: a slice or boolean mask concatenates in order, while a fancy index scatters each file's rows back into the positions they were requested in. The result is one ndarray in the requested order. A single-file dataset skips the split and reads its one child directly.</desc>
+<defs>
+  <marker id="ah" markerWidth="9" markerHeight="9" refX="6.5" refY="3" orient="auto">
+    <path d="M0,0 L6.5,3 L0,6 Z" fill="#73726C"/>
+  </marker>
+</defs>
+<style>
+  .box  { fill: #F1EFE8; stroke: #888780; stroke-width: 0.75; }
+  .kbox { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 0.75; }
+  .rbox { fill: #FBF1DE; stroke: #B9852B; stroke-width: 0.75; }
+  .div  { stroke: #888780; stroke-width: 0.75; }
+  .t    { fill: #2C2C2A; font-size: 13px; font-weight: 500; }
+  .ts   { fill: #5F5E5A; font-size: 11px; font-weight: 400; }
+  .kt   { fill: #04342C; font-size: 13px; font-weight: 500; }
+  .kts  { fill: #0F6E56; font-size: 11px; font-weight: 400; }
+  .rt   { fill: #6B4A12; font-size: 13px; font-weight: 500; }
+  .rts  { fill: #8A6320; font-size: 11px; font-weight: 400; }
+  .lbl  { fill: #5F5E5A; font-size: 11px; font-weight: 400; }
+  .arr  { stroke: #73726C; stroke-width: 1.25; fill: none; }
+</style>
+
+<!-- Selector -->
+<rect class="box" x="250" y="28" width="180" height="40" rx="4"/>
+<text class="t"  x="340" y="47" text-anchor="middle">ds[selector]</text>
+<text class="ts" x="340" y="61" text-anchor="middle">slice · fancy · mask</text>
+<line class="arr" x1="340" y1="68" x2="340" y2="86" marker-end="url(#ah)"/>
+
+<!-- Global row space, partitioned by file -->
+<rect class="box" x="50" y="88" width="580" height="40" rx="4"/>
+<line class="div" x1="282" y1="88" x2="282" y2="128"/>
+<line class="div" x1="485" y1="88" x2="485" y2="128"/>
+<text class="t"  x="166" y="108" text-anchor="middle">file 0</text>
+<text class="ts" x="166" y="121" text-anchor="middle">[0, n0)</text>
+<text class="t"  x="383" y="108" text-anchor="middle">file 1</text>
+<text class="ts" x="383" y="121" text-anchor="middle">[n0, n0+n1)</text>
+<text class="t"  x="557" y="108" text-anchor="middle">file 2</text>
+<text class="ts" x="557" y="121" text-anchor="middle">[…, N)</text>
+<text class="lbl" x="340" y="147" text-anchor="middle">global rows · offsets = [0, n0, n0+n1, …] · searchsorted picks the owning file</text>
+
+<!-- Fan out to per-file portions -->
+<line class="arr" x1="166" y1="128" x2="150" y2="166" marker-end="url(#ah)"/>
+<line class="arr" x1="383" y1="128" x2="340" y2="166" marker-end="url(#ah)"/>
+<line class="arr" x1="557" y1="128" x2="530" y2="166" marker-end="url(#ah)"/>
+
+<!-- Per-file sub-selections -->
+<rect class="box" x="75"  y="168" width="150" height="40" rx="4"/>
+<rect class="box" x="265" y="168" width="150" height="40" rx="4"/>
+<rect class="box" x="455" y="168" width="150" height="40" rx="4"/>
+<text class="t"  x="150" y="187" text-anchor="middle">file 0</text>
+<text class="ts" x="150" y="201" text-anchor="middle">local rows</text>
+<text class="t"  x="340" y="187" text-anchor="middle">file 1</text>
+<text class="ts" x="340" y="201" text-anchor="middle">local rows</text>
+<text class="t"  x="530" y="187" text-anchor="middle">file 2</text>
+<text class="ts" x="530" y="201" text-anchor="middle">local rows</text>
+
+<line class="arr" x1="150" y1="208" x2="150" y2="246" marker-end="url(#ah)"/>
+<line class="arr" x1="340" y1="208" x2="340" y2="246" marker-end="url(#ah)"/>
+<line class="arr" x1="530" y1="208" x2="530" y2="246" marker-end="url(#ah)"/>
+
+<!-- Per-file gather kernels (reused from the single-file reader) -->
+<rect class="kbox" x="75"  y="248" width="150" height="40" rx="4"/>
+<rect class="kbox" x="265" y="248" width="150" height="40" rx="4"/>
+<rect class="kbox" x="455" y="248" width="150" height="40" rx="4"/>
+<text class="kt"  x="150" y="267" text-anchor="middle">gather</text>
+<text class="kts" x="150" y="281" text-anchor="middle">single-file kernel</text>
+<text class="kt"  x="340" y="267" text-anchor="middle">gather</text>
+<text class="kts" x="340" y="281" text-anchor="middle">single-file kernel</text>
+<text class="kt"  x="530" y="267" text-anchor="middle">gather</text>
+<text class="kts" x="530" y="281" text-anchor="middle">single-file kernel</text>
+
+<!-- Converge to the stitch step -->
+<line class="arr" x1="150" y1="288" x2="285" y2="324" marker-end="url(#ah)"/>
+<line class="arr" x1="340" y1="288" x2="340" y2="324" marker-end="url(#ah)"/>
+<line class="arr" x1="530" y1="288" x2="395" y2="324" marker-end="url(#ah)"/>
+
+<!-- Stitch -->
+<rect class="box" x="210" y="326" width="260" height="44" rx="4"/>
+<text class="t"  x="340" y="346" text-anchor="middle">stitch in file order</text>
+<text class="ts" x="340" y="361" text-anchor="middle">concat (slice / mask) · scatter-back (fancy)</text>
+<line class="arr" x1="340" y1="370" x2="340" y2="408" marker-end="url(#ah)"/>
+
+<!-- Result -->
+<rect class="rbox" x="250" y="410" width="180" height="40" rx="4"/>
+<text class="rt"  x="340" y="429" text-anchor="middle">one ndarray</text>
+<text class="rts" x="340" y="443" text-anchor="middle">in requested order</text>
+</svg>

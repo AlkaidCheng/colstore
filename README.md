@@ -44,35 +44,6 @@ ds[indices, ['price', 'qty']].recarray()     # structured ndarray
 ds[indices, ['price', 'qty']].frame()        # pandas DataFrame
 ```
 
-## Reader, writer, frame: which to use
-
-colstore has three objects, one per job. Most code only ever needs
-`ColStoreReader`.
-
-| | Job | Get one from | Output |
-|---|---|---|---|
-| **`ColStoreReader`** | Read an existing file | `colstore.open(path)` | NumPy arrays / DataFrames, in memory |
-| **`ColStoreWriter`** | Write a *new* file from data you hold | `colstore.create` / `recreate` / `update` (context manager) | a `.cstore` on disk |
-| **`ColStoreFrame`** | Derive a *new* file from an existing one | `reader.edit()` | a new `.cstore` on disk, plus a reader for it |
-
-- **`ColStoreReader`** is the read interface. `colstore.open(path)` returns one;
-  index it for lazy views (`ds[rows, cols]`) and materialize with `.array()`,
-  `.dict()`, `.recarray()`, or `.frame()`. This is what you use to get data out.
-- **`ColStoreWriter`** is the write interface for *new* data. You use it through
-  the `colstore.create` / `recreate` / `update` context managers to stream
-  records into a file. For a single in-memory dataset there is no need to touch
-  it directly — `colstore.store(data, path)` writes a dict, record array, or
-  DataFrame in one shot. (See **Writing**, below.)
-- **`ColStoreFrame`** is the edit interface. `reader.edit()` returns one; update,
-  add, drop, rename, or transform its columns and call `.write(path)` to stream
-  the result to a new file. It never modifies the source store.
-
-The distinction people miss is **writer vs. frame**: a writer persists data you
-are already holding in memory, while a frame derives a new file from one already
-on disk by transforming its columns. Starting from raw arrays, reach for a writer
-(or `store`); starting from a `.cstore` you want a modified copy of, reach for
-`edit()`, which gives you a frame.
-
 ## Writing
 
 `colstore.store(data, path)` is the one-shot path; it dispatches on the
@@ -147,6 +118,55 @@ and `shutil.copyfileobj` on macOS/Windows; on both paths memory
 footprint is bounded by the kernel/I/O buffer (tens of KB) regardless
 of file size — files much larger than RAM compact fine.
 
+## Multiple files
+
+A run is often split across many same-schema `.cstore` files. Open them as one
+logical table — every read decomposes across the files and is stitched back
+together, with no data copied:
+
+```python
+ds = colstore.open(["jan.cstore", "feb.cstore", "mar.cstore"])  # a ColStoreDataset
+ds.n_rows                                  # sum of the files
+ds[1_000:2_000, ["price", "qty"]].dict()   # slices span the files transparently
+ds[[5, 1_000_000, 7], "price"].array()     # fancy and boolean selection too
+```
+
+The result is a `ColStoreDataset`. It is empty-constructible and growable, and
+takes a mix of paths (which it opens and *owns*) and already-open readers or
+datasets (which it *borrows* and leaves open):
+
+```python
+from colstore import ColStoreDataset
+
+ds = ColStoreDataset()                       # empty; grow it later
+ds.append("jan.cstore")                      # opens and owns this file
+ds.append(existing_reader)                   # borrows an open reader
+ds |= another_reader                         # in-place combine (borrows)
+
+combined = reader_a | reader_b | reader_c    # combine open readers into one dataset
+```
+
+A dataset supports everything a single-file reader does — indexing, the lazy
+views, `dict()`/`recarray()`/`frame()`, and `edit()` — by delegating to the
+per-file readers, so the tuned single-file gather path is reused unchanged; a
+one-file dataset costs the same as the bare reader. Closing a dataset closes
+only the files it opened, so readers you passed in stay open and remain yours to
+close.
+
+To materialize the combination as one physical file, use `concat`:
+
+```python
+# Lazy: a dataset over the files, no copy — the same as open([...]).
+ds = colstore.concat(["jan.cstore", "feb.cstore"])
+
+# Eager: stream the combined data into one new file, in bounded memory.
+reader = colstore.concat(["jan.cstore", "feb.cstore"], out="q1.cstore")
+```
+
+The written file reads back on the single-record fast path. See the [dataset
+read decomposition](docs/dataset_read_decomposition.svg) diagram for how a read
+is split across files and reassembled.
+
 ## Introspection
 
 ```python
@@ -192,7 +212,7 @@ at the full cap, depending on the route taken. Either way the kernel's
 the number of indices and clamps it to the cap, so small reads stay serial and
 only large ones spend the whole budget.
 
-![Gather thread decision flow](docs/assets/gather_thread_decision.svg)
+![Gather thread decision flow](docs/gather_thread_decision.svg)
 
 The cap itself defaults to half the physical cores, bounded by a per-socket
 allowance so multi-socket hosts (with more memory channels) get a higher
@@ -208,7 +228,7 @@ that keeps pages near the reading thread. Placement is decided at the first page
 fault, so warm pages cannot be moved — only a cold read (pages not yet resident)
 is placed according to the policy.
 
-![NUMA placement decision](docs/assets/numa_placement_decision.svg)
+![NUMA placement decision](docs/numa_placement_decision.svg)
 
 Whether the best cold-read placement depends on the access pattern was the one
 case the warm sweep never covered. `benchmark/check_cold_read_placement.py`
@@ -224,11 +244,11 @@ lever that ships **off**: a placement × binding × cap sweep measured spread
 binding 24–51% slower on a multi-node host, so `gather_binding` defaults to off
 and the realized path is the unbound default pool.
 
-![Gather thread binding status](docs/assets/gather_thread_binding_status.svg)
+![Gather thread binding status](docs/gather_thread_binding_status.svg)
 
 ## On-disk format
 
-![The .cstore on-disk format](docs/assets/file_format.svg)
+![The .cstore on-disk format](docs/file_format.svg)
 
 ```
 [magic 8B = b"CSTORE\x00\x01"]
@@ -249,7 +269,7 @@ that reads via a per-column memmap fast path; a streamed write produces a
 multi-record file with per-pattern dispatch (contiguous range, sorted
 fancy, unsorted fancy).
 
-![Single-record vs multi-record column layout](docs/assets/record_layout.svg)
+![Single-record vs multi-record column layout](docs/record_layout.svg)
 
 ## Supported dtypes
 
