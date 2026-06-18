@@ -675,6 +675,46 @@ def test_multifile_fancy_native_matches_fallback_and_oracle(tmp_path, monkeypatc
         np.testing.assert_array_equal(both["y"], oy[index])
 
 
+def test_multifile_fancy_native_sorted_matches_fallback_and_oracle(tmp_path, monkeypatch):
+    # Non-decreasing fancy indices route through the cursor-walk kernel (single
+    # column and dict). It must match the portable fallback and the oracle.
+    from colstore import kernels
+    from colstore.reader import _indices_are_sorted
+
+    single = tmp_path / "single.cstore"
+    x0 = np.arange(30, dtype=np.int64)
+    colstore.store({"x": x0, "y": (x0 * 2.0)}, single, show_progress=False).close()
+
+    multi = tmp_path / "multi.cstore"
+    x_blocks, y_blocks = [x0], [x0 * 2.0]
+    with colstore.create(multi) as writer:
+        for i in range(3):
+            xb = np.arange(30 + 12 * i, 30 + 12 * (i + 1), dtype=np.int64)
+            writer.write({"x": xb, "y": xb * 2.0})
+            x_blocks.append(xb)
+            y_blocks.append(xb * 2.0)
+    ox = np.concatenate(x_blocks)
+    oy = np.concatenate(y_blocks)
+
+    index = np.sort(np.random.default_rng(0).integers(0, ox.size, size=400)).astype(np.int64)
+    assert _indices_are_sorted(index)  # the sorted branch is taken
+
+    with colstore.open([single, multi]) as ds:
+        native_x = ds[index, "x"].array()
+        native_both = ds[index, ["x", "y"]].dict()
+
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)
+    with colstore.open([single, multi]) as ds:
+        fallback_x = ds[index, "x"].array()
+        fallback_both = ds[index, ["x", "y"]].dict()
+
+    for result in (native_x, fallback_x):
+        np.testing.assert_array_equal(result, ox[index])
+    for both in (native_both, fallback_both):
+        np.testing.assert_array_equal(both["x"], ox[index])
+        np.testing.assert_array_equal(both["y"], oy[index])
+
+
 # ---- Zero-copy seam rules ----------------------------------------------
 
 
