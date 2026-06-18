@@ -37,7 +37,8 @@ reversed selection all require a copying gather.
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -278,64 +279,101 @@ class ColStoreDataset(_ReaderBase):
             parts.append((file_index, slice(first - lo, last_excl - lo, step)))
         return parts
 
-    def _concat_one(self, parts: list[NDArray[Any]], column_name: str) -> NDArray[Any]:
-        if not parts:
-            return np.empty(0, dtype=self.dtypes[column_name])
-        if len(parts) == 1:
-            return parts[0]
-        return np.concatenate(parts)
-
-    def _concat_many(
-        self, per_file: list[dict[str, NDArray[Any]]], column_names: list[str]
-    ) -> dict[str, NDArray[Any]]:
-        if not per_file:
-            return {name: np.empty(0, dtype=self.dtypes[name]) for name in column_names}
-        if len(per_file) == 1:
-            return per_file[0]
-        return {name: np.concatenate([chunk[name] for chunk in per_file]) for name in column_names}
-
     def _require_columns(self, column_names: list[str]) -> None:
         unknown = [name for name in column_names if name not in self._column_dtypes]
         if unknown:
             raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
 
-    # ---- Fancy / boolean decomposition ---------------------------------
+    # ---- Parallel fill across files ------------------------------------
+    #
+    # Every multi-file read preallocates one output and fills each file's region
+    # concurrently: the per-file reads are independent and write disjoint regions
+    # (a contiguous slice, or disjoint scattered positions), so they need no
+    # locking. The pool is sized to the gather thread budget and each per-file
+    # read runs single-threaded, so the total thread count stays in the same
+    # envelope as a single-file read -- the parallelism just moves up to the file
+    # level, where each file's copy is too small to trip the single-file
+    # parallel-copy size gate on its own.
 
-    def _indices_by_file(
-        self, indices: NDArray[np.int64]
-    ) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
-        """For each global index, the owning file and the file order (argsort)."""
-        file_of = np.searchsorted(self._offsets[1:], indices, side="right")
-        return file_of, np.unique(file_of)
+    def _read_budget(self) -> int:
+        return max(1, config.get_gather_thread_cap())
 
-    def _fancy_one(
-        self, column_name: str, indices: NDArray[np.int64], thread_cap: int | None
-    ) -> NDArray[Any]:
-        """Gather arbitrary global rows, preserving the requested order.
+    def _run_fill_jobs(self, jobs: list[Callable[[], None]]) -> None:
+        if len(jobs) <= 1:
+            for job in jobs:
+                job()
+            return
+        workers = min(len(jobs), self._read_budget())
+        if workers <= 1:
+            for job in jobs:
+                job()
+            return
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            for future in [executor.submit(job) for job in jobs]:
+                future.result()
 
-        Group the indices by owning file, gather each file's rows with one local
-        call, and scatter the chunks back into the positions they were asked in.
+    def _portion_source(self, child: ColStoreReader, column_name: str, sub: Any) -> NDArray[Any]:
+        """A readable array for one file's portion of a column.
+
+        A zero-copy view when the child can give one (native single-record,
+        contiguous selector), so the value is copied into the output exactly
+        once; otherwise a single-threaded gather (file-level parallelism owns the
+        threads, so the per-file read does not also spin up its own).
         """
-        out = np.empty(len(indices), dtype=self.dtypes[column_name])
-        file_of, files = self._indices_by_file(indices)
-        for file_index in files:
-            positions = np.flatnonzero(file_of == file_index)
-            local = indices[positions] - int(self._offsets[file_index])
-            out[positions] = self._children[file_index]._gather_one(column_name, local, thread_cap)
-        return out
+        try:
+            return child._view_one(column_name, sub)
+        except ValueError:
+            return child._gather_one(column_name, sub, thread_cap=1)
 
-    def _fancy_many(
-        self, column_names: list[str], indices: NDArray[np.int64]
-    ) -> dict[str, NDArray[Any]]:
-        out = {name: np.empty(len(indices), dtype=self.dtypes[name]) for name in column_names}
-        file_of, files = self._indices_by_file(indices)
-        for file_index in files:
-            positions = np.flatnonzero(file_of == file_index)
-            local = indices[positions] - int(self._offsets[file_index])
-            chunk = self._children[file_index]._gather_many(column_names, local)
+    def _fill_one(
+        self, out: NDArray[Any], lo: int, hi: int, child: ColStoreReader, column_name: str, sub: Any
+    ) -> Callable[[], None]:
+        def job() -> None:
+            out[lo:hi] = self._portion_source(child, column_name, sub)
+
+        return job
+
+    def _fill_many(
+        self,
+        out: dict[str, NDArray[Any]],
+        lo: int,
+        hi: int,
+        child: ColStoreReader,
+        column_names: list[str],
+        sub: Any,
+    ) -> Callable[[], None]:
+        def job() -> None:
             for name in column_names:
-                out[name][positions] = chunk[name]
-        return out
+                out[name][lo:hi] = self._portion_source(child, name, sub)
+
+        return job
+
+    def _scatter_one(
+        self,
+        out: NDArray[Any],
+        positions: NDArray[np.intp],
+        child: ColStoreReader,
+        column_name: str,
+        local: NDArray[np.int64],
+    ) -> Callable[[], None]:
+        def job() -> None:
+            out[positions] = self._portion_source(child, column_name, local)
+
+        return job
+
+    def _scatter_many(
+        self,
+        out: dict[str, NDArray[Any]],
+        positions: NDArray[np.intp],
+        child: ColStoreReader,
+        column_names: list[str],
+        local: NDArray[np.int64],
+    ) -> Callable[[], None]:
+        def job() -> None:
+            for name in column_names:
+                out[name][positions] = self._portion_source(child, name, local)
+
+        return job
 
     def _mask_parts(self, mask: NDArray[np.bool_]) -> list[tuple[int, NDArray[np.bool_]]]:
         """Split a global boolean mask into per-file sub-masks, skipping empties."""
@@ -348,23 +386,48 @@ class ColStoreDataset(_ReaderBase):
                 parts.append((file_index, sub))
         return parts
 
-    def _mask_one(
-        self, column_name: str, mask: NDArray[np.bool_], thread_cap: int | None
-    ) -> NDArray[Any]:
-        parts = [
-            self._children[file_index]._gather_one(column_name, sub, thread_cap)
-            for file_index, sub in self._mask_parts(mask)
+    def _contiguous_lengths(self, parts: list[tuple[int, Any]], is_mask: bool) -> list[int]:
+        """Per-part output lengths for a slice (range size) or mask (popcount)."""
+        if is_mask:
+            return [int(sub.sum()) for _, sub in parts]
+        return [
+            len(range(*sub.indices(self._children[file_index].n_rows))) for file_index, sub in parts
         ]
-        return self._concat_one(parts, column_name)
 
-    def _mask_many(
-        self, column_names: list[str], mask: NDArray[np.bool_]
+    def _fancy_one(self, column_name: str, indices: NDArray[np.int64]) -> NDArray[Any]:
+        """Gather arbitrary global rows in parallel, preserving requested order.
+
+        Group the indices by owning file, gather each file's rows (single
+        call per file), and scatter the chunks back into the positions they were
+        asked in. Per-file positions are disjoint, so the scatters are
+        thread-safe.
+        """
+        out = np.empty(len(indices), dtype=self.dtypes[column_name])
+        file_of = np.searchsorted(self._offsets[1:], indices, side="right")
+        jobs: list[Callable[[], None]] = []
+        for file_index in np.unique(file_of):
+            positions = np.flatnonzero(file_of == file_index)
+            local = indices[positions] - int(self._offsets[file_index])
+            jobs.append(
+                self._scatter_one(out, positions, self._children[file_index], column_name, local)
+            )
+        self._run_fill_jobs(jobs)
+        return out
+
+    def _fancy_many(
+        self, column_names: list[str], indices: NDArray[np.int64]
     ) -> dict[str, NDArray[Any]]:
-        per_file = [
-            self._children[file_index]._gather_many(column_names, sub)
-            for file_index, sub in self._mask_parts(mask)
-        ]
-        return self._concat_many(per_file, column_names)
+        out = {name: np.empty(len(indices), dtype=self.dtypes[name]) for name in column_names}
+        file_of = np.searchsorted(self._offsets[1:], indices, side="right")
+        jobs: list[Callable[[], None]] = []
+        for file_index in np.unique(file_of):
+            positions = np.flatnonzero(file_of == file_index)
+            local = indices[positions] - int(self._offsets[file_index])
+            jobs.append(
+                self._scatter_many(out, positions, self._children[file_index], column_names, local)
+            )
+        self._run_fill_jobs(jobs)
+        return out
 
     # ---- Copying seam --------------------------------------------------
 
@@ -373,58 +436,102 @@ class ColStoreDataset(_ReaderBase):
     ) -> NDArray[Any]:
         self._check_open()
         self._require_columns([column_name])
-        if len(self._children) == 1:
-            return self._children[0]._gather_one(column_name, row_indexer, thread_cap)
+        children = self._children
+        if len(children) == 1:
+            return children[0]._gather_one(column_name, row_indexer, thread_cap)
+        dtype = self.dtypes[column_name]
         if row_indexer is None:
-            parts = [child._gather_one(column_name, None, thread_cap) for child in self._children]
-            return self._concat_one(parts, column_name)
+            out = np.empty(self._n_rows, dtype=dtype)
+            jobs: list[Callable[[], None]] = []
+            for file_index, child in enumerate(children):
+                lo, hi = int(self._offsets[file_index]), int(self._offsets[file_index + 1])
+                if lo < hi:
+                    jobs.append(self._fill_one(out, lo, hi, child, column_name, None))
+            self._run_fill_jobs(jobs)
+            return out
         if isinstance(row_indexer, (int, np.integer)):
             file_index, local = self._locate(int(row_indexer))
-            return self._children[file_index]._gather_one(column_name, local, thread_cap)
+            return children[file_index]._gather_one(column_name, local, thread_cap)
         if isinstance(row_indexer, slice):
             start, stop, step = row_indexer.indices(self._n_rows)
             if step < 0:
-                indices = np.arange(start, stop, step, dtype=np.int64)
-                return self._fancy_one(column_name, indices, thread_cap)
-            parts = [
-                self._children[file_index]._gather_one(column_name, sub, thread_cap)
-                for file_index, sub in self._slice_parts(row_indexer)
-            ]
-            return self._concat_one(parts, column_name)
+                return self._fancy_one(column_name, np.arange(start, stop, step, dtype=np.int64))
+            return self._gather_one_contiguous(
+                column_name, dtype, self._slice_parts(row_indexer), False
+            )
         if isinstance(row_indexer, np.ndarray):
             if row_indexer.dtype == np.bool_:
-                return self._mask_one(column_name, row_indexer, thread_cap)
-            return self._fancy_one(
-                column_name, row_indexer.astype(np.int64, copy=False), thread_cap
-            )
+                return self._gather_one_contiguous(
+                    column_name, dtype, self._mask_parts(row_indexer), True
+                )
+            return self._fancy_one(column_name, row_indexer.astype(np.int64, copy=False))
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
+
+    def _gather_one_contiguous(
+        self, column_name: str, dtype: np.dtype[Any], parts: list[tuple[int, Any]], is_mask: bool
+    ) -> NDArray[Any]:
+        lengths = self._contiguous_lengths(parts, is_mask)
+        out = np.empty(sum(lengths), dtype=dtype)
+        jobs: list[Callable[[], None]] = []
+        write = 0
+        for (file_index, sub), length in zip(parts, lengths, strict=True):
+            jobs.append(
+                self._fill_one(
+                    out, write, write + length, self._children[file_index], column_name, sub
+                )
+            )
+            write += length
+        self._run_fill_jobs(jobs)
+        return out
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         self._check_open()
         self._require_columns(column_names)
-        if len(self._children) == 1:
-            return self._children[0]._gather_many(column_names, row_indexer)
+        children = self._children
+        if len(children) == 1:
+            return children[0]._gather_many(column_names, row_indexer)
         if row_indexer is None:
-            per_file = [child._gather_many(column_names, None) for child in self._children]
-            return self._concat_many(per_file, column_names)
+            out = {name: np.empty(self._n_rows, dtype=self.dtypes[name]) for name in column_names}
+            jobs: list[Callable[[], None]] = []
+            for file_index, child in enumerate(children):
+                lo, hi = int(self._offsets[file_index]), int(self._offsets[file_index + 1])
+                if lo < hi:
+                    jobs.append(self._fill_many(out, lo, hi, child, column_names, None))
+            self._run_fill_jobs(jobs)
+            return out
         if isinstance(row_indexer, (int, np.integer)):
             file_index, local = self._locate(int(row_indexer))
-            return self._children[file_index]._gather_many(column_names, local)
+            return children[file_index]._gather_many(column_names, local)
         if isinstance(row_indexer, slice):
             start, stop, step = row_indexer.indices(self._n_rows)
             if step < 0:
-                indices = np.arange(start, stop, step, dtype=np.int64)
-                return self._fancy_many(column_names, indices)
-            per_file = [
-                self._children[file_index]._gather_many(column_names, sub)
-                for file_index, sub in self._slice_parts(row_indexer)
-            ]
-            return self._concat_many(per_file, column_names)
+                return self._fancy_many(column_names, np.arange(start, stop, step, dtype=np.int64))
+            return self._gather_many_contiguous(column_names, self._slice_parts(row_indexer), False)
         if isinstance(row_indexer, np.ndarray):
             if row_indexer.dtype == np.bool_:
-                return self._mask_many(column_names, row_indexer)
+                return self._gather_many_contiguous(
+                    column_names, self._mask_parts(row_indexer), True
+                )
             return self._fancy_many(column_names, row_indexer.astype(np.int64, copy=False))
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
+
+    def _gather_many_contiguous(
+        self, column_names: list[str], parts: list[tuple[int, Any]], is_mask: bool
+    ) -> dict[str, NDArray[Any]]:
+        lengths = self._contiguous_lengths(parts, is_mask)
+        total = sum(lengths)
+        out = {name: np.empty(total, dtype=self.dtypes[name]) for name in column_names}
+        jobs: list[Callable[[], None]] = []
+        write = 0
+        for (file_index, sub), length in zip(parts, lengths, strict=True):
+            jobs.append(
+                self._fill_many(
+                    out, write, write + length, self._children[file_index], column_names, sub
+                )
+            )
+            write += length
+        self._run_fill_jobs(jobs)
+        return out
 
     # ---- Zero-copy seam ------------------------------------------------
 
