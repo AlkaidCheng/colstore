@@ -57,6 +57,11 @@ cdef extern from "colstore/gather.hpp" nogil:
     int colstore_gather_multifile(const int64_t*, uint8_t*, ptrdiff_t,
                                   const int64_t*, const int64_t*, int64_t,
                                   int, int, ptrdiff_t)
+    int colstore_gather_multifile_bins(const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+                                       const int64_t*, const int64_t*, int64_t,
+                                       int, int, ptrdiff_t)
+    int colstore_gather_multifile_withbins(const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
+                                           const int64_t*, int, int, ptrdiff_t)
     int colstore_gather_multirecord_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
@@ -1002,6 +1007,100 @@ def gather_multifile(cnp.ndarray indices, cnp.ndarray output,
     cdef int status
     with nogil:
         status = colstore_gather_multifile(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+def gather_multifile_bins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray bins,
+                          cnp.ndarray segment_starts_rows, cnp.ndarray segment_base,
+                          int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Fused multi-file gather that also records each index's segment bin.
+
+    Identical addressing and output to :func:`gather_multifile`, plus ``bins[i]``
+    is filled with the segment index (``int32``) that ``indices[i]`` binned to.
+    The segment is column-independent, so a multi-column read computes it once
+    here and reuses it via :func:`gather_multifile_withbins`. ``bins`` must be
+    1D ``int32`` of the same length as ``indices``; the caller guarantees
+    ``n_segments <= 2**31 - 1``. ``segment_base`` is this column's bases.
+    """
+    _require_1d((indices, output, bins, segment_starts_rows, segment_base), "indices, output, bins, and segment arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_int64(segment_starts_rows, "segment_starts_rows")
+    _require_int64(segment_base, "segment_base")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError(
+            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
+            f"match indices length {n}."
+        )
+    cdef long long n_segments = segment_base.shape[0]
+    if segment_starts_rows.shape[0] != n_segments + 1:
+        raise ValueError("segment_starts_rows length must be n_segments + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("indices", indices), ("output", output), ("bins", bins), ("segment_starts_rows", segment_starts_rows), ("segment_base", segment_base)))
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef int32_t* bins_ptr = <int32_t*>cnp.PyArray_DATA(bins)
+    cdef const int64_t* ssr = <const int64_t*>cnp.PyArray_DATA(segment_starts_rows)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multifile_bins(indices_ptr, output_ptr, bins_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+
+def gather_multifile_withbins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray bins,
+                              cnp.ndarray segment_base,
+                              int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Gather one column reusing segment bins from :func:`gather_multifile_bins`.
+
+    The segment is the sequential ``int32`` read ``bins[i]`` rather than a
+    search; the address is ``segment_base[bins[i]] + indices[i] * itemsize`` with
+    this column's ``segment_base``. ``bins`` must be 1D ``int32`` of the same
+    length as ``indices`` (as filled by :func:`gather_multifile_bins`).
+    """
+    _require_1d((indices, output, bins, segment_base), "indices, output, bins, and segment_base must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_int64(segment_base, "segment_base")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError(
+            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
+            f"match indices length {n}."
+        )
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("indices", indices), ("output", output), ("bins", bins), ("segment_base", segment_base)))
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int32_t* bins_ptr = <const int32_t*>cnp.PyArray_DATA(bins)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multifile_withbins(indices_ptr, output_ptr, bins_ptr, n, sb, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "

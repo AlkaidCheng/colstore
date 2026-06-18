@@ -523,6 +523,76 @@ inline void gather_multifile_typed(const std::int64_t* COLSTORE_RESTRICT indices
   }
 }
 
+// Bin-recording multi-file gather: gather_multifile_typed plus bins[i] = s.
+// The prefetch search does NOT write bins (the look-ahead element may belong to
+// another thread's chunk -- a write there would race), matching the single-file
+// bins policy.
+template <typename T>
+inline void gather_multifile_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+                                        std::uint8_t* COLSTORE_RESTRICT output,
+                                        std::int32_t* COLSTORE_RESTRICT bins,
+                                        std::ptrdiff_t n_indices,
+                                        const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
+                                        const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                        std::int64_t n_segments, int thread_cap,
+                                        std::ptrdiff_t prefetch_distance) {
+  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t len = n_segments + 1;
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      const std::int64_t pidx = indices[i + prefetch_distance];
+      const std::int64_t ps = bin_record(segment_starts_rows, len, pidx);
+      COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
+          segment_base[ps] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+    }
+    const std::int64_t idx = indices[i];
+    const std::int64_t s = bin_record(segment_starts_rows, len, idx);
+    bins[i] = static_cast<std::int32_t>(s);
+    const std::int64_t addr = segment_base[s] + idx * static_cast<std::int64_t>(sizeof(T));
+    dst[i] = load_unaligned<T>(
+        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+  }
+}
+
+// Bins-provided multi-file gather: the segment is a sequential int32 read, no
+// search; the prefetch look-ahead reads its bin too. ``segment_base`` is this
+// column's bases.
+template <typename T>
+inline void gather_multifile_withbins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+                                            std::uint8_t* COLSTORE_RESTRICT output,
+                                            const std::int32_t* COLSTORE_RESTRICT bins,
+                                            std::ptrdiff_t n_indices,
+                                            const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                            int thread_cap, std::ptrdiff_t prefetch_distance) {
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      const std::int64_t ps = bins[i + prefetch_distance];
+      COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
+          segment_base[ps] +
+          indices[i + prefetch_distance] * static_cast<std::int64_t>(sizeof(T)))));
+    }
+    const std::int64_t s = bins[i];
+    const std::int64_t addr = segment_base[s] + indices[i] * static_cast<std::int64_t>(sizeof(T));
+    dst[i] = load_unaligned<T>(
+        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+  }
+}
+
 }  // namespace
 
 // Contiguous multi-record range copy. See header for the addressing contract.
@@ -1239,6 +1309,30 @@ int colstore_gather_multifile(const std::int64_t* indices,
     using T = typename decltype(tag)::type;
     colstore::gather_multifile_typed<T>(indices, output, n, segment_starts_rows, segment_base,
                                         n_segments, thread_cap, prefetch_distance);
+  });
+}
+
+int colstore_gather_multifile_bins(const std::int64_t* indices, std::uint8_t* output,
+                                   std::int32_t* bins, std::ptrdiff_t n,
+                                   const std::int64_t* segment_starts_rows,
+                                   const std::int64_t* segment_base, std::int64_t n_segments,
+                                   int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
+  return colstore::run_sized(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    colstore::gather_multifile_bins_typed<T>(indices, output, bins, n, segment_starts_rows,
+                                             segment_base, n_segments, thread_cap,
+                                             prefetch_distance);
+  });
+}
+
+int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t* output,
+                                       const std::int32_t* bins, std::ptrdiff_t n,
+                                       const std::int64_t* segment_base, int itemsize,
+                                       int thread_cap, std::ptrdiff_t prefetch_distance) {
+  return colstore::run_sized(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    colstore::gather_multifile_withbins_typed<T>(indices, output, bins, n, segment_base,
+                                                 thread_cap, prefetch_distance);
   });
 }
 

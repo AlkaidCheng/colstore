@@ -177,6 +177,31 @@ int colstore_gather_multifile(const std::int64_t* indices,
                               std::int64_t n_segments, int itemsize, int thread_cap,
                               std::ptrdiff_t prefetch_distance);
 
+// Bin-recording multi-file gather: like colstore_gather_multifile, and also
+// writes ``bins[i]`` = the segment index found for ``indices[i]``. The segment
+// is column-independent, so a multi-column read computes it once here and the
+// other columns reuse it via colstore_gather_multifile_withbins, skipping the
+// search -- the same amortization the single-file bins pair gives across
+// records. ``segment_base`` is THIS (first) column's per-segment absolute
+// bases; ``bins`` has length ``n`` and requires ``n_segments <= INT32_MAX``
+// (the caller guards). Other arguments and the dtype contract match
+// colstore_gather_multifile.
+int colstore_gather_multifile_bins(const std::int64_t* indices, std::uint8_t* output,
+                                   std::int32_t* bins, std::ptrdiff_t n,
+                                   const std::int64_t* segment_starts_rows,
+                                   const std::int64_t* segment_base, std::int64_t n_segments,
+                                   int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
+
+// Companion: gather one column reusing segment ids from
+// colstore_gather_multifile_bins for the same indices. The segment is a
+// sequential int32 read instead of a search (the prefetch look-ahead reads its
+// bin too), and the address is ``segment_base[bins[i]] + indices[i] * itemsize``
+// with THIS column's bases. No segment boundary array is needed.
+int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t* output,
+                                       const std::int32_t* bins, std::ptrdiff_t n,
+                                       const std::int64_t* segment_base, int itemsize,
+                                       int thread_cap, std::ptrdiff_t prefetch_distance);
+
 // Sorted multi-record fancy gather: a linear record walk instead of a
 // per-element binary search. Requires ``indices`` to be non-decreasing
 // (the caller checks; behavior is undefined otherwise). Each OpenMP thread
