@@ -857,6 +857,16 @@ def _resolve_streaming_layout(
     return columns_meta, on_disk_dtypes, bytes_per_row
 
 
+def _release_memmap(view: np.memmap[Any, np.dtype[Any]]) -> None:
+    """Close a memmap's underlying mapping so the file can be renamed/reused.
+
+    An open mapping blocks the rename on Windows and pins pages everywhere.
+    """
+    mmap_obj = getattr(view, "_mmap", None)
+    if mmap_obj is not None:
+        mmap_obj.close()
+
+
 def _fill_streaming(
     tmp_path: str,
     specs: dict[str, Expr],
@@ -901,13 +911,142 @@ def _fill_streaming(
         for name in names:
             views[name].flush()
     finally:
-        # Release the mappings before the caller renames the file: an open
-        # mapping blocks the rename on Windows and pins pages everywhere.
+        # Release the mappings before the caller renames the file.
         for view in views.values():
-            mmap_obj = getattr(view, "_mmap", None)
-            if mmap_obj is not None:
-                mmap_obj.close()
+            _release_memmap(view)
         views.clear()
+
+
+# One merge-copy run: (source path, source byte offset, destination byte offset,
+# byte count). A plan is these runs in destination-write order; copied in order
+# they fill the body.
+CopyRun = tuple[PathLike, int, int, int]
+
+# Override for the merge-copy strategy, for benchmarking only (not public API).
+# ``None`` autodetects (copy_file_range on Linux, else mmap); "mmap" or "cfr"
+# forces that strategy regardless of platform.
+_MERGE_COPY_OVERRIDE: str | None = None
+
+
+def _merge_copy_plan(
+    specs: dict[str, Expr],
+    names: list[str],
+    on_disk_dtypes: dict[str, np.dtype[Any]],
+    body_offset: int,
+    n_rows: int,
+) -> list[CopyRun] | None:
+    """Plan a raw byte-copy for a pure passthrough merge, or ``None``.
+
+    A pure merge is one where every output column is a bare, unshared,
+    native-dtype passthrough, so the destination body is the sources' column
+    bytes concatenated. For such a write, returns a flat list of
+    ``(src_path, src_offset, dst_offset, n_bytes)`` runs that, copied in order,
+    fill the preallocated body byte-for-byte -- identical to the materializing
+    streaming write, including the trailing body padding the preallocation
+    leaves zero. Returns ``None`` for anything else, and the caller falls back
+    to the materializing write.
+    """
+    passthroughs = fusible_passthroughs(specs)
+    if len(passthroughs) != len(specs):
+        return None
+    plan: list[CopyRun] = []
+    dst_column_offset = body_offset
+    for name in names:
+        column_bytes = n_rows * on_disk_dtypes[name].itemsize
+        try:
+            runs = passthroughs[name]._disk_runs()
+        except ValueError:
+            return None  # non-native source column: not raw-copyable
+        if sum(nbytes for _, _, nbytes in runs) != column_bytes:
+            return None  # run total disagrees with the column size; fall back
+        write = dst_column_offset
+        for src_path, src_offset, nbytes in runs:
+            plan.append((src_path, src_offset, write, nbytes))
+            write += nbytes
+        dst_column_offset += column_bytes
+    return plan
+
+
+def _copy_plan_mmap(dst_path: str, plan: list[CopyRun]) -> None:
+    """Fill the destination body by mmap memcpy, one run at a time.
+
+    Maps the destination once and each distinct source once; the runs are
+    disjoint and cover the body, so a single sequential pass fills it. The
+    mappings are released before the caller renames the file (an open mapping
+    blocks the rename on Windows and pins pages everywhere).
+    """
+    dst = np.memmap(dst_path, dtype=np.uint8, mode="r+")
+    src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
+    try:
+        for src_path, src_offset, dst_offset, nbytes in plan:
+            key = os.fspath(src_path)
+            src = src_maps.get(key)
+            if src is None:
+                src = np.memmap(key, dtype=np.uint8, mode="r")
+                src_maps[key] = src
+            dst[dst_offset : dst_offset + nbytes] = src[src_offset : src_offset + nbytes]
+        dst.flush()
+    finally:
+        _release_memmap(dst)
+        for src in src_maps.values():
+            _release_memmap(src)
+
+
+def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun]) -> None:
+    """Fill the destination body with ``copy_file_range`` (Linux only).
+
+    Each run is copied range-to-range without a user-space bounce; on reflink
+    filesystems and networked stores the kernel can share extents or copy
+    server-side, so the bytes need not transit the client at all. Raises
+    ``OSError`` if the platform or filesystem does not support it, which the
+    caller catches to fall back to :func:`_copy_plan_mmap`.
+    """
+    if sys.platform != "linux":
+        # copy_file_range is Linux-only; signal the caller to fall back to mmap.
+        raise OSError("copy_file_range is unavailable on this platform.")
+    src_fds: dict[str, int] = {}
+    dst_fd = os.open(dst_path, os.O_WRONLY)
+    try:
+        for src_path, src_offset, dst_offset, nbytes in plan:
+            key = os.fspath(src_path)
+            src_fd = src_fds.get(key)
+            if src_fd is None:
+                src_fd = os.open(key, os.O_RDONLY)
+                src_fds[key] = src_fd
+            remaining, read_at, write_at = nbytes, src_offset, dst_offset
+            while remaining:
+                copied = os.copy_file_range(
+                    src_fd, dst_fd, remaining, offset_src=read_at, offset_dst=write_at
+                )
+                if copied == 0:
+                    raise OSError("copy_file_range made no progress (short source).")
+                remaining -= copied
+                read_at += copied
+                write_at += copied
+    finally:
+        os.close(dst_fd)
+        for fd in src_fds.values():
+            os.close(fd)
+
+
+def _execute_copy_plan(dst_path: str, plan: list[CopyRun]) -> None:
+    """Run a merge-copy plan with the best strategy for this platform.
+
+    Uses ``copy_file_range`` on Linux, where reflink and networked filesystems
+    can complete the copy as a near-metadata-only operation, and falls back to
+    an mmap memcpy elsewhere or when the kernel call is unsupported.
+    ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
+    """
+    strategy = _MERGE_COPY_OVERRIDE or ("cfr" if sys.platform == "linux" else "mmap")
+    if strategy == "cfr":
+        try:
+            _copy_plan_copy_file_range(dst_path, plan)
+            return
+        except OSError:
+            # Unsupported platform/kernel/filesystem: fall back. The mmap pass
+            # rewrites the whole body, so any partial progress is overwritten.
+            pass
+    _copy_plan_mmap(dst_path, plan)
 
 
 def write_dataset_streaming(
@@ -977,9 +1116,15 @@ def write_dataset_streaming(
             # faulted in by the memmap writes -- same policy as write_dataset
             # and ColStoreWriter, via the shared gate in _numa.
             with _numa.writer_policy_scope():
-                _fill_streaming(
-                    tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows
-                )
+                # A pure no-transform merge copies the sources' column bytes
+                # straight into the body; anything else materializes per batch.
+                plan = _merge_copy_plan(specs, names, on_disk_dtypes, body_offset, n_rows)
+                if plan is not None:
+                    _execute_copy_plan(tmp_path, plan)
+                else:
+                    _fill_streaming(
+                        tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows
+                    )
 
         # Reopen read/write (not read-only) for the durability fsync: on Windows
         # os.fsync maps to _commit(), which fails with EBADF on a read-only

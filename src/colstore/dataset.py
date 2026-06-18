@@ -432,6 +432,23 @@ class ColStoreDataset(_ReaderBase):
         starts = np.concatenate([*start_parts, np.array([self._n_rows], dtype=np.int64)])
         return starts.astype(np.int64, copy=False), np.concatenate(base_parts)
 
+    def _column_disk_runs(self, column_name: str) -> list[tuple[Path, int, int]]:
+        """On-disk byte runs for one column across all files, in global row order.
+
+        Concatenates each child's :meth:`ColStoreReader._column_disk_runs` in
+        file order, which is the global row order, so the runs reproduce the
+        column's image as the dataset would gather it. Propagates the child's
+        ``ValueError`` for a non-native dtype, so the merge-copy caller falls
+        back to the materializing write.
+        """
+        self._check_open()
+        self._require_columns([column_name])
+        runs: list[tuple[Path, int, int]] = []
+        for child in self._children:
+            if child.n_rows:
+                runs.extend(child._column_disk_runs(column_name))
+        return runs
+
     def _native_gather(
         self,
         out: NDArray[Any],
