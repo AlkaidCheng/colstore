@@ -21,17 +21,20 @@ from colstore.kernels import cpp_available
 pytestmark = pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
 
 
-def build_segments(file_record_rows, dtype):
+def build_segments(file_record_rows, dtype, seed=7):
     """Build a synthetic segment table from per-file, per-record row counts.
 
     ``file_record_rows`` is one entry per file, each a list of that file's
     per-record row counts. Each file is a single contiguous buffer; its records
-    are segments at increasing byte offsets within it. Returns
-    ``(segment_starts_rows, segment_base, oracle, keepalive)`` where ``oracle``
-    is the global-row concatenation and ``keepalive`` pins the buffers alive.
+    are segments at increasing byte offsets within it. ``seed`` varies the data
+    (not the layout), so two calls with the same ``file_record_rows`` model two
+    columns: identical ``segment_starts_rows``, different ``segment_base`` and
+    data. Returns ``(segment_starts_rows, segment_base, oracle, keepalive)``
+    where ``oracle`` is the global-row concatenation and ``keepalive`` pins the
+    buffers alive.
     """
     itemsize = np.dtype(dtype).itemsize
-    rng = np.random.default_rng(7)
+    rng = np.random.default_rng(seed)
     starts = [0]
     seg_base: list[int] = []
     oracle_blocks = []
@@ -145,3 +148,68 @@ def test_non_int64_indices_raises():
     out = np.empty(4, dtype=np.float64)
     with pytest.raises(TypeError):
         _gather.gather_multifile(np.zeros(4, dtype=np.int32), out, starts, seg_base)
+
+
+# ---- Segment-bin reuse across columns --------------------------------------
+
+
+def test_multifile_bins_reuse_matches_plain_and_oracle():
+    # Two columns share one segmentation (same row layout, different data). The
+    # bins kernel gathers the first column and records the segment ids; the
+    # withbins kernel reuses those ids -- no search -- to gather the second from
+    # its own bases. Both must equal their oracle, the bins kernel must equal the
+    # plain kernel, and the recorded ids must be the true segment of each index.
+    layout = [[40, 30, 30], [50], [0], [20, 25]]  # multi-record, single, empty
+    starts_a, base_a, oracle_a, _ka = build_segments(layout, np.float64, seed=7)
+    starts_b, base_b, oracle_b, _kb = build_segments(layout, np.float64, seed=11)
+    np.testing.assert_array_equal(starts_a, starts_b)  # column-independent layout
+
+    total = int(starts_a[-1])
+    rng = np.random.default_rng(3)
+    idx = rng.integers(0, total, size=2000, dtype=np.int64)
+    idx[::9] = idx[0]  # duplicates
+
+    out_a = np.empty(len(idx), dtype=np.float64)
+    bins = np.empty(len(idx), dtype=np.int32)
+    _gather.gather_multifile_bins(idx, out_a, bins, starts_a, base_a, 0, -1)
+    np.testing.assert_array_equal(out_a, oracle_a[idx])
+    np.testing.assert_array_equal(out_a, gather(idx, starts_a, base_a, np.float64))
+    expected = np.searchsorted(starts_a, idx, side="right").astype(np.int32) - 1
+    np.testing.assert_array_equal(bins, expected)
+
+    out_b = np.empty(len(idx), dtype=np.float64)
+    _gather.gather_multifile_withbins(idx, out_b, bins, base_b, 0, -1)
+    np.testing.assert_array_equal(out_b, oracle_b[idx])
+
+
+def test_multifile_bins_reuse_small_dtype_and_cap():
+    # Bin reuse holds for a sub-word dtype and an explicit thread cap.
+    layout = [[16, 16], [24]]
+    starts, base_a, oracle_a, _ka = build_segments(layout, np.int16, seed=1)
+    _starts_b, base_b, oracle_b, _kb = build_segments(layout, np.int16, seed=2)
+    idx = np.arange(int(starts[-1]) - 1, -1, -1, dtype=np.int64)  # reversed, exhaustive
+    out_a = np.empty(len(idx), dtype=np.int16)
+    bins = np.empty(len(idx), dtype=np.int32)
+    _gather.gather_multifile_bins(idx, out_a, bins, starts, base_a, 2, 4)
+    out_b = np.empty(len(idx), dtype=np.int16)
+    _gather.gather_multifile_withbins(idx, out_b, bins, base_b, 2, 4)
+    np.testing.assert_array_equal(out_a, oracle_a[idx])
+    np.testing.assert_array_equal(out_b, oracle_b[idx])
+
+
+def test_multifile_bins_length_mismatch_raises():
+    starts, seg_base, _oracle, _keep = build_segments([[8], [8]], np.float64)
+    idx = np.zeros(4, dtype=np.int64)
+    out = np.empty(4, dtype=np.float64)
+    bins = np.empty(3, dtype=np.int32)  # wrong length
+    with pytest.raises(ValueError, match="bins"):
+        _gather.gather_multifile_bins(idx, out, bins, starts, seg_base)
+
+
+def test_multifile_bins_wrong_dtype_raises():
+    starts, seg_base, _oracle, _keep = build_segments([[8], [8]], np.float64)
+    idx = np.zeros(4, dtype=np.int64)
+    out = np.empty(4, dtype=np.float64)
+    bins = np.empty(4, dtype=np.int64)  # must be int32
+    with pytest.raises(TypeError, match="bins"):
+        _gather.gather_multifile_bins(idx, out, bins, starts, seg_base)

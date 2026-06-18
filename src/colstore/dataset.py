@@ -57,6 +57,10 @@ if TYPE_CHECKING:
 # (borrowed). The constructor and append() accept one of these or a sequence.
 _SourceLike: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
 
+# Segment ids are recorded as int32 bins for cross-column reuse; above this many
+# segments the dict path keeps an independent pass per column instead.
+_INT32_MAX = (1 << 31) - 1
+
 _VIEW_FANCY_MESSAGE = (
     "A zero-copy read is available only for contiguous selectors; fancy and "
     "boolean selection require a copying gather. Use copy=True."
@@ -442,6 +446,42 @@ class ColStoreDataset(_ReaderBase):
             indices, out, starts, segment_base, config.get_gather_thread_cap(), -1
         )
 
+    def _native_gather_many(
+        self,
+        out: dict[str, NDArray[Any]],
+        column_names: list[str],
+        indices: NDArray[np.int64],
+        tables: list[tuple[NDArray[np.int64], NDArray[np.int64]] | None],
+    ) -> None:
+        """Native dict gather, reusing the segment search across columns.
+
+        Which segment a row falls in is column-independent, so the first column
+        computes and records it (``gather_multifile_bins``) and the rest read it
+        back (``gather_multifile_withbins``) -- one search for the whole read,
+        the same amortization the single-file multi-column path gives across
+        records. Falls back to an independent pass per column for a single
+        column or when the segment count exceeds the int32 bin range.
+        """
+        from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+        cap = config.get_gather_thread_cap()
+        first = tables[0]
+        assert first is not None  # the caller passes only all-native tables
+        first_starts, first_base = first
+        if len(column_names) == 1 or first_base.shape[0] > _INT32_MAX:
+            for name, table in zip(column_names, tables, strict=True):
+                assert table is not None
+                self._native_gather(out[name], indices, table)
+            return
+        bins = np.empty(len(indices), dtype=np.int32)
+        _cpp_module.gather_multifile_bins(
+            indices, out[column_names[0]], bins, first_starts, first_base, cap, -1
+        )
+        for name, table in zip(column_names[1:], tables[1:], strict=True):
+            assert table is not None
+            _, segment_base = table
+            _cpp_module.gather_multifile_withbins(indices, out[name], bins, segment_base, cap, -1)
+
     def _fancy_one(self, column_name: str, indices: NDArray[np.int64]) -> NDArray[Any]:
         """Gather arbitrary global rows across files, preserving requested order.
 
@@ -483,9 +523,7 @@ class ColStoreDataset(_ReaderBase):
             return out
         tables = [self._native_segment_table(name) for name in column_names]
         if all(table is not None for table in tables):
-            for name, table in zip(column_names, tables, strict=True):
-                assert table is not None  # narrowed by the all() guard above
-                self._native_gather(out[name], indices, table)
+            self._native_gather_many(out, column_names, indices, tables)
             return out
         order, blocks = self._sorted_blocks(indices)
         for name in column_names:
