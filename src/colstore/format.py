@@ -929,6 +929,12 @@ CopyRun = tuple[PathLike, int, int, int]
 # forces that strategy regardless of platform.
 _MERGE_COPY_OVERRIDE: str | None = None
 
+# Runs larger than this are split into chunks so the parallel copy can balance
+# across threads when the plan has few large runs (e.g. a handful of big files);
+# 0 disables splitting. Off by default pending a node measurement of whether the
+# finer granularity helps -- the benchmark sweeps it.
+_MERGE_COPY_CHUNK_BYTES = 0
+
 
 def _merge_copy_plan(
     specs: dict[str, Expr],
@@ -1070,15 +1076,37 @@ def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun], workers: int)
             os.close(fd)
 
 
+def _chunk_plan(plan: list[CopyRun], chunk_bytes: int) -> list[CopyRun]:
+    """Split runs larger than ``chunk_bytes`` into disjoint, in-order sub-runs.
+
+    More, smaller runs let the parallel copy balance across threads when the
+    plan has few large runs (e.g. a handful of big files), where per-run
+    parallelism alone would leave most threads idle. ``chunk_bytes <= 0`` and
+    runs already at or below the threshold pass through unchanged.
+    """
+    if chunk_bytes <= 0:
+        return plan
+    chunked: list[CopyRun] = []
+    for src_path, src_offset, dst_offset, nbytes in plan:
+        written = 0
+        while written < nbytes:
+            size = min(chunk_bytes, nbytes - written)
+            chunked.append((src_path, src_offset + written, dst_offset + written, size))
+            written += size
+    return chunked
+
+
 def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     """Run a merge-copy plan with the best strategy for this platform.
 
     Uses ``copy_file_range`` on Linux, where reflink and networked filesystems
     can complete the copy as a near-metadata-only operation, and falls back to
     an mmap memcpy elsewhere or when the kernel call is unsupported. Both
-    strategies copy the disjoint runs concurrently across ``workers`` threads.
-    ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
+    strategies copy the disjoint runs concurrently across ``workers`` threads;
+    large runs are first split (``_MERGE_COPY_CHUNK_BYTES``) so the work
+    balances. ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
     """
+    plan = _chunk_plan(plan, _MERGE_COPY_CHUNK_BYTES)
     have_cfr = sys.platform == "linux" and hasattr(os, "copy_file_range")
     strategy = _MERGE_COPY_OVERRIDE or ("cfr" if have_cfr else "mmap")
     if strategy == "cfr":
