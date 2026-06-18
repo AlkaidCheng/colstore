@@ -593,6 +593,75 @@ inline void gather_multifile_withbins_typed(const std::int64_t* COLSTORE_RESTRIC
   }
 }
 
+// Sorted multi-file gather: a monotonic segment cursor instead of a per-index
+// search. Requires ``indices`` non-decreasing (the caller proves it). Each
+// thread takes a contiguous chunk, binary-searches its first segment, then
+// walks the cursor forward -- O(K + n_segments) total comparisons versus
+// O(K log n_segments), with sequential within-segment access. ``segment_base``
+// is already each segment's folded absolute base, so the steady state is one
+// compare, one multiply-add, one load. The look-ahead prefetch is issued only
+// when the look-ahead index still lies in the current segment, mirroring the
+// single-file sorted kernel.
+template <typename T>
+void gather_multifile_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+                                   std::uint8_t* COLSTORE_RESTRICT output,
+                                   std::ptrdiff_t n_indices,
+                                   const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
+                                   const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                   std::int64_t n_segments, int thread_cap,
+                                   std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  const std::int64_t len = n_segments + 1;
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+
+  const auto walk_range = [&](std::ptrdiff_t lo, std::ptrdiff_t hi) {
+    if (lo >= hi) {
+      return;
+    }
+    std::int64_t s = bin_record(segment_starts_rows, len, indices[lo]);
+    std::int64_t next_boundary = segment_starts_rows[s + 1];
+    std::int64_t seg_base = segment_base[s];
+    for (std::ptrdiff_t i = lo; i < hi; ++i) {
+      const std::int64_t idx = indices[i];
+      if (idx >= next_boundary) {
+        do {
+          ++s;
+        } while (idx >= segment_starts_rows[s + 1]);
+        next_boundary = segment_starts_rows[s + 1];
+        seg_base = segment_base[s];
+      }
+      if (prefetch_distance > 0 && i + prefetch_distance < hi) {
+        const std::int64_t j = indices[i + prefetch_distance];
+        if (j < next_boundary) {
+          COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(
+              static_cast<std::uintptr_t>(seg_base + j * itemsize)));
+        }
+      }
+      dst[i] = load_unaligned<T>(
+          reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(seg_base + idx * itemsize)));
+    }
+  };
+
+#ifdef _OPENMP
+  if (n_threads > 1) {
+#pragma omp parallel num_threads(static_cast<int>(n_threads))
+    {
+      const std::ptrdiff_t worker_count = omp_get_num_threads();
+      const std::ptrdiff_t worker_id = omp_get_thread_num();
+      const std::ptrdiff_t chunk = (n_indices + worker_count - 1) / worker_count;
+      const std::ptrdiff_t lo = worker_id * chunk;
+      const std::ptrdiff_t hi = std::min(n_indices, lo + chunk);
+      walk_range(lo, hi);
+    }
+    return;
+  }
+#else
+  (void)n_threads;
+#endif
+  walk_range(0, n_indices);
+}
+
 }  // namespace
 
 // Contiguous multi-record range copy. See header for the addressing contract.
@@ -1333,6 +1402,19 @@ int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t
     using T = typename decltype(tag)::type;
     colstore::gather_multifile_withbins_typed<T>(indices, output, bins, n, segment_base,
                                                  thread_cap, prefetch_distance);
+  });
+}
+
+int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* output,
+                                     std::ptrdiff_t n, const std::int64_t* segment_starts_rows,
+                                     const std::int64_t* segment_base, std::int64_t n_segments,
+                                     int itemsize, int thread_cap,
+                                     std::ptrdiff_t prefetch_distance) {
+  return colstore::run_sized(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    colstore::gather_multifile_sorted_typed<T>(indices, output, n, segment_starts_rows,
+                                               segment_base, n_segments, thread_cap,
+                                               prefetch_distance);
   });
 }
 

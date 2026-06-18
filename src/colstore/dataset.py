@@ -48,7 +48,7 @@ from numpy.typing import NDArray
 
 from . import config
 from ._base import _ReaderBase
-from .reader import ColStoreReader, _make_dataframe_no_consolidate
+from .reader import ColStoreReader, _indices_are_sorted, _make_dataframe_no_consolidate
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -437,14 +437,18 @@ class ColStoreDataset(_ReaderBase):
         out: NDArray[Any],
         indices: NDArray[np.int64],
         table: tuple[NDArray[np.int64], NDArray[np.int64]],
+        indices_sorted: bool,
     ) -> None:
-        """Fill ``out`` with one fused pass of the native multi-file kernel."""
+        """Fill ``out`` with one native pass: a cursor walk if the indices are
+        non-decreasing, otherwise the searching kernel."""
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
         starts, segment_base = table
-        _cpp_module.gather_multifile(
-            indices, out, starts, segment_base, config.get_gather_thread_cap(), -1
-        )
+        cap = config.get_gather_thread_cap()
+        if indices_sorted:
+            _cpp_module.gather_multifile_sorted(indices, out, starts, segment_base, cap, -1)
+        else:
+            _cpp_module.gather_multifile(indices, out, starts, segment_base, cap, -1)
 
     def _native_gather_many(
         self,
@@ -453,26 +457,28 @@ class ColStoreDataset(_ReaderBase):
         indices: NDArray[np.int64],
         tables: list[tuple[NDArray[np.int64], NDArray[np.int64]] | None],
     ) -> None:
-        """Native dict gather, reusing the segment search across columns.
+        """Native dict gather.
 
-        Which segment a row falls in is column-independent, so the first column
-        computes and records it (``gather_multifile_bins``) and the rest read it
-        back (``gather_multifile_withbins``) -- one search for the whole read,
-        the same amortization the single-file multi-column path gives across
-        records. Falls back to an independent pass per column for a single
-        column or when the segment count exceeds the int32 bin range.
+        Sorted indices take the per-column cursor walk -- a walk has no search to
+        amortize, and its within-segment access is sequential. Unsorted reads of
+        two or more columns search the (column-independent) segment once with
+        ``gather_multifile_bins`` and replay it per column with
+        ``gather_multifile_withbins``, the same amortization the single-file
+        multi-column path gives across records. A single column, or a segment
+        count past the int32 bin range, takes an independent pass per column.
         """
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
-        cap = config.get_gather_thread_cap()
+        indices_sorted = _indices_are_sorted(indices)
         first = tables[0]
         assert first is not None  # the caller passes only all-native tables
         first_starts, first_base = first
-        if len(column_names) == 1 or first_base.shape[0] > _INT32_MAX:
+        if indices_sorted or len(column_names) == 1 or first_base.shape[0] > _INT32_MAX:
             for name, table in zip(column_names, tables, strict=True):
                 assert table is not None
-                self._native_gather(out[name], indices, table)
+                self._native_gather(out[name], indices, table, indices_sorted)
             return
+        cap = config.get_gather_thread_cap()
         bins = np.empty(len(indices), dtype=np.int32)
         _cpp_module.gather_multifile_bins(
             indices, out[column_names[0]], bins, first_starts, first_base, cap, -1
@@ -496,7 +502,7 @@ class ColStoreDataset(_ReaderBase):
             return out
         table = self._native_segment_table(column_name)
         if table is not None:
-            self._native_gather(out, indices, table)
+            self._native_gather(out, indices, table, _indices_are_sorted(indices))
             return out
         order, blocks = self._sorted_blocks(indices)
         buffer = np.empty(len(indices), dtype=self.dtypes[column_name])

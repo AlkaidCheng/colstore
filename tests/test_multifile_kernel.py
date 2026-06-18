@@ -213,3 +213,40 @@ def test_multifile_bins_wrong_dtype_raises():
     bins = np.empty(4, dtype=np.int64)  # must be int32
     with pytest.raises(TypeError, match="bins"):
         _gather.gather_multifile_bins(idx, out, bins, starts, seg_base)
+
+
+# ---- Sorted cursor walk ----------------------------------------------------
+
+
+@pytest.mark.parametrize("cap", [0, 1, 2, 4])
+def test_multifile_sorted_matches_plain_and_oracle(cap):
+    # Non-decreasing indices through the cursor walk must equal the searching
+    # kernel and the oracle, with duplicates, across many segments (including an
+    # empty one), serial and threaded.
+    layout = [[40, 30, 30], [50], [0], [20, 25], [60]]
+    starts, base, oracle, _keep = build_segments(layout, np.float64, seed=5)
+    total = int(starts[-1])
+    idx = np.sort(np.random.default_rng(2).integers(0, total, size=3000)).astype(np.int64)
+    out = np.empty(len(idx), dtype=np.float64)
+    _gather.gather_multifile_sorted(idx, out, starts, base, cap, -1)
+    np.testing.assert_array_equal(out, oracle[idx])
+    np.testing.assert_array_equal(out, gather(idx, starts, base, np.float64, thread_cap=cap))
+
+
+def test_multifile_sorted_exhaustive_ascending():
+    # Every row in order crosses each segment boundary exactly once.
+    layout = [[16, 16, 16], [8], [24]]
+    starts, base, oracle, _keep = build_segments(layout, np.int32, seed=6)
+    idx = np.arange(int(starts[-1]), dtype=np.int64)
+    out = np.empty(len(idx), dtype=np.int32)
+    _gather.gather_multifile_sorted(idx, out, starts, base, 2, 4)
+    np.testing.assert_array_equal(out, oracle[idx])
+
+
+def test_multifile_sorted_duplicates_and_single_segment():
+    # Heavy duplicates (the cursor must hold) within a single segment.
+    starts, base, oracle, _keep = build_segments([[100]], np.float64, seed=8)
+    idx = np.sort(np.array([0, 0, 0, 5, 5, 99, 99, 50], dtype=np.int64))
+    out = np.empty(len(idx), dtype=np.float64)
+    _gather.gather_multifile_sorted(idx, out, starts, base, 0, -1)
+    np.testing.assert_array_equal(out, oracle[idx])

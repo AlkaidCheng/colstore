@@ -62,6 +62,9 @@ cdef extern from "colstore/gather.hpp" nogil:
                                        int, int, ptrdiff_t)
     int colstore_gather_multifile_withbins(const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
                                            const int64_t*, int, int, ptrdiff_t)
+    int colstore_gather_multifile_sorted(const int64_t*, uint8_t*, ptrdiff_t,
+                                         const int64_t*, const int64_t*, int64_t,
+                                         int, int, ptrdiff_t)
     int colstore_gather_multirecord_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
@@ -1007,6 +1010,53 @@ def gather_multifile(cnp.ndarray indices, cnp.ndarray output,
     cdef int status
     with nogil:
         status = colstore_gather_multifile(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+
+def gather_multifile_sorted(cnp.ndarray indices, cnp.ndarray output,
+                            cnp.ndarray segment_starts_rows,
+                            cnp.ndarray segment_base,
+                            int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Sorted multi-file fancy gather: a monotonic segment cursor, no search.
+
+    Identical output to :func:`gather_multifile` but requires ``indices``
+    non-decreasing (the caller proves it). The cursor advances forward through
+    the segments as the indices climb, so the per-index cost drops to one
+    boundary compare and the within-segment access is sequential. A cursor walk
+    has nothing to amortize across columns, so a multi-column sorted read calls
+    this per column rather than the bins pair. All other parameters and errors
+    match :func:`gather_multifile`.
+    """
+    _require_1d((indices, output, segment_starts_rows, segment_base), "indices, output, and segment arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int64(segment_starts_rows, "segment_starts_rows")
+    _require_int64(segment_base, "segment_base")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    _require_output_len(output, n, "indices")
+    cdef long long n_segments = segment_base.shape[0]
+    if segment_starts_rows.shape[0] != n_segments + 1:
+        raise ValueError("segment_starts_rows length must be n_segments + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("indices", indices), ("output", output), ("segment_starts_rows", segment_starts_rows), ("segment_base", segment_base)))
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* ssr = <const int64_t*>cnp.PyArray_DATA(segment_starts_rows)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multifile_sorted(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "

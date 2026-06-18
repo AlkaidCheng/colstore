@@ -202,6 +202,18 @@ int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t
                                        const std::int64_t* segment_base, int itemsize,
                                        int thread_cap, std::ptrdiff_t prefetch_distance);
 
+// Sorted multi-file gather: requires ``indices`` non-decreasing (the caller
+// proves it) and replaces the per-index segment search with a monotonic cursor,
+// O(K + n_segments) comparisons with sequential within-segment access. A cursor
+// walk has no search to amortize, so multi-column sorted reads call this per
+// column rather than the bins pair. Arguments and dtype contract otherwise
+// match colstore_gather_multifile.
+int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* output,
+                                     std::ptrdiff_t n, const std::int64_t* segment_starts_rows,
+                                     const std::int64_t* segment_base, std::int64_t n_segments,
+                                     int itemsize, int thread_cap,
+                                     std::ptrdiff_t prefetch_distance);
+
 // Sorted multi-record fancy gather: a linear record walk instead of a
 // per-element binary search. Requires ``indices`` to be non-decreasing
 // (the caller checks; behavior is undefined otherwise). Each OpenMP thread
