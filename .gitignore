@@ -78,3 +78,8 @@ ENV/
 
 # Private
 collect_perf_reference.sh
+
+# Claude
+.claude/
+CLAUDE.md
+CLAUDE.local.md
