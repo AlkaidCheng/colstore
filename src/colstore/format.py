@@ -55,7 +55,7 @@ import numpy as np
 
 from . import _numa, config
 from ._sizes import parse_byte_size
-from .frame import Expr, evaluate, validate_length
+from .frame import Expr, evaluate, fusible_passthroughs, validate_length
 from .progress import progress_bar
 
 FILE_EXTENSION = ".cstore"
@@ -884,11 +884,20 @@ def _fill_streaming(
                 tmp_path, dtype=dtype, mode="r+", offset=offset, shape=(n_rows,)
             )
             offset += n_rows * dtype.itemsize
+        fusible = fusible_passthroughs(specs)
         for start in range(0, n_rows, batch_rows):
             stop = min(start + batch_rows, n_rows)
             memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
             for name in names:
-                views[name][start:stop] = evaluate(specs[name], start, stop, memo)
+                target = views[name][start:stop]
+                passthrough = fusible.get(name)
+                if passthrough is not None:
+                    # A plain native passthrough: fill the output region straight
+                    # from the source, skipping the intermediate array (and the
+                    # per-batch memo it would otherwise occupy).
+                    passthrough._fill_into(target, start, stop)
+                else:
+                    target[:] = evaluate(specs[name], start, stop, memo)
         for name in names:
             views[name].flush()
     finally:

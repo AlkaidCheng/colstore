@@ -63,6 +63,17 @@ class _ReaderBase(abc.ABC):
     def _view_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         """Zero-copy read of several columns, or raise when a copy is unavoidable."""
 
+    def _gather_slice_into(
+        self, out: NDArray[Any], column_name: str, start: int, stop: int
+    ) -> None:
+        """Fill ``out`` with rows ``[start, stop)`` of one column.
+
+        The generic path materializes the forward slice and copies it in. The
+        multi-file reader overrides this to write each file's portion of ``out``
+        directly, sparing the intermediate array.
+        """
+        out[:] = self._gather_one(column_name, slice(start, stop))
+
     # ---- Column metadata -----------------------------------------------
 
     @property

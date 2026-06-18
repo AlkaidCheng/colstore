@@ -35,6 +35,7 @@ value-dependent surprises.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -399,6 +400,17 @@ class NativeColumn(_Leaf):
             return np.empty(0, dtype=self._dtype)
         return self._store._gather_one(self._name, slice(start, stop))
 
+    def _fill_into(self, out: NDArray[Any], start: int, stop: int) -> None:
+        """Write rows ``[start, stop)`` of the backing column straight into ``out``.
+
+        The read counterpart to :meth:`_read` that fills the caller's array (e.g.
+        a region of a memory-mapped output) instead of allocating a fresh one, so
+        a passthrough column reaches its destination in a single copy from the
+        source rather than via an intermediate array.
+        """
+        if stop > start:
+            self._store._gather_slice_into(out, self._name, start, stop)
+
 
 class MemoryColumn(_Leaf):
     """A leaf backed by an in-memory 1-D array.
@@ -527,6 +539,23 @@ def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
         for child in node._inputs:
             if isinstance(child, Expr):
                 yield from _iter_leaves(child)
+
+
+def fusible_passthroughs(specs: dict[str, Expr]) -> dict[str, NativeColumn]:
+    """Output columns a streaming sink can fill straight from their source.
+
+    A column qualifies when its expression is a bare :class:`NativeColumn` (a
+    plain passthrough, no transform) whose source leaf is referenced by no other
+    column. The second condition preserves the evaluator's shared-subexpression
+    reuse: a native read feeding another column too is left on the memoized path
+    so it is read once, not once per consumer.
+    """
+    counts = Counter(leaf._key for spec in specs.values() for leaf in _iter_leaves(spec))
+    return {
+        name: spec
+        for name, spec in specs.items()
+        if isinstance(spec, NativeColumn) and counts[spec._key] == 1
+    }
 
 
 def declared_length(node: Expr) -> int | None:
