@@ -348,33 +348,6 @@ class ColStoreDataset(_ReaderBase):
 
         return job
 
-    def _scatter_one(
-        self,
-        out: NDArray[Any],
-        positions: NDArray[np.intp],
-        child: ColStoreReader,
-        column_name: str,
-        local: NDArray[np.int64],
-    ) -> Callable[[], None]:
-        def job() -> None:
-            out[positions] = self._portion_source(child, column_name, local)
-
-        return job
-
-    def _scatter_many(
-        self,
-        out: dict[str, NDArray[Any]],
-        positions: NDArray[np.intp],
-        child: ColStoreReader,
-        column_names: list[str],
-        local: NDArray[np.int64],
-    ) -> Callable[[], None]:
-        def job() -> None:
-            for name in column_names:
-                out[name][positions] = self._portion_source(child, name, local)
-
-        return job
-
     def _mask_parts(self, mask: NDArray[np.bool_]) -> list[tuple[int, NDArray[np.bool_]]]:
         """Split a global boolean mask into per-file sub-masks, skipping empties."""
         parts: list[tuple[int, NDArray[np.bool_]]] = []
@@ -394,39 +367,72 @@ class ColStoreDataset(_ReaderBase):
             len(range(*sub.indices(self._children[file_index].n_rows))) for file_index, sub in parts
         ]
 
+    def _sorted_blocks(
+        self, indices: NDArray[np.int64]
+    ) -> tuple[NDArray[np.intp], list[tuple[int, int, int, NDArray[np.int64]]]]:
+        """Group global indices by owning file with a single sort.
+
+        Sorting the indices ascending turns each file's rows into one contiguous
+        run (the files are offset-ordered), whose bounds in the sorted array fall
+        out of searchsorting the file boundaries -- replacing a per-file scan of
+        the whole index array with one sort. Returns the argsort permutation (to
+        un-sort the gathered values back into the requested order) and, per
+        non-empty file, the sorted half-open range ``[lo, hi)`` and the
+        file-local, ascending row indices to gather.
+        """
+        order = np.argsort(indices)
+        sorted_indices = indices[order]
+        boundaries = np.searchsorted(sorted_indices, self._offsets)
+        blocks: list[tuple[int, int, int, NDArray[np.int64]]] = []
+        for file_index in range(len(self._children)):
+            lo, hi = int(boundaries[file_index]), int(boundaries[file_index + 1])
+            if lo < hi:
+                local = sorted_indices[lo:hi] - int(self._offsets[file_index])
+                blocks.append((file_index, lo, hi, local))
+        return order, blocks
+
     def _fancy_one(self, column_name: str, indices: NDArray[np.int64]) -> NDArray[Any]:
         """Gather arbitrary global rows in parallel, preserving requested order.
 
-        Group the indices by owning file, gather each file's rows (single
-        call per file), and scatter the chunks back into the positions they were
-        asked in. Per-file positions are disjoint, so the scatters are
-        thread-safe.
+        Sort the indices once to group them into one contiguous block per file,
+        fill each file's block of a sorted buffer concurrently (disjoint regions,
+        so no locking), then un-sort the buffer into the requested order with one
+        scatter.
         """
         out = np.empty(len(indices), dtype=self.dtypes[column_name])
-        file_of = np.searchsorted(self._offsets[1:], indices, side="right")
-        jobs: list[Callable[[], None]] = []
-        for file_index in np.unique(file_of):
-            positions = np.flatnonzero(file_of == file_index)
-            local = indices[positions] - int(self._offsets[file_index])
-            jobs.append(
-                self._scatter_one(out, positions, self._children[file_index], column_name, local)
-            )
+        if indices.size == 0:
+            return out
+        order, blocks = self._sorted_blocks(indices)
+        buffer = np.empty(len(indices), dtype=self.dtypes[column_name])
+        jobs = [
+            self._fill_one(buffer, lo, hi, self._children[file_index], column_name, local)
+            for file_index, lo, hi, local in blocks
+        ]
         self._run_fill_jobs(jobs)
+        out[order] = buffer
         return out
 
     def _fancy_many(
         self, column_names: list[str], indices: NDArray[np.int64]
     ) -> dict[str, NDArray[Any]]:
+        """Multi-column :meth:`_fancy_one` sharing one sort across all columns.
+
+        The grouping is computed once; each column fills and un-sorts through a
+        single reused buffer, so peak memory stays at one column's worth rather
+        than scaling with the column count.
+        """
         out = {name: np.empty(len(indices), dtype=self.dtypes[name]) for name in column_names}
-        file_of = np.searchsorted(self._offsets[1:], indices, side="right")
-        jobs: list[Callable[[], None]] = []
-        for file_index in np.unique(file_of):
-            positions = np.flatnonzero(file_of == file_index)
-            local = indices[positions] - int(self._offsets[file_index])
-            jobs.append(
-                self._scatter_many(out, positions, self._children[file_index], column_names, local)
-            )
-        self._run_fill_jobs(jobs)
+        if indices.size == 0:
+            return out
+        order, blocks = self._sorted_blocks(indices)
+        for name in column_names:
+            buffer = np.empty(len(indices), dtype=self.dtypes[name])
+            jobs = [
+                self._fill_one(buffer, lo, hi, self._children[file_index], name, local)
+                for file_index, lo, hi, local in blocks
+            ]
+            self._run_fill_jobs(jobs)
+            out[name][order] = buffer
         return out
 
     # ---- Copying seam --------------------------------------------------
