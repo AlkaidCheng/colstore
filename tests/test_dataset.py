@@ -650,6 +650,36 @@ def test_unknown_column_raises_key_error(tmp_path):
         ds["nope"].array()
 
 
+# ---- Parallel fill path ------------------------------------------------
+
+
+def test_parallel_fill_matches_oracle_with_threads(tmp_path):
+    # Force the file-level fill pool on (CI otherwise runs the budget=1 serial
+    # path), so the concurrent disjoint writes are exercised against the oracle.
+    from colstore import config
+
+    paths, ox, oy = _build_files(tmp_path, [40, 0, 60, 35])
+    previous = config.get_gather_thread_cap()
+    config.set_gather_thread_cap(4)
+    try:
+        with colstore.open(paths) as ds:
+            n = ds.n_rows
+            np.testing.assert_array_equal(ds["x"].array(), ox)
+            whole = ds[:].dict()
+            np.testing.assert_array_equal(whole["x"], ox)
+            np.testing.assert_array_equal(whole["y"], oy)
+            for sl in (slice(1, n - 1), slice(3, n, 7), slice(None, None, -2)):
+                np.testing.assert_array_equal(ds[sl, "x"].array(), ox[sl])
+            idx = np.array([n - 1, 0, n // 2, 5, 5, 1], dtype=np.int64)
+            both = ds[idx, ["x", "y"]].dict()
+            np.testing.assert_array_equal(both["x"], ox[idx])
+            np.testing.assert_array_equal(both["y"], oy[idx])
+            mask = np.random.default_rng(0).random(n) < 0.4
+            np.testing.assert_array_equal(ds[mask, "x"].array(), ox[mask])
+    finally:
+        config.set_gather_thread_cap(previous)
+
+
 # ---- concat(): lazy dataset or eager written file ----------------------
 
 
