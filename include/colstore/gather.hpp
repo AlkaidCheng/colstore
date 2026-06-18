@@ -153,6 +153,30 @@ int colstore_gather_multirecord(const std::uint8_t* base,
                                    std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
                                std::ptrdiff_t prefetch_distance);
 
+// Fused multi-FILE fancy gather: the fused multi-record gather one level up.
+// A dataset of several files is one global row space; each file contributes
+// one or more *segments* (a segment is one record of one file), whose global
+// rows are ``[segment_starts_rows[s], segment_starts_rows[s + 1])``.
+// ``output[i]`` is the element at global row ``indices[i]``, in one pass: the
+// segment is found by the same branchless binary search used for records, and
+// the byte address is ``segment_base[s] + indices[i] * itemsize``.
+// ``segment_base[s]`` is an absolute byte address -- the file's mmap base plus
+// the record's body and column offset, with the segment's global start row
+// folded out so a *global* index plugs straight in. The address is absolute
+// rather than ``base + offset`` because each segment lives in a different mmap;
+// reconstructing a cross-mmap pointer from one base by arithmetic would be
+// undefined. Output is contiguous in requested order -- no grouping, no
+// reorder, no scratch. ``segment_starts_rows`` has ``n_segments + 1`` entries;
+// ``segment_base`` has ``n_segments``. Caller guarantees native byte order and
+// every index in ``[0, segment_starts_rows[n_segments])``. Dispatched on
+// itemsize (1/2/4/8 bytes; any other returns -1).
+int colstore_gather_multifile(const std::int64_t* indices,
+                              std::uint8_t* output, std::ptrdiff_t n,
+                              const std::int64_t* segment_starts_rows,
+                              const std::int64_t* segment_base,
+                              std::int64_t n_segments, int itemsize, int thread_cap,
+                              std::ptrdiff_t prefetch_distance);
+
 // Sorted multi-record fancy gather: a linear record walk instead of a
 // per-element binary search. Requires ``indices`` to be non-decreasing
 // (the caller checks; behavior is undefined otherwise). Each OpenMP thread

@@ -480,6 +480,49 @@ inline int run_sized(int itemsize, F&& f) {
   return dispatch_itemsize(itemsize, std::forward<F>(f)) ? 0 : -1;
 }
 
+// Fused multi-file fancy gather (see header for the addressing contract).
+//
+// Its own driver rather than gather_core: each segment lives in a different
+// mmap, so the address is an absolute pointer (segment_base[s] is whole, not
+// an offset from one base) -- forming a cross-mmap pointer by arithmetic from a
+// single base would be undefined. Everything else is reused: bin_record (the
+// segment table is the record table one level up), load_unaligned for the
+// alignment-safe typed load, and the resolve_thread_count / OpenMP skeleton.
+// The prefetch recomputes the segment for the look-ahead index, like the
+// fused multi-record kernel; the search is cheap against the DRAM latency it
+// hides.
+template <typename T>
+inline void gather_multifile_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+                                   std::uint8_t* COLSTORE_RESTRICT output,
+                                   std::ptrdiff_t n_indices,
+                                   const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
+                                   const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                   std::int64_t n_segments, int thread_cap,
+                                   std::ptrdiff_t prefetch_distance) {
+  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t len = n_segments + 1;
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      const std::int64_t pidx = indices[i + prefetch_distance];
+      const std::int64_t ps = bin_record(segment_starts_rows, len, pidx);
+      COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
+          segment_base[ps] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+    }
+    const std::int64_t idx = indices[i];
+    const std::int64_t s = bin_record(segment_starts_rows, len, idx);
+    const std::int64_t addr = segment_base[s] + idx * static_cast<std::int64_t>(sizeof(T));
+    dst[i] = load_unaligned<T>(
+        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+  }
+}
+
 }  // namespace
 
 // Contiguous multi-record range copy. See header for the addressing contract.
@@ -1184,6 +1227,19 @@ int colstore_gather_multirecord_withbins_rbase(
     int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
   return colstore::gather_entry<colstore::RBasePolicy>(
       itemsize, base, output, n, thread_cap, prefetch_distance, indices, bins, record_base);
+}
+
+int colstore_gather_multifile(const std::int64_t* indices,
+                              std::uint8_t* output, std::ptrdiff_t n,
+                              const std::int64_t* segment_starts_rows,
+                              const std::int64_t* segment_base,
+                              std::int64_t n_segments, int itemsize, int thread_cap,
+                              std::ptrdiff_t prefetch_distance) {
+  return colstore::run_sized(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    colstore::gather_multifile_typed<T>(indices, output, n, segment_starts_rows, segment_base,
+                                        n_segments, thread_cap, prefetch_distance);
+  });
 }
 
 int colstore_gather_multirecord_mask(
