@@ -147,6 +147,56 @@ and `shutil.copyfileobj` on macOS/Windows; on both paths memory
 footprint is bounded by the kernel/I/O buffer (tens of KB) regardless
 of file size — files much larger than RAM compact fine.
 
+
+## Multiple files
+
+A run is often split across many same-schema `.cstore` files. Open them as one
+logical table — every read decomposes across the files and is stitched back
+together, with no data copied:
+
+```python
+ds = colstore.open(["jan.cstore", "feb.cstore", "mar.cstore"])  # a ColStoreDataset
+ds.n_rows                                  # sum of the files
+ds[1_000:2_000, ["price", "qty"]].dict()   # slices span the files transparently
+ds[[5, 1_000_000, 7], "price"].array()     # fancy and boolean selection too
+```
+
+The result is a `ColStoreDataset`. It is empty-constructible and growable, and
+takes a mix of paths (which it opens and *owns*) and already-open readers or
+datasets (which it *borrows* and leaves open):
+
+```python
+from colstore import ColStoreDataset
+
+ds = ColStoreDataset()                       # empty; grow it later
+ds.append("jan.cstore")                      # opens and owns this file
+ds.append(existing_reader)                   # borrows an open reader
+ds |= another_reader                         # in-place combine (borrows)
+
+combined = reader_a | reader_b | reader_c    # combine open readers into one dataset
+```
+
+A dataset supports everything a single-file reader does — indexing, the lazy
+views, `dict()`/`recarray()`/`frame()`, and `edit()` — by delegating to the
+per-file readers, so the tuned single-file gather path is reused unchanged; a
+one-file dataset costs the same as the bare reader. Closing a dataset closes
+only the files it opened, so readers you passed in stay open and remain yours to
+close.
+
+To materialize the combination as one physical file, use `concat`:
+
+```python
+# Lazy: a dataset over the files, no copy — the same as open([...]).
+ds = colstore.concat(["jan.cstore", "feb.cstore"])
+
+# Eager: stream the combined data into one new file, in bounded memory.
+reader = colstore.concat(["jan.cstore", "feb.cstore"], out="q1.cstore")
+```
+
+The written file reads back on the single-record fast path. See the [dataset
+read decomposition](docs/dataset_read_decomposition.svg) diagram for how a read
+is split across files and reassembled.
+
 ## Introspection
 
 ```python

@@ -33,6 +33,7 @@ stands alone.
 | [file_format.svg](assets/file_format.svg) | The on-disk `.cstore` header and record layout. |
 | [record_layout.svg](assets/record_layout.svg) | Single-record vs multi-record column layout, and what `compact()` does. |
 | [kernel_dispatch.svg](assets/kernel_dispatch.svg) | How a single-column read picks its kernel, in priority order. |
+| [dataset_read_decomposition.svg](assets/dataset_read_decomposition.svg) | How a multi-file `ColStoreDataset` splits a read across files and stitches the result. |
 | [gather_thread_decision.svg](assets/gather_thread_decision.svg) | How the gather thread count is decided for single- and multi-column reads. |
 | [numa_placement_decision.svg](assets/numa_placement_decision.svg) | The `auto` NUMA page-placement decision and the cold-read verdict. |
 | [gather_thread_binding_status.svg](assets/gather_thread_binding_status.svg) | Why reader-side thread binding ships off. |
