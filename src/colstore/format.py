@@ -49,6 +49,8 @@ import sys
 import tempfile
 import time
 import zlib
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import IO, Any
 
 import numpy as np
@@ -967,24 +969,49 @@ def _merge_copy_plan(
     return plan
 
 
-def _copy_plan_mmap(dst_path: str, plan: list[CopyRun]) -> None:
-    """Fill the destination body by mmap memcpy, one run at a time.
+def _run_copy_jobs(jobs: list[Callable[[], None]], workers: int) -> None:
+    """Run copy jobs, in parallel when the budget and job count allow.
 
-    Maps the destination once and each distinct source once; the runs are
-    disjoint and cover the body, so a single sequential pass fills it. The
-    mappings are released before the caller renames the file (an open mapping
-    blocks the rename on Windows and pins pages everywhere).
+    The runs write disjoint destination regions, so the jobs need no locking.
+    On a parallel filesystem this is what saturates the write path -- a serial
+    copy leaves most of the bandwidth idle.
+    """
+    if len(jobs) <= 1 or workers <= 1:
+        for job in jobs:
+            job()
+        return
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as executor:
+        for future in [executor.submit(job) for job in jobs]:
+            future.result()
+
+
+def _copy_plan_mmap(dst_path: str, plan: list[CopyRun], workers: int) -> None:
+    """Fill the destination body by mmap memcpy, runs copied concurrently.
+
+    Maps the destination once and each distinct source once, then copies the
+    disjoint runs in parallel: each writes its own region of the shared
+    destination mapping, so no locking is needed. The mappings are released
+    before the caller renames the file (an open mapping blocks the rename on
+    Windows and pins pages everywhere).
     """
     dst = np.memmap(dst_path, dtype=np.uint8, mode="r+")
     src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
-    try:
-        for src_path, src_offset, dst_offset, nbytes in plan:
-            key = os.fspath(src_path)
-            src = src_maps.get(key)
-            if src is None:
-                src = np.memmap(key, dtype=np.uint8, mode="r")
-                src_maps[key] = src
+    for src_path, _src_offset, _dst_offset, _nbytes in plan:
+        key = os.fspath(src_path)
+        if key not in src_maps:
+            src_maps[key] = np.memmap(key, dtype=np.uint8, mode="r")
+
+    def make_job(run: CopyRun) -> Callable[[], None]:
+        src_path, src_offset, dst_offset, nbytes = run
+        src = src_maps[os.fspath(src_path)]
+
+        def job() -> None:
             dst[dst_offset : dst_offset + nbytes] = src[src_offset : src_offset + nbytes]
+
+        return job
+
+    try:
+        _run_copy_jobs([make_job(run) for run in plan], workers)
         dst.flush()
     finally:
         _release_memmap(dst)
@@ -992,12 +1019,14 @@ def _copy_plan_mmap(dst_path: str, plan: list[CopyRun]) -> None:
             _release_memmap(src)
 
 
-def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun]) -> None:
+def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     """Fill the destination body with ``copy_file_range`` (Linux only).
 
     Each run is copied range-to-range without a user-space bounce; on reflink
     filesystems and networked stores the kernel can share extents or copy
-    server-side, so the bytes need not transit the client at all. Raises
+    server-side, so the bytes need not transit the client at all. The disjoint
+    runs are copied concurrently against a shared destination descriptor (each
+    call gives explicit offsets, so the file position is untouched). Raises
     ``OSError`` if the platform or filesystem does not support it, which the
     caller catches to fall back to :func:`_copy_plan_mmap`.
     """
@@ -1007,46 +1036,55 @@ def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun]) -> None:
     src_fds: dict[str, int] = {}
     dst_fd = os.open(dst_path, os.O_WRONLY)
     try:
-        for src_path, src_offset, dst_offset, nbytes in plan:
+        for src_path, _src_offset, _dst_offset, _nbytes in plan:
             key = os.fspath(src_path)
-            src_fd = src_fds.get(key)
-            if src_fd is None:
-                src_fd = os.open(key, os.O_RDONLY)
-                src_fds[key] = src_fd
-            remaining, read_at, write_at = nbytes, src_offset, dst_offset
-            while remaining:
-                copied = os.copy_file_range(
-                    src_fd, dst_fd, remaining, offset_src=read_at, offset_dst=write_at
-                )
-                if copied == 0:
-                    raise OSError("copy_file_range made no progress (short source).")
-                remaining -= copied
-                read_at += copied
-                write_at += copied
+            if key not in src_fds:
+                src_fds[key] = os.open(key, os.O_RDONLY)
+
+        def make_job(run: CopyRun) -> Callable[[], None]:
+            src_path, src_offset, dst_offset, nbytes = run
+            src_fd = src_fds[os.fspath(src_path)]
+
+            def job() -> None:
+                remaining, read_at, write_at = nbytes, src_offset, dst_offset
+                while remaining:
+                    copied = os.copy_file_range(
+                        src_fd, dst_fd, remaining, offset_src=read_at, offset_dst=write_at
+                    )
+                    if copied == 0:
+                        raise OSError("copy_file_range made no progress (short source).")
+                    remaining -= copied
+                    read_at += copied
+                    write_at += copied
+
+            return job
+
+        _run_copy_jobs([make_job(run) for run in plan], workers)
     finally:
         os.close(dst_fd)
         for fd in src_fds.values():
             os.close(fd)
 
 
-def _execute_copy_plan(dst_path: str, plan: list[CopyRun]) -> None:
+def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     """Run a merge-copy plan with the best strategy for this platform.
 
     Uses ``copy_file_range`` on Linux, where reflink and networked filesystems
     can complete the copy as a near-metadata-only operation, and falls back to
-    an mmap memcpy elsewhere or when the kernel call is unsupported.
+    an mmap memcpy elsewhere or when the kernel call is unsupported. Both
+    strategies copy the disjoint runs concurrently across ``workers`` threads.
     ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
     """
     strategy = _MERGE_COPY_OVERRIDE or ("cfr" if sys.platform == "linux" else "mmap")
     if strategy == "cfr":
         try:
-            _copy_plan_copy_file_range(dst_path, plan)
+            _copy_plan_copy_file_range(dst_path, plan, workers)
             return
         except OSError:
             # Unsupported platform/kernel/filesystem: fall back. The mmap pass
             # rewrites the whole body, so any partial progress is overwritten.
             pass
-    _copy_plan_mmap(dst_path, plan)
+    _copy_plan_mmap(dst_path, plan, workers)
 
 
 def write_dataset_streaming(
@@ -1120,7 +1158,8 @@ def write_dataset_streaming(
                 # straight into the body; anything else materializes per batch.
                 plan = _merge_copy_plan(specs, names, on_disk_dtypes, body_offset, n_rows)
                 if plan is not None:
-                    _execute_copy_plan(tmp_path, plan)
+                    workers = max(1, config.get_gather_thread_cap())
+                    _execute_copy_plan(tmp_path, plan, workers)
                 else:
                     _fill_streaming(
                         tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows
