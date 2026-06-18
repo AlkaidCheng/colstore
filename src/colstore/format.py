@@ -1030,9 +1030,13 @@ def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun], workers: int)
     ``OSError`` if the platform or filesystem does not support it, which the
     caller catches to fall back to :func:`_copy_plan_mmap`.
     """
+    # copy_file_range needs a Linux kernel and an interpreter whose os module
+    # exposes it -- builds against an old glibc (e.g. some conda-forge Pythons)
+    # omit it. Either way, signal the caller to fall back to mmap.
     if sys.platform != "linux":
-        # copy_file_range is Linux-only; signal the caller to fall back to mmap.
         raise OSError("copy_file_range is unavailable on this platform.")
+    if not hasattr(os, "copy_file_range"):
+        raise OSError("copy_file_range is not available in this interpreter.")
     src_fds: dict[str, int] = {}
     dst_fd = os.open(dst_path, os.O_WRONLY)
     try:
@@ -1075,14 +1079,16 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
     strategies copy the disjoint runs concurrently across ``workers`` threads.
     ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
     """
-    strategy = _MERGE_COPY_OVERRIDE or ("cfr" if sys.platform == "linux" else "mmap")
+    have_cfr = sys.platform == "linux" and hasattr(os, "copy_file_range")
+    strategy = _MERGE_COPY_OVERRIDE or ("cfr" if have_cfr else "mmap")
     if strategy == "cfr":
         try:
             _copy_plan_copy_file_range(dst_path, plan, workers)
             return
         except OSError:
-            # Unsupported platform/kernel/filesystem: fall back. The mmap pass
-            # rewrites the whole body, so any partial progress is overwritten.
+            # Unsupported platform/kernel/filesystem, or copy_file_range absent
+            # from this interpreter: fall back. The mmap pass rewrites the whole
+            # body, so any partial copy_file_range progress is overwritten.
             pass
     _copy_plan_mmap(dst_path, plan, workers)
 

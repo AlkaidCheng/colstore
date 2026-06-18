@@ -195,6 +195,22 @@ def test_non_native_dtype_declines_merge(tmp_path):
         store.close()
 
 
+def test_copy_file_range_absent_raises_oserror(tmp_path, monkeypatch):
+    # On a Linux interpreter whose os module lacks copy_file_range (e.g. a build
+    # against an old glibc), the cfr strategy must raise OSError -- which the
+    # executor catches to fall back to mmap -- not AttributeError, which would
+    # crash the write. Real files and a non-empty run, so without the guard the
+    # call would reach os.copy_file_range and raise AttributeError instead.
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"x" * 64)
+    dst = tmp_path / "dst.bin"
+    dst.write_bytes(b"\0" * 64)
+    monkeypatch.setattr(fmt.sys, "platform", "linux")
+    monkeypatch.delattr(fmt.os, "copy_file_range", raising=False)
+    with pytest.raises(OSError):
+        fmt._copy_plan_copy_file_range(str(dst), [(src, 0, 0, 64)], 1)
+
+
 def test_disk_runs_reconstruct_column_bytes(tmp_path):
     # The runs of a multi-record column, concatenated, equal the column's bytes.
     store = testing.make_store(tmp_path / "s.cstore", rows=300, cols=2, records=3, dtype="float64")
