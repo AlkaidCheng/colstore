@@ -278,3 +278,25 @@ def test_batch_count_matches_ceiling(tmp_path):
     path = tmp_path / "c.cstore"
     write_dataset_streaming({"x": col}, n, path, memory_budget=8 * rows_per_batch)
     assert col.reads == math.ceil(n / rows_per_batch)
+
+
+def test_fusible_passthroughs_selects_unshared_native_columns(tmp_path):
+    # The streaming sink fills a passthrough column straight from its source only
+    # when its expression is a bare native column whose leaf no other column
+    # reads -- so a native read shared with a transform stays on the memoized
+    # path and is read once, not once per consumer.
+    from colstore.frame import NativeColumn, fusible_passthroughs
+
+    path = tmp_path / "s.cstore"
+    colstore.store(
+        {"a": np.arange(5, dtype=np.int64), "b": np.arange(5, dtype=np.float64)},
+        path,
+        show_progress=False,
+    ).close()
+    with colstore.open(path) as store:
+        a = NativeColumn(store, "a")
+        b = NativeColumn(store, "b")
+        specs = {"a": a, "a_plus": a + 1, "b": b}  # a feeds a transform; b is plain
+        fusible = fusible_passthroughs(specs)
+        assert set(fusible) == {"b"}  # a excluded (shared leaf), a_plus excluded (transform)
+        assert fusible["b"] is b

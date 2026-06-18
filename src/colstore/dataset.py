@@ -473,11 +473,18 @@ class ColStoreDataset(_ReaderBase):
             return self._fancy_one(column_name, row_indexer.astype(np.int64, copy=False))
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
 
-    def _gather_one_contiguous(
-        self, column_name: str, dtype: np.dtype[Any], parts: list[tuple[int, Any]], is_mask: bool
-    ) -> NDArray[Any]:
-        lengths = self._contiguous_lengths(parts, is_mask)
-        out = np.empty(sum(lengths), dtype=dtype)
+    def _fill_contiguous(
+        self,
+        out: NDArray[Any],
+        column_name: str,
+        parts: list[tuple[int, Any]],
+        lengths: list[int],
+    ) -> None:
+        """Fill ``out`` left to right, each file's portion of one column in turn.
+
+        The portions cover disjoint, in-order regions of ``out``, so the per-file
+        fills run concurrently without locking.
+        """
         jobs: list[Callable[[], None]] = []
         write = 0
         for (file_index, sub), length in zip(parts, lengths, strict=True):
@@ -488,6 +495,29 @@ class ColStoreDataset(_ReaderBase):
             )
             write += length
         self._run_fill_jobs(jobs)
+
+    def _gather_slice_into(
+        self, out: NDArray[Any], column_name: str, start: int, stop: int
+    ) -> None:
+        """Fill ``out`` with a forward slice's rows directly, one file at a time.
+
+        The forward-slice case of :meth:`_gather_one`, but writing each file's
+        portion straight into the caller's array (e.g. a region of a memory-mapped
+        output) instead of allocating and returning a fresh one -- one copy from
+        source to destination rather than two.
+        """
+        self._check_open()
+        self._require_columns([column_name])
+        parts = self._slice_parts(slice(start, stop))
+        lengths = self._contiguous_lengths(parts, False)
+        self._fill_contiguous(out, column_name, parts, lengths)
+
+    def _gather_one_contiguous(
+        self, column_name: str, dtype: np.dtype[Any], parts: list[tuple[int, Any]], is_mask: bool
+    ) -> NDArray[Any]:
+        lengths = self._contiguous_lengths(parts, is_mask)
+        out = np.empty(sum(lengths), dtype=dtype)
+        self._fill_contiguous(out, column_name, parts, lengths)
         return out
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
