@@ -679,6 +679,44 @@ class ColStoreReader(_ReaderBase):
         start_rows = np.array([0, self._n_rows], dtype=np.int64)
         return start_rows, np.array([base], dtype=np.int64)
 
+    def _column_disk_runs(self, column_name: str) -> list[tuple[Path, int, int]]:
+        """On-disk byte runs for one column, for a raw passthrough merge copy.
+
+        Returns ``(path, file_offset, n_bytes)`` per record (one run for a
+        single-record file, one per record otherwise), in global row order, so
+        concatenating the runs reproduces the column's contiguous on-disk image.
+        These are *file* coordinates -- the copy counterpart to the in-memory
+        addresses :meth:`_column_segment_table` produces for the gather kernel.
+
+        Raises ``ValueError`` for a non-native on-disk dtype: a raw byte copy
+        cannot byteswap, so the caller falls back to the materializing write.
+        """
+        if self._closed:
+            raise ValueError("ColStoreReader is closed.")
+        disk_dtype = self._column_dtypes[column_name]
+        if not _dtype_is_native(disk_dtype):
+            raise ValueError(
+                f"Raw merge copy requires native byte order; column "
+                f"{column_name!r} has dtype {disk_dtype}."
+            )
+        itemsize = disk_dtype.itemsize
+        if self._is_multi_record:
+            rsb = self._record_starts_bytes
+            nrr = self._n_rows_per_record
+            col_prefix = int(self._column_prefix_bytes[column_name])
+            runs: list[tuple[Path, int, int]] = []
+            for record_index in range(len(nrr)):
+                rows = int(nrr[record_index])
+                if rows == 0:
+                    continue
+                offset = int(rsb[record_index]) + col_prefix * rows
+                runs.append((self._path, offset, rows * itemsize))
+            return runs
+        if self._n_rows == 0:
+            return []
+        column_offset, _ = self._layout[column_name]
+        return [(self._path, int(column_offset), self._n_rows * itemsize)]
+
     # ---- Multi-record read path -----------------------------------------
 
     def _detect_uniform_record_layout(self) -> tuple[int, int, int, int] | None:

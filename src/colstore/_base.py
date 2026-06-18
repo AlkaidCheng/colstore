@@ -21,6 +21,8 @@ from numpy.typing import NDArray
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from .frame import ColStoreFrame
 
 
@@ -73,6 +75,23 @@ class _ReaderBase(abc.ABC):
         directly, sparing the intermediate array.
         """
         out[:] = self._gather_one(column_name, slice(start, stop))
+
+    @abc.abstractmethod
+    def _column_disk_runs(self, column_name: str) -> list[tuple[Path, int, int]]:
+        """On-disk byte runs of one column, in global row order.
+
+        Returns ``(path, file_offset, n_bytes)`` triples whose concatenation is
+        the column's contiguous on-disk image -- the file-coordinate basis for a
+        raw passthrough merge copy, which writes those bytes straight to the
+        destination instead of materializing them. A single-record file yields
+        one run; a multi-record or multi-file source yields one per record, in
+        order.
+
+        Implementations raise ``ValueError`` when a raw byte copy would not
+        preserve values (a non-native on-disk dtype, which cannot be byteswapped
+        by a copy); the merge-copy caller treats that as "not a pure merge" and
+        falls back to the materializing write.
+        """
 
     # ---- Column metadata -----------------------------------------------
 

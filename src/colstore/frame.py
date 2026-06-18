@@ -411,6 +411,17 @@ class NativeColumn(_Leaf):
         if stop > start:
             self._store._gather_slice_into(out, self._name, start, stop)
 
+    def _disk_runs(self) -> list[tuple[Any, int, int]]:
+        """Source ``(path, file_offset, n_bytes)`` runs for a raw merge copy.
+
+        Defers to the backing store's :meth:`~colstore._base._ReaderBase.
+        _column_disk_runs`, so a no-transform merge copies the column's bytes
+        straight from the source file(s). Raises ``ValueError`` (propagated from
+        the store) when the dtype cannot be raw-copied, which the caller treats
+        as "not a pure merge".
+        """
+        return self._store._column_disk_runs(self._name)
+
 
 class MemoryColumn(_Leaf):
     """A leaf backed by an in-memory 1-D array.
