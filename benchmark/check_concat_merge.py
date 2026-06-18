@@ -23,11 +23,13 @@ No numbers are baked in -- run it on the target machine.
     PYTHONPATH=src python benchmark/check_concat_merge.py --records 8   # multi-record sources
 
 To sweep run-split sizes (the question of whether finer parallel granularity
-helps the copy), pass several ``--chunk-mb`` values; ``0`` is no split. Few large
-files is where splitting should matter most:
+helps the copy), pass several ``--chunk-mb`` values; ``0`` is no split. Splitting
+can only help when the run count (files x columns) is below the copy's thread
+budget, so test it on a compute node with a high ``--thread`` cap and few large
+files -- otherwise the runs already fill the threads and splitting is a no-op:
 
-    PYTHONPATH=src python benchmark/check_concat_merge.py --files 2 --rows 8000000 \\
-        --chunk-mb 0 1 4 16
+    PYTHONPATH=src python benchmark/check_concat_merge.py --files 2 --rows 16000000 \\
+        --thread 64 --chunk-mb 0 4 16 64
 """
 
 from __future__ import annotations
@@ -109,7 +111,14 @@ def main() -> None:
         help="run-split sizes (MiB) to sweep for the merge/mmap copy; 0 = no split",
     )
     _c.add_common_args(
-        parser, repeat=7, warmup=2, rows=1_000_000, cols=4, dtype="float64", scale=True
+        parser,
+        repeat=7,
+        warmup=2,
+        rows=1_000_000,
+        cols=4,
+        dtype="float64",
+        threads=True,
+        scale=True,
     )
     args = parser.parse_args()
     _c.apply_runtime_config(args)
