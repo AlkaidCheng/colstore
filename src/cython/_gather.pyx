@@ -54,6 +54,9 @@ cdef extern from "colstore/gather.hpp" nogil:
     int colstore_gather_multirecord(const uint8_t*, const int64_t*, uint8_t*,
                                        ptrdiff_t, const int64_t*, const int64_t*,
                                        const int64_t*, int64_t, int64_t, int, int, ptrdiff_t)
+    int colstore_gather_multifile(const int64_t*, uint8_t*, ptrdiff_t,
+                                  const int64_t*, const int64_t*, int64_t,
+                                  int, int, ptrdiff_t)
     int colstore_gather_multirecord_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
@@ -926,6 +929,79 @@ def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
     cdef int status
     with nogil:
         status = colstore_gather_multirecord(base, indices_ptr, output_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+def gather_multifile(cnp.ndarray indices, cnp.ndarray output,
+                     cnp.ndarray segment_starts_rows,
+                     cnp.ndarray segment_base,
+                     int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Fused multi-file fancy gather: ``output[i] = value(indices[i])``.
+
+    The multi-record fused gather one level up: several files form one global
+    row space, decomposed into segments (one record of one file each). Each
+    index is binned to its segment by the same branchless search the
+    multi-record kernel uses for records, and read at an absolute address --
+    no source base pointer, because segments live in different mmaps.
+
+    Parameters
+    ----------
+    indices : numpy.ndarray
+        1D ``int64`` global row indices, each in
+        ``[0, segment_starts_rows[-1])`` (the view layer guarantees this).
+        Need not be sorted.
+    output : numpy.ndarray
+        1D destination of length ``len(indices)`` and the column's dtype, in
+        *native* byte order (the kernel does a raw typed load and cannot
+        byteswap). Filled in-place, contiguous in requested order.
+    segment_starts_rows : numpy.ndarray
+        1D ``int64`` cumulative global row counts, length ``n_segments + 1``.
+    segment_base : numpy.ndarray
+        1D ``int64`` per-segment absolute byte addresses, length
+        ``n_segments``: global row ``idx`` of segment ``s`` is at
+        ``segment_base[s] + idx * itemsize``. The caller folds each file's
+        mmap base, record body and column offset, and the segment's global
+        start row into this value.
+    thread_cap, prefetch_distance : int, optional
+        Shared kernel parameters; see the module docstring.
+
+    Raises
+    ------
+    TypeError
+        If ``indices`` or any segment array is not ``int64``, or the element
+        size is unsupported.
+    ValueError
+        If shapes are 1D-inconsistent or lengths disagree.
+    """
+    _require_1d((indices, output, segment_starts_rows, segment_base), "indices, output, and segment arrays must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int64(segment_starts_rows, "segment_starts_rows")
+    _require_int64(segment_base, "segment_base")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    _require_output_len(output, n, "indices")
+    cdef long long n_segments = segment_base.shape[0]
+    if segment_starts_rows.shape[0] != n_segments + 1:
+        raise ValueError("segment_starts_rows length must be n_segments + 1.")
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("indices", indices), ("output", output), ("segment_starts_rows", segment_starts_rows), ("segment_base", segment_base)))
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* ssr = <const int64_t*>cnp.PyArray_DATA(segment_starts_rows)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multifile(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
