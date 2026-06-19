@@ -2,24 +2,25 @@
 
 ``concat(parts, out=...)`` of same-schema files with no transform is a pure
 merge: the destination body is exactly the sources' column bytes concatenated.
-This compares three ways to fill that body, interleaved A/B so page-cache and
-scheduler state stay comparable:
+This compares two write paths -- the materializing per-batch write (used by every
+transform/general write) and the no-transform merge fast path -- each with an
+mmap fill and a pwrite fill, interleaved A/B so page-cache and scheduler state
+stay comparable:
 
-  streaming      : the materializing per-batch write (the prior path) -- read
-                   each column region into NumPy, assign into the output memmap
-  merge / mmap   : the merge fast path, mmap memcpy of the source byte ranges
-  merge / pwrite : the merge fast path issuing large sequential ``os.pwrite``
-                   calls instead of mmap's page-granular dirtying -- the pattern
-                   a parallel filesystem (Lustre) serves well where mmap does not
-  merge / cfr    : the merge fast path via ``copy_file_range`` (Linux only;
-                   on reflink/networked filesystems the kernel can share extents
-                   or copy server-side, avoiding the client byte transfer)
+  streaming / mmap   : materialize each batch, store it through a per-column mmap
+                       (the pre-pwrite default, and the baseline)
+  streaming / pwrite : materialize each batch, write it with large ``os.pwrite``
+  merge / mmap       : merge fast path, mmap memcpy of the source byte ranges
+  merge / pwrite     : merge fast path, large sequential ``os.pwrite`` of them
+  merge / cfr        : merge fast path via ``copy_file_range`` (Linux only)
 
+mmap dirties the destination one page at a time, which a parallel filesystem
+(Lustre) serves poorly; pwrite issues large contiguous writes it serves well.
 The ``cfr`` row appears only where ``os.copy_file_range`` exists. A correctness
-gate asserts all active strategies produce a byte-identical file before any
-timing. No numbers are baked in -- run it on the target machine, and set
-``TMPDIR`` to the real target filesystem (an mmap store to a parallel filesystem
-behaves nothing like one to a node-local disk):
+gate asserts all active variants produce a byte-identical file before any timing.
+No numbers are baked in -- run it on the target machine, and set ``TMPDIR`` to the
+real target filesystem (an mmap store to a parallel filesystem behaves nothing
+like one to a node-local disk):
 
     PYTHONPATH=src python benchmark/check_concat_merge.py
     PYTHONPATH=src python benchmark/check_concat_merge.py --files 16 --rows 2000000
@@ -60,25 +61,29 @@ def build_parts(
 
 
 def make_writer(parts: list[Path], out: Path, strategy: str | None, streaming: bool):
-    """A no-arg callable that writes ``out`` with the chosen fill strategy.
+    """A no-arg callable that writes ``out`` with the chosen method.
 
-    ``streaming=True`` forces the materializing path (the merge plan disabled);
-    otherwise the merge fast path runs with ``strategy`` ("mmap"/"cfr"/None).
-    Module state is set per call and restored, so interleaving stays correct.
+    ``streaming=True`` forces the materializing path (the merge plan disabled)
+    with its fill method set to ``strategy`` ("mmap"/"pwrite"); otherwise the
+    merge fast path runs with ``strategy`` ("mmap"/"pwrite"/"cfr"). Module state
+    is set per call and restored, so interleaving stays correct.
     """
 
     def run() -> None:
         saved_plan = fmt._merge_copy_plan
-        saved_override = fmt._MERGE_COPY_OVERRIDE
+        saved_merge = fmt._MERGE_COPY_OVERRIDE
+        saved_stream = fmt._STREAMING_FILL_OVERRIDE
         if streaming:
             fmt._merge_copy_plan = lambda *args, **kwargs: None  # type: ignore[assignment]
+            fmt._STREAMING_FILL_OVERRIDE = strategy
         else:
             fmt._MERGE_COPY_OVERRIDE = strategy
         try:
             colstore.concat(parts, out=out).close()
         finally:
             fmt._merge_copy_plan = saved_plan
-            fmt._MERGE_COPY_OVERRIDE = saved_override
+            fmt._MERGE_COPY_OVERRIDE = saved_merge
+            fmt._STREAMING_FILL_OVERRIDE = saved_stream
 
     return run
 
@@ -115,11 +120,14 @@ def main() -> None:
             directory, args.files, rows_per_file, args.cols, args.dtype, args.records
         )
 
-        # Build the variant list: streaming baseline, mmap, sequential pwrite,
-        # and cfr where present. pwrite issues large contiguous writes instead of
-        # mmap's page-granular dirtying -- the question for a parallel filesystem.
+        # Build the variant list. Both the materializing (streaming) write and
+        # the merge fast path are compared with their mmap fill against their
+        # pwrite fill: pwrite issues large contiguous writes instead of mmap's
+        # page-granular dirtying -- the question for a parallel filesystem. The
+        # mmap streaming write is the baseline (the pre-pwrite default).
         variants: list[tuple[str, str | None, bool]] = [
-            ("streaming (materialize)", None, True),
+            ("streaming / mmap", "mmap", True),
+            ("streaming / pwrite", "pwrite", True),
             ("merge / mmap", "mmap", False),
             ("merge / pwrite", "pwrite", False),
         ]
@@ -136,7 +144,7 @@ def main() -> None:
             for label, strategy, streaming in variants:
                 make_writer(parts, outputs[label], strategy, streaming)()
                 digests[label] = _digest(outputs[label])
-            reference = digests["streaming (materialize)"]
+            reference = digests[variants[0][0]]
             for label, value in digests.items():
                 status = "ok" if value == reference else "MISMATCH"
                 print(f"  correctness {label:28s} {status}")

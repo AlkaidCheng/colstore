@@ -101,6 +101,34 @@ def test_byte_identical_to_write_dataset(tmp_path):
     )
 
 
+def test_streaming_pwrite_matches_mmap(tmp_path):
+    # The pwrite and mmap streaming fills must produce byte-identical output. A
+    # transform keeps the write off the pure-merge fast path, and the on-disk
+    # source columns are fusible passthroughs, so both fill branches (evaluate
+    # and _fill_into) run; a tiny budget forces many batches.
+    from colstore import format as fmt
+    from colstore import testing
+
+    store = testing.make_store(tmp_path / "src.cstore", rows=500, cols=2, dtype="float64", seed=3)
+    try:
+        column = store.columns[0]
+        digests = {}
+        for method in ("mmap", "pwrite"):
+            frame = store.edit()
+            frame["scaled"] = frame[column] * 2.0
+            saved = fmt._STREAMING_FILL_OVERRIDE
+            fmt._STREAMING_FILL_OVERRIDE = method
+            try:
+                out = tmp_path / f"{method}.cstore"
+                frame.write(out, memory_budget=8 * 8)  # many batches
+            finally:
+                fmt._STREAMING_FILL_OVERRIDE = saved
+            digests[method] = hashlib.sha256(out.read_bytes()).hexdigest()
+        assert digests["mmap"] == digests["pwrite"]
+    finally:
+        store.close()
+
+
 def test_transform_and_const_columns_round_trip(tmp_path):
     rng = np.random.default_rng(2)
     n = 500
