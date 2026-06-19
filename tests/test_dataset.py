@@ -715,6 +715,50 @@ def test_multifile_fancy_native_sorted_matches_fallback_and_oracle(tmp_path, mon
         np.testing.assert_array_equal(both["y"], oy[index])
 
 
+def test_segment_table_cache_invalidated_on_append(tmp_path):
+    # The per-column native segment table is memoized across reads; growing the
+    # dataset must clear that memo so later reads see the new file. The
+    # correctness check holds whether or not the compiled kernel is present (a
+    # stale table would fold the pre-append offsets and misread the new rows).
+    from colstore import kernels
+
+    paths, ox, oy = _build_files(tmp_path, [40, 25, 35])
+    rng = np.random.default_rng(0)
+
+    ds = ColStoreDataset(paths[:2])  # 65 rows
+    try:
+        first = rng.integers(0, 65, size=200, dtype=np.int64)
+        np.testing.assert_array_equal(ds[first, "x"].array(), ox[first])
+        if kernels.cpp_available():
+            assert "x" in ds._segment_table_cache  # populated by the read
+
+        ds.append(paths[2])  # 65 -> 100 rows
+        assert ds._segment_table_cache == {}  # invalidated by the structure change
+
+        second = rng.integers(0, 100, size=300, dtype=np.int64)
+        second[:4] = [66, 80, 99, 70]  # force reads from the appended file
+        both = ds[second, ["x", "y"]].dict()
+        np.testing.assert_array_equal(both["x"], ox[second])
+        np.testing.assert_array_equal(both["y"], oy[second])
+    finally:
+        ds.close()
+
+
+def test_segment_table_memoized_across_reads(tmp_path):
+    # A second read reuses the cached table object rather than rebuilding it.
+    from colstore import kernels
+
+    if not kernels.cpp_available():
+        pytest.skip("native segment table requires the compiled gather extension")
+    paths, _, _ = _build_files(tmp_path, [50, 50])
+    rng = np.random.default_rng(1)
+    with colstore.open(paths) as ds:
+        ds[rng.integers(0, 100, size=100, dtype=np.int64), "x"].array()
+        cached = ds._segment_table_cache["x"]
+        ds[rng.integers(0, 100, size=100, dtype=np.int64), "x"].array()
+        assert ds._native_segment_table("x") is cached  # same object, not rebuilt
+
+
 # ---- Zero-copy seam rules ----------------------------------------------
 
 
