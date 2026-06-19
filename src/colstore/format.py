@@ -925,8 +925,8 @@ def _fill_streaming(
 CopyRun = tuple[PathLike, int, int, int]
 
 # Override for the merge-copy strategy, for benchmarking only (not public API).
-# ``None`` autodetects (copy_file_range on Linux, else mmap); "mmap" or "cfr"
-# forces that strategy regardless of platform.
+# ``None`` autodetects (pwrite where os.pwrite exists, else mmap); "pwrite",
+# "mmap", or "cfr" forces that strategy regardless of platform.
 _MERGE_COPY_OVERRIDE: str | None = None
 
 
@@ -1070,17 +1070,58 @@ def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun], workers: int)
             os.close(fd)
 
 
-def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None:
-    """Run a merge-copy plan with the best strategy for this platform.
+def _copy_plan_pwrite(dst_path: str, plan: list[CopyRun], workers: int) -> None:
+    """Fill the destination body with large sequential ``pwrite`` calls.
 
-    Uses ``copy_file_range`` on Linux, where reflink and networked filesystems
-    can complete the copy as a near-metadata-only operation, and falls back to
-    an mmap memcpy elsewhere or when the kernel call is unsupported. Both
-    strategies copy the disjoint runs concurrently across ``workers`` threads.
-    ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
+    Each run is read from its source mapping as a zero-copy ``memoryview`` and
+    written to the destination descriptor with :func:`os.pwrite` -- one large,
+    contiguous write per run rather than the page-granular dirtying an mmap
+    store does. A parallel filesystem (e.g. Lustre) serves the large-write
+    pattern efficiently and the mmap pattern poorly. The runs target disjoint,
+    explicit offsets, so they parallelize on a shared descriptor without
+    locking; the caller's ``fsync`` flushes the buffered writes.
     """
-    have_cfr = sys.platform == "linux" and hasattr(os, "copy_file_range")
-    strategy = _MERGE_COPY_OVERRIDE or ("cfr" if have_cfr else "mmap")
+    dst_fd = os.open(dst_path, os.O_WRONLY)
+    src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
+    for src_path, _src_offset, _dst_offset, _nbytes in plan:
+        key = os.fspath(src_path)
+        if key not in src_maps:
+            src_maps[key] = np.memmap(key, dtype=np.uint8, mode="r")
+
+    def make_job(run: CopyRun) -> Callable[[], None]:
+        src_path, src_offset, dst_offset, nbytes = run
+        view = src_maps[os.fspath(src_path)].data  # zero-copy buffer over the mmap
+
+        def job() -> None:
+            written = 0
+            while written < nbytes:
+                chunk = view[src_offset + written : src_offset + nbytes]
+                written += os.pwrite(dst_fd, chunk, dst_offset + written)
+
+        return job
+
+    try:
+        _run_copy_jobs([make_job(run) for run in plan], workers)
+    finally:
+        os.close(dst_fd)
+        for src in src_maps.values():
+            _release_memmap(src)
+
+
+def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None:
+    """Run a merge-copy plan with the best available strategy.
+
+    Defaults to ``pwrite`` -- large sequential writes, which a parallel
+    filesystem (Lustre) serves far better than mmap's page-granular dirtying
+    (measured ~4x on Lustre; faster node-local too) -- and falls back to an mmap
+    memcpy only where ``os.pwrite`` is unavailable (Windows). The disjoint runs
+    copy concurrently across ``workers`` threads. ``_MERGE_COPY_OVERRIDE`` forces
+    a strategy ("pwrite", "mmap", or "cfr") for benchmarking; ``copy_file_range``
+    is no longer auto-selected -- unconfirmed against pwrite and absent on some
+    interpreters -- but stays reachable for evaluation.
+    """
+    have_pwrite = hasattr(os, "pwrite")
+    strategy = _MERGE_COPY_OVERRIDE or ("pwrite" if have_pwrite else "mmap")
     if strategy == "cfr":
         try:
             _copy_plan_copy_file_range(dst_path, plan, workers)
@@ -1090,6 +1131,9 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
             # from this interpreter: fall back. The mmap pass rewrites the whole
             # body, so any partial copy_file_range progress is overwritten.
             pass
+    elif strategy == "pwrite" and have_pwrite:
+        _copy_plan_pwrite(dst_path, plan, workers)
+        return
     _copy_plan_mmap(dst_path, plan, workers)
 
 

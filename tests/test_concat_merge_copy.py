@@ -52,7 +52,7 @@ def _reset_strategy_override():
 # ---- Byte identity: the merge copy matches the materializing write ---------
 
 
-@pytest.mark.parametrize("strategy", [None, "mmap", "cfr"])
+@pytest.mark.parametrize("strategy", [None, "mmap", "cfr", "pwrite"])
 def test_single_record_merge_is_byte_identical(tmp_path, strategy):
     fmt._MERGE_COPY_OVERRIDE = strategy
     parts = []

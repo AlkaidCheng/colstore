@@ -5,22 +5,25 @@ merge: the destination body is exactly the sources' column bytes concatenated.
 This compares three ways to fill that body, interleaved A/B so page-cache and
 scheduler state stay comparable:
 
-  streaming     : the materializing per-batch write (the prior path) -- read
-                  each column region into NumPy, assign into the output memmap
-  merge / mmap  : the merge fast path, mmap memcpy of the source byte ranges
-  merge / cfr   : the merge fast path via ``copy_file_range`` (Linux only;
-                  on reflink/networked filesystems the kernel can share extents
-                  or copy server-side, avoiding the client byte transfer)
+  streaming      : the materializing per-batch write (the prior path) -- read
+                   each column region into NumPy, assign into the output memmap
+  merge / mmap   : the merge fast path, mmap memcpy of the source byte ranges
+  merge / pwrite : the merge fast path issuing large sequential ``os.pwrite``
+                   calls instead of mmap's page-granular dirtying -- the pattern
+                   a parallel filesystem (Lustre) serves well where mmap does not
+  merge / cfr    : the merge fast path via ``copy_file_range`` (Linux only;
+                   on reflink/networked filesystems the kernel can share extents
+                   or copy server-side, avoiding the client byte transfer)
 
-The ``cfr`` row appears only where ``os.copy_file_range`` exists, so the same
-script reports streaming vs. mmap on a local machine and adds the
-``copy_file_range`` comparison on a multi-node Linux target. A correctness gate
-asserts all active strategies produce a byte-identical file before any timing.
-No numbers are baked in -- run it on the target machine.
+The ``cfr`` row appears only where ``os.copy_file_range`` exists. A correctness
+gate asserts all active strategies produce a byte-identical file before any
+timing. No numbers are baked in -- run it on the target machine, and set
+``TMPDIR`` to the real target filesystem (an mmap store to a parallel filesystem
+behaves nothing like one to a node-local disk):
 
     PYTHONPATH=src python benchmark/check_concat_merge.py
     PYTHONPATH=src python benchmark/check_concat_merge.py --files 16 --rows 2000000
-    PYTHONPATH=src python benchmark/check_concat_merge.py --records 8   # multi-record sources
+    TMPDIR=/scratch/... PYTHONPATH=src python benchmark/check_concat_merge.py --files 2 --rows 16000000
 """
 
 from __future__ import annotations
@@ -112,10 +115,13 @@ def main() -> None:
             directory, args.files, rows_per_file, args.cols, args.dtype, args.records
         )
 
-        # Build the variant list: streaming baseline, mmap, and cfr where present.
+        # Build the variant list: streaming baseline, mmap, sequential pwrite,
+        # and cfr where present. pwrite issues large contiguous writes instead of
+        # mmap's page-granular dirtying -- the question for a parallel filesystem.
         variants: list[tuple[str, str | None, bool]] = [
             ("streaming (materialize)", None, True),
             ("merge / mmap", "mmap", False),
+            ("merge / pwrite", "pwrite", False),
         ]
         if have_cfr:
             variants.append(("merge / copy_file_range", "cfr", False))
