@@ -1070,6 +1070,44 @@ def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun], workers: int)
             os.close(fd)
 
 
+def _copy_plan_pwrite(dst_path: str, plan: list[CopyRun], workers: int) -> None:
+    """Fill the destination body with large sequential ``pwrite`` calls.
+
+    Each run is read from its source mapping as a zero-copy ``memoryview`` and
+    written to the destination descriptor with :func:`os.pwrite` -- one large,
+    contiguous write per run rather than the page-granular dirtying an mmap
+    store does. A parallel filesystem (e.g. Lustre) serves the large-write
+    pattern efficiently and the mmap pattern poorly. The runs target disjoint,
+    explicit offsets, so they parallelize on a shared descriptor without
+    locking; the caller's ``fsync`` flushes the buffered writes.
+    """
+    dst_fd = os.open(dst_path, os.O_WRONLY)
+    src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
+    for src_path, _src_offset, _dst_offset, _nbytes in plan:
+        key = os.fspath(src_path)
+        if key not in src_maps:
+            src_maps[key] = np.memmap(key, dtype=np.uint8, mode="r")
+
+    def make_job(run: CopyRun) -> Callable[[], None]:
+        src_path, src_offset, dst_offset, nbytes = run
+        view = src_maps[os.fspath(src_path)].data  # zero-copy buffer over the mmap
+
+        def job() -> None:
+            written = 0
+            while written < nbytes:
+                chunk = view[src_offset + written : src_offset + nbytes]
+                written += os.pwrite(dst_fd, chunk, dst_offset + written)
+
+        return job
+
+    try:
+        _run_copy_jobs([make_job(run) for run in plan], workers)
+    finally:
+        os.close(dst_fd)
+        for src in src_maps.values():
+            _release_memmap(src)
+
+
 def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     """Run a merge-copy plan with the best strategy for this platform.
 
@@ -1077,7 +1115,8 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
     can complete the copy as a near-metadata-only operation, and falls back to
     an mmap memcpy elsewhere or when the kernel call is unsupported. Both
     strategies copy the disjoint runs concurrently across ``workers`` threads.
-    ``_MERGE_COPY_OVERRIDE`` forces a strategy for benchmarking.
+    ``_MERGE_COPY_OVERRIDE`` forces a strategy (incl. ``"pwrite"``, a sequential
+    large-write path under evaluation for parallel filesystems) for benchmarking.
     """
     have_cfr = sys.platform == "linux" and hasattr(os, "copy_file_range")
     strategy = _MERGE_COPY_OVERRIDE or ("cfr" if have_cfr else "mmap")
@@ -1090,6 +1129,9 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
             # from this interpreter: fall back. The mmap pass rewrites the whole
             # body, so any partial copy_file_range progress is overwritten.
             pass
+    elif strategy == "pwrite":
+        _copy_plan_pwrite(dst_path, plan, workers)
+        return
     _copy_plan_mmap(dst_path, plan, workers)
 
 
