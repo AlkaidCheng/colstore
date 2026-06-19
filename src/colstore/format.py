@@ -881,15 +881,19 @@ def _resolve_write_method(override: str | None) -> str:
     """Resolve the destination write method shared by the merge copy and the
     streaming write.
 
-    Returns ``override`` when given, else ``"pwrite"`` where ``os.pwrite`` exists
-    (large sequential writes, which a parallel filesystem serves far better than
-    mmap's page-granular dirtying) and ``"mmap"`` otherwise (Windows). A forced
-    ``"pwrite"`` downgrades to ``"mmap"`` when ``os.pwrite`` is missing; any other
-    override (e.g. ``"cfr"``) passes through for the caller to validate.
+    Uses ``override`` (a per-call benchmark flag) when given, else the public
+    ``config.get_write_method()`` setting. ``"auto"`` resolves to ``"pwrite"``
+    where ``os.pwrite`` exists (large sequential writes, which a parallel
+    filesystem serves far better than mmap's page-granular dirtying) and
+    ``"mmap"`` otherwise (Windows); a forced ``"pwrite"`` likewise downgrades to
+    ``"mmap"`` when ``os.pwrite`` is missing. Any other override (e.g. ``"cfr"``)
+    passes through for the caller to validate.
     """
-    method = override or ("pwrite" if hasattr(os, "pwrite") else "mmap")
-    if method == "pwrite" and not hasattr(os, "pwrite"):
-        return "mmap"
+    method = override if override is not None else config.get_write_method()
+    if method == "auto":
+        method = "pwrite" if hasattr(os, "pwrite") else "mmap"
+    elif method == "pwrite" and not hasattr(os, "pwrite"):
+        method = "mmap"
     return method
 
 

@@ -21,6 +21,7 @@ except ImportError:
 MadviseOption = Literal["normal", "sequential", "random", "willneed", "dontneed"]
 GatherBackend = Literal["cpp", "numpy", "numba"]
 NumaPolicy = Literal["auto", "interleave", "local"]
+WriteMethod = Literal["auto", "pwrite", "mmap"]
 
 # Per-socket ceiling on gather threads. The kernel is memory-bandwidth-bound,
 # so throughput saturates once the memory channels are busy -- a small count
@@ -104,6 +105,7 @@ _default_madvise: MadviseOption | None = "sequential"
 _default_backend: GatherBackend = "cpp"
 _gather_thread_cap: int = _default_gather_thread_cap()
 _numa_policy: NumaPolicy = "auto"
+_write_method: WriteMethod = "auto"
 _prefetch_distance: int | Literal["auto"] = "auto"
 _default_memory_budget: int = _DEFAULT_MEMORY_BUDGET
 
@@ -471,3 +473,28 @@ def set_numa_policy(policy: NumaPolicy) -> None:
         raise ValueError(f"numa policy must be 'auto', 'interleave', or 'local'; got {policy!r}.")
     global _numa_policy
     _numa_policy = policy
+
+
+def get_write_method() -> WriteMethod:
+    """Return how written file bodies reach disk. See :func:`set_write_method`."""
+    return _write_method
+
+
+def set_write_method(method: WriteMethod) -> None:
+    """Set how written file bodies (merge copies and the streaming write) are filled.
+
+    * ``"auto"`` (default) -- ``"pwrite"`` where :func:`os.pwrite` exists (Unix),
+      else ``"mmap"`` (Windows).
+    * ``"pwrite"`` -- large sequential ``os.pwrite`` calls. Far faster on a
+      parallel filesystem (e.g. Lustre), where mmap's page-granular dirtying is
+      slow; also faster node-local.
+    * ``"mmap"`` -- store each batch/run through a memory-mapped output. The
+      pre-pwrite behavior; kept for parity and as the non-Unix fallback.
+
+    The default suits every filesystem measured so far; override only to force a
+    method (e.g. to reproduce the mmap path, or on a platform where it wins).
+    """
+    if method not in ("auto", "pwrite", "mmap"):
+        raise ValueError(f"write method must be 'auto', 'pwrite', or 'mmap'; got {method!r}.")
+    global _write_method
+    _write_method = method

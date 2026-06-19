@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from colstore import (
+    config,
     get_default_backend,
     get_default_madvise,
     get_max_workers,
@@ -71,3 +72,23 @@ def test_set_default_backend_roundtrips():
 def test_set_default_backend_rejects_unknown():
     with pytest.raises(ValueError):
         set_default_backend("unknown-backend")
+
+
+def test_write_method_starts_as_auto():
+    assert config.get_write_method() == "auto"
+
+
+def test_set_write_method_roundtrips():
+    original = config.get_write_method()
+    try:
+        config.set_write_method("mmap")
+        assert config.get_write_method() == "mmap"
+        config.set_write_method("pwrite")
+        assert config.get_write_method() == "pwrite"
+    finally:
+        config.set_write_method(original)
+
+
+def test_set_write_method_rejects_unknown():
+    with pytest.raises(ValueError):
+        config.set_write_method("bogus")

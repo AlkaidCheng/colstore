@@ -229,6 +229,7 @@ set_default_madvise("sequential")  # OS read-ahead hint for sorted-index reads
 set_default_backend("cpp")         # gather kernel: cpp | numpy | numba
 set_gather_thread_cap(16)          # threads per gather (default scales with socket count)
 config.set_numa_policy("auto")     # page placement: auto (interleave on multi-node) | local
+config.set_write_method("auto")    # write fill: auto (pwrite where available) | pwrite | mmap
 calibrate()                        # one-time: measure the thread/prefetch knees for this host
 ```
 
@@ -275,6 +276,51 @@ binding 24–51% slower on a multi-node host, so `gather_binding` defaults to of
 and the realized path is the unbound default pool.
 
 ![Gather thread binding status](docs/assets/gather_thread_binding_status.svg)
+
+## How writes reach disk
+
+Every write — `frame.write()`, `concat(..., out=...)`, `write_dataset` — chooses
+a path and a fill method:
+
+```
+write
+│
+├─ pure merge?  every output column an unchanged on-disk passthrough
+│  │            (e.g. concat of same-schema files, no edits)
+│  └─ yes ─► merge copy   : copy each source column's byte ranges straight
+│                           into the output (no materialization)
+│
+└─ no           a transform, a new/dropped/renamed column, an in-memory
+   │            or constant column, or a single source
+   └────────► streaming write : evaluate each column in bounded-memory
+                                 batches, then write each batch out
+
+   both paths fill the destination body with one of:
+     pwrite  (default where os.pwrite exists)  large sequential writes
+     mmap    (fallback, e.g. Windows)          memory-mapped output
+```
+
+**Why the fill method matters.** An `mmap`'d output is dirtied one page at a
+time; a parallel filesystem (Lustre) serves that pattern poorly — a 1 GB write
+faults ~250k pages and runs at a fraction of the device's bandwidth. `pwrite`
+issues large contiguous writes instead, which such filesystems serve well:
+measured ~2× faster for the streaming write and ~4× for the merge copy on Lustre
+(zero page faults vs ~250k), and faster node-local too. `pwrite` is therefore the
+default wherever `os.pwrite` exists; `mmap` remains the fallback on Windows.
+
+**Controlling it.** The default (`auto`) is right on every filesystem measured so
+far. Override only to force a method — to reproduce the `mmap` path, or on a
+platform where it is faster:
+
+```python
+from colstore import config
+
+config.set_write_method("pwrite")  # auto (default) | pwrite | mmap
+```
+
+The merge copy reuses the gather thread budget to copy its byte ranges in
+parallel; the streaming write fills one batch at a time within the configured
+memory budget. Output is byte-identical across every method.
 
 ## On-disk format
 

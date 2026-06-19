@@ -129,6 +129,28 @@ def test_streaming_pwrite_matches_mmap(tmp_path):
         store.close()
 
 
+def test_config_write_method_is_honored(tmp_path):
+    # The public config.set_write_method knob drives the streaming write; each
+    # value produces valid byte-identical output, confirming the config path
+    # reaches the fill choice (not just the private benchmark override).
+    from colstore import config
+
+    cols = {"x": np.arange(500, dtype=np.float64), "y": np.arange(500, dtype=np.int32)}
+    original = config.get_write_method()
+    digests = {}
+    try:
+        for method in ("mmap", "pwrite"):
+            config.set_write_method(method)
+            out = tmp_path / f"{method}.cstore"
+            write_dataset_streaming(
+                {k: MemoryColumn(v) for k, v in cols.items()}, 500, out, memory_budget=512
+            )
+            digests[method] = hashlib.sha256(out.read_bytes()).hexdigest()
+    finally:
+        config.set_write_method(original)
+    assert digests["mmap"] == digests["pwrite"]
+
+
 def test_transform_and_const_columns_round_trip(tmp_path):
     rng = np.random.default_rng(2)
     n = 500
