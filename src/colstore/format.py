@@ -869,7 +869,35 @@ def _release_memmap(view: np.memmap[Any, np.dtype[Any]]) -> None:
         mmap_obj.close()
 
 
-def _fill_streaming(
+def _pwrite_all(fd: int, data: memoryview, offset: int) -> None:
+    """Write all of ``data`` to ``fd`` at ``offset``, looping over short writes."""
+    total = len(data)
+    written = 0
+    while written < total:
+        written += os.pwrite(fd, data[written:], offset + written)
+
+
+def _resolve_write_method(override: str | None) -> str:
+    """Resolve the destination write method shared by the merge copy and the
+    streaming write.
+
+    Uses ``override`` (a per-call benchmark flag) when given, else the public
+    ``config.get_write_method()`` setting. ``"auto"`` resolves to ``"pwrite"``
+    where ``os.pwrite`` exists (large sequential writes, which a parallel
+    filesystem serves far better than mmap's page-granular dirtying) and
+    ``"mmap"`` otherwise (Windows); a forced ``"pwrite"`` likewise downgrades to
+    ``"mmap"`` when ``os.pwrite`` is missing. Any other override (e.g. ``"cfr"``)
+    passes through for the caller to validate.
+    """
+    method = override if override is not None else config.get_write_method()
+    if method == "auto":
+        method = "pwrite" if hasattr(os, "pwrite") else "mmap"
+    elif method == "pwrite" and not hasattr(os, "pwrite"):
+        method = "mmap"
+    return method
+
+
+def _fill_streaming_mmap(
     tmp_path: str,
     specs: dict[str, Expr],
     names: list[str],
@@ -919,14 +947,92 @@ def _fill_streaming(
         views.clear()
 
 
+def _fill_streaming_pwrite(
+    tmp_path: str,
+    specs: dict[str, Expr],
+    names: list[str],
+    on_disk_dtypes: dict[str, np.dtype[Any]],
+    body_offset: int,
+    n_rows: int,
+    batch_rows: int,
+) -> None:
+    """Fill a preallocated file body with sequential ``os.pwrite``, batch by batch.
+
+    Same per-batch evaluation as :func:`_fill_streaming_mmap` -- a fresh memo
+    shared across columns, so a subexpression feeding several columns is computed
+    once and released when the batch ends -- but each column's batch is written
+    to the destination with a large ``os.pwrite`` at its fixed offset instead of
+    stored through a per-column memmap. A parallel filesystem (Lustre) serves the
+    large contiguous writes far better than mmap's page-granular dirtying. Byte
+    order is normalized to little-endian when the batch is cast to the on-disk
+    dtype (a no-op on a little-endian host).
+    """
+    column_offset: dict[str, int] = {}
+    offset = body_offset
+    for name in names:
+        column_offset[name] = offset
+        offset += n_rows * on_disk_dtypes[name].itemsize
+    fusible = fusible_passthroughs(specs)
+    fd = os.open(tmp_path, os.O_WRONLY)
+    try:
+        for start in range(0, n_rows, batch_rows):
+            stop = min(start + batch_rows, n_rows)
+            memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
+            for name in names:
+                dtype = on_disk_dtypes[name]
+                passthrough = fusible.get(name)
+                if passthrough is not None:
+                    # A plain native passthrough: fill a batch buffer straight
+                    # from the source, then write it (one copy, as the mmap path).
+                    batch = np.empty(stop - start, dtype=dtype)
+                    passthrough._fill_into(batch, start, stop)
+                else:
+                    batch = np.ascontiguousarray(
+                        evaluate(specs[name], start, stop, memo), dtype=dtype
+                    )
+                _pwrite_all(
+                    fd, batch.view(np.uint8).data, column_offset[name] + start * dtype.itemsize
+                )
+    finally:
+        os.close(fd)
+
+
+# Override for the streaming-fill method, for benchmarking only (not public API).
+# ``None`` autodetects (see _resolve_write_method); "pwrite" or "mmap" forces it.
+_STREAMING_FILL_OVERRIDE: str | None = None
+
+
+def _fill_streaming(
+    tmp_path: str,
+    specs: dict[str, Expr],
+    names: list[str],
+    on_disk_dtypes: dict[str, np.dtype[Any]],
+    body_offset: int,
+    n_rows: int,
+    batch_rows: int,
+) -> None:
+    """Fill the preallocated body one batch at a time, with the best method.
+
+    Defaults to sequential ``os.pwrite`` (large contiguous writes a parallel
+    filesystem serves well), falling back to the per-column mmap store where
+    ``os.pwrite`` is unavailable. ``_STREAMING_FILL_OVERRIDE`` forces a method.
+    """
+    fill = (
+        _fill_streaming_pwrite
+        if _resolve_write_method(_STREAMING_FILL_OVERRIDE) == "pwrite"
+        else _fill_streaming_mmap
+    )
+    fill(tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows)
+
+
 # One merge-copy run: (source path, source byte offset, destination byte offset,
 # byte count). A plan is these runs in destination-write order; copied in order
 # they fill the body.
 CopyRun = tuple[PathLike, int, int, int]
 
 # Override for the merge-copy strategy, for benchmarking only (not public API).
-# ``None`` autodetects (pwrite where os.pwrite exists, else mmap); "pwrite",
-# "mmap", or "cfr" forces that strategy regardless of platform.
+# ``None`` autodetects (see _resolve_write_method); "pwrite", "mmap", or "cfr"
+# forces that strategy.
 _MERGE_COPY_OVERRIDE: str | None = None
 
 
@@ -1090,15 +1196,9 @@ def _copy_plan_pwrite(dst_path: str, plan: list[CopyRun], workers: int) -> None:
 
     def make_job(run: CopyRun) -> Callable[[], None]:
         src_path, src_offset, dst_offset, nbytes = run
-        view = src_maps[os.fspath(src_path)].data  # zero-copy buffer over the mmap
-
-        def job() -> None:
-            written = 0
-            while written < nbytes:
-                chunk = view[src_offset + written : src_offset + nbytes]
-                written += os.pwrite(dst_fd, chunk, dst_offset + written)
-
-        return job
+        # zero-copy byte view of the run over the source mmap
+        chunk = src_maps[os.fspath(src_path)].data[src_offset : src_offset + nbytes]
+        return lambda: _pwrite_all(dst_fd, chunk, dst_offset)
 
     try:
         _run_copy_jobs([make_job(run) for run in plan], workers)
@@ -1120,8 +1220,7 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
     is no longer auto-selected -- unconfirmed against pwrite and absent on some
     interpreters -- but stays reachable for evaluation.
     """
-    have_pwrite = hasattr(os, "pwrite")
-    strategy = _MERGE_COPY_OVERRIDE or ("pwrite" if have_pwrite else "mmap")
+    strategy = _resolve_write_method(_MERGE_COPY_OVERRIDE)
     if strategy == "cfr":
         try:
             _copy_plan_copy_file_range(dst_path, plan, workers)
@@ -1131,7 +1230,7 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
             # from this interpreter: fall back. The mmap pass rewrites the whole
             # body, so any partial copy_file_range progress is overwritten.
             pass
-    elif strategy == "pwrite" and have_pwrite:
+    elif strategy == "pwrite":
         _copy_plan_pwrite(dst_path, plan, workers)
         return
     _copy_plan_mmap(dst_path, plan, workers)
