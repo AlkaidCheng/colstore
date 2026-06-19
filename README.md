@@ -301,12 +301,13 @@ write
 ```
 
 **Why the fill method matters.** An `mmap`'d output is dirtied one page at a
-time; a parallel filesystem (Lustre) serves that pattern poorly — a 1 GB write
-faults ~250k pages and runs at a fraction of the device's bandwidth. `pwrite`
-issues large contiguous writes instead, which such filesystems serve well:
-measured ~2× faster for the streaming write and ~4× for the merge copy on Lustre
-(zero page faults vs ~250k), and faster node-local too. `pwrite` is therefore the
-default wherever `os.pwrite` exists; `mmap` remains the fallback on Windows.
+time; a parallel filesystem serves that pattern poorly — a 1 GB write faults
+~250k pages and runs at a fraction of the device's bandwidth. `pwrite` issues
+large contiguous writes instead, which such filesystems serve well: measured ~2×
+faster for the streaming write and ~4× for the merge copy on a parallel
+filesystem (zero page faults vs ~250k), and faster node-local too. `pwrite` is
+therefore the default wherever `os.pwrite` exists; `mmap` remains the fallback on
+Windows.
 
 **Controlling it.** The default (`auto`) is right on every filesystem measured so
 far. Override only to force a method — to reproduce the `mmap` path, or on a

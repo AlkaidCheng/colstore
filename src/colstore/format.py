@@ -956,16 +956,18 @@ def _fill_streaming_pwrite(
     n_rows: int,
     batch_rows: int,
 ) -> None:
-    """Fill a preallocated file body with sequential ``os.pwrite``, batch by batch.
+    """Fill a preallocated file body with ``os.pwrite``, batch by batch.
 
     Same per-batch evaluation as :func:`_fill_streaming_mmap` -- a fresh memo
     shared across columns, so a subexpression feeding several columns is computed
     once and released when the batch ends -- but each column's batch is written
     to the destination with a large ``os.pwrite`` at its fixed offset instead of
-    stored through a per-column memmap. A parallel filesystem (Lustre) serves the
-    large contiguous writes far better than mmap's page-granular dirtying. Byte
-    order is normalized to little-endian when the batch is cast to the on-disk
-    dtype (a no-op on a little-endian host).
+    stored through a per-column memmap. The columns of a batch write disjoint
+    regions, so their writes are issued concurrently across the gather thread
+    budget; a parallel filesystem serves several large writes in flight far
+    better than mmap's page-granular dirtying. Byte order is normalized to
+    little-endian when the batch is cast to the on-disk dtype (a no-op on a
+    little-endian host).
     """
     column_offset: dict[str, int] = {}
     offset = body_offset
@@ -973,11 +975,21 @@ def _fill_streaming_pwrite(
         column_offset[name] = offset
         offset += n_rows * on_disk_dtypes[name].itemsize
     fusible = fusible_passthroughs(specs)
+    workers = max(1, config.get_gather_thread_cap())
     fd = os.open(tmp_path, os.O_WRONLY)
+
+    def write_job(data: memoryview, dst_offset: int) -> Callable[[], None]:
+        return lambda: _pwrite_all(fd, data, dst_offset)
+
     try:
         for start in range(0, n_rows, batch_rows):
             stop = min(start + batch_rows, n_rows)
             memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
+            # Evaluate the batch's columns serially through the shared memo (so a
+            # shared subexpression is computed once), holding their bytes; the
+            # batch is sized to fit the memory budget, so holding all of one
+            # batch's buffers stays within it.
+            jobs: list[Callable[[], None]] = []
             for name in names:
                 dtype = on_disk_dtypes[name]
                 passthrough = fusible.get(name)
@@ -990,9 +1002,13 @@ def _fill_streaming_pwrite(
                     batch = np.ascontiguousarray(
                         evaluate(specs[name], start, stop, memo), dtype=dtype
                     )
-                _pwrite_all(
-                    fd, batch.view(np.uint8).data, column_offset[name] + start * dtype.itemsize
+                jobs.append(
+                    write_job(
+                        batch.view(np.uint8).data, column_offset[name] + start * dtype.itemsize
+                    )
                 )
+            # The columns of a batch write disjoint regions; issue them at once.
+            _run_copy_jobs(jobs, workers)
     finally:
         os.close(fd)
 
@@ -1182,8 +1198,8 @@ def _copy_plan_pwrite(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     Each run is read from its source mapping as a zero-copy ``memoryview`` and
     written to the destination descriptor with :func:`os.pwrite` -- one large,
     contiguous write per run rather than the page-granular dirtying an mmap
-    store does. A parallel filesystem (e.g. Lustre) serves the large-write
-    pattern efficiently and the mmap pattern poorly. The runs target disjoint,
+    store does. A parallel filesystem serves the large-write pattern efficiently
+    and the mmap pattern poorly. The runs target disjoint,
     explicit offsets, so they parallelize on a shared descriptor without
     locking; the caller's ``fsync`` flushes the buffered writes.
     """
@@ -1212,8 +1228,8 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
     """Run a merge-copy plan with the best available strategy.
 
     Defaults to ``pwrite`` -- large sequential writes, which a parallel
-    filesystem (Lustre) serves far better than mmap's page-granular dirtying
-    (measured ~4x on Lustre; faster node-local too) -- and falls back to an mmap
+    filesystem serves far better than mmap's page-granular dirtying (and which is
+    faster node-local too) -- and falls back to an mmap
     memcpy only where ``os.pwrite`` is unavailable (Windows). The disjoint runs
     copy concurrently across ``workers`` threads. ``_MERGE_COPY_OVERRIDE`` forces
     a strategy ("pwrite", "mmap", or "cfr") for benchmarking; ``copy_file_range``

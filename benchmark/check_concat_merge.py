@@ -15,7 +15,7 @@ stay comparable:
   merge / cfr        : merge fast path via ``copy_file_range`` (Linux only)
 
 mmap dirties the destination one page at a time, which a parallel filesystem
-(Lustre) serves poorly; pwrite issues large contiguous writes it serves well.
+serves poorly; pwrite issues large contiguous writes it serves well.
 The ``cfr`` row appears only where ``os.copy_file_range`` exists. A correctness
 gate asserts all active variants produce a byte-identical file before any timing.
 No numbers are baked in -- run it on the target machine, and set ``TMPDIR`` to the
