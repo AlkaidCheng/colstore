@@ -61,6 +61,10 @@ _SourceLike: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreData
 # segments the dict path keeps an independent pass per column instead.
 _INT32_MAX = (1 << 31) - 1
 
+# One column's native multi-file gather table: cumulative segment start rows and
+# each segment's absolute byte base (see _native_segment_table).
+SegmentTable: TypeAlias = tuple[NDArray[np.int64], NDArray[np.int64]]
+
 _VIEW_FANCY_MESSAGE = (
     "A zero-copy read is available only for contiguous selectors; fancy and "
     "boolean selection require a copying gather. Use copy=True."
@@ -93,6 +97,15 @@ class ColStoreDataset(_ReaderBase):
     Paths are opened and *owned* (closed on :meth:`close`); readers and datasets
     are *borrowed* (left open). Datasets are flattened to their children. The
     public read surface matches :class:`~colstore.reader.ColStoreReader`.
+
+    The native multi-file gather's per-column segment table (:meth:`_native_segment_table`)
+    depends only on the children and the column, not on the rows a read requests,
+    so it is **memoized per column** in ``_segment_table_cache`` and reused across
+    reads. Rebuilding it dominates the per-read cost of the small, repeated fancy
+    reads that index sampling over many files issues -- the table-build is
+    ``O(n_files)`` while the kernel touches only the sampled rows -- so the memo is
+    what keeps that workload fast. The cache is cleared whenever the children
+    change (:meth:`_rebuild_offsets`), so it never serves a stale table.
     """
 
     def __init__(
@@ -105,6 +118,7 @@ class ColStoreDataset(_ReaderBase):
         self._column_dtypes: dict[str, np.dtype[Any]] = {}
         self._offsets: NDArray[np.int64] = np.zeros(1, dtype=np.int64)
         self._n_rows = 0
+        self._segment_table_cache: dict[str, SegmentTable | None] = {}
         self._closed = False
         if sources is not None:
             self.append(sources, **reader_kwargs)
@@ -175,6 +189,7 @@ class ColStoreDataset(_ReaderBase):
                 )
 
     def _rebuild_offsets(self) -> None:
+        self._segment_table_cache.clear()
         self._offsets = np.zeros(len(self._children) + 1, dtype=np.int64)
         if self._children:
             self._offsets[1:] = np.cumsum([child.n_rows for child in self._children])
@@ -395,26 +410,41 @@ class ColStoreDataset(_ReaderBase):
                 blocks.append((file_index, lo, hi, local))
         return order, blocks
 
-    def _native_segment_table(
-        self, column_name: str
-    ) -> tuple[NDArray[np.int64], NDArray[np.int64]] | None:
+    def _native_segment_table(self, column_name: str) -> SegmentTable | None:
         """Global segment table across all files for the native multi-file gather.
 
-        Stitches each file's local table
-        (:meth:`ColStoreReader._column_segment_table`) into one global table by
-        folding the file's row offset into the segment start rows and bases, so
-        a global index reads at ``segment_base[s] + idx * itemsize``. Returns
-        ``None`` -- and the caller takes the portable sort-once path -- when the
-        kernel is unavailable, the element size is unsupported, or any file
-        cannot supply native segments (e.g. a non-native on-disk dtype).
+        Returns the column's ``(start_rows, segment_base)`` stitch, or ``None``
+        -- the caller then takes the portable sort-once path -- when the kernel
+        is unavailable, the element size is unsupported, or any file cannot
+        supply native segments (e.g. a non-native on-disk dtype).
+
+        The stitch is row-independent, so it is memoized per column (see the
+        class docstring). The cheap availability and element-size guards stay
+        live -- re-evaluated on every call -- so the memo holds only the
+        structure-dependent stitch and a build under one ``cpp_available()``
+        regime is never replayed under another.
         """
         from . import kernels
 
         if not kernels.cpp_available():
             return None
-        itemsize = self.dtypes[column_name].itemsize
+        itemsize = self._column_dtypes[column_name].itemsize
         if itemsize not in (1, 2, 4, 8):
             return None
+        cache = self._segment_table_cache
+        if column_name not in cache:
+            cache[column_name] = self._stitch_native_segment_table(column_name, itemsize)
+        return cache[column_name]
+
+    def _stitch_native_segment_table(self, column_name: str, itemsize: int) -> SegmentTable | None:
+        """Build one column's global segment table from the children's local ones.
+
+        Stitches each file's local table
+        (:meth:`ColStoreReader._column_segment_table`) into one global table by
+        folding the file's row offset into the segment start rows and bases, so
+        a global index reads at ``segment_base[s] + idx * itemsize``. Returns
+        ``None`` when a file cannot supply native segments or every file is empty.
+        """
         start_parts: list[NDArray[np.int64]] = []
         base_parts: list[NDArray[np.int64]] = []
         for file_index, child in enumerate(self._children):
@@ -453,7 +483,7 @@ class ColStoreDataset(_ReaderBase):
         self,
         out: NDArray[Any],
         indices: NDArray[np.int64],
-        table: tuple[NDArray[np.int64], NDArray[np.int64]],
+        table: SegmentTable,
         indices_sorted: bool,
     ) -> None:
         """Fill ``out`` with one native pass: a cursor walk if the indices are
@@ -472,7 +502,7 @@ class ColStoreDataset(_ReaderBase):
         out: dict[str, NDArray[Any]],
         column_names: list[str],
         indices: NDArray[np.int64],
-        tables: list[tuple[NDArray[np.int64], NDArray[np.int64]] | None],
+        tables: list[SegmentTable | None],
     ) -> None:
         """Native dict gather.
 
