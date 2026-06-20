@@ -20,7 +20,8 @@ from numpy.typing import NDArray
 
 from . import config, kernels
 from ._query import _Expr, parse_query, validate_predicate
-from .view import ColumnView, TableView
+from ._render import Preview
+from .view import ColumnView, TableView, build_preview, resolve_preview_n, row_width
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -124,6 +125,37 @@ class _ReaderBase(abc.ABC):
         """``(n_rows, n_columns)``."""
         return self.n_rows, len(self._column_dtypes)
 
+    # ---- Peeking -------------------------------------------------------
+
+    def head(self, n: int | None = None) -> Preview:
+        """First ``n`` rows of the store as a previewable peek (default config rows)."""
+        rows = self._preview_n(n)
+        return self._preview(None, slice(0, max(0, rows)))
+
+    def tail(self, n: int | None = None) -> Preview:
+        """Last ``n`` rows of the store, as a previewable peek."""
+        rows = self._preview_n(n)
+        return self._preview(None, slice(max(0, self.n_rows - rows), self.n_rows))
+
+    def _repr_html_(self) -> str | None:
+        """Rich Jupyter display: a head preview under a shape caption.
+
+        Returns ``None`` -- so Jupyter uses the text repr -- only if the preview
+        can't be built.
+        """
+        try:
+            return self._preview(self.n_rows, slice(0, max(0, self._preview_n(None))))._repr_html_()
+        except Exception:
+            return None
+
+    def _preview_n(self, n: int | None) -> int:
+        """Resolve a whole-store preview row count, warning if it would be large."""
+        return resolve_preview_n(n, self.n_rows, row_width(self, self.columns))
+
+    def _preview(self, total_rows: int | None, rows: slice) -> Preview:
+        """A whole-store preview over a concrete ``rows`` slice."""
+        return build_preview(type(self).__name__, total_rows, self, self.columns, rows)
+
     # ---- Whole-store materializer --------------------------------------
 
     def recarray(self) -> NDArray[Any]:
@@ -132,7 +164,7 @@ class _ReaderBase(abc.ABC):
         One field per column, in stored order; ``result[name]`` is the column.
         See :meth:`_build_recarray` for how the columns are interleaved.
         """
-        names = list(self._column_dtypes)
+        names = self.columns
         if not names or self.n_rows == 0:
             record_dtype = np.dtype([(name, self._native_dtype(name)) for name in names])
             return np.empty(self.n_rows, dtype=record_dtype)
@@ -239,7 +271,7 @@ class _ReaderBase(abc.ABC):
             row_part, column_part = key, None
 
         if column_part is None:
-            column_names = list(self._column_dtypes)
+            column_names = self.columns
             is_single_column = False
         elif isinstance(column_part, str):
             column_names = [column_part]
