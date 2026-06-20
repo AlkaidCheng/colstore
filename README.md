@@ -95,6 +95,11 @@ ds.query("pt > @cut and region == 'SR'", params={"cut": 30}).dict()
 ds[(col("pt") > 30) & (col("region") == "SR")].frame()
 ds.where(col("pt").isin([30, 40, 50]))                  # the explicit verb
 ds[col("pt") > 30, ["pt", "eta"]].recarray()            # project columns
+
+# select() / drop() project columns by exact name -- chainable, stays lazy:
+ds.select("pt", "eta")                                  # lazy view of those columns
+ds.drop("weight")                                       # all columns except weight
+ds.query("pt > 30").select("eta")                       # filter rows, then project
 ```
 
 **Lazy by default; `evaluate()` to peek.** `query()` and `ds[expr]` defer
@@ -102,6 +107,13 @@ everything; call `.evaluate()` (or `query(..., lazy=False)`) to resolve the row
 mask now — it reads the predicate columns and returns a view whose rows are
 fixed, so a following `.frame()` / `.dict()` doesn't recompute the selection. The
 selected columns are still materialized only on demand.
+
+**Projection.** `select(*names)` / `drop(*names)` choose columns by **exact name**
+— no wildcards, so column selection stays explicit and unambiguous. Both return a
+lazy `TableView`, preserve the row selection, and chain with `query()` / `col()`;
+`select` keeps the order you give and rejects duplicates, and an unknown name
+raises `KeyError` immediately. A single `select("x")` is still a one-column
+`TableView` — use `ds["x"]` for a 1-D `ColumnView`.
 
 The string grammar is a strict whitelist evaluated **without `eval`**: column
 names, numeric/string/bool literals, comparisons (including chained `a < x < b`),
