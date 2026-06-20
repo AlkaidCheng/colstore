@@ -21,7 +21,15 @@ from numpy.typing import NDArray
 from . import config, kernels
 from ._query import _Expr, parse_query, validate_predicate
 from ._render import Preview
-from .view import ColumnView, TableView, build_preview, resolve_preview_n, row_width
+from .view import (
+    ColumnView,
+    TableView,
+    build_preview,
+    resolve_drop,
+    resolve_preview_n,
+    resolve_select,
+    row_width,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -124,6 +132,21 @@ class _ReaderBase(abc.ABC):
     def shape(self) -> tuple[int, int]:
         """``(n_rows, n_columns)``."""
         return self.n_rows, len(self._column_dtypes)
+
+    # ---- Column selection ----------------------------------------------
+
+    def select(self, *columns: str) -> TableView:
+        """Lazy view of the named ``columns`` (in the given order), all rows.
+
+        Names are validated immediately; unknown names raise ``KeyError``. A
+        single name still yields a (one-column) ``TableView`` -- use ``ds[name]``
+        for a 1-D ``ColumnView``.
+        """
+        return TableView(self, None, resolve_select(self.columns, columns))
+
+    def drop(self, *columns: str) -> TableView:
+        """Lazy view of all columns except the named ``columns``, all rows."""
+        return TableView(self, None, resolve_drop(self.columns, columns))
 
     # ---- Peeking -------------------------------------------------------
 

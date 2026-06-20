@@ -85,6 +85,33 @@ def build_preview(
     return Preview(rec, columns, preview_index(indexer, store.n_rows), total_rows, label)
 
 
+def validate_columns(available: list[str], names: list[str]) -> None:
+    """Raise ``KeyError`` for any name not in ``available`` (matching ``__getitem__``)."""
+    available_set = set(available)
+    unknown = [n for n in names if n not in available_set]
+    if unknown:
+        raise KeyError(f"Unknown column(s): {unknown}. Available columns: {available}")
+
+
+def resolve_select(available: list[str], names: tuple[str, ...]) -> list[str]:
+    """Columns to keep for ``select(*names)``: validated, deduplicated-checked, given order."""
+    if not names:
+        raise ValueError("select() requires at least one column name.")
+    chosen = list(names)
+    validate_columns(available, chosen)
+    if len(set(chosen)) != len(chosen):
+        dups = sorted({n for n in chosen if chosen.count(n) > 1})
+        raise ValueError(f"Duplicate column(s) in select(): {dups}")
+    return chosen
+
+
+def resolve_drop(available: list[str], names: tuple[str, ...]) -> list[str]:
+    """Columns to keep for ``drop(*names)``: ``available`` minus ``names``, in stored order."""
+    validate_columns(available, list(names))
+    dropped = set(names)
+    return [c for c in available if c not in dropped]
+
+
 class _BaseView:
     """Shared row-indexer plumbing for the two view types.
 
@@ -372,6 +399,19 @@ class TableView(_BaseView):
     def n_columns(self) -> int:
         """Number of columns selected by this view."""
         return len(self._column_names)
+
+    def select(self, *columns: str) -> TableView:
+        """Narrow this view to the named ``columns`` (in the given order), same rows.
+
+        Unknown names raise ``KeyError``; a single name still yields a
+        (one-column) ``TableView``. The row selection -- including a lazy
+        ``col()`` / ``query`` predicate -- is preserved.
+        """
+        return TableView(self._store, self._row_part, resolve_select(self._column_names, columns))
+
+    def drop(self, *columns: str) -> TableView:
+        """Drop the named ``columns``, keeping the rest in stored order and the same rows."""
+        return TableView(self._store, self._row_part, resolve_drop(self._column_names, columns))
 
     @property
     def dtypes(self) -> dict[str, np.dtype]:
