@@ -73,6 +73,29 @@ def test_table_view_recarray_preserves_each_dtype(small_store, small_frame):
     assert record_array.shape == (10,)
 
 
+@pytest.mark.parametrize(
+    "select",
+    [
+        slice(None),  # whole, contiguous views
+        slice(100, 200),  # forward slice
+        slice(None, None, 3),  # strided -> sources materialized
+        np.array([7, 1, 200, 1, 50]),  # fancy -> sources materialized
+    ],
+)
+def test_table_view_recarray_kernel_matches_fallback(small_store, select, monkeypatch):
+    # A view's recarray() now interleaves through the kernel for any row
+    # selection; it must equal the column-major host fallback field for field.
+    from colstore import kernels
+
+    columns = ["price", "qty", "flag", "id"]
+    with_kernel = small_store[select, columns].recarray()
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)
+    fallback = small_store[select, columns].recarray()
+    assert with_kernel.dtype == fallback.dtype
+    for name in columns:
+        np.testing.assert_array_equal(with_kernel[name], fallback[name])
+
+
 def test_table_view_frame_returns_dataframe(small_store, small_frame):
     out_frame = small_store[100:110, ["price", "qty"]].frame()
     assert isinstance(out_frame, pd.DataFrame)

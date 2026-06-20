@@ -254,13 +254,7 @@ class TableView(_BaseView):
         numpy.ndarray
             Structured 1D array. ``result[name]`` returns the column.
         """
-        column_data = self.dict()
-        n_records = next(iter(column_data.values())).shape[0]
-        record_dtype = np.dtype([(name, column_data[name].dtype) for name in self._column_names])
-        record_array = np.empty(n_records, dtype=record_dtype)
-        for name in self._column_names:
-            record_array[name] = column_data[name]
-        return record_array
+        return self._store._build_recarray(self._resolve_row_indexer(), self._column_names)
 
     def frame(self) -> pd.DataFrame:
         """Materialize as a pandas DataFrame.
