@@ -42,6 +42,7 @@ ds['price'].array()                          # 1D ndarray
 ds[indices, ['price', 'qty']].dict()         # dict of 1D arrays
 ds[indices, ['price', 'qty']].recarray()     # structured ndarray
 ds[indices, ['price', 'qty']].frame()        # pandas DataFrame
+ds[100:200].dict(copy=False)                 # read-only views, no copy (see Zero-copy reads)
 ```
 
 ## Reader, writer, frame: which to use
@@ -233,6 +234,39 @@ config.set_write_method("auto")    # write fill: auto (pwrite where available) |
 calibrate()                        # one-time: measure the thread/prefetch knees for this host
 ```
 
+## Zero-copy reads (`copy=False`)
+
+Materializing a whole store normally copies every column out of the mapping into
+fresh arrays — doubling peak memory and reading+writing every byte before you
+touch it. When the layout allows it, `copy=False` instead returns **read-only
+views over the page cache itself**:
+
+```python
+ds = colstore.open("data.cstore")                  # ideally compacted first
+d = ds.dict(copy=False)                            # read-only ndarrays backed by the mmap
+total = d["energy"].sum()                          # computed straight from page-cache bytes
+
+ds["price"].array(copy=False)                      # one read-only column
+ds[100:200, ["price", "qty"]].frame(copy=False)    # a read-only DataFrame aliasing the mmap
+```
+
+`copy=False` is a **guarantee, not a hint**: it returns a real view or raises —
+never a silent copy. It is supported exactly when the store is **single-record**
+(`colstore.compact` produces these), the dtype is **native byte order**, and the
+selector is whole-store / an int / a slice of any step. A fancy or boolean
+selector needs a gather, which by definition copies, so it raises `ValueError`
+with the remedy; the whole-table forms are all-or-nothing and never return a mix
+of views and copies.
+
+`array`, `dict`, and `frame` all take `copy=False`; `recarray` always repacks
+(it interleaves the columns into one record buffer) and so ignores it. View
+creation is O(1) in column size and **halves peak resident memory** — the data
+stays page-cache-backed and reclaimable instead of committed to a second buffer.
+Views pin the mapping, so they stay valid after `ds.close()`. Because the views
+are read-only they cannot corrupt the store; use the default `copy=True` when you
+need to mutate. The full contract is in
+[Performance &amp; internals](docs/performance.md) §7.
+
 ## How reads parallelize
 
 A gather's thread count is decided in two stages. A single-column read runs at
@@ -356,6 +390,37 @@ and fixed-width strings (`S` bytes and `U` unicode, with the width baked
 into the dtype, e.g. `S16` or `U8`). Object dtype (variable-length
 strings, Python objects) is rejected at write time — the design point is
 zero-copy random access, which requires a fixed stride per row.
+
+## Design philosophy
+
+A few choices shape everything above:
+
+- **Load and write, not stream-compute.** colstore persists a structured array
+  and reads arbitrary row/column subsets back fast; it is not a query engine.
+  Reads are memory-mapped, so process memory stays bounded by the output you ask
+  for, never the file size.
+- **Speed first, on the hardware that matters.** The hot paths — every
+  access-pattern gather, the SoA→AoS record interleave, the contiguous and merge
+  copies — run in C++/OpenMP kernels bound through Cython, dispatched per pattern
+  (contiguous range, strided, sorted/unsorted fancy, boolean mask). Performance is
+  judged on multi-socket, multi-NUMA compute nodes; wheels stay portable (no
+  `-march=native`), with per-host calibration of the thread cap and prefetch
+  distance.
+- **No optimization ships without measurement.** Every change is gated by an
+  interleaved A/B against the path it replaces, asserted output-identical, and
+  carries a committed `benchmark/check_*.py`. Rejected and deferred alternatives
+  are recorded with the measurement that closed them and a named reopen condition
+  (see the [optimization series](docs/optimization_series.md)), so an idea is not
+  relitigated without new evidence.
+- **Zero-copy where the layout permits.** A compacted, native-byte-order store is
+  contiguous on disk, so whole-column reads can hand back read-only views of the
+  page cache (`copy=False`) instead of copying. The format is built around a fixed
+  stride per row to keep this possible — which is why variable-length object
+  dtypes are refused at write time.
+- **Correctness is not traded for speed.** Misaligned packed columns load safely
+  (UBSan-verified), writes commit atomically via a fixed counters block, a reader
+  opening mid-write sees only the last committed state, and `copy=False` is a hard
+  guarantee that raises rather than silently copying.
 
 ## Documentation
 

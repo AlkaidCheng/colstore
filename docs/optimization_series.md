@@ -27,6 +27,14 @@ as a measured regression), and made writes portable to filesystems that lack
 `OMP_NUM_THREADS=8` regimes at every stage (the deployment node collects a
 handful of additional host-conditional tests).
 
+Round 4 returned to the read path's residual Python overhead — a zero-copy
+`frame(copy=False)` and a min-first fancy-index validation — after an
+investigation classified the gather kernels as memory-bandwidth- and
+outstanding-miss-bound, leaving the remaining C++ levers node-gated (recorded
+under Deferred). The multi-file dataset reads and the parallel-filesystem write
+path that landed between Round 3 and here are documented in the README and
+`performance.md` rather than as numbered stages.
+
 ---
 
 # Round 1 — Stages 1–6
@@ -656,6 +664,70 @@ errnos still propagate, so a conflicting writer remains an actionable error. The
 one-shot `store()` path was unaffected — it writes via `write_dataset`, which
 never took the lock.
 
+# Round 4 — Read-path Python offloads
+
+A fresh investigation classified every gather-kernel family as
+outstanding-miss-bound or already vectorized at the baseline x86-64 SSE2 the
+wheels are built for, putting the C++ side at the memory-bandwidth /
+miss-handling frontier; the levers that remain are node-gated and recorded
+under Deferred. This round took the two read-path Python costs that survived
+that analysis. Both were gated by an interleaved A/B and asserted
+output-identical to the prior path; the figures are local-dev-machine
+indicative, with the committed benchmark as the deployment-node re-validation
+harness.
+
+## Stage 13 — Zero-copy `frame(copy=False)`
+
+**Branch:** `perf/frame-copy-false`
+
+**Problem.** `frame()` built its DataFrame from `dict()` at the default
+`copy=True`, gathering an owning copy of every column — the redundant
+read+write pass the Stage-11 zero-copy API removed for `array()` and `dict()`,
+but never extended to `frame()`. The per-column `BlockManager` the frame already
+builds (one `Block` per column, no consolidation) wraps its input arrays *by
+reference*, so the gather copy was the only thing between `frame()` and aliasing
+the mapping.
+
+**Change.** `frame()` on the reader, the table view, and the dataset takes
+`copy: bool = True`, forwarding into the existing `dict(copy=...)`.
+`frame(copy=False)` feeds the `dict(copy=False)` views straight into the
+per-column `BlockManager`, so the frame's columns alias the open memmaps with no
+extra copy. The all-or-nothing preconditions and the read-only contract are
+inherited from `dict(copy=False)` — multi-record, non-native byte order,
+fancy/boolean, and multi-file whole-store reads raise rather than copying, and
+the columns are read-only so a write cannot reach the store. `copy=True` is
+unchanged.
+
+**Measured (local dev machine, warm, indicative).** On a compact single-record
+native store: read-and-reduce ~1.5×, frame construction ~58× (the gather copy is
+gone), peak resident memory halved (no committed second buffer). Output sharing
+and the one-`Block`-per-column construction are asserted by tests; parity of
+`copy=True` is unchanged. Benchmark: `benchmark/check_frame_construction.py`
+(Scenario F, the interleaved `copy=True` vs `copy=False` A/B).
+
+## Stage 14 — Min-first fancy-index validation
+
+**Branch:** `perf/fancy-index-validation`
+
+**Problem.** Every integer-fancy selection runs through `_validate_fancy_index`,
+which folds negatives and bounds-checks the array. It opened with
+`(indices < 0).any()` — a full O(K) scan plus a K-byte boolean temporary —
+*before* the min/max bounds reductions, redundant in the common all-non-negative
+case (shuffled-sample index loops). The step is serial and upstream of the
+threaded gather, so its share of a read grows with thread count.
+
+**Change.** Take `lo = indices.min()` first and fold negatives only when
+`lo < 0`, then recompute `lo`. `min() < 0` is exactly `(indices < 0).any()`, and
+an index below `-n_rows` stays negative after folding (caught by the post-fold
+`lo < 0` check), so the result is byte-identical to folding before the check —
+the common selector now costs two reductions instead of three, dropping the scan
+and its temporary.
+
+**Measured (local dev machine, warm, indicative).** Validation in isolation,
+interleaved A/B with output parity asserted each case: all-non-negative
+~1.55–1.77× (K = 1k…10M), with-negatives ~1.04× (no regression). A below-range
+test (an index past `-n_rows` must still raise) locks in the post-fold recheck.
+
 # Net effect
 
 For the motivating workload — multi-column selection-driven reads over
@@ -725,6 +797,27 @@ caches.
   for every pattern (1.10x contiguous, ~1.0x within noise otherwise) and never
   slower; no flip, so the single `auto` default (interleave on multi-node)
   stands and no per-pattern mechanism is warranted. (`check_cold_read_placement`)
+* **Portable SIMD / `target_clones` / runtime-AVX2 infrastructure** — a
+  per-kernel classification generalized the `vpgather` finding above: every
+  scatter-gather family (indexed, bytes, multirecord, multifile, sorted, strided,
+  withbins, uniform) is outstanding-miss-bound, and the one compute-bound inner
+  loop — `count_mask_range`, the mask kernel's pass-1 byte-sum — already
+  autovectorizes at the baseline x86-64 SSE2 the wheels target, with no
+  `-march`. A runtime CPU-dispatch / function-multi-versioning layer would net
+  ~1.0× while adding ifunc plumbing, feature detection, and a portability matrix.
+  Reopen only if a future kernel becomes genuinely compute-bound (on-the-fly
+  decode/decompression), or if the deploy compiler is found lowering
+  `count_mask_range` to a scalar / i64-widened sum with a non-trivial share of a
+  dense-mask read — a narrow `psadbw` rewrite of *that one loop*, not general
+  infrastructure. (Round 4 investigation)
+* **`frame()` BlockManager construction offload to C++** — the per-column
+  no-consolidate `BlockManager` already removed the consolidation copy that made
+  `frame()` ~10× slower than `dict()` (construction ~0.1 ms on a 1 GB / 50-column
+  frame, ~873× over the consolidating constructor). The residual is irreducible
+  pandas `Block`-object construction (~1.5 µs/column), not a data copy a kernel
+  can take; `_from_arrays` still consolidates and an Arrow path would add a copy.
+  The one live frame lever — the gather copy — was taken by Stage 13. (Round 4
+  investigation)
 
 # Open / deferred items (recorded reasons)
 
@@ -732,10 +825,17 @@ caches.
   `--threads 8` sweep on a quiet node, or justify the axis with it.
 * **Multi-record `writev` batching** — remaining tiny-record writer gap is
   per-call Python cost; complicates durability semantics.
-* **int32 index kernels** — halves index bandwidth for K-large reads when
-  total rows < 2³¹; premise-check the index-traffic share first. The
-  mask-native path (Stage 12) already removes index traffic entirely for
-  the densities where it dominates, narrowing this item's scope.
+* **int32 index kernels** — halves the index-array read for K-large reads when
+  total rows < 2³¹. Premise-checked in Round 4 and left deferred: the gathers are
+  outstanding-miss-bound, so each scatter pulls a full ~64 B line and the int64
+  index stream (sequential, hardware-prefetched) is only ~10% of DRAM-line
+  traffic — ~5% after halving — and an indicative probe put int32 indices at
+  parity-or-slower (0.78–0.96×) across resident and DRAM regimes. The view layer
+  also materializes int64, so an int32 route adds a K-element conversion (12 B/elem
+  to save 4 B/elem inside the kernel), and the mask-native path (Stage 12) already
+  removes index traffic where it dominates. Reopen only on a node perf-counter run
+  of an L2/L3-resident small-itemsize (int8/int16) column where int32 wins ≥ 1.05×
+  with the index a > 25% traffic share. (Round 4 investigation)
 * **Native record-index scan** — open-latency for very-high-record-count
   files; only if open time shows up in real profiles.
 * **Format-level column alignment** — a future format-version decision, not
@@ -758,3 +858,22 @@ caches.
   patterns is resolved (see rejected alternatives: interleave wins or ties,
   no per-pattern flip). Still open: a strict single-threaded-reader variant,
   and writer-side interleave scope on real Lustre paths.
+* **Thread-to-file NUMA co-location** (Round 4) — pinning each
+  `gather_multifile_sorted` worker to the node owning the files its contiguous
+  sorted-index chunk reads (the inverse of the rejected spread binding: sorted
+  chunking makes a worker's data location knowable). Node-only, and gated on
+  first confirming per-file page locality via `move_pages`/`numa_maps` — if the
+  reader's interleave already round-robined every file across nodes, there is no
+  node to co-locate to.
+* **Homogeneous-width recarray interleave** (Round 4) — a compile-time
+  field-width specialization of the row-major `interleave_records` inner loop for
+  all-same-itemsize recarrays would drop the per-field width dispatch. Node-only
+  and gated on whether the transpose is instruction-bound or already
+  write-bandwidth-bound at scale (achieved write GB/s vs the streaming-store
+  ceiling, 4M×50 float64); the gross transpose win is already banked.
+* **Run-descriptor sorted gather** (Round 4) — generalizing the strided kernel to
+  a list of (start, length) runs would read zero per-element index bytes for
+  run-structured sorted selectors (distinct from the rejected run-coalescing,
+  which read the full int64 index). Gated on a profile showing such selectors
+  reach the reader un-materialized rather than as a flatnonzero/arange int64
+  array.
