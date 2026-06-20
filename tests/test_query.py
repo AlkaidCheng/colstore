@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import ColStoreDataset, QueryError, TableView
+from colstore import ColStoreDataset, ColumnView, QueryError, TableView, col
+from colstore._query import _Expr
 
 
 @pytest.fixture()
@@ -129,3 +130,128 @@ def test_query_on_multifile_dataset(tmp_path):
     assert isinstance(ds, ColStoreDataset)
     assert ds.query("pt > 50").dict()["pt"].tolist() == [60.0, 110.0, 160.0]
     ds.close()
+
+
+# ---- col() expression form -------------------------------------------------
+
+
+def test_col_comparison(qstore):
+    ds, _ = qstore
+    assert _pts(ds[col("pt") > 25]) == [30.0, 40.0, 50.0]
+
+
+def test_col_where_verb(qstore):
+    ds, _ = qstore
+    assert _pts(ds.where(col("pt") > 25)) == [30.0, 40.0, 50.0]
+
+
+def test_col_stacking_with_and(qstore):
+    ds, _ = qstore
+    # pt > 20 -> {30,40,50}; region == 'SR' -> {10,30}; & -> {30}
+    assert _pts(ds[(col("pt") > 20) & (col("region") == "SR")]) == [30.0]
+
+
+def test_col_or_and_invert(qstore):
+    ds, _ = qstore
+    assert _pts(ds[(col("pt") > 40) | (col("eta") < -2)]) == [10.0, 50.0]
+    assert _pts(ds[~col("is_sig")]) == [20.0, 40.0]
+
+
+def test_col_isin(qstore):
+    ds, _ = qstore
+    assert _pts(ds[col("pt").isin([10, 50])]) == [10.0, 50.0]
+
+
+def test_col_reflected_arithmetic(qstore):
+    ds, _ = qstore
+    # reflected arithmetic (__rsub__): 100 - pt > 50  ->  pt < 50  ->  {10,20,30,40}
+    assert _pts(ds[100 - col("pt") > 50]) == [10.0, 20.0, 30.0, 40.0]
+    assert _pts(ds[col("pt") / 10 >= 3]) == [30.0, 40.0, 50.0]
+
+
+def test_col_string_equality(qstore):
+    ds, _ = qstore
+    assert _pts(ds[col("region") == "SR"]) == [10.0, 30.0]
+
+
+def test_col_with_column_projection(qstore):
+    ds, _ = qstore
+    cv = ds[col("pt") > 40, "region"]
+    assert isinstance(cv, ColumnView)
+    assert cv.array().tolist() == [b"CR"]  # pt 50 -> region CR
+
+
+def test_query_accepts_col_expression(qstore):
+    ds, _ = qstore
+    assert _pts(ds.query(col("pt") > 25)) == [30.0, 40.0, 50.0]
+
+
+def test_col_bool_guard():
+    # and / or / not are not overloadable; the guard catches a stray bool() call.
+    with pytest.raises(QueryError, match="no truth value"):
+        bool(col("pt") > 5)
+    with pytest.raises(QueryError, match="no truth value"):
+        (col("pt") > 5) and (col("pt") < 50)
+
+
+def test_col_unknown_column_raises_eagerly(qstore):
+    ds, _ = qstore
+    with pytest.raises(QueryError, match="unknown column"):
+        ds[col("missing") > 5]
+
+
+def test_col_non_boolean_raises_eagerly(qstore):
+    ds, _ = qstore
+    with pytest.raises(QueryError, match="boolean condition"):
+        ds[col("pt") + 1]
+
+
+def test_col_name_must_be_str():
+    with pytest.raises(TypeError, match="must be a string"):
+        col(123)  # type: ignore[arg-type]
+
+
+# ---- laziness and evaluate() -----------------------------------------------
+
+
+def test_query_carries_an_unresolved_predicate(qstore):
+    ds, _ = qstore
+    # The predicate rides the view as an expression, not yet a materialized mask.
+    assert isinstance(ds.query("pt > 25")._row_part, _Expr)
+    assert isinstance(ds[col("pt") > 25]._row_part, _Expr)
+
+
+def test_evaluate_resolves_the_mask(qstore):
+    ds, _ = qstore
+    resolved = ds.query("pt > 25").evaluate()
+    assert isinstance(resolved, TableView)
+    # The row selection is now a concrete boolean mask, not an expression.
+    assert isinstance(resolved._row_part, np.ndarray)
+    assert resolved._row_part.dtype == bool
+    assert _pts(resolved) == [30.0, 40.0, 50.0]
+
+
+def test_query_lazy_false_returns_resolved_view(qstore):
+    ds, _ = qstore
+    view = ds.query("pt > 25", lazy=False)
+    assert isinstance(view, TableView)
+    assert isinstance(view._row_part, np.ndarray)
+    assert _pts(view) == [30.0, 40.0, 50.0]
+
+
+def test_columnview_evaluate(qstore):
+    ds, _ = qstore
+    resolved = ds[col("pt") > 25, "region"].evaluate()
+    assert isinstance(resolved, ColumnView)
+    assert resolved.array().tolist() == [b"SR", b"VR", b"CR"]  # pt 30,40,50 -> SR,VR,CR
+
+
+def test_col_on_multifile_dataset(tmp_path):
+    for i in range(2):
+        colstore.store(
+            {"pt": np.array([10.0, 60.0]) + i * 100},
+            tmp_path / f"p{i}.cstore",
+            show_progress=False,
+        ).close()
+    with colstore.open([str(tmp_path / "p0.cstore"), str(tmp_path / "p1.cstore")]) as ds:
+        assert _pts(ds[col("pt") > 50]) == [60.0, 110.0, 160.0]

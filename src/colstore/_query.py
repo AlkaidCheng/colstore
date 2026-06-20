@@ -1,29 +1,32 @@
-"""A safe predicate parser for :meth:`_ReaderBase.query`.
+"""Lazy column expressions and the predicate-string parser for ``query()``.
 
-Turns a pandas-style predicate string into a boolean row mask, reading only the
-columns it names. The grammar is a strict whitelist walked over an ``ast`` tree
--- never ``eval`` -- so a query expresses exactly: column references, numeric /
+``col("pt") > 30`` and the like build a lazy :class:`_Expr` tree that reads
+nothing until it is applied to a store; the string form ``query("pt > 30")``
+parses to the *same* tree. Evaluating an ``_Expr`` against a store yields a NumPy
+array -- a boolean one is a row mask. The string grammar is a strict whitelist
+walked over an ``ast`` tree (**never** ``eval``): column references, numeric /
 string / bool literals, comparisons (including chained ``a < x < b``), the
 boolean operators (``and`` / ``or`` / ``not`` and ``& | ~``), arithmetic, and
 membership (``in`` / ``not in``). A ``@name`` token resolves from a caller-
-supplied ``params`` mapping; the calling frame is never inspected. Any other
-construct -- a function call, an attribute, a subscript, a name that is neither a
-column nor a parameter -- is rejected, so an untrusted string can neither execute
-code nor read beyond the named columns.
+supplied ``params`` mapping; the calling frame is never inspected. Anything else
+-- a function call, an attribute, a name that is neither a column nor a parameter
+-- is rejected, so an untrusted string can neither execute code nor read beyond
+the named columns. ``col()`` expressions cannot express ``and``/``or``/``not``
+(Python evaluates those eagerly); use ``& | ~`` and ``.isin(...)`` instead.
 """
 
 from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, NoReturn
 
 import numpy as np
 from numpy.typing import NDArray
 
 # ``@name`` is not valid Python, so it is rewritten to a reserved identifier
-# before parsing and mapped back to ``params[name]`` during evaluation.
+# before parsing and mapped back to ``params[name]`` while building the tree.
 _PARAM_RE = re.compile(r"@([A-Za-z_]\w*)")
 _PARAM_PREFIX = "__colstore_param_"
 
@@ -54,9 +57,11 @@ _UNARY_OPS: dict[type[ast.unaryop], np.ufunc] = {
     ast.Not: np.logical_not,
 }
 
+ReadColumn = Callable[[str], NDArray[Any]]
+
 
 class QueryError(ValueError):
-    """A query string is malformed or uses an unsupported construct."""
+    """A query string or column expression is malformed or unsupported."""
 
 
 def _string_kind(value: Any) -> str:
@@ -87,122 +92,341 @@ def _align_strings(left: Any, right: Any) -> tuple[Any, Any]:
     return np.asarray(left, dtype=kind), right
 
 
-class _Evaluator:
-    """Walks the whitelisted ``ast`` nodes, reading each named column once."""
+def _operand(value: Any, read_column: ReadColumn) -> Any:
+    """Evaluate an operand: an ``_Expr`` against the columns, a scalar as itself."""
+    return value._evaluate(read_column) if isinstance(value, _Expr) else value
 
-    def __init__(
-        self,
-        columns: frozenset[str],
-        read_column: Callable[[str], NDArray[Any]],
-        params: dict[str, Any],
-        source: str,
-    ) -> None:
-        self._columns = columns
-        self._read = read_column
-        self._params = params
-        self._source = source
-        self._cache: dict[str, NDArray[Any]] = {}
 
-    def _fail(self, message: str) -> NoReturn:
-        raise QueryError(f"in query {self._source!r}: {message}")
+def _operand_columns(value: Any) -> Iterator[str]:
+    """Column names a (possibly scalar) operand references."""
+    if isinstance(value, _Expr):
+        yield from value._columns()
 
-    def visit(self, node: ast.AST) -> Any:
-        if isinstance(node, ast.BoolOp):
-            return self._bool_op(node)
-        if isinstance(node, ast.UnaryOp):
-            return self._unary_op(node)
-        if isinstance(node, ast.BinOp):
-            return self._bin_op(node)
-        if isinstance(node, ast.Compare):
-            return self._compare(node)
-        if isinstance(node, ast.Name):
-            return self._name(node)
-        if isinstance(node, ast.Constant):
-            return node.value
-        if isinstance(node, (ast.List, ast.Tuple)):
-            return [self.visit(element) for element in node.elts]
-        self._fail(f"unsupported expression element {type(node).__name__}.")
 
-    def _name(self, node: ast.Name) -> Any:
-        name = node.id
-        if name.startswith(_PARAM_PREFIX):
-            key = name[len(_PARAM_PREFIX) :]
-            if key not in self._params:
-                self._fail(f"undefined parameter @{key}; pass params={{{key!r}: ...}}.")
-            return self._params[key]
-        if name in self._columns:
-            cached = self._cache.get(name)
-            if cached is None:
-                cached = self._read(name)
-                self._cache[name] = cached
-            return cached
-        self._fail(f"unknown name {name!r}: not a column or an @param.")
+class _Expr:
+    """A node in a lazy column-expression tree built by :func:`col` and operators.
 
-    def _bool_op(self, node: ast.BoolOp) -> Any:
-        reducer = np.logical_and if isinstance(node.op, ast.And) else np.logical_or
-        result = self.visit(node.values[0])
-        for value in node.values[1:]:
-            result = reducer(result, self.visit(value))
-        return result
+    Operators build new nodes rather than computing; nothing is read until
+    :meth:`_evaluate` is called against a store. Instances have no truth value
+    and are not hashable -- ``==`` / ``<`` build comparison nodes, so a stray
+    ``and`` / ``or`` / ``not`` (which Python would evaluate eagerly) or use as a
+    dict key is a mistake, caught here with a pointed message.
+    """
 
-    def _unary_op(self, node: ast.UnaryOp) -> Any:
-        op = _UNARY_OPS.get(type(node.op))
-        if op is None:
-            self._fail(f"unsupported unary operator {type(node.op).__name__}.")
-        return op(self.visit(node.operand))
+    __slots__ = ()
+    # Make ``ndarray <op> expr`` / ``scalar <op> expr`` defer to us.
+    __array_priority__ = 1_000_000
 
-    def _bin_op(self, node: ast.BinOp) -> Any:
-        op = _BINOP_OPS.get(type(node.op))
-        if op is None:
-            self._fail(f"unsupported operator {type(node.op).__name__}.")
-        return op(self.visit(node.left), self.visit(node.right))
+    def _evaluate(self, read_column: ReadColumn) -> Any:
+        raise NotImplementedError
 
-    def _compare(self, node: ast.Compare) -> Any:
-        # Chained comparisons ``a < x < b`` combine pairwise with logical-and.
-        left = self.visit(node.left)
-        result: Any = None
-        for op, comparator in zip(node.ops, node.comparators, strict=True):
-            right = self.visit(comparator)
-            piece = self._compare_one(op, left, right)
-            result = piece if result is None else np.logical_and(result, piece)
-            left = right
-        return result
+    def _columns(self) -> Iterator[str]:
+        return iter(())
 
-    def _compare_one(self, op: ast.cmpop, left: Any, right: Any) -> Any:
-        if isinstance(op, (ast.In, ast.NotIn)):
-            left, members = _align_strings(left, np.asarray(right))
-            found = np.isin(left, members)
-            return found if isinstance(op, ast.In) else np.logical_not(found)
-        compare = _COMPARE_OPS.get(type(op))
-        if compare is None:
-            self._fail(f"unsupported comparison {type(op).__name__}.")
+    def __bool__(self) -> NoReturn:
+        raise QueryError(
+            "a column expression has no truth value; combine conditions with "
+            "& | ~ (not and / or / not), and apply with ds[expr] or ds.where(expr)."
+        )
+
+    __hash__ = None  # type: ignore[assignment]
+
+    # -- comparisons (Python derives the reflected forms, e.g. 30 < col -> col > 30) --
+    def __lt__(self, other: Any) -> _Expr:
+        return _Compare(np.less, self, other)
+
+    def __le__(self, other: Any) -> _Expr:
+        return _Compare(np.less_equal, self, other)
+
+    def __gt__(self, other: Any) -> _Expr:
+        return _Compare(np.greater, self, other)
+
+    def __ge__(self, other: Any) -> _Expr:
+        return _Compare(np.greater_equal, self, other)
+
+    def __eq__(self, other: Any) -> _Expr:  # type: ignore[override]
+        return _Compare(np.equal, self, other)
+
+    def __ne__(self, other: Any) -> _Expr:  # type: ignore[override]
+        return _Compare(np.not_equal, self, other)
+
+    # -- boolean combinators (use & | ~, like pandas) --
+    def __and__(self, other: Any) -> _Expr:
+        return _Op(np.bitwise_and, self, other)
+
+    def __rand__(self, other: Any) -> _Expr:
+        return _Op(np.bitwise_and, other, self)
+
+    def __or__(self, other: Any) -> _Expr:
+        return _Op(np.bitwise_or, self, other)
+
+    def __ror__(self, other: Any) -> _Expr:
+        return _Op(np.bitwise_or, other, self)
+
+    def __xor__(self, other: Any) -> _Expr:
+        return _Op(np.bitwise_xor, self, other)
+
+    def __invert__(self) -> _Expr:
+        return _Op(np.invert, self)
+
+    # -- arithmetic (with reflected forms for scalar-on-the-left) --
+    def __add__(self, other: Any) -> _Expr:
+        return _Op(np.add, self, other)
+
+    def __radd__(self, other: Any) -> _Expr:
+        return _Op(np.add, other, self)
+
+    def __sub__(self, other: Any) -> _Expr:
+        return _Op(np.subtract, self, other)
+
+    def __rsub__(self, other: Any) -> _Expr:
+        return _Op(np.subtract, other, self)
+
+    def __mul__(self, other: Any) -> _Expr:
+        return _Op(np.multiply, self, other)
+
+    def __rmul__(self, other: Any) -> _Expr:
+        return _Op(np.multiply, other, self)
+
+    def __truediv__(self, other: Any) -> _Expr:
+        return _Op(np.true_divide, self, other)
+
+    def __rtruediv__(self, other: Any) -> _Expr:
+        return _Op(np.true_divide, other, self)
+
+    def __floordiv__(self, other: Any) -> _Expr:
+        return _Op(np.floor_divide, self, other)
+
+    def __mod__(self, other: Any) -> _Expr:
+        return _Op(np.mod, self, other)
+
+    def __pow__(self, other: Any) -> _Expr:
+        return _Op(np.power, self, other)
+
+    def __neg__(self) -> _Expr:
+        return _Op(np.negative, self)
+
+    def isin(self, values: Any) -> _Expr:
+        """Build a membership test (``in``); ``values`` is any sequence of scalars."""
+        return _Isin(self, values)
+
+
+class _Col(_Expr):
+    """A column reference: reads the named column when evaluated."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def _evaluate(self, read_column: ReadColumn) -> Any:
+        return read_column(self._name)
+
+    def _columns(self) -> Iterator[str]:
+        yield self._name
+
+
+class _Op(_Expr):
+    """A NumPy ufunc applied to one or more operands (arithmetic / boolean)."""
+
+    __slots__ = ("_operands", "_ufunc")
+
+    def __init__(self, ufunc: np.ufunc, *operands: Any) -> None:
+        self._ufunc = ufunc
+        self._operands = operands
+
+    def _evaluate(self, read_column: ReadColumn) -> Any:
+        return self._ufunc(*(_operand(o, read_column) for o in self._operands))
+
+    def _columns(self) -> Iterator[str]:
+        for operand in self._operands:
+            yield from _operand_columns(operand)
+
+
+class _Compare(_Expr):
+    """A comparison ufunc, with str/bytes operands coerced to the column's kind."""
+
+    __slots__ = ("_left", "_right", "_ufunc")
+
+    def __init__(self, ufunc: np.ufunc, left: Any, right: Any) -> None:
+        self._ufunc = ufunc
+        self._left = left
+        self._right = right
+
+    def _evaluate(self, read_column: ReadColumn) -> Any:
+        left = _operand(self._left, read_column)
+        right = _operand(self._right, read_column)
         left, right = _align_strings(left, right)
-        return compare(left, right)
+        return self._ufunc(left, right)
+
+    def _columns(self) -> Iterator[str]:
+        yield from _operand_columns(self._left)
+        yield from _operand_columns(self._right)
 
 
-def evaluate_query(
-    expression: str,
-    columns: frozenset[str],
-    read_column: Callable[[str], NDArray[Any]],
-    params: dict[str, Any] | None = None,
-) -> NDArray[np.bool_]:
-    """Evaluate ``expression`` to a boolean row mask over ``columns``.
+class _Isin(_Expr):
+    """A membership test ``target in values`` (``np.isin``)."""
 
-    ``read_column(name)`` returns one column as a 1-D array (each referenced
-    column is read once). ``params`` supplies ``@name`` values. Raises
-    :class:`QueryError` on a malformed or unsupported expression, or when the
-    result is not boolean.
+    __slots__ = ("_target", "_values")
+
+    def __init__(self, target: _Expr, values: Any) -> None:
+        self._target = target
+        self._values = values
+
+    def _evaluate(self, read_column: ReadColumn) -> Any:
+        target = _operand(self._target, read_column)
+        target, members = _align_strings(target, np.asarray(self._values))
+        return np.isin(target, members)
+
+    def _columns(self) -> Iterator[str]:
+        yield from _operand_columns(self._target)
+
+
+def col(name: str) -> _Expr:
+    """A lazy reference to a column, for building filter expressions.
+
+    ``col("pt") > 30`` and combinations (``(col("pt") > 30) & col("ok")``,
+    ``col("eta").isin([0, 1])``) build a lazy predicate that reads nothing until
+    applied with ``ds[expr]`` / :meth:`ColStoreReader.where` / passed to
+    :meth:`ColStoreReader.query`. Combine conditions with ``& | ~`` (not
+    ``and`` / ``or`` / ``not``), and use ``.isin(...)`` for membership.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"col() name must be a string; got {type(name).__name__}.")
+    return _Col(name)
+
+
+# ---- String predicate -> the same _Expr tree -------------------------------
+
+
+def parse_query(expression: str, columns: frozenset[str], params: dict[str, Any] | None) -> _Expr:
+    """Parse a predicate string into an :class:`_Expr`, validating columns/params.
+
+    Builds the same tree :func:`col` and operators build, so the string and
+    object forms evaluate identically. Raises :class:`QueryError` on a syntax
+    error, an unsupported construct, an unknown column name, or an undefined
+    ``@param``.
     """
     prepared = _PARAM_RE.sub(lambda match: _PARAM_PREFIX + match.group(1), expression)
     try:
         tree = ast.parse(prepared, mode="eval")
     except SyntaxError as exc:
         raise QueryError(f"could not parse query {expression!r}: {exc.msg}.") from None
-    result = _Evaluator(columns, read_column, params or {}, expression).visit(tree.body)
-    mask = np.asarray(result)
-    if mask.dtype.kind != "b":
+    built = _build(tree.body, columns, params or {}, expression)
+    if not isinstance(built, _Expr):
+        raise QueryError(f"query {expression!r} must reference at least one column.")
+    return built
+
+
+def _fail(source: str, message: str) -> NoReturn:
+    raise QueryError(f"in query {source!r}: {message}")
+
+
+def _build(node: ast.AST, columns: frozenset[str], params: dict[str, Any], source: str) -> Any:
+    """Map one whitelisted ``ast`` node to an ``_Expr`` (or a literal scalar)."""
+    if isinstance(node, ast.BoolOp):
+        reducer = np.logical_and if isinstance(node.op, ast.And) else np.logical_or
+        built = _build(node.values[0], columns, params, source)
+        for value in node.values[1:]:
+            built = _Op(reducer, built, _build(value, columns, params, source))
+        return built
+    if isinstance(node, ast.UnaryOp):
+        ufunc = _UNARY_OPS.get(type(node.op))
+        if ufunc is None:
+            _fail(source, f"unsupported unary operator {type(node.op).__name__}.")
+        return _Op(ufunc, _build(node.operand, columns, params, source))
+    if isinstance(node, ast.BinOp):
+        ufunc = _BINOP_OPS.get(type(node.op))
+        if ufunc is None:
+            _fail(source, f"unsupported operator {type(node.op).__name__}.")
+        return _Op(
+            ufunc,
+            _build(node.left, columns, params, source),
+            _build(node.right, columns, params, source),
+        )
+    if isinstance(node, ast.Compare):
+        return _build_compare(node, columns, params, source)
+    if isinstance(node, ast.Name):
+        return _build_name(node, columns, params, source)
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [_build(element, columns, params, source) for element in node.elts]
+    _fail(source, f"unsupported expression element {type(node).__name__}.")
+
+
+def _build_compare(
+    node: ast.Compare, columns: frozenset[str], params: dict[str, Any], source: str
+) -> _Expr:
+    left = _build(node.left, columns, params, source)
+    result: _Expr | None = None
+    for op, comparator in zip(node.ops, node.comparators, strict=True):
+        right = _build(comparator, columns, params, source)
+        if isinstance(op, ast.In):
+            piece: _Expr = _Isin(_as_expr(left, source), right)
+        elif isinstance(op, ast.NotIn):
+            piece = _Op(np.logical_not, _Isin(_as_expr(left, source), right))
+        else:
+            ufunc = _COMPARE_OPS.get(type(op))
+            if ufunc is None:
+                _fail(source, f"unsupported comparison {type(op).__name__}.")
+            piece = _Compare(ufunc, left, right)
+        result = piece if result is None else _Op(np.bitwise_and, result, piece)
+        left = right
+    assert result is not None  # a Compare always has at least one operator
+    return result
+
+
+def _build_name(
+    node: ast.Name, columns: frozenset[str], params: dict[str, Any], source: str
+) -> Any:
+    name = node.id
+    if name.startswith(_PARAM_PREFIX):
+        key = name[len(_PARAM_PREFIX) :]
+        if key not in params:
+            _fail(source, f"undefined parameter @{key}; pass params={{{key!r}: ...}}.")
+        return params[key]
+    if name in columns:
+        return _Col(name)
+    _fail(source, f"unknown name {name!r}: not a column or an @param.")
+
+
+def _as_expr(value: Any, source: str) -> _Expr:
+    if isinstance(value, _Expr):
+        return value
+    _fail(source, "the left side of 'in' must reference a column.")
+
+
+# ---- Validation and evaluation against a store -----------------------------
+
+
+def validate_predicate(expr: _Expr, columns: frozenset[str], probe: ReadColumn) -> None:
+    """Eagerly reject a predicate that is unusable, without reading data.
+
+    Checks every referenced column exists and that the predicate reduces to a
+    boolean condition over at least one column, the latter via a 0-row dtype
+    probe (``probe(name)`` returns an empty typed array). Raises
+    :class:`QueryError`; reads no row data.
+    """
+    referenced = set(expr._columns())
+    missing = sorted(name for name in referenced if name not in columns)
+    if missing:
+        raise QueryError(f"query references unknown column(s) {missing}; have {sorted(columns)}.")
+    if not referenced:
+        raise QueryError("a query must reference at least one column.")
+    result = np.asarray(expr._evaluate(probe))
+    if result.dtype.kind != "b":
         raise QueryError(
-            f"query {expression!r} must be a boolean condition; it evaluated to "
-            f"dtype {mask.dtype}."
+            f"a query must be a boolean condition; this one evaluates to dtype {result.dtype}."
+        )
+
+
+def evaluate_mask(expr: _Expr, read_column: ReadColumn, n_rows: int) -> NDArray[np.bool_]:
+    """Evaluate a (validated) predicate to a boolean row mask of length ``n_rows``."""
+    mask = np.asarray(expr._evaluate(read_column))
+    if mask.ndim != 1 or mask.shape[0] != n_rows:
+        raise QueryError(
+            f"a query must reduce to a per-row condition of length {n_rows}; "
+            f"got an array of shape {mask.shape}."
         )
     return mask

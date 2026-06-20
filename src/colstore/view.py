@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from ._query import _Expr, evaluate_mask
+
 if TYPE_CHECKING:
     import pandas as pd
 
@@ -40,15 +42,19 @@ class _BaseView:
         self._row_part = row_part
 
     def _resolve_row_indexer(self) -> _RowIndexer:
-        """Normalize the user's row selector into None / int / slice / int-array.
+        """Normalize the row selector into None / int / slice / int-array / mask.
 
         All integer selectors are validated against ``n_rows`` here, and
         negative positions are folded to their non-negative equivalents. This
         makes every gather backend (NumPy, C++, Numba) agree on bounds and
         wraparound semantics, instead of leaving the unchecked kernels to read
-        out of bounds on a memmap.
+        out of bounds on a memmap. A ``col()`` / ``query`` predicate is evaluated
+        against the store first -- reading the columns it references -- into a
+        boolean mask.
         """
         row = self._row_part
+        if isinstance(row, _Expr):
+            row = evaluate_mask(row, self._store._read_query_column, self._store.n_rows)
         if row is None:
             return None
         if isinstance(row, (int, np.integer)):
@@ -192,6 +198,16 @@ class ColumnView(_BaseView):
             return self._store._view_one(self._column_name, row_indexer)
         return self._store._gather_one(self._column_name, row_indexer)
 
+    def evaluate(self) -> ColumnView:
+        """Resolve the (lazy) row selection now; return a view over the concrete rows.
+
+        For a ``col()`` / ``query`` selection this reads the predicate columns and
+        computes the boolean row mask once, returning an equivalent view whose
+        rows are already resolved -- so a later ``.array()`` does not recompute the
+        selection. The column itself is not materialized.
+        """
+        return ColumnView(self._store, self._resolve_row_indexer(), self._column_name)
+
 
 class TableView(_BaseView):
     """Lazy view of multiple columns produced by any non-string indexing.
@@ -295,3 +311,14 @@ class TableView(_BaseView):
         from .reader import _make_dataframe_no_consolidate
 
         return _make_dataframe_no_consolidate(self.dict(copy=copy))
+
+    def evaluate(self) -> TableView:
+        """Resolve the (lazy) row selection now; return a view over the concrete rows.
+
+        For a ``col()`` / ``query`` selection this reads the predicate columns and
+        computes the boolean row mask once, returning an equivalent view whose
+        rows are already resolved -- so a later ``.frame()`` / ``.dict()`` /
+        ``.recarray()`` (or the head/preview helpers) does not recompute the
+        selection. The selected columns are not materialized.
+        """
+        return TableView(self._store, self._resolve_row_indexer(), self._column_names)
