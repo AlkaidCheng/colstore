@@ -125,16 +125,20 @@ def _selector_row_count(row_indexer: Any, n_rows: int) -> int:
 
 # ---- Parallel contiguous copy ------------------------------------------
 #
-# A contiguous column read is one memcpy from the memmap into an owning
-# ndarray. NumPy's copy is single-threaded; where one core cannot saturate
-# the memory bus, splitting the copy across threads wins on big reads. The
-# conservative thresholds below keep small reads single-threaded: any read
-# below _PARALLEL_COPY_MIN_BYTES goes single-threaded, and each worker gets
-# at least _PARALLEL_COPY_BYTES_PER_THREAD of work so the threadpool fork
-# cost is amortized.
+# A contiguous column read is one memcpy from the memmap into an owning ndarray.
+# NumPy's copy is single-threaded; where one core cannot saturate the memory bus,
+# splitting the copy across threads wins on big reads. A native-dtype, contiguous
+# copy of at least _KERNEL_COPY_MIN_BYTES goes through the parallel-copy kernel,
+# which load-balances the bytes over an OpenMP team (persistent, so no per-read
+# pool fork) -- it parallelizes from a lower size than the Python path and beat
+# it at every measured size. Below that gate the per-read run-array setup
+# outweighs the win, so a single np.array copy is faster; a byteswapping
+# (non-native) or strided copy the kernel cannot take, and falls back to that
+# np.array copy or, above _PARALLEL_COPY_MIN_BYTES, a Python-threadpool row split.
 
 _PARALLEL_COPY_MIN_BYTES = 16 * 1024 * 1024
 _PARALLEL_COPY_BYTES_PER_THREAD = 16 * 1024 * 1024
+_KERNEL_COPY_MIN_BYTES = 2 * 1024 * 1024
 
 
 def _parallel_copy(
@@ -145,12 +149,15 @@ def _parallel_copy(
 ) -> NDArray[Any]:
     """Copy a 1-D numpy view into a new owning ndarray, optionally in parallel.
 
-    The ``source`` may be contiguous (a plain slice) or strided (a stepped
-    slice). The per-chunk ``out[a:b] = source[a:b]`` assignment handles either
-    layout -- NumPy walks the source's strides and releases the GIL during the
-    bulk element copy -- so the same row-range splitting parallelizes both.
+    A contiguous, native-dtype source of at least ``_KERNEL_COPY_MIN_BYTES``
+    copies through the parallel-copy kernel (a single byte run split across the
+    thread budget). Otherwise the ``source`` may be contiguous or strided (a
+    stepped slice): the per-chunk ``out[a:b] = source[a:b]`` assignment handles
+    either layout -- NumPy walks the source's strides and releases the GIL during
+    the bulk copy -- so the same row-range splitting parallelizes both.
 
-    Falls back to a single ``np.array`` copy when:
+    Falls back to a single ``np.array`` copy (which also byteswaps a non-native
+    source) when:
 
       * ``thread_cap <= 1`` (caller doesn't want parallelism, e.g. because
         the column threadpool is already saturating cores), OR
@@ -163,13 +170,29 @@ def _parallel_copy(
     strided view is sized by the data actually copied, not the span it walks.
     """
     n_bytes = source.nbytes
+    if (
+        thread_cap > 1
+        and n_bytes >= _KERNEL_COPY_MIN_BYTES
+        and source.dtype == dst_dtype
+        and source.flags["C_CONTIGUOUS"]
+        and kernels.cpp_available()
+    ):
+        out: NDArray[Any] = np.empty(source.shape[0], dtype=dst_dtype)
+        kernels.parallel_copy_runs(
+            out,
+            np.array([source.ctypes.data], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([n_bytes], dtype=np.int64),
+            thread_cap,
+        )
+        return out
     if thread_cap <= 1 or n_bytes < _PARALLEL_COPY_MIN_BYTES:
         return np.array(source, dtype=dst_dtype, copy=True)
     n_threads = min(thread_cap, max(1, n_bytes // _PARALLEL_COPY_BYTES_PER_THREAD))
     if n_threads <= 1:
         return np.array(source, dtype=dst_dtype, copy=True)
     n_rows = source.shape[0]
-    out: NDArray[Any] = np.empty(n_rows, dtype=dst_dtype)
+    out = np.empty(n_rows, dtype=dst_dtype)
     chunk = (n_rows + n_threads - 1) // n_threads
 
     def copy_chunk(start: int, end: int) -> None:

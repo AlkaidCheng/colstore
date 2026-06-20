@@ -52,6 +52,23 @@ def max_threads() -> int:
     return 1
 
 
+def parallel_copy_runs(
+    output: np.ndarray,
+    src_addrs: np.ndarray,
+    dst_offsets: np.ndarray,
+    byte_lengths: np.ndarray,
+    thread_cap: int,
+) -> None:
+    """Copy byte runs into ``output`` via the C++ kernel.
+
+    Run ``r`` copies ``byte_lengths[r]`` bytes from absolute address
+    ``src_addrs[r]`` to ``output`` byte offset ``dst_offsets[r]``, splitting the
+    runs' total bytes across threads. The caller ensures the extension is built
+    (:func:`cpp_available`) and keeps the source buffers alive across the call.
+    """
+    _cpp_module.parallel_copy_runs(output, src_addrs, dst_offsets, byte_lengths, thread_cap)
+
+
 def _is_native_order(array: np.ndarray) -> bool:
     """Return whether `array` is in the host's native byte order."""
     byteorder = array.dtype.byteorder

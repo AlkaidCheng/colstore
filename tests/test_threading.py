@@ -113,6 +113,38 @@ def test_thread_count_resolution_rules():
         assert _gather.thread_count_for(20_000_000, 32) >= _gather.thread_count_for(1_000_000, 32)
 
 
+@pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
+def test_kernel_copy_path_routes_large_native_contiguous_reads(tmp_path, monkeypatch):
+    # A large native contiguous read (whole table, forward slice) goes through
+    # the parallel-copy kernel; a strided slice never does. All results stay
+    # correct. The store clears _KERNEL_COPY_MIN_BYTES (2 MiB) at 8 bytes/row.
+    from colstore import kernels
+
+    n = 300_000
+    data = np.arange(n, dtype=np.float64)
+    store = colstore.store({"a": data}, tmp_path / "big.cstore", show_progress=False, backend="cpp")
+    calls = {"n": 0}
+    real = kernels.parallel_copy_runs
+
+    def spy(*args):
+        calls["n"] += 1
+        return real(*args)
+
+    monkeypatch.setattr(kernels, "parallel_copy_runs", spy)
+    original = config.get_gather_thread_cap()
+    try:
+        config.set_gather_thread_cap(4)  # force the thread_cap > 1 kernel path
+        np.testing.assert_array_equal(store["a"].array(), data)
+        np.testing.assert_array_equal(store[100 : n - 100, "a"].array(), data[100 : n - 100])
+        assert calls["n"] >= 2  # whole and forward slice both routed to the kernel
+        before = calls["n"]
+        np.testing.assert_array_equal(store[::3, "a"].array(), data[::3])  # strided
+        assert calls["n"] == before  # the strided copy stays on the host path
+    finally:
+        config.set_gather_thread_cap(original)
+        store.close()
+
+
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
 def test_gather_correct_under_various_caps(tmp_path):
     store = colstore.store(
