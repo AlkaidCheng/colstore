@@ -19,7 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import config, kernels
-from ._query import QueryError, evaluate_query
+from ._query import _Expr, parse_query, validate_predicate
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
@@ -215,12 +215,14 @@ class _ReaderBase(abc.ABC):
     @overload
     def __getitem__(self, key: tuple[Any, str]) -> ColumnView: ...
     @overload
-    def __getitem__(self, key: int | slice | list[Any] | NDArray[Any]) -> TableView: ...
+    def __getitem__(self, key: int | slice | list[Any] | NDArray[Any] | _Expr) -> TableView: ...
     @overload
     def __getitem__(self, key: tuple[Any, list[str] | tuple[str, ...]]) -> TableView: ...
 
     def __getitem__(self, key: Any) -> ColumnView | TableView:
         row_part, column_names, is_single_column = self._parse_key(key)
+        if isinstance(row_part, _Expr):
+            validate_predicate(row_part, frozenset(self._column_dtypes), self._query_probe)
         if is_single_column:
             return ColumnView(self, row_part, column_names[0])
         return TableView(self, row_part, column_names)
@@ -282,55 +284,73 @@ class _ReaderBase(abc.ABC):
 
     def query(
         self,
-        expression: str,
+        expression: str | _Expr,
         *,
         columns: list[str] | tuple[str, ...] | None = None,
         params: dict[str, Any] | None = None,
+        lazy: bool = True,
     ) -> TableView:
-        """Select the rows matching a predicate string; returns a lazy view.
+        """Select the rows matching a predicate; returns a lazy view by default.
 
-        ``expression`` is a pandas-style condition over the columns -- e.g.
-        ``"energy > 100 and -2.5 < eta < 2.5"``. Only the referenced columns are
-        read (once each) to compute the row mask; the result is a lazy
-        :class:`~colstore.view.TableView` whose selected columns are not
-        materialized until ``.frame()`` / ``.dict()`` / ``.recarray()`` /
-        ``.array()`` is called.
+        ``expression`` is either a pandas-style condition string -- e.g.
+        ``"energy > 100 and -2.5 < eta < 2.5"`` -- or a :func:`~colstore.col`
+        expression (``(col("pt") > 30) & col("ok")``). The predicate is parsed and
+        validated eagerly (an unknown column, an unsupported construct, or a
+        non-boolean condition raises :class:`~colstore.QueryError` immediately,
+        reading no data), but evaluation is deferred: the result is a lazy
+        :class:`~colstore.view.TableView` whose row selection is computed -- and
+        whose selected columns are materialized -- only when you call
+        :meth:`~colstore.view.TableView.evaluate`, ``.frame()`` / ``.dict()`` /
+        ``.recarray()`` / ``.array()``, or another consumer. Pass ``lazy=False``
+        to resolve the row mask immediately (equivalent to calling
+        :meth:`~colstore.view.TableView.evaluate` on the result).
 
-        The grammar is a strict whitelist evaluated without ``eval``: column
-        names, numeric / string / bool literals, comparisons (including chained
-        ``a < x < b``), the boolean operators (``and`` / ``or`` / ``not`` and
-        ``& | ~`` -- parenthesize the bitwise forms, which bind tighter than
+        The string grammar is a strict whitelist evaluated without ``eval``:
+        column names, numeric / string / bool literals, comparisons (including
+        chained ``a < x < b``), the boolean operators (``and`` / ``or`` / ``not``
+        and ``& | ~`` -- parenthesize the bitwise forms, which bind tighter than
         comparison), arithmetic, and ``in`` / ``not in`` membership. ``@name``
         resolves from ``params`` (``query("pt > @cut", params={"cut": 30})``);
-        the calling frame is never inspected. A function call, an attribute, or
-        any unknown name raises :class:`~colstore.QueryError`.
+        the calling frame is never inspected.
 
         Parameters
         ----------
-        expression : str
-            The predicate. Must reduce to a per-row boolean condition (so it
-            references at least one column, or a bool column on its own).
+        expression : str or column expression
+            The predicate. Must reduce to a per-row boolean condition.
         columns : list of str, optional
             Project the result to these columns; the default keeps all columns.
         params : dict, optional
-            Values for ``@name`` references in ``expression``.
+            Values for ``@name`` references (string ``expression`` only).
+        lazy : bool, optional
+            ``True`` (default) returns a lazy view; ``False`` resolves the row
+            mask now and returns a view over it.
 
         Returns
         -------
         TableView
             A lazy view of the matching rows (and selected columns).
         """
-        mask = evaluate_query(expression, frozenset(self.columns), self._read_query_column, params)
-        if mask.ndim != 1 or mask.shape[0] != self.n_rows:
-            raise QueryError(
-                f"query {expression!r} must reduce to a per-row condition of length "
-                f"{self.n_rows}; got an array of shape {mask.shape}. Does it "
-                f"reference at least one column?"
-            )
-        if columns is None:
-            return self[mask]
-        return self[mask, list(columns)]
+        predicate = (
+            expression
+            if isinstance(expression, _Expr)
+            else parse_query(expression, frozenset(self.columns), params)
+        )
+        view = self[predicate] if columns is None else self[predicate, list(columns)]
+        return view if lazy else view.evaluate()
+
+    def where(self, condition: _Expr) -> TableView:
+        """Select rows where a :func:`~colstore.col` expression is true (lazy).
+
+        ``ds.where(col("pt") > 30)`` is the explicit form of
+        ``ds[col("pt") > 30]``: a lazy :class:`~colstore.view.TableView` of the
+        matching rows. Combine conditions with ``& | ~``.
+        """
+        return self[condition]
 
     def _read_query_column(self, name: str) -> NDArray[Any]:
-        """Read one whole column as an array, for :meth:`query` predicate evaluation."""
+        """Read one whole column as an array, for predicate evaluation."""
         return self[name].array()
+
+    def _query_probe(self, name: str) -> NDArray[Any]:
+        """An empty typed array for one column, for the data-free query dtype probe."""
+        return np.empty(0, dtype=self._native_dtype(name))

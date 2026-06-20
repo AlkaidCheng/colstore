@@ -74,29 +74,44 @@ on disk by transforming its columns. Starting from raw arrays, reach for a write
 (or `store`); starting from a `.cstore` you want a modified copy of, reach for
 `edit()`, which gives you a frame.
 
-## Filtering with `query()`
+## Filtering with `query()` and `col()`
 
-`query()` selects rows with a pandas-style predicate string and returns a **lazy
-view** — only the columns named in the predicate are read to build the row mask;
-the selected columns aren't materialized until you call `.frame()` / `.dict()` /
-`.recarray()` / `.array()`.
+Filter rows with a pandas-style predicate **string** or a composable **`col()`
+expression** — both return a **lazy view**. Nothing is read until you
+materialize: the predicate columns are read (and the row mask computed) on the
+first `.evaluate()` / `.frame()` / `.dict()` / `.recarray()` / `.array()`, and the
+selected columns only when you ask for them.
 
 ```python
-hot = ds.query("energy > 100 and -2.5 < eta < 2.5")    # lazy TableView
-hot.frame()                                             # materialize now
+from colstore import col
+
+# String form (parsed and validated eagerly, evaluated lazily):
+hot = ds.query("energy > 100 and -2.5 < eta < 2.5")     # lazy TableView
+hot.frame()                                              # read + materialize now
 ds.query("pt > @cut and region == 'SR'", params={"cut": 30}).dict()
-ds.query("flag in (1, 3)", columns=["pt", "eta"]).recarray()
+
+# col() form (composable; stacks with & | ~ and stays lazy):
+ds[(col("pt") > 30) & (col("region") == "SR")].frame()
+ds.where(col("pt").isin([30, 40, 50]))                  # the explicit verb
+ds[col("pt") > 30, ["pt", "eta"]].recarray()            # project columns
 ```
 
-The grammar is a strict whitelist evaluated **without `eval`**: column names,
-numeric/string/bool literals, comparisons (including chained `a < x < b`), the
-boolean operators (`and` / `or` / `not` and `& | ~` — parenthesize the bitwise
-forms, which bind tighter than comparison), arithmetic, and `in` / `not in`
-membership. `@name` resolves from `params` (the calling frame is never
-inspected), and a bool column is a predicate on its own (`ds.query("is_signal")`).
-Anything outside the grammar — a function call, an attribute — raises
-`colstore.QueryError`. It behaves identically on a single file and a multi-file
-dataset.
+**Lazy by default; `evaluate()` to peek.** `query()` and `ds[expr]` defer
+everything; call `.evaluate()` (or `query(..., lazy=False)`) to resolve the row
+mask now — it reads the predicate columns and returns a view whose rows are
+fixed, so a following `.frame()` / `.dict()` doesn't recompute the selection. The
+selected columns are still materialized only on demand.
+
+The string grammar is a strict whitelist evaluated **without `eval`**: column
+names, numeric/string/bool literals, comparisons (including chained `a < x < b`),
+the boolean operators (`and` / `or` / `not` and `& | ~` — parenthesize the
+bitwise forms, which bind tighter than comparison), arithmetic, and `in` /
+`not in`. `@name` resolves from `params` (the calling frame is never inspected),
+and a bool column is a predicate on its own (`ds.query("is_signal")`). `col()`
+expressions combine with `& | ~` and `.isin(...)` (Python's `and` / `or` / `not`
+can't be overloaded). An unknown column, an unsupported construct, or a
+non-boolean condition raises `colstore.QueryError` immediately, reading no data.
+Everything behaves the same on a single file and a multi-file dataset.
 
 ## Writing
 
