@@ -1418,6 +1418,69 @@ int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* 
   });
 }
 
+void colstore_parallel_copy_runs(std::uint8_t* output, const std::int64_t* src_addrs,
+                                 const std::int64_t* dst_offsets,
+                                 const std::int64_t* byte_lengths,
+                                 std::int64_t n_runs, int thread_cap) {
+  if (n_runs <= 0) {
+    return;
+  }
+  // Prefix sum of the run lengths: prefix[r] is run r's first byte in the runs'
+  // logical concatenation. Threads partition that logical span, so the work
+  // balances over bytes regardless of run sizes. The output positions
+  // (dst_offsets) are independent of the prefix, so the runs may leave gaps --
+  // a region a non-viewable file fills separately.
+  std::vector<std::int64_t> prefix(static_cast<std::size_t>(n_runs) + 1);
+  prefix[0] = 0;
+  for (std::int64_t r = 0; r < n_runs; ++r) {
+    prefix[r + 1] = prefix[r] + byte_lengths[r];
+  }
+  const std::int64_t total = prefix[n_runs];
+  if (total <= 0) {
+    return;
+  }
+  const std::ptrdiff_t n_threads =
+      colstore::resolve_thread_count(static_cast<std::ptrdiff_t>(total), thread_cap);
+
+  // Copy logical bytes [lo, hi), mapping each to its run via the prefix and
+  // writing at the run's output position. upper_bound finds the run holding
+  // byte lo; ++run advances across run boundaries.
+  const auto copy_logical_range = [&](std::int64_t lo, std::int64_t hi) {
+    std::int64_t run = std::upper_bound(prefix.begin(), prefix.end(), lo) - prefix.begin() - 1;
+    std::int64_t p = lo;
+    while (p < hi) {
+      const std::int64_t end = std::min(hi, prefix[run + 1]);
+      const std::int64_t within = p - prefix[run];
+      std::memcpy(output + dst_offsets[run] + within,
+                  reinterpret_cast<const std::uint8_t*>(
+                      static_cast<std::uintptr_t>(src_addrs[run] + within)),
+                  static_cast<std::size_t>(end - p));
+      p = end;
+      ++run;
+    }
+  };
+
+#ifdef _OPENMP
+  if (n_threads > 1) {
+#pragma omp parallel num_threads(static_cast<int>(n_threads))
+    {
+      const std::int64_t nt = omp_get_num_threads();
+      const std::int64_t tid = omp_get_thread_num();
+      const std::int64_t chunk = (total + nt - 1) / nt;
+      const std::int64_t lo = tid * chunk;
+      const std::int64_t hi = std::min(total, lo + chunk);
+      if (lo < hi) {
+        copy_logical_range(lo, hi);
+      }
+    }
+    return;
+  }
+#else
+  (void)n_threads;
+#endif
+  copy_logical_range(0, total);
+}
+
 int colstore_gather_multirecord_mask(
     const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
     std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,

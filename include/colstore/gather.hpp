@@ -214,6 +214,20 @@ int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* 
                                      int itemsize, int thread_cap,
                                      std::ptrdiff_t prefetch_distance);
 
+// Parallel byte copy of runs into one output buffer. Run ``r`` copies
+// ``byte_lengths[r]`` bytes from absolute source address ``src_addrs[r]`` to
+// ``output + dst_offsets[r]``. The runs' lengths are split across threads in one
+// OpenMP region, load-balanced over bytes so a few large runs still parallelize
+// -- so a multi-file whole or forward-slice read fills one buffer without a
+// per-file host-language copy. Output positions are independent, so the runs may
+// leave gaps (a non-viewable file's region, filled separately). Source addresses
+// are absolute because the runs are slices of independent mmaps (a base+offset
+// form would be undefined across mappings).
+void colstore_parallel_copy_runs(std::uint8_t* output, const std::int64_t* src_addrs,
+                                 const std::int64_t* dst_offsets,
+                                 const std::int64_t* byte_lengths,
+                                 std::int64_t n_runs, int thread_cap);
+
 // Sorted multi-record fancy gather: a linear record walk instead of a
 // per-element binary search. Requires ``indices`` to be non-decreasing
 // (the caller checks; behavior is undefined otherwise). Each OpenMP thread

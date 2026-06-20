@@ -832,6 +832,47 @@ def test_parallel_fill_matches_oracle_with_threads(tmp_path):
         config.set_gather_thread_cap(previous)
 
 
+def test_contiguous_read_mixed_record_files_matches_oracle(tmp_path, monkeypatch):
+    # A dataset mixing a single-record file (kernel-copyable) and a multi-record
+    # file (not viewable -> gathered) exercises the gap path of the contiguous
+    # fill: some regions copy through the parallel-copy kernel, the rest gather
+    # alongside. The same read with the kernel forced off takes the host-language
+    # path for every region. Both must equal the concatenated oracle.
+    from colstore import kernels
+
+    single = tmp_path / "s.cstore"
+    x0 = np.arange(40, dtype=np.int64)
+    colstore.store({"x": x0, "y": x0 * 1.5}, single, show_progress=False).close()
+
+    multi = tmp_path / "m.cstore"
+    x_blocks, y_blocks = [x0], [x0 * 1.5]
+    with colstore.create(multi) as writer:
+        for i in range(3):
+            xb = np.arange(40 + 10 * i, 40 + 10 * (i + 1), dtype=np.int64)
+            writer.write({"x": xb, "y": xb * 1.5})
+            x_blocks.append(xb)
+            y_blocks.append(xb * 1.5)
+    ox, oy = np.concatenate(x_blocks), np.concatenate(y_blocks)
+
+    def check(ds):
+        n = ds.n_rows
+        np.testing.assert_array_equal(ds["x"].array(), ox)
+        whole = ds.dict()
+        np.testing.assert_array_equal(whole["x"], ox)
+        np.testing.assert_array_equal(whole["y"], oy)
+        np.testing.assert_array_equal(ds[3 : n - 2, "x"].array(), ox[3 : n - 2])
+        mask = np.zeros(n, dtype=bool)
+        mask[::3] = True
+        np.testing.assert_array_equal(ds[mask, "y"].array(), oy[mask])
+
+    with colstore.open([single, multi]) as ds:
+        assert any(child._is_multi_record for child in ds._children)  # gap path is live
+        check(ds)
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)
+    with colstore.open([single, multi]) as ds:
+        check(ds)
+
+
 # ---- concat(): lazy dataset or eager written file ----------------------
 
 
