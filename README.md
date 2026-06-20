@@ -66,8 +66,10 @@ colstore has three objects, one per job. Most code only ever needs
   it directly — `colstore.store(data, path)` writes a dict, record array, or
   DataFrame in one shot. (See **Writing**, below.)
 - **`ColStoreFrame`** is the edit interface. `reader.edit()` returns one; update,
-  add, drop, rename, or transform its columns and call `.write(path)` to stream
-  the result to a new file. It never modifies the source store.
+  add, drop, rename, or transform its columns, then either materialize in memory
+  (`compute(name)` for one column, `dict()` / `recarray()` for all) or
+  `.write(path)` to stream the result to a new file. It never modifies the source
+  store.
 
 The distinction people miss is **writer vs. frame**: a writer persists data you
 are already holding in memory, while a frame derives a new file from one already

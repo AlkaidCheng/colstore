@@ -282,3 +282,58 @@ def test_write_empty_frame_raises(source, tmp_path):
     cf = source.edit().drop(*source.columns)
     with pytest.raises(ValueError, match="empty column mapping"):
         cf.write(tmp_path / "o.cstore")
+
+
+# -- in-memory terminals: dict() / recarray() --
+
+
+def test_frame_dict_matches_source_columns(source, source_cols):
+    out = source.edit().dict()
+    assert list(out) == ["a", "b", "c"]
+    for name, arr in source_cols.items():
+        assert np.array_equal(out[name], arr)
+
+
+def test_frame_recarray_fields_and_values(source, source_cols):
+    rec = source.edit().recarray()
+    assert rec.dtype.names == ("a", "b", "c")
+    assert len(rec) == source.n_rows
+    for name, arr in source_cols.items():
+        assert np.array_equal(rec[name], arr)
+
+
+def test_frame_dict_reflects_derived_columns(source, source_cols):
+    cf = source.edit()
+    cf.assign(a2=cf["a"] * 2, s=cf["a"] + cf["b"])
+    out = cf.dict()
+    assert np.array_equal(out["a2"], source_cols["a"] * 2)
+    assert np.array_equal(out["s"], source_cols["a"] + source_cols["b"])
+
+
+def test_frame_in_memory_matches_write_roundtrip(source, source_cols, tmp_path):
+    cf = source.edit()
+    cf.assign(s=cf["a"] + cf["b"]).drop("c").rename({"b": "bb"})
+    in_memory = cf.dict()
+    written = _written(cf, tmp_path)
+    assert list(in_memory) == list(written)
+    for name in in_memory:
+        assert np.array_equal(in_memory[name], written[name])
+
+
+def test_frame_terminals_allow_empty(source):
+    cf = source.edit().drop(*source.columns)
+    assert cf.dict() == {}
+    assert len(cf.recarray()) == source.n_rows
+
+
+def test_frame_recarray_fallback_matches_kernel(source, monkeypatch):
+    from colstore import kernels
+
+    cf = source.edit()
+    cf.assign(s=cf["a"] + cf["b"])
+    expected = cf.recarray()
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)  # force per-field assembly
+    fallback = cf.recarray()
+    assert fallback.dtype == expected.dtype
+    for name in expected.dtype.names:
+        assert np.array_equal(fallback[name], expected[name])
