@@ -250,3 +250,74 @@ def test_multifile_sorted_duplicates_and_single_segment():
     out = np.empty(len(idx), dtype=np.float64)
     _gather.gather_multifile_sorted(idx, out, starts, base, 0, -1)
     np.testing.assert_array_equal(out, oracle[idx])
+
+
+# ---- parallel_copy_runs ------------------------------------------------
+
+
+def _runs(sources, dst_rows, itemsize):
+    """Run arrays placing each source array at its destination row offset."""
+    src = np.array([s.ctypes.data for s in sources], dtype=np.int64)
+    dst = np.array([row * itemsize for row in dst_rows], dtype=np.int64)
+    lengths = np.array([s.size * itemsize for s in sources], dtype=np.int64)
+    return src, dst, lengths
+
+
+@pytest.mark.parametrize("cap", [0, 1, 2, 4])
+def test_parallel_copy_runs_matches_concatenation(cap):
+    rng = np.random.default_rng(11)
+    blocks = [rng.integers(0, 1000, size=n).astype(np.float64) for n in (50, 1, 200, 99, 7)]
+    offsets = np.cumsum([0, *(b.size for b in blocks)])
+    out = np.empty(int(offsets[-1]), dtype=np.float64)
+    src, dst, lengths = _runs(blocks, offsets[:-1], 8)
+    _gather.parallel_copy_runs(out, src, dst, lengths, cap)
+    np.testing.assert_array_equal(out, np.concatenate(blocks))
+
+
+def test_parallel_copy_runs_leaves_gaps_untouched():
+    # Runs need not tile the output: a left-out region keeps its prior contents.
+    a = np.arange(10, dtype=np.float64)
+    b = np.arange(100, 105, dtype=np.float64)
+    out = np.full(20, -1.0, dtype=np.float64)
+    src, dst, lengths = _runs([a, b], [0, 15], 8)  # gap at rows [10, 15)
+    _gather.parallel_copy_runs(out, src, dst, lengths, 4)
+    expected = np.full(20, -1.0)
+    expected[0:10] = a
+    expected[15:20] = b
+    np.testing.assert_array_equal(out, expected)
+
+
+def test_parallel_copy_runs_large_multithread():
+    rng = np.random.default_rng(3)
+    blocks = [rng.integers(0, 1 << 20, size=n).astype(np.int32) for n in (2_000_000, 1_500_000)]
+    offsets = np.cumsum([0, *(b.size for b in blocks)])
+    out = np.empty(int(offsets[-1]), dtype=np.int32)
+    src, dst, lengths = _runs(blocks, offsets[:-1], 4)
+    _gather.parallel_copy_runs(out, src, dst, lengths, 4)
+    np.testing.assert_array_equal(out, np.concatenate(blocks))
+
+
+def test_parallel_copy_runs_empty_is_noop():
+    out = np.array([1.0, 2.0])
+    empty = np.empty(0, dtype=np.int64)
+    _gather.parallel_copy_runs(out, empty, empty, empty, 0)
+    np.testing.assert_array_equal(out, [1.0, 2.0])
+
+
+def test_parallel_copy_runs_length_mismatch_raises():
+    out = np.empty(4, dtype=np.float64)
+    src = np.array([out.ctypes.data], dtype=np.int64)
+    with pytest.raises(ValueError, match="equal length"):
+        _gather.parallel_copy_runs(
+            out, src, np.array([0, 0], dtype=np.int64), np.array([32], dtype=np.int64), 0
+        )
+
+
+def test_parallel_copy_runs_non_int64_raises():
+    # The dtype guard rejects the int32 address array before any dereference.
+    out = np.empty(4, dtype=np.float64)
+    bad = np.array([0], dtype=np.int32)
+    with pytest.raises(TypeError, match="int64"):
+        _gather.parallel_copy_runs(
+            out, bad, np.array([0], dtype=np.int64), np.array([32], dtype=np.int64), 0
+        )

@@ -65,6 +65,8 @@ cdef extern from "colstore/gather.hpp" nogil:
     int colstore_gather_multifile_sorted(const int64_t*, uint8_t*, ptrdiff_t,
                                          const int64_t*, const int64_t*, int64_t,
                                          int, int, ptrdiff_t)
+    void colstore_parallel_copy_runs(uint8_t*, const int64_t*, const int64_t*,
+                                     const int64_t*, int64_t, int)
     int colstore_gather_multirecord_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
@@ -1062,6 +1064,37 @@ def gather_multifile_sorted(cnp.ndarray indices, cnp.ndarray output,
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
         )
+
+
+def parallel_copy_runs(cnp.ndarray output, cnp.ndarray src_addrs,
+                       cnp.ndarray dst_offsets, cnp.ndarray byte_lengths,
+                       int thread_cap=0):
+    """Parallel byte copy of contiguous runs into ``output``.
+
+    Run ``r`` copies ``byte_lengths[r]`` bytes from absolute address
+    ``src_addrs[r]`` to ``output`` byte offset ``dst_offsets[r]``; the runs
+    tile ``output`` in ascending order. The total byte span is split across
+    threads, so a few large runs (a multi-file whole/forward-slice read) still
+    parallelize. The caller keeps the source buffers alive across the call.
+    """
+    _require_1d((src_addrs, dst_offsets, byte_lengths), "run arrays must be 1D.")
+    _require_int64(src_addrs, "src_addrs")
+    _require_int64(dst_offsets, "dst_offsets")
+    _require_int64(byte_lengths, "byte_lengths")
+    cdef long long n_runs = src_addrs.shape[0]
+    if dst_offsets.shape[0] != n_runs or byte_lengths.shape[0] != n_runs:
+        raise ValueError("src_addrs, dst_offsets, and byte_lengths must be equal length.")
+    if n_runs == 0:
+        return
+    _require_c_contiguous((("output", output), ("src_addrs", src_addrs),
+                           ("dst_offsets", dst_offsets), ("byte_lengths", byte_lengths)))
+    cdef uint8_t* out_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* sa = <const int64_t*>cnp.PyArray_DATA(src_addrs)
+    cdef const int64_t* do = <const int64_t*>cnp.PyArray_DATA(dst_offsets)
+    cdef const int64_t* bl = <const int64_t*>cnp.PyArray_DATA(byte_lengths)
+    with nogil:
+        colstore_parallel_copy_runs(out_ptr, sa, do, bl, n_runs, thread_cap)
+
 
 def gather_multifile_bins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray bins,
                           cnp.ndarray segment_starts_rows, cnp.ndarray segment_base,

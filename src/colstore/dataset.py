@@ -65,6 +65,11 @@ _INT32_MAX = (1 << 31) - 1
 # each segment's absolute byte base (see _native_segment_table).
 SegmentTable: TypeAlias = tuple[NDArray[np.int64], NDArray[np.int64]]
 
+# One file's contribution to a contiguous read: the half-open output row range
+# ``[out_lo, out_hi)`` it fills, its child reader, and the per-file selector
+# (``None``, a slice, or a boolean sub-mask) -- see _fill_contiguous_columns.
+Region: TypeAlias = tuple[int, int, ColStoreReader, Any]
+
 _VIEW_FANCY_MESSAGE = (
     "A zero-copy read is available only for contiguous selectors; fancy and "
     "boolean selection require a copying gather. Use copy=True."
@@ -305,14 +310,17 @@ class ColStoreDataset(_ReaderBase):
 
     # ---- Parallel fill across files ------------------------------------
     #
-    # Every multi-file read preallocates one output and fills each file's region
-    # concurrently: the per-file reads are independent and write disjoint regions
-    # (a contiguous slice, or disjoint scattered positions), so they need no
-    # locking. The pool is sized to the gather thread budget and each per-file
-    # read runs single-threaded, so the total thread count stays in the same
-    # envelope as a single-file read -- the parallelism just moves up to the file
-    # level, where each file's copy is too small to trip the single-file
-    # parallel-copy size gate on its own.
+    # Every multi-file read preallocates one output and fills disjoint regions of
+    # it concurrently, so the fills need no locking. A contiguous read (whole
+    # table or a forward slice) of native, single-record files copies through the
+    # parallel-copy kernel: each file's bytes become a run, and one kernel call
+    # splits the runs across the gather thread budget -- so a few large files no
+    # longer copy single-threaded one at a time, the way the single-file reader
+    # already splits a large contiguous copy. A region the kernel cannot take (a
+    # strided view, a multi-record or non-native file, a boolean mask) fills on a
+    # thread pool instead, one job per region at thread_cap=1 so the total thread
+    # count stays in the single-file envelope. The fancy gather still scatters
+    # through _fill_one (see _fancy_one / _fancy_many).
 
     def _read_budget(self) -> int:
         return max(1, config.get_gather_thread_cap())
@@ -352,18 +360,94 @@ class ColStoreDataset(_ReaderBase):
 
         return job
 
-    def _fill_many(
+    def _offset_regions(self) -> list[Region]:
+        """Whole-read regions: each non-empty file owns its global row range."""
+        regions: list[Region] = []
+        for file_index, child in enumerate(self._children):
+            lo, hi = int(self._offsets[file_index]), int(self._offsets[file_index + 1])
+            if lo < hi:
+                regions.append((lo, hi, child, None))
+        return regions
+
+    def _contiguous_regions(self, parts: list[tuple[int, Any]], lengths: list[int]) -> list[Region]:
+        """Slice/mask regions: each file's portion mapped to its output write offset."""
+        regions: list[Region] = []
+        write = 0
+        for (file_index, sub), length in zip(parts, lengths, strict=True):
+            regions.append((write, write + length, self._children[file_index], sub))
+            write += length
+        return regions
+
+    def _fill_contiguous_columns(
+        self, out: dict[str, NDArray[Any]], column_names: list[str], regions: list[Region]
+    ) -> None:
+        """Fill each column's disjoint output regions from the files' bytes.
+
+        Each native, single-record, contiguously-viewable file portion becomes a
+        run of the parallel-copy kernel, which splits the column's bytes across
+        the gather thread budget in one pass. A portion the kernel cannot take --
+        a strided view, or a multi-record/non-native file that needs a gather --
+        fills on the side, single-threaded. With the kernel unavailable every
+        portion takes that side path, so the read still completes.
+        """
+        from . import kernels
+
+        use_kernel = kernels.cpp_available()
+        cap = config.get_gather_thread_cap()
+        for name in column_names:
+            target = out[name]
+            itemsize = target.dtype.itemsize
+            src: list[int] = []
+            dst: list[int] = []
+            lengths: list[int] = []
+            held: list[NDArray[Any]] = []
+            jobs: list[Callable[[], None]] = []
+            for out_lo, out_hi, child, sub in regions:
+                try:
+                    view = child._view_one(name, sub)
+                except ValueError:
+                    jobs.append(self._gather_fill_job(target, out_lo, out_hi, child, name, sub))
+                    continue
+                if use_kernel and view.flags["C_CONTIGUOUS"]:
+                    src.append(view.ctypes.data)
+                    dst.append(out_lo * itemsize)
+                    lengths.append((out_hi - out_lo) * itemsize)
+                    held.append(view)
+                else:
+                    jobs.append(self._copy_view_job(target, out_lo, out_hi, view))
+            if src:
+                from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+                _cpp_module.parallel_copy_runs(
+                    target,
+                    np.array(src, dtype=np.int64),
+                    np.array(dst, dtype=np.int64),
+                    np.array(lengths, dtype=np.int64),
+                    cap,
+                )
+                held.clear()  # release the source views now the kernel has read them
+            self._run_fill_jobs(jobs)
+
+    @staticmethod
+    def _copy_view_job(
+        out: NDArray[Any], out_lo: int, out_hi: int, view: NDArray[Any]
+    ) -> Callable[[], None]:
+        def job() -> None:
+            out[out_lo:out_hi] = view
+
+        return job
+
+    def _gather_fill_job(
         self,
-        out: dict[str, NDArray[Any]],
-        lo: int,
-        hi: int,
+        out: NDArray[Any],
+        out_lo: int,
+        out_hi: int,
         child: ColStoreReader,
-        column_names: list[str],
+        name: str,
         sub: Any,
     ) -> Callable[[], None]:
         def job() -> None:
-            for name in column_names:
-                out[name][lo:hi] = self._portion_source(child, name, sub)
+            out[out_lo:out_hi] = child._gather_one(name, sub, thread_cap=1)
 
         return job
 
@@ -602,12 +686,7 @@ class ColStoreDataset(_ReaderBase):
         dtype = self.dtypes[column_name]
         if row_indexer is None:
             out = np.empty(self._n_rows, dtype=dtype)
-            jobs: list[Callable[[], None]] = []
-            for file_index, child in enumerate(children):
-                lo, hi = int(self._offsets[file_index]), int(self._offsets[file_index + 1])
-                if lo < hi:
-                    jobs.append(self._fill_one(out, lo, hi, child, column_name, None))
-            self._run_fill_jobs(jobs)
+            self._fill_contiguous_columns({column_name: out}, [column_name], self._offset_regions())
             return out
         if isinstance(row_indexer, (int, np.integer)):
             file_index, local = self._locate(int(row_indexer))
@@ -634,21 +713,10 @@ class ColStoreDataset(_ReaderBase):
         parts: list[tuple[int, Any]],
         lengths: list[int],
     ) -> None:
-        """Fill ``out`` left to right, each file's portion of one column in turn.
-
-        The portions cover disjoint, in-order regions of ``out``, so the per-file
-        fills run concurrently without locking.
-        """
-        jobs: list[Callable[[], None]] = []
-        write = 0
-        for (file_index, sub), length in zip(parts, lengths, strict=True):
-            jobs.append(
-                self._fill_one(
-                    out, write, write + length, self._children[file_index], column_name, sub
-                )
-            )
-            write += length
-        self._run_fill_jobs(jobs)
+        """Fill ``out`` with one column's per-file portions in file order."""
+        self._fill_contiguous_columns(
+            {column_name: out}, [column_name], self._contiguous_regions(parts, lengths)
+        )
 
     def _gather_slice_into(
         self, out: NDArray[Any], column_name: str, start: int, stop: int
@@ -682,12 +750,7 @@ class ColStoreDataset(_ReaderBase):
             return children[0]._gather_many(column_names, row_indexer)
         if row_indexer is None:
             out = {name: np.empty(self._n_rows, dtype=self.dtypes[name]) for name in column_names}
-            jobs: list[Callable[[], None]] = []
-            for file_index, child in enumerate(children):
-                lo, hi = int(self._offsets[file_index]), int(self._offsets[file_index + 1])
-                if lo < hi:
-                    jobs.append(self._fill_many(out, lo, hi, child, column_names, None))
-            self._run_fill_jobs(jobs)
+            self._fill_contiguous_columns(out, column_names, self._offset_regions())
             return out
         if isinstance(row_indexer, (int, np.integer)):
             file_index, local = self._locate(int(row_indexer))
@@ -711,16 +774,7 @@ class ColStoreDataset(_ReaderBase):
         lengths = self._contiguous_lengths(parts, is_mask)
         total = sum(lengths)
         out = {name: np.empty(total, dtype=self.dtypes[name]) for name in column_names}
-        jobs: list[Callable[[], None]] = []
-        write = 0
-        for (file_index, sub), length in zip(parts, lengths, strict=True):
-            jobs.append(
-                self._fill_many(
-                    out, write, write + length, self._children[file_index], column_names, sub
-                )
-            )
-            write += length
-        self._run_fill_jobs(jobs)
+        self._fill_contiguous_columns(out, column_names, self._contiguous_regions(parts, lengths))
         return out
 
     # ---- Zero-copy seam ------------------------------------------------
