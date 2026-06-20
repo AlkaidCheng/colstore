@@ -677,6 +677,31 @@ class ColStoreDataset(_ReaderBase):
 
     # ---- Copying seam --------------------------------------------------
 
+    def _classify_rows(self, row_indexer: Any) -> tuple[str, Any]:
+        """Map a row selector to ``(kind, payload)`` for the gather dispatch.
+
+        The classification is identical for single- and multi-column reads --
+        only the terminal materialization differs -- so it lives here once.
+        ``kind`` is ``"whole"`` (payload ``None``), ``"scalar"`` (payload
+        ``(file_index, local)``), ``"fancy"`` (an ``int64`` index array, also
+        covering a negative-step slice), or ``"contiguous"`` (payload
+        ``(parts, is_mask)`` for a forward slice or a boolean mask).
+        """
+        if row_indexer is None:
+            return "whole", None
+        if isinstance(row_indexer, (int, np.integer)):
+            return "scalar", self._locate(int(row_indexer))
+        if isinstance(row_indexer, slice):
+            start, stop, step = row_indexer.indices(self._n_rows)
+            if step < 0:
+                return "fancy", np.arange(start, stop, step, dtype=np.int64)
+            return "contiguous", (self._slice_parts(row_indexer), False)
+        if isinstance(row_indexer, np.ndarray):
+            if row_indexer.dtype == np.bool_:
+                return "contiguous", (self._mask_parts(row_indexer), True)
+            return "fancy", row_indexer.astype(np.int64, copy=False)
+        raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
+
     def _gather_one(
         self, column_name: str, row_indexer: Any, thread_cap: int | None = None
     ) -> NDArray[Any]:
@@ -685,28 +710,19 @@ class ColStoreDataset(_ReaderBase):
         children = self._children
         if len(children) == 1:
             return children[0]._gather_one(column_name, row_indexer, thread_cap)
-        dtype = self._native_dtype(column_name)
-        if row_indexer is None:
-            out = np.empty(self._n_rows, dtype=dtype)
+        kind, payload = self._classify_rows(row_indexer)
+        if kind == "scalar":
+            file_index, local = payload
+            child: ColStoreReader = children[file_index]
+            return child._gather_one(column_name, local, thread_cap)
+        if kind == "fancy":
+            return self._fancy_one(column_name, payload)
+        if kind == "whole":
+            out = np.empty(self._n_rows, dtype=self._native_dtype(column_name))
             self._fill_contiguous_columns({column_name: out}, [column_name], self._offset_regions())
             return out
-        if isinstance(row_indexer, (int, np.integer)):
-            file_index, local = self._locate(int(row_indexer))
-            return children[file_index]._gather_one(column_name, local, thread_cap)
-        if isinstance(row_indexer, slice):
-            start, stop, step = row_indexer.indices(self._n_rows)
-            if step < 0:
-                return self._fancy_one(column_name, np.arange(start, stop, step, dtype=np.int64))
-            return self._gather_one_contiguous(
-                column_name, dtype, self._slice_parts(row_indexer), False
-            )
-        if isinstance(row_indexer, np.ndarray):
-            if row_indexer.dtype == np.bool_:
-                return self._gather_one_contiguous(
-                    column_name, dtype, self._mask_parts(row_indexer), True
-                )
-            return self._fancy_one(column_name, row_indexer.astype(np.int64, copy=False))
-        raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
+        parts, is_mask = payload
+        return self._gather_one_contiguous(column_name, parts, is_mask)
 
     def _fill_contiguous(
         self,
@@ -737,10 +753,10 @@ class ColStoreDataset(_ReaderBase):
         self._fill_contiguous(out, column_name, parts, lengths)
 
     def _gather_one_contiguous(
-        self, column_name: str, dtype: np.dtype[Any], parts: list[tuple[int, Any]], is_mask: bool
+        self, column_name: str, parts: list[tuple[int, Any]], is_mask: bool
     ) -> NDArray[Any]:
         lengths = self._contiguous_lengths(parts, is_mask)
-        out = np.empty(sum(lengths), dtype=dtype)
+        out = np.empty(sum(lengths), dtype=self._native_dtype(column_name))
         self._fill_contiguous(out, column_name, parts, lengths)
         return out
 
@@ -750,28 +766,22 @@ class ColStoreDataset(_ReaderBase):
         children = self._children
         if len(children) == 1:
             return children[0]._gather_many(column_names, row_indexer)
-        if row_indexer is None:
+        kind, payload = self._classify_rows(row_indexer)
+        if kind == "scalar":
+            file_index, local = payload
+            child: ColStoreReader = children[file_index]
+            return child._gather_many(column_names, local)
+        if kind == "fancy":
+            return self._fancy_many(column_names, payload)
+        if kind == "whole":
             out = {
                 name: np.empty(self._n_rows, dtype=self._native_dtype(name))
                 for name in column_names
             }
             self._fill_contiguous_columns(out, column_names, self._offset_regions())
             return out
-        if isinstance(row_indexer, (int, np.integer)):
-            file_index, local = self._locate(int(row_indexer))
-            return children[file_index]._gather_many(column_names, local)
-        if isinstance(row_indexer, slice):
-            start, stop, step = row_indexer.indices(self._n_rows)
-            if step < 0:
-                return self._fancy_many(column_names, np.arange(start, stop, step, dtype=np.int64))
-            return self._gather_many_contiguous(column_names, self._slice_parts(row_indexer), False)
-        if isinstance(row_indexer, np.ndarray):
-            if row_indexer.dtype == np.bool_:
-                return self._gather_many_contiguous(
-                    column_names, self._mask_parts(row_indexer), True
-                )
-            return self._fancy_many(column_names, row_indexer.astype(np.int64, copy=False))
-        raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
+        parts, is_mask = payload
+        return self._gather_many_contiguous(column_names, parts, is_mask)
 
     def _gather_many_contiguous(
         self, column_names: list[str], parts: list[tuple[int, Any]], is_mask: bool
