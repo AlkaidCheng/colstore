@@ -831,9 +831,7 @@ class ColStoreReader(_ReaderBase):
             ):
                 output = np.empty(selected, dtype=disk_dtype)
                 if selected:
-                    effective_cap = (
-                        config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
-                    )
+                    effective_cap = config.resolve_gather_thread_cap(thread_cap)
                     _cpp_module.gather_multirecord_mask(
                         self._file_mmap,
                         mask,
@@ -901,7 +899,7 @@ class ColStoreReader(_ReaderBase):
         # copy on big-endian ones. The fused native kernel branch is only
         # taken when disk == native, where the distinction vanishes.
         output = np.empty(n, dtype=disk_dtype)
-        effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+        effective_cap = config.resolve_gather_thread_cap(thread_cap)
 
         # Sortedness gate: sampled rejection short-circuits the full O(K)
         # pass for random unsorted selectors; sorted selectors still get the
@@ -1144,7 +1142,7 @@ class ColStoreReader(_ReaderBase):
         output = np.empty(n, dtype=disk_dtype)
         if n == 0:
             return output.astype(native_dtype, copy=False)
-        effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+        effective_cap = config.resolve_gather_thread_cap(thread_cap)
         _cpp_module.gather_multirecord_strided(
             self._file_mmap,
             output,
@@ -1207,6 +1205,14 @@ class ColStoreReader(_ReaderBase):
             }
             return {name: futures[name].result() for name in column_names}
 
+    def _native_column_names(self, column_names: list[str]) -> list[str]:
+        """The subset of names whose on-disk dtype is native byte order.
+
+        The native-dtype reuse routes (mask, bins) gather these columns with the
+        raw-byte kernels; a non-native column would need a byteswap they cannot do.
+        """
+        return [name for name in column_names if _dtype_is_native(self._column_dtypes[name])]
+
     def _gather_many_mask(
         self, column_names: list[str], row_indexer: Any
     ) -> dict[str, NDArray[Any]] | None:
@@ -1230,9 +1236,7 @@ class ColStoreReader(_ReaderBase):
         selected = int(np.count_nonzero(mask))
         if selected / self._n_rows < config.resolve_mask_density_gate():
             return None
-        native_names = [
-            name for name in column_names if _dtype_is_native(self._column_dtypes[name])
-        ]
+        native_names = self._native_column_names(column_names)
         if len(native_names) < 2:
             return None
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
@@ -1303,9 +1307,7 @@ class ColStoreReader(_ReaderBase):
         n_records = int(self._record_starts_bytes.shape[0])
         if n_records > np.iinfo(np.int32).max:
             return None  # bins are int32; unreachable in practice, cheap guard
-        native_names = [
-            name for name in column_names if _dtype_is_native(self._column_dtypes[name])
-        ]
+        native_names = self._native_column_names(column_names)
         if len(native_names) <= 1:
             return None
 

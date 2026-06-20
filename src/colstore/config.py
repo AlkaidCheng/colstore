@@ -171,6 +171,16 @@ def set_gather_thread_cap(n: int) -> None:
     _gather_thread_cap = int(n)
 
 
+def resolve_gather_thread_cap(thread_cap: int | None) -> int:
+    """Resolve a per-call gather thread cap.
+
+    ``None`` takes the configured default (:func:`get_gather_thread_cap`); an
+    explicit value is honored but clamped to at least 1, so a kernel that splits
+    its work always sees a positive cap.
+    """
+    return get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+
+
 def get_default_memory_budget() -> int:
     """Return the per-commit in-RAM working-set budget (bytes) for the streaming
     write path."""
