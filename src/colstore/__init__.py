@@ -57,6 +57,7 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
 from . import parsers, profiling, testing
+from ._query import QueryError
 from .api import (
     ColStoreInfo,
     compact,
@@ -104,6 +105,7 @@ __all__ = [
     "ColStoreWriter",
     "ColumnView",
     "FormatError",
+    "QueryError",
     "TableView",
     "__version__",
     "calibrate",
