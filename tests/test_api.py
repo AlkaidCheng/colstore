@@ -14,7 +14,7 @@ import pandas as pd
 import pytest
 
 import colstore
-from colstore import ColStoreInfo, ColStoreReader, ColStoreWriter, FormatError
+from colstore import ColStoreDataset, ColStoreInfo, ColStoreReader, ColStoreWriter, FormatError
 
 # ---- open ------------------------------------------------------------------
 
@@ -33,6 +33,71 @@ def test_open_missing_file_raises(tmp_path):
     """Opening a missing file raises FileNotFoundError (or a clear FormatError)."""
     with pytest.raises((FileNotFoundError, OSError)):
         colstore.open(tmp_path / "nope.cstore")
+
+
+# ---- open: glob patterns ---------------------------------------------------
+
+
+def _make_marker_file(path, marker):
+    """A single-row store whose column ``a`` holds ``marker``, identifying the file."""
+    colstore.store({"a": np.array([marker], dtype=np.int64)}, path, show_progress=False).close()
+
+
+def test_open_glob_returns_dataset_over_matches(tmp_path):
+    for n in (1, 2, 3):
+        _make_marker_file(tmp_path / f"part_{n}.cstore", n)
+    with colstore.open(str(tmp_path / "part_*.cstore")) as ds:
+        assert isinstance(ds, ColStoreDataset)
+        assert ds.n_rows == 3
+        assert ds[:, "a"].array().tolist() == [1, 2, 3]
+
+
+def test_open_glob_orders_matches_numerically(tmp_path):
+    # Lexicographic order would put run_10 before run_2; natural sort must not.
+    for n in (1, 2, 10):
+        _make_marker_file(tmp_path / f"run_{n}.cstore", n)
+    with colstore.open(str(tmp_path / "run_*.cstore")) as ds:
+        assert ds[:, "a"].array().tolist() == [1, 2, 10]
+
+
+def test_open_glob_no_match_raises(tmp_path):
+    with pytest.raises(FileNotFoundError, match="no files matched"):
+        colstore.open(str(tmp_path / "absent_*.cstore"))
+
+
+def test_open_literal_path_still_returns_reader(tmp_path):
+    # A path with no glob magic is unchanged: a single Reader, not a dataset.
+    _make_marker_file(tmp_path / "solo.cstore", 7)
+    with colstore.open(tmp_path / "solo.cstore") as ds:
+        assert isinstance(ds, ColStoreReader)
+
+
+def test_open_list_expands_glob_elements(tmp_path):
+    _make_marker_file(tmp_path / "a_1.cstore", 1)
+    _make_marker_file(tmp_path / "a_2.cstore", 2)
+    _make_marker_file(tmp_path / "b.cstore", 3)
+    with colstore.open([str(tmp_path / "a_*.cstore"), str(tmp_path / "b.cstore")]) as ds:
+        assert isinstance(ds, ColStoreDataset)
+        assert ds[:, "a"].array().tolist() == [1, 2, 3]
+
+
+def test_concat_expands_glob(tmp_path):
+    for n in (1, 2):
+        _make_marker_file(tmp_path / f"q_{n}.cstore", n)
+    out = tmp_path / "combined.cstore"
+    with colstore.concat([str(tmp_path / "q_*.cstore")], out=out) as reader:
+        assert reader.n_rows == 2
+        assert reader[:, "a"].array().tolist() == [1, 2]
+
+
+def test_dataset_append_expands_glob(tmp_path):
+    for n in (1, 2):
+        _make_marker_file(tmp_path / f"app_{n}.cstore", n)
+    ds = ColStoreDataset()
+    ds.append(str(tmp_path / "app_*.cstore"))
+    assert ds.n_rows == 2
+    assert ds[:, "a"].array().tolist() == [1, 2]
+    ds.close()
 
 
 # ---- create / recreate -----------------------------------------------------

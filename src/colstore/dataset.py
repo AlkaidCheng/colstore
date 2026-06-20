@@ -48,6 +48,7 @@ from numpy.typing import NDArray
 
 from . import config
 from ._base import _ReaderBase
+from ._paths import expand_glob
 from .reader import ColStoreReader, _indices_are_sorted, _make_dataframe_no_consolidate
 
 if TYPE_CHECKING:
@@ -98,10 +99,14 @@ class ColStoreDataset(_ReaderBase):
         ColStoreDataset([path])           # same
         ColStoreDataset(reader)           # borrow one open reader
         ColStoreDataset([p, reader, ds])  # paths owned, readers/datasets borrowed
+        ColStoreDataset("run_*.cstore")   # glob: own every match, numeric order
 
     Paths are opened and *owned* (closed on :meth:`close`); readers and datasets
-    are *borrowed* (left open). Datasets are flattened to their children. The
-    public read surface matches :class:`~colstore.reader.ColStoreReader`.
+    are *borrowed* (left open). Datasets are flattened to their children. A path
+    *string* may be a glob (``*``, ``?``, ``[``; ``**`` recursive), expanded to
+    its matches in numeric order; a pattern matching no files raises
+    :class:`FileNotFoundError`. The public read surface matches
+    :class:`~colstore.reader.ColStoreReader`.
 
     The native multi-file gather's per-column segment table (:meth:`_native_segment_table`)
     depends only on the children and the column, not on the rows a read requests,
@@ -155,9 +160,10 @@ class ColStoreDataset(_ReaderBase):
         try:
             for item in self._as_source_list(sources):
                 if isinstance(item, (str, os.PathLike)):
-                    reader = ColStoreReader(item, **reader_kwargs)
-                    opened.append(reader)
-                    pairs.append((reader, True))
+                    for path in expand_glob(item):
+                        reader = ColStoreReader(path, **reader_kwargs)
+                        opened.append(reader)
+                        pairs.append((reader, True))
                 elif isinstance(item, ColStoreDataset):
                     pairs.extend((child, False) for child in item._children)
                 elif isinstance(item, ColStoreReader):
