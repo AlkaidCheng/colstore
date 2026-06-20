@@ -13,11 +13,14 @@ base is internal and not part of the public API.
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from . import config
 from ._query import _Expr, evaluate_mask
+from ._render import Preview, render_lazy_card
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -25,6 +28,61 @@ if TYPE_CHECKING:
     from ._base import _ReaderBase
 
 _RowIndexer = int | slice | np.ndarray | None
+
+
+def resolve_preview_n(n: int | None, available_rows: int, row_itemsize: int) -> int:
+    """Resolve a preview row count, warning first if the preview would be large.
+
+    ``None`` takes ``config.get_preview_rows()``. If the rows actually shown
+    (bounded by ``available_rows``) times ``row_itemsize`` would exceed the
+    configured preview memory limit, a ``UserWarning`` is emitted before the
+    caller materializes anything.
+    """
+    rows = config.get_preview_rows() if n is None else n
+    limit = config.get_preview_memory_limit()
+    if limit:
+        estimated = min(max(0, rows), available_rows) * row_itemsize
+        if estimated > limit:
+            warnings.warn(
+                f"this preview would materialize about {estimated / 1e6:.0f} MB; pass a "
+                f"smaller n, or raise colstore.config.set_preview_memory_limit().",
+                stacklevel=3,
+            )
+    return rows
+
+
+def row_width(store: _ReaderBase, columns: list[str]) -> int:
+    """Bytes per row across ``columns`` -- the basis for the preview-size estimate."""
+    return sum(store._native_dtype(c).itemsize for c in columns)
+
+
+def preview_index(indexer: _RowIndexer, n_rows: int) -> list[int]:
+    """Store row positions for a concrete row ``indexer`` -- the preview index column."""
+    if isinstance(indexer, (int, np.integer)):
+        return [int(indexer)]
+    if indexer is None:
+        return list(range(n_rows))
+    if isinstance(indexer, slice):
+        return list(range(*indexer.indices(n_rows)))
+    if indexer.dtype == bool:
+        return [int(i) for i in np.flatnonzero(indexer)]
+    return [int(i) for i in indexer]
+
+
+def build_preview(
+    label: str,
+    total_rows: int | None,
+    store: _ReaderBase,
+    columns: list[str],
+    indexer: _RowIndexer,
+) -> Preview:
+    """Materialize a concrete row ``indexer`` into a dual-repr ``Preview``.
+
+    Shared by ``TableView`` and the reader/dataset; ``ColumnView`` builds its own
+    single-column ``Preview`` from a 1-D array.
+    """
+    rec = store._build_recarray(indexer, columns)
+    return Preview(rec, columns, preview_index(indexer, store.n_rows), total_rows, label)
 
 
 class _BaseView:
@@ -135,6 +193,44 @@ class _BaseView:
             return f"<ndarray shape={row_part.shape} dtype={row_part.dtype}>"
         return repr(row_part)
 
+    def _head_rows(self, n: int) -> _RowIndexer:
+        """A row indexer for the first ``n`` rows of this view's selection."""
+        n = max(0, n)
+        indexer = self._resolve_row_indexer()
+        if isinstance(indexer, (int, np.integer)):
+            return indexer
+        if indexer is None:
+            return slice(0, n)
+        if isinstance(indexer, slice):
+            chosen = range(*indexer.indices(self._store.n_rows))[:n]
+            return np.fromiter(chosen, dtype=np.int64, count=len(chosen))
+        selected = np.flatnonzero(indexer) if indexer.dtype == bool else indexer
+        return selected[:n]
+
+    def _tail_rows(self, n: int) -> _RowIndexer:
+        """A row indexer for the last ``n`` rows of this view's selection."""
+        n = max(0, n)
+        n_rows = self._store.n_rows
+        indexer = self._resolve_row_indexer()
+        if isinstance(indexer, (int, np.integer)):
+            return indexer
+        if indexer is None:
+            return slice(max(0, n_rows - n), n_rows)
+        if isinstance(indexer, slice):
+            full = range(*indexer.indices(n_rows))
+            chosen = full[max(0, len(full) - n) :]
+            return np.fromiter(chosen, dtype=np.int64, count=len(chosen))
+        selected = np.flatnonzero(indexer) if indexer.dtype == bool else indexer
+        return selected[max(0, len(selected) - n) :]
+
+    def _row_width(self) -> int:
+        """Bytes per row across this view's selected column(s)."""
+        raise NotImplementedError
+
+    def _preview_n(self, n: int | None) -> int:
+        """Resolve a preview row count for this view, warning if it would be large."""
+        return resolve_preview_n(n, self._store.n_rows, self._row_width())
+
 
 class ColumnView(_BaseView):
     """Lazy view of a single column produced by indexing with a string name.
@@ -207,6 +303,38 @@ class ColumnView(_BaseView):
         selection. The column itself is not materialized.
         """
         return ColumnView(self._store, self._resolve_row_indexer(), self._column_name)
+
+    def head(self, n: int | None = None) -> Preview:
+        """First ``n`` values of the column as a previewable peek (default config rows)."""
+        return self._preview(self._head_rows(self._preview_n(n)))
+
+    def tail(self, n: int | None = None) -> Preview:
+        """Last ``n`` values of the selected column, as a previewable peek."""
+        return self._preview(self._tail_rows(self._preview_n(n)))
+
+    def _row_width(self) -> int:
+        return self._store._native_dtype(self._column_name).itemsize
+
+    def _preview(self, indexer: _RowIndexer) -> Preview:
+        """A single-column ``Preview`` over a concrete row ``indexer``."""
+        values = ColumnView(self._store, indexer, self._column_name).array()
+        index = preview_index(indexer, self._store.n_rows)
+        return Preview(values, [self._column_name], index, None, "ColumnView")
+
+    def _repr_html_(self) -> str | None:
+        """Rich Jupyter display: a one-column preview table, or a lazy card.
+
+        A concrete selection previews the first values; a column still under a
+        ``col()`` / ``query`` predicate shows a lazy card rather than evaluating
+        the predicate to fill it. Returns ``None`` only if the preview can't be
+        built (Jupyter then uses the text repr).
+        """
+        if isinstance(self._row_part, _Expr):
+            return render_lazy_card(f"ColumnView({self._column_name!r})", [self._column_name])
+        try:
+            return self._preview(self._head_rows(self._preview_n(None)))._repr_html_()
+        except Exception:
+            return None
 
 
 class TableView(_BaseView):
@@ -322,3 +450,36 @@ class TableView(_BaseView):
         selection. The selected columns are not materialized.
         """
         return TableView(self._store, self._resolve_row_indexer(), self._column_names)
+
+    def head(self, n: int | None = None) -> Preview:
+        """First ``n`` rows of the selection as a previewable peek (default config rows)."""
+        return self._preview(self._head_rows(self._preview_n(n)))
+
+    def tail(self, n: int | None = None) -> Preview:
+        """Last ``n`` rows of the selection, as a previewable peek."""
+        return self._preview(self._tail_rows(self._preview_n(n)))
+
+    def _row_width(self) -> int:
+        return row_width(self._store, self._column_names)
+
+    def _preview(self, indexer: _RowIndexer) -> Preview:
+        """A multi-column ``Preview`` over a concrete row ``indexer``."""
+        return build_preview("TableView", None, self._store, self._column_names, indexer)
+
+    def _repr_html_(self) -> str | None:
+        """Rich Jupyter display: a small preview table, or a lazy card.
+
+        A view whose row selection is already concrete (whole store, slice, mask,
+        or an evaluated predicate) shows the preview. A view still carrying a
+        ``col()`` / ``query`` predicate shows a lazy card instead -- previewing it
+        would have to read the predicate columns, which a repr must not trigger;
+        call ``.head()`` or ``.evaluate()`` to opt in. The full row count is
+        omitted (it too is lazy). Returns ``None`` (text repr) if the preview
+        can't be built.
+        """
+        if isinstance(self._row_part, _Expr):
+            return render_lazy_card("TableView", self._column_names)
+        try:
+            return self._preview(self._head_rows(self._preview_n(None)))._repr_html_()
+        except Exception:
+            return None

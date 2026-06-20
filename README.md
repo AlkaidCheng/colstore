@@ -43,6 +43,7 @@ ds[indices, ['price', 'qty']].dict()         # dict of 1D arrays
 ds[indices, ['price', 'qty']].recarray()     # structured ndarray
 ds[indices, ['price', 'qty']].frame()        # pandas DataFrame
 ds[100:200].dict(copy=False)                 # read-only views, no copy (see Zero-copy reads)
+ds.head()                                    # peek: a table that renders in notebook + terminal
 ```
 
 ## Reader, writer, frame: which to use
@@ -270,8 +271,21 @@ set_default_backend("cpp")         # gather kernel: cpp | numpy | numba
 set_gather_thread_cap(16)          # threads per gather (default scales with socket count)
 config.set_numa_policy("auto")     # page placement: auto (interleave on multi-node) | local
 config.set_write_method("auto")    # write fill: auto (pwrite where available) | pwrite | mmap
+config.set_preview_rows(20)        # rows shown by head()/tail() and the Jupyter repr (default 10)
+config.set_preview_precision(4)    # decimal places shown for floats in a preview (default 6)
+config.set_preview_memory_limit(512 * 1024 * 1024)  # warn before a larger head()/tail()
 calibrate()                        # one-time: measure the thread/prefetch knees for this host
 ```
+
+In a notebook, displaying a reader, dataset, or concrete view renders a small
+preview table (`_repr_html_`); a still-lazy `query()` / `col()` view shows a
+compact card instead, since previewing it would have to read its predicate
+columns. `ds.head(n)` / `ds.tail(n)` return a `Preview` that renders as an HTML
+table in a notebook and a plain-text table in a terminal; indexing and array
+attributes (`.shape`, `.values`, `head["pt"]`) delegate to the underlying numpy
+data. On a filtered view, `ds.query(...).head()` previews the matching rows. The
+default row count and the size at which a preview warns are the `config`
+settings above.
 
 ## Zero-copy reads (`copy=False`)
 

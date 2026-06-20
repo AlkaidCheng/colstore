@@ -508,3 +508,65 @@ def set_write_method(method: WriteMethod) -> None:
         raise ValueError(f"write method must be 'auto', 'pwrite', or 'mmap'; got {method!r}.")
     global _write_method
     _write_method = method
+
+
+# ---- Notebook / preview display ----------------------------------------
+
+_DEFAULT_PREVIEW_ROWS = 10
+_DEFAULT_PREVIEW_MEMORY_LIMIT = 256 * 1024 * 1024  # 256 MiB
+
+_preview_rows: int = _DEFAULT_PREVIEW_ROWS
+_preview_memory_limit: int = _DEFAULT_PREVIEW_MEMORY_LIMIT
+
+
+def get_preview_rows() -> int:
+    """Return the default row count for ``head()`` / ``tail()`` and the repr preview."""
+    return _preview_rows
+
+
+def set_preview_rows(n: int) -> None:
+    """Set how many rows ``head()`` / ``tail()`` and the rich (Jupyter) repr show by
+    default (``>= 0``)."""
+    global _preview_rows
+    if n < 0:
+        raise ValueError(f"preview_rows must be >= 0, got {n}.")
+    _preview_rows = int(n)
+
+
+def get_preview_memory_limit() -> int:
+    """Return the byte threshold above which a preview warns. See
+    :func:`set_preview_memory_limit`."""
+    return _preview_memory_limit
+
+
+def set_preview_memory_limit(n_bytes: int) -> None:
+    """Set the preview memory threshold (bytes; ``0`` disables it).
+
+    A ``head()`` / ``tail()`` whose estimated materialized size (rows shown times
+    the row width) exceeds this emits a ``UserWarning`` before building it, so a
+    stray large ``head(...)`` or an oversized ``preview_rows`` is caught rather
+    than silently allocating gigabytes.
+    """
+    global _preview_memory_limit
+    if n_bytes < 0:
+        raise ValueError(f"preview_memory_limit must be >= 0, got {n_bytes}.")
+    _preview_memory_limit = int(n_bytes)
+
+
+_DEFAULT_PREVIEW_PRECISION = 6  # decimal places shown for floating-point preview values
+_preview_precision: int = _DEFAULT_PREVIEW_PRECISION
+
+
+def get_preview_precision() -> int:
+    """Return the number of decimal places shown for floating-point preview values."""
+    return _preview_precision
+
+
+def set_preview_precision(n: int) -> None:
+    """Set the decimal places shown for floating-point values in ``head()`` / ``tail()``
+    and the rich repr (``>= 0``). A column trims trailing zeros shared by every value,
+    so an integer-valued float column still shows a single ``.0``."""
+    global _preview_precision
+    if n < 0:
+        raise ValueError(f"preview_precision must be >= 0, got {n}.")
+    _preview_precision = int(n)
