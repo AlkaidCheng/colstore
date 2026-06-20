@@ -228,6 +228,22 @@ void colstore_parallel_copy_runs(std::uint8_t* output, const std::int64_t* src_a
                                  const std::int64_t* byte_lengths,
                                  std::int64_t n_runs, int thread_cap);
 
+// Interleave columns into a record (structured) array: the SoA -> AoS transpose.
+// Row ``i`` of the output holds each column's element ``i`` at its field offset;
+// column ``c``'s element ``i`` is ``src_itemsizes[c]`` bytes at
+// ``src_addrs[c] + i * src_itemsizes[c]`` (each column contiguous, absolute
+// address so the source may be a memmap), written to
+// ``output + i * record_itemsize + field_offsets[c]``. Parallelized over row
+// ranges, so each thread writes a contiguous record block -- the row-major order
+// streams the output once, where the column-major host assignment streams it
+// once per column. Caller guarantees native byte order (a raw field copy cannot
+// byteswap).
+void colstore_interleave_records(std::uint8_t* output, std::int64_t record_itemsize,
+                                 std::int64_t n_rows, const std::int64_t* src_addrs,
+                                 const std::int64_t* src_itemsizes,
+                                 const std::int64_t* field_offsets,
+                                 std::int64_t n_cols, int thread_cap);
+
 // Sorted multi-record fancy gather: a linear record walk instead of a
 // per-element binary search. Requires ``indices`` to be non-decreasing
 // (the caller checks; behavior is undefined otherwise). Each OpenMP thread

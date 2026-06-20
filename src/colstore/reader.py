@@ -1464,22 +1464,6 @@ class ColStoreReader(_ReaderBase):
             return self._view_many(list(self._column_dtypes), None)
         return self._gather_many(list(self._column_dtypes), None)
 
-    def recarray(self) -> NDArray[Any]:
-        """Materialize the whole store as a structured ndarray.
-
-        Returns
-        -------
-        numpy.ndarray
-            Structured 1D array with one field per column. ``result[name]``
-            returns the column.
-        """
-        column_data = self.dict()
-        record_dtype = np.dtype([(name, column_data[name].dtype) for name in self._column_dtypes])
-        record_array = np.empty(self._n_rows, dtype=record_dtype)
-        for name in self._column_dtypes:
-            record_array[name] = column_data[name]
-        return record_array
-
     def frame(self) -> pd.DataFrame:
         """Materialize the whole store as a pandas DataFrame.
 

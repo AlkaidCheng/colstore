@@ -820,15 +820,6 @@ class ColStoreDataset(_ReaderBase):
             return self._view_many(column_names, None)
         return self._gather_many(column_names, None)
 
-    def recarray(self) -> NDArray[Any]:
-        """Materialize the whole dataset as a structured ndarray."""
-        column_data = self.dict()
-        record_dtype = np.dtype([(name, self.dtypes[name]) for name in self._column_dtypes])
-        record_array = np.empty(self._n_rows, dtype=record_dtype)
-        for name in self._column_dtypes:
-            record_array[name] = column_data[name]
-        return record_array
-
     def frame(self) -> pd.DataFrame:
         """Materialize the whole dataset as a pandas DataFrame."""
         return _make_dataframe_no_consolidate(self.dict())

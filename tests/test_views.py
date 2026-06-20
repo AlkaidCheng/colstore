@@ -153,6 +153,37 @@ def test_reader_recarray_matches_explicit_slice_view(small_store):
     np.testing.assert_array_equal(direct, via_view)
 
 
+def test_reader_recarray_kernel_matches_fallback(small_store, monkeypatch):
+    """``recarray()`` agrees whether the interleave kernel runs or the host path."""
+    from colstore import kernels
+
+    with_kernel = small_store.recarray()
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)
+    fallback = small_store.recarray()
+    np.testing.assert_array_equal(with_kernel, fallback)
+
+
+def test_recarray_over_multirecord_store_matches_oracle(tmp_path):
+    """A multi-record store's columns are not viewable, so ``recarray()``
+    gathers each before interleaving; the result must match the concatenation."""
+    import colstore
+
+    path = tmp_path / "multi.cstore"
+    x_blocks, y_blocks = [], []
+    with colstore.create(path) as writer:
+        for i in range(3):
+            x = np.arange(10 * i, 10 * (i + 1), dtype=np.int64)
+            y = (x * 0.5).astype(np.float64)
+            writer.write({"x": x, "y": y})
+            x_blocks.append(x)
+            y_blocks.append(y)
+    with colstore.open(path) as reader:
+        assert reader._is_multi_record  # the gather-source path is exercised
+        rec = reader.recarray()
+        np.testing.assert_array_equal(rec["x"], np.concatenate(x_blocks))
+        np.testing.assert_array_equal(rec["y"], np.concatenate(y_blocks))
+
+
 def test_reader_frame_returns_dataframe_with_all_columns(small_store):
     """``ds.frame()`` returns a DataFrame whose columns match the on-disk order."""
     df = small_store.frame()
