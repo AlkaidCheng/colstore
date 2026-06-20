@@ -138,7 +138,7 @@ def gather(
     # order and a fixed set of numeric kinds. Anything else uses NumPy, which
     # handles byte-swapping and exotic dtypes correctly.
     kernel_compatible = dtype.kind in ("f", "i", "u", "b") and _is_native_order(source)
-    effective_cap = config.get_gather_thread_cap() if thread_cap is None else max(1, thread_cap)
+    effective_cap = config.resolve_gather_thread_cap(thread_cap)
 
     if backend == "cpp":
         if _CPP_AVAILABLE and kernel_compatible:

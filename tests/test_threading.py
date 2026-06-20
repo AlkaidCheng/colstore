@@ -84,6 +84,18 @@ def test_set_gather_thread_cap_rejects_non_positive():
         config.set_gather_thread_cap(0)
 
 
+def test_resolve_gather_thread_cap():
+    original = config.get_gather_thread_cap()
+    try:
+        config.set_gather_thread_cap(6)
+        assert config.resolve_gather_thread_cap(None) == 6  # default when unset
+        assert config.resolve_gather_thread_cap(3) == 3  # explicit value honored
+        assert config.resolve_gather_thread_cap(0) == 1  # clamped to >= 1
+        assert config.resolve_gather_thread_cap(-4) == 1
+    finally:
+        config.set_gather_thread_cap(original)
+
+
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
 def test_thread_count_resolution_rules():
     from colstore import _gather  # type: ignore[attr-defined]
