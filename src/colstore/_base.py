@@ -19,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import config, kernels
+from ._query import QueryError, evaluate_query
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
@@ -278,3 +279,58 @@ class _ReaderBase(abc.ABC):
         from .frame import ColStoreFrame
 
         return ColStoreFrame(self)
+
+    def query(
+        self,
+        expression: str,
+        *,
+        columns: list[str] | tuple[str, ...] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> TableView:
+        """Select the rows matching a predicate string; returns a lazy view.
+
+        ``expression`` is a pandas-style condition over the columns -- e.g.
+        ``"energy > 100 and -2.5 < eta < 2.5"``. Only the referenced columns are
+        read (once each) to compute the row mask; the result is a lazy
+        :class:`~colstore.view.TableView` whose selected columns are not
+        materialized until ``.frame()`` / ``.dict()`` / ``.recarray()`` /
+        ``.array()`` is called.
+
+        The grammar is a strict whitelist evaluated without ``eval``: column
+        names, numeric / string / bool literals, comparisons (including chained
+        ``a < x < b``), the boolean operators (``and`` / ``or`` / ``not`` and
+        ``& | ~`` -- parenthesize the bitwise forms, which bind tighter than
+        comparison), arithmetic, and ``in`` / ``not in`` membership. ``@name``
+        resolves from ``params`` (``query("pt > @cut", params={"cut": 30})``);
+        the calling frame is never inspected. A function call, an attribute, or
+        any unknown name raises :class:`~colstore.QueryError`.
+
+        Parameters
+        ----------
+        expression : str
+            The predicate. Must reduce to a per-row boolean condition (so it
+            references at least one column, or a bool column on its own).
+        columns : list of str, optional
+            Project the result to these columns; the default keeps all columns.
+        params : dict, optional
+            Values for ``@name`` references in ``expression``.
+
+        Returns
+        -------
+        TableView
+            A lazy view of the matching rows (and selected columns).
+        """
+        mask = evaluate_query(expression, frozenset(self.columns), self._read_query_column, params)
+        if mask.ndim != 1 or mask.shape[0] != self.n_rows:
+            raise QueryError(
+                f"query {expression!r} must reduce to a per-row condition of length "
+                f"{self.n_rows}; got an array of shape {mask.shape}. Does it "
+                f"reference at least one column?"
+            )
+        if columns is None:
+            return self[mask]
+        return self[mask, list(columns)]
+
+    def _read_query_column(self, name: str) -> NDArray[Any]:
+        """Read one whole column as an array, for :meth:`query` predicate evaluation."""
+        return self[name].array()

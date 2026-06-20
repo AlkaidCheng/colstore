@@ -74,6 +74,30 @@ on disk by transforming its columns. Starting from raw arrays, reach for a write
 (or `store`); starting from a `.cstore` you want a modified copy of, reach for
 `edit()`, which gives you a frame.
 
+## Filtering with `query()`
+
+`query()` selects rows with a pandas-style predicate string and returns a **lazy
+view** — only the columns named in the predicate are read to build the row mask;
+the selected columns aren't materialized until you call `.frame()` / `.dict()` /
+`.recarray()` / `.array()`.
+
+```python
+hot = ds.query("energy > 100 and -2.5 < eta < 2.5")    # lazy TableView
+hot.frame()                                             # materialize now
+ds.query("pt > @cut and region == 'SR'", params={"cut": 30}).dict()
+ds.query("flag in (1, 3)", columns=["pt", "eta"]).recarray()
+```
+
+The grammar is a strict whitelist evaluated **without `eval`**: column names,
+numeric/string/bool literals, comparisons (including chained `a < x < b`), the
+boolean operators (`and` / `or` / `not` and `& | ~` — parenthesize the bitwise
+forms, which bind tighter than comparison), arithmetic, and `in` / `not in`
+membership. `@name` resolves from `params` (the calling frame is never
+inspected), and a bool column is a predicate on its own (`ds.query("is_signal")`).
+Anything outside the grammar — a function call, an attribute — raises
+`colstore.QueryError`. It behaves identically on a single file and a multi-file
+dataset.
+
 ## Writing
 
 `colstore.store(data, path)` is the one-shot path; it dispatches on the
