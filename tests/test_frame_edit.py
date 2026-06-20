@@ -337,3 +337,46 @@ def test_frame_recarray_fallback_matches_kernel(source, monkeypatch):
     assert fallback.dtype == expected.dtype
     for name in expected.dtype.names:
         assert np.array_equal(fallback[name], expected[name])
+
+
+# -- casting: astype --
+
+
+def test_frame_astype_casts_named_columns(source, source_cols):
+    out = source.edit().astype({"a": "float32", "b": np.int64}).dict()
+    assert out["a"].dtype == np.float32
+    assert np.array_equal(out["a"], source_cols["a"].astype(np.float32))
+    assert out["b"].dtype == np.int64
+    assert np.array_equal(out["b"], source_cols["b"].astype(np.int64))  # float -> int truncates
+    assert out["c"].dtype == source_cols["c"].dtype  # untouched column unchanged
+
+
+def test_expr_astype_in_assign(source, source_cols):
+    cf = source.edit()
+    cf.assign(a32=cf["a"].astype("int32"))
+    assert cf.dict()["a32"].dtype == np.int32
+
+
+def test_astype_reflected_in_recarray_and_write(source, source_cols, tmp_path):
+    rec = source.edit().astype({"a": "float32"}).recarray()
+    assert rec.dtype["a"] == np.float32
+    written = _written(source.edit().astype({"a": "float32"}), tmp_path)
+    assert written["a"].dtype == np.float32
+    assert np.array_equal(written["a"], source_cols["a"].astype(np.float32))
+
+
+def test_astype_unknown_column_raises(source):
+    with pytest.raises(KeyError, match="not in the frame"):
+        source.edit().astype({"missing": "float32"})
+
+
+def test_astype_invalid_dtype_raises(source):
+    with pytest.raises(TypeError):
+        source.edit().astype({"a": "definitely_not_a_dtype"})
+
+
+def test_astype_validates_before_mutating(source, source_cols):
+    cf = source.edit()
+    with pytest.raises(TypeError):
+        cf.astype({"a": "int8", "b": "definitely_not_a_dtype"})
+    assert cf.dict()["a"].dtype == source_cols["a"].dtype  # the valid cast was not applied

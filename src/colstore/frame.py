@@ -327,6 +327,11 @@ class Expr:
             node = UFunc(np.minimum, (node, high))
         return node
 
+    def astype(self, dtype: Any) -> Expr:
+        """Cast this column to ``dtype`` (anything ``numpy.dtype`` accepts), NumPy
+        ``astype`` semantics."""
+        return Cast(self, np.dtype(dtype))
+
     def compute(self, n_rows: int | None = None) -> NDArray[Any]:
         """Eagerly materialize this column as a NumPy array.
 
@@ -508,6 +513,22 @@ class UFunc(Expr):
         )
 
 
+class Cast(Expr):
+    """An internal node casting its input to a target dtype (NumPy ``astype``).
+
+    Elementwise and row-independent like the ufunc nodes, so it evaluates one row
+    range at a time. The structural key folds in the dtype, so two casts of the
+    same input to the same dtype are computed once.
+    """
+
+    __slots__ = ("_dtype", "_input", "_key")
+
+    def __init__(self, node: Expr, dtype: np.dtype[Any]) -> None:
+        self._input = node
+        self._dtype = dtype
+        self._key = ("cast", dtype.str, node._key)
+
+
 def evaluate(
     node: Expr,
     start: int,
@@ -534,7 +555,9 @@ def evaluate(
             for child in node._inputs
         ]
         result = node._ufunc(*args)
-    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf and UFunc
+    elif isinstance(node, Cast):
+        result = evaluate(node._input, start, stop, memo).astype(node._dtype)
+    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast
         raise TypeError(f"cannot evaluate node of type {type(node).__name__!r}.")
     memo[node._key] = result
     return result
@@ -553,6 +576,8 @@ def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
         for child in node._inputs:
             if isinstance(child, Expr):
                 yield from _iter_leaves(child)
+    elif isinstance(node, Cast):
+        yield from _iter_leaves(node._input)
 
 
 def fusible_passthroughs(specs: dict[str, Expr]) -> dict[str, NativeColumn]:
@@ -732,6 +757,23 @@ class ColStoreFrame:
                 raise ValueError(f"rename produces a duplicate column name {target!r}.")
             renamed[target] = expr
         self._columns = renamed
+        return self
+
+    def astype(self, dtypes: dict[str, Any]) -> ColStoreFrame:
+        """Cast the named columns to new dtypes (deferred); returns ``self``.
+
+        Each value is anything ``numpy.dtype`` accepts. Like every other edit the
+        cast is lazy -- evaluated by ``compute`` / ``dict`` / ``recarray`` /
+        ``write``. Raises ``KeyError`` for a name that is not in the frame, and
+        validates every dtype before changing anything, so a bad argument leaves
+        the frame untouched.
+        """
+        missing = [name for name in dtypes if name not in self._columns]
+        if missing:
+            raise KeyError(f"cannot cast columns that are not in the frame: {missing}.")
+        resolved = {name: np.dtype(dtype) for name, dtype in dtypes.items()}
+        for name, dtype in resolved.items():
+            self._columns[name] = Cast(self._columns[name], dtype)
         return self
 
     def compute(self, name: str) -> NDArray[Any]:
