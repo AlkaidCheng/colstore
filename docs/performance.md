@@ -434,9 +434,10 @@ handled by NumPy's `.base` chain — the returned view holds a reference to the
 underlying mapping, so it stays valid even after `ds.close()`; the file simply
 stays mapped until the last view is garbage-collected. (Invalidating views at
 close was rejected — it converts a harmless refcount into a segfault class.)
-`recarray()` and `frame()` always repack and so ignore `copy`. The whole-table
-form is **all-or-nothing**: if any requested column can't be viewed, the call
-raises rather than returning a mix of views and copies.
+`recarray()` always repacks and so ignores `copy`; `frame()` forwards `copy` to
+`dict()`, so `frame(copy=False)` returns a read-only frame aliasing the views
+(§7.3). The whole-table form is **all-or-nothing**: if any requested column can't
+be viewed, the call raises rather than returning a mix of views and copies.
 
 View creation is O(1) in column size — microseconds regardless of whether the
 column is 8 MB or 800 MB — and it **halves peak resident memory**, because the
@@ -482,6 +483,13 @@ df = pd.DataFrame._from_mgr(mgr, axes=mgr.axes)
 This shares memory with the gathered arrays (zero extra copies) and runs `frame()`
 close to `dict()` speed. On pandas versions lacking that private API it falls back
 to the standard constructor with a warning, so the call always succeeds.
+
+Because the per-column blocks share their input arrays, `frame(copy=False)` feeds
+the zero-copy `dict(copy=False)` views (§7.1) straight through, yielding a
+**read-only DataFrame backed by the mapping** — the same all-or-nothing
+preconditions apply, so it raises rather than copying when a column can't be
+viewed. (On the consolidating fallback above, which warns, pandas copies the
+views; correctness is unchanged.)
 
 ### 7.4 Vectored writes
 
