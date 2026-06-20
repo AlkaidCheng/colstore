@@ -1466,8 +1466,21 @@ class ColStoreReader(_ReaderBase):
             return self._view_many(list(self._column_dtypes), None)
         return self._gather_many(list(self._column_dtypes), None)
 
-    def frame(self) -> pd.DataFrame:
+    def frame(self, copy: bool = True) -> pd.DataFrame:
         """Materialize the whole store as a pandas DataFrame.
+
+        Parameters
+        ----------
+        copy : bool, optional
+            ``True`` (default): owning columns, gathered out of the mapping.
+            ``False``: a READ-ONLY DataFrame whose columns are zero-copy
+            views over the open memmaps. The per-column block construction
+            already shares memory with its input arrays (see
+            :func:`_make_dataframe_no_consolidate`), so feeding it the
+            :meth:`dict` ``copy=False`` views aliases the mapping with no
+            extra copy. The same all-or-nothing preconditions and lifetime
+            semantics as :meth:`dict` apply: the call raises rather than
+            copying when any column cannot be viewed.
 
         Returns
         -------
@@ -1477,4 +1490,4 @@ class ColStoreReader(_ReaderBase):
             column) -- see :func:`_make_dataframe_no_consolidate` for
             rationale and details.
         """
-        return _make_dataframe_no_consolidate(self.dict())
+        return _make_dataframe_no_consolidate(self.dict(copy=copy))

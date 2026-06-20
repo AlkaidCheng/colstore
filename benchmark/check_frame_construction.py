@@ -193,6 +193,36 @@ def main():
         finally:
             ds.close()
 
+        # ---- Scenario F: zero-copy frame(copy=False) ------------------------
+        # frame(copy=False) feeds the dict(copy=False) views into the per-column
+        # BlockManager, so the frame aliases the mapping with no gather copy
+        # (and halves peak resident memory). The realistic workload is
+        # read-and-reduce: copy=True gathers a full second buffer then reduces
+        # it; copy=False reduces straight from the page cache. df.sum() reduces
+        # per block, so it does not re-consolidate the zero-copy columns.
+        ds = colstore.open(str(many_homog))
+        try:
+            total_mb = ds.n_rows * len(ds.columns) * 8 / 1e6
+            banner(f"ZERO-COPY FRAME read-and-reduce: 50 cols float64 ({total_mb:.0f} MB)")
+            drop_pagecache_softly([many_homog])
+            _c.compare(
+                [
+                    (
+                        "frame(copy=True).sum()   (gather + reduce)",
+                        lambda: ds.frame(copy=True).sum(),
+                    ),
+                    (
+                        "frame(copy=False).sum()  (zero-copy + reduce)",
+                        lambda: ds.frame(copy=False).sum(),
+                    ),
+                ],
+                repeat=args.repeat,
+                warmup=1,
+                baseline=0,
+            )
+        finally:
+            ds.close()
+
 
 if __name__ == "__main__":
     main()

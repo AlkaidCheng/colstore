@@ -835,9 +835,14 @@ class ColStoreDataset(_ReaderBase):
             return self._view_many(column_names, None)
         return self._gather_many(column_names, None)
 
-    def frame(self) -> pd.DataFrame:
-        """Materialize the whole dataset as a pandas DataFrame."""
-        return _make_dataframe_no_consolidate(self.dict())
+    def frame(self, copy: bool = True) -> pd.DataFrame:
+        """Materialize the whole dataset as a pandas DataFrame.
+
+        ``copy=False`` returns a read-only frame whose columns are zero-copy
+        views over the open memmaps, under the same all-or-nothing conditions
+        as :meth:`dict` (raising rather than copying when unavailable).
+        """
+        return _make_dataframe_no_consolidate(self.dict(copy=copy))
 
     # ---- Combination ---------------------------------------------------
 

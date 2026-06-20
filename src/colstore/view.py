@@ -232,8 +232,10 @@ class TableView(_BaseView):
             ``True`` (default): owning arrays. ``False``: READ-ONLY
             zero-copy views backed by the store's open memmaps,
             all-or-nothing -- see :meth:`ColumnView.array` for the exact
-            support conditions and lifetime semantics. ``recarray`` and
-            ``frame`` have no zero-copy form (both repack by construction).
+            support conditions and lifetime semantics. ``recarray`` has no
+            zero-copy form (it repacks by construction); ``frame`` accepts
+            ``copy`` and forwards it here, so ``frame(copy=False)`` aliases
+            the same views.
 
         Returns
         -------
@@ -256,8 +258,19 @@ class TableView(_BaseView):
         """
         return self._store._build_recarray(self._resolve_row_indexer(), self._column_names)
 
-    def frame(self) -> pd.DataFrame:
+    def frame(self, copy: bool = True) -> pd.DataFrame:
         """Materialize as a pandas DataFrame.
+
+        Parameters
+        ----------
+        copy : bool, optional
+            ``True`` (default): owning columns. ``False``: a READ-ONLY
+            DataFrame whose columns are zero-copy views over the open
+            memmaps, forwarding the same all-or-nothing conditions and
+            lifetime semantics as :meth:`dict` (raising rather than copying
+            when any column cannot be viewed). The per-column block
+            construction already shares memory with its input arrays, so the
+            frame aliases the mapping with no extra copy.
 
         Returns
         -------
@@ -270,4 +283,4 @@ class TableView(_BaseView):
         """
         from .reader import _make_dataframe_no_consolidate
 
-        return _make_dataframe_no_consolidate(self.dict())
+        return _make_dataframe_no_consolidate(self.dict(copy=copy))

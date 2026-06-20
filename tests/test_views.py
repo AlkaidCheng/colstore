@@ -497,6 +497,73 @@ def test_fancy_and_boolean_selectors_raise(single_record_store):
         dataset[mask, "f8"].array(copy=False)
 
 
+def test_table_view_frame_copy_false_shares_memory(single_record_store):
+    dataset, data = single_record_store
+    df = dataset[:, ["f8", "i2"]].frame(copy=False)
+    assert list(df.columns) == ["f8", "i2"]
+    for name in ("f8", "i2"):
+        assert np.shares_memory(df[name].values, dataset._memmaps[name]), name
+        assert np.array_equal(df[name].values, data[name]), name
+
+
+def test_reader_frame_copy_false_shares_memory(single_record_store):
+    dataset, data = single_record_store
+    df = dataset.frame(copy=False)  # whole-store reader shortcut
+    assert set(df.columns) == set(data)
+    for name in data:
+        assert np.shares_memory(df[name].values, dataset._memmaps[name]), name
+
+
+def test_frame_copy_false_is_immutable(single_record_store):
+    dataset, _ = single_record_store
+    df = dataset.frame(copy=False)
+    # Writing through the read-only view must raise, not reach the store.
+    with pytest.raises(ValueError, match="read-only"):
+        df.iloc[0, 0] = 1.0
+
+
+def test_frame_copy_true_owns_its_columns(single_record_store):
+    dataset, data = single_record_store
+    df = dataset.frame()  # default copy=True: owning columns
+    assert not np.shares_memory(df["f8"].values, dataset._memmaps["f8"])
+    assert np.array_equal(df["f8"].values, data["f8"])
+
+
+def test_frame_keeps_one_block_per_column(tmp_path):
+    # Two same-dtype columns consolidate into a single block under the default
+    # pandas constructor; the per-column manager keeps them separate. A silent
+    # fallback to a consolidating constructor would fail this assertion.
+    data = {"a": np.arange(128, dtype=np.float64), "b": np.arange(128, dtype=np.float64) + 1}
+    path = tmp_path / "two_f8.cstore"
+    with colstore.create(path) as writer:
+        writer.write(data)
+    with colstore.open(path) as dataset:
+        for frame in (dataset.frame(), dataset.frame(copy=False)):
+            assert len(frame._mgr.blocks) == frame.shape[1] == 2
+
+
+def test_frame_copy_false_rejected_for_fancy(single_record_store):
+    dataset, _ = single_record_store
+    with pytest.raises(ValueError, match="copy=True"):
+        dataset[np.array([3, 1, 2]), ["f8", "i2"]].frame(copy=False)
+
+
+def test_dataset_frame_copy_false_rejected_across_files(tmp_path):
+    # A multi-file dataset's columns are not contiguous in memory, so the
+    # whole-store zero-copy frame must raise rather than copy (inherited from
+    # dict(copy=False)).
+    paths = []
+    for i in range(2):
+        path = tmp_path / f"part{i}.cstore"
+        with colstore.create(path) as writer:
+            writer.write({"a": np.arange(100, dtype=np.float64) + i})
+        paths.append(path)
+    with colstore.open(paths) as dataset:
+        assert dataset.n_rows == 200  # a combined multi-file dataset
+        with pytest.raises(ValueError, match="copy=True"):
+            dataset.frame(copy=False)
+
+
 def test_multi_record_store_raises_with_compact_hint(tmp_path):
     rng = np.random.default_rng(52)
     full = rng.standard_normal(2_000)
