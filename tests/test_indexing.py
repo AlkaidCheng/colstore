@@ -153,6 +153,14 @@ def test_negative_fancy_index_folds(validation_store):
 
 
 @pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
+def test_negative_fancy_index_below_range_raises(validation_store):
+    # An index below -n_rows stays negative after folding (-101 + 100 = -1), so
+    # the post-fold minimum check must still reject it.
+    with pytest.raises(IndexError, match="out of bounds"):
+        validation_store[np.array([5, -101]), "a"].array()
+
+
+@pytest.mark.parametrize("validation_store", _BACKENDS, indirect=True)
 def test_out_of_bounds_scalar_raises(validation_store):
     with pytest.raises(IndexError, match="out of bounds"):
         validation_store[100, "a"].array()
