@@ -17,6 +17,7 @@ from typing import Any, TypeAlias, overload
 import numpy as np
 
 from . import format as fmt
+from ._paths import has_glob_magic
 from .compaction import compact_file
 from .dataset import ColStoreDataset
 from .reader import ColStoreReader
@@ -32,7 +33,7 @@ def open(
 ) -> ColStoreReader | ColStoreDataset:
     """Open an existing ``.cstore`` file, or several as one logical dataset.
 
-    A single path (``str`` or ``os.PathLike``) returns a
+    A single literal path (``str`` or ``os.PathLike``) returns a
     :class:`~colstore.reader.ColStoreReader`, equivalent to
     ``ColStoreReader(path, **kwargs)``. A list or tuple of paths returns a
     :class:`~colstore.dataset.ColStoreDataset` spanning the files in order (all
@@ -41,7 +42,17 @@ def open(
     dataset owns the files it opened and closes them on :meth:`close`. Each file
     must exist and be valid; otherwise :class:`FileNotFoundError` or
     :class:`~colstore.FormatError` propagates.
+
+    A ``str`` containing a shell glob (``*``, ``?``, ``[``; ``**`` is recursive)
+    is expanded to its matches and returns a :class:`ColStoreDataset` -- e.g.
+    ``open("run_*.cstore")`` opens every matching file as one logical table.
+    Matches are ordered numerically (``run_2`` before ``run_10``), since file
+    order is the dataset's row order, and a pattern matching no files raises
+    :class:`FileNotFoundError`. Globbing applies to path arguments only -- column
+    selection is always explicit -- and a list element may itself be a glob.
     """
+    if isinstance(path, str) and has_glob_magic(path):
+        return ColStoreDataset(path, **kwargs)
     if isinstance(path, (str, os.PathLike)):
         return ColStoreReader(path, **kwargs)
     return ColStoreDataset(path, **kwargs)
@@ -268,7 +279,8 @@ def concat(
 
     ``sources`` is a list or tuple mixing file paths and already-open readers or
     datasets; all must share one schema. Paths are opened (and owned by the
-    result); readers and datasets are borrowed and left open.
+    result); readers and datasets are borrowed and left open. A path string may
+    be a glob (e.g. ``"run_*.cstore"``), expanded to its matches in numeric order.
 
     Parameters
     ----------
