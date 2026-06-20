@@ -34,6 +34,16 @@ def test_dtypes_match_source(small_store):
     assert small_store.dtypes["id"] == np.int64
 
 
+def test_native_dtype_matches_dtypes_and_raises_for_unknown(small_store):
+    # _native_dtype is the single-column accessor the dtypes property and the hot
+    # read paths build on; it must agree with dtypes[name] and reject unknowns.
+    dtypes = small_store.dtypes
+    for name in small_store.columns:
+        assert small_store._native_dtype(name) == dtypes[name]
+    with pytest.raises(KeyError):
+        small_store._native_dtype("not_a_column")
+
+
 def test_repr_includes_path_and_shape(small_store):
     repr_text = repr(small_store)
     assert "ColStoreReader" in repr_text

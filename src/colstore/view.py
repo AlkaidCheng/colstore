@@ -153,7 +153,7 @@ class ColumnView(_BaseView):
     @property
     def dtype(self) -> np.dtype:
         """NumPy dtype of the selected column."""
-        return self._store.dtypes[self._column_name]
+        return self._store._native_dtype(self._column_name)
 
     def array(self, copy: bool = True) -> np.ndarray:
         """Materialize as a 1D ndarray.
@@ -221,7 +221,7 @@ class TableView(_BaseView):
     @property
     def dtypes(self) -> dict[str, np.dtype]:
         """Per-column NumPy dtypes."""
-        return {name: self._store.dtypes[name] for name in self._column_names}
+        return {name: self._store._native_dtype(name) for name in self._column_names}
 
     def dict(self, copy: bool = True) -> dict[str, np.ndarray]:
         """Materialize as a dict mapping column name to 1D ndarray.

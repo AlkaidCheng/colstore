@@ -104,7 +104,19 @@ class _ReaderBase(abc.ABC):
     @property
     def dtypes(self) -> dict[str, np.dtype[Any]]:
         """Column dtypes in native byte order, in stored order."""
-        return {name: dtype.newbyteorder("=") for name, dtype in self._column_dtypes.items()}
+        return {name: self._native_dtype(name) for name in self._column_dtypes}
+
+    def _native_dtype(self, column_name: str) -> np.dtype[Any]:
+        """One column's dtype in native byte order.
+
+        The on-disk column is little-endian; a big-endian host reads it as a
+        non-native dtype that the gather/copy converts. Callers needing a single
+        column's native dtype use this instead of indexing :attr:`dtypes`, which
+        rebuilds the whole mapping on every access -- doing that once per column
+        is quadratic in the column count. Raises ``KeyError`` for an unknown name.
+        """
+        native: np.dtype[Any] = self._column_dtypes[column_name].newbyteorder("=")
+        return native
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -126,8 +138,7 @@ class _ReaderBase(abc.ABC):
         back to the column-major assignment from a materialized column dict.
         """
         names = list(self._column_dtypes)
-        dtypes = self.dtypes
-        record_dtype = np.dtype([(name, dtypes[name]) for name in names])
+        record_dtype = np.dtype([(name, self._native_dtype(name)) for name in names])
         record_array: NDArray[Any] = np.empty(self.n_rows, dtype=record_dtype)
         if self.n_rows == 0 or not names:
             return record_array
@@ -174,7 +185,7 @@ class _ReaderBase(abc.ABC):
         return isinstance(column_name, str) and column_name in self._column_dtypes
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self.columns)
+        return iter(self._column_dtypes)
 
     # ---- Indexing ------------------------------------------------------
 
