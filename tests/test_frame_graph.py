@@ -43,6 +43,13 @@ class _StubStore:
     def dtypes(self) -> dict[str, np.dtype]:
         return {name: arr.dtype for name, arr in self._columns.items()}
 
+    @property
+    def columns(self) -> list[str]:
+        return list(self._columns)
+
+    def _native_dtype(self, name: str) -> np.dtype:
+        return self._columns[name].dtype.newbyteorder("=")
+
     def _gather_one(self, name: str, row_indexer: slice) -> np.ndarray:
         self.gather_calls.append((name, row_indexer))
         return np.array(self._columns[name][row_indexer], copy=True)

@@ -628,7 +628,7 @@ class ColStoreDataset(_ReaderBase):
         fills a sorted buffer concurrently (disjoint regions, no locking), then
         un-sorts into the requested order with one scatter.
         """
-        out = np.empty(len(indices), dtype=self.dtypes[column_name])
+        out = np.empty(len(indices), dtype=self._native_dtype(column_name))
         if indices.size == 0:
             return out
         table = self._native_segment_table(column_name)
@@ -636,7 +636,7 @@ class ColStoreDataset(_ReaderBase):
             self._native_gather(out, indices, table, _indices_are_sorted(indices))
             return out
         order, blocks = self._sorted_blocks(indices)
-        buffer = np.empty(len(indices), dtype=self.dtypes[column_name])
+        buffer = np.empty(len(indices), dtype=self._native_dtype(column_name))
         jobs = [
             self._fill_one(buffer, lo, hi, self._children[file_index], column_name, local)
             for file_index, lo, hi, local in blocks
@@ -655,7 +655,9 @@ class ColStoreDataset(_ReaderBase):
         sort across all columns and reuses a single per-column buffer, so peak
         memory stays at one column's worth rather than scaling with the count.
         """
-        out = {name: np.empty(len(indices), dtype=self.dtypes[name]) for name in column_names}
+        out = {
+            name: np.empty(len(indices), dtype=self._native_dtype(name)) for name in column_names
+        }
         if indices.size == 0:
             return out
         tables = [self._native_segment_table(name) for name in column_names]
@@ -664,7 +666,7 @@ class ColStoreDataset(_ReaderBase):
             return out
         order, blocks = self._sorted_blocks(indices)
         for name in column_names:
-            buffer = np.empty(len(indices), dtype=self.dtypes[name])
+            buffer = np.empty(len(indices), dtype=self._native_dtype(name))
             jobs = [
                 self._fill_one(buffer, lo, hi, self._children[file_index], name, local)
                 for file_index, lo, hi, local in blocks
@@ -683,7 +685,7 @@ class ColStoreDataset(_ReaderBase):
         children = self._children
         if len(children) == 1:
             return children[0]._gather_one(column_name, row_indexer, thread_cap)
-        dtype = self.dtypes[column_name]
+        dtype = self._native_dtype(column_name)
         if row_indexer is None:
             out = np.empty(self._n_rows, dtype=dtype)
             self._fill_contiguous_columns({column_name: out}, [column_name], self._offset_regions())
@@ -749,7 +751,10 @@ class ColStoreDataset(_ReaderBase):
         if len(children) == 1:
             return children[0]._gather_many(column_names, row_indexer)
         if row_indexer is None:
-            out = {name: np.empty(self._n_rows, dtype=self.dtypes[name]) for name in column_names}
+            out = {
+                name: np.empty(self._n_rows, dtype=self._native_dtype(name))
+                for name in column_names
+            }
             self._fill_contiguous_columns(out, column_names, self._offset_regions())
             return out
         if isinstance(row_indexer, (int, np.integer)):
@@ -773,7 +778,7 @@ class ColStoreDataset(_ReaderBase):
     ) -> dict[str, NDArray[Any]]:
         lengths = self._contiguous_lengths(parts, is_mask)
         total = sum(lengths)
-        out = {name: np.empty(total, dtype=self.dtypes[name]) for name in column_names}
+        out = {name: np.empty(total, dtype=self._native_dtype(name)) for name in column_names}
         self._fill_contiguous_columns(out, column_names, self._contiguous_regions(parts, lengths))
         return out
 

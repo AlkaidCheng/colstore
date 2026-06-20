@@ -551,7 +551,8 @@ def to_root(
             stacklevel=2,
         )
 
-    row_nbytes = sum(reader.dtypes[name].itemsize for name in selected)
+    dtypes = reader.dtypes
+    row_nbytes = sum(dtypes[name].itemsize for name in selected)
     total_bytes = total_rows * row_nbytes
     rows_per_chunk = _resolve_chunk_rows(batch_size, row_nbytes)
     options = _build_options(

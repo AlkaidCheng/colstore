@@ -376,11 +376,12 @@ class NativeColumn(_Leaf):
     __slots__ = ("_dtype", "_key", "_name", "_store")
 
     def __init__(self, store: _ReaderBase, name: str) -> None:
-        if name not in store.dtypes:
-            raise KeyError(f"column {name!r} is not in the store; have {list(store.dtypes)}.")
+        try:
+            self._dtype = store._native_dtype(name)
+        except KeyError:
+            raise KeyError(f"column {name!r} is not in the store; have {store.columns}.") from None
         self._store = store
         self._name = name
-        self._dtype = store.dtypes[name]
         self._key = ("native", id(store), name)
 
     @property
