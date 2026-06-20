@@ -7,6 +7,7 @@ and full-column reads where fancy indexing isn't required.
 """
 
 import warnings
+from typing import Any
 
 import numpy as np
 
@@ -89,6 +90,38 @@ def interleave_records(
     _cpp_module.interleave_records(
         output, record_itemsize, n_rows, src_addrs, src_itemsizes, field_offsets, thread_cap
     )
+
+
+def interleave_record_array(
+    column_names: list[str], sources: list[np.ndarray], record_dtype: np.dtype[Any]
+) -> np.ndarray:
+    """Assemble per-column ``sources`` into one record array (assumes >= 1 source).
+
+    Uses the parallel :func:`interleave_records` kernel when the extension is
+    built -- writing the record array row-major, once -- else a column-major
+    per-field assignment. Each source must be C-contiguous with a dtype equal to
+    its field in ``record_dtype`` (the kernel copies raw bytes, so source and
+    field byte order match by construction); ``sources`` aligns with
+    ``column_names``. Shared by the reader's gather path and the editing frame.
+    """
+    n_records = sources[0].shape[0]
+    record_array: np.ndarray = np.empty(n_records, dtype=record_dtype)
+    if n_records == 0 or not cpp_available():
+        for name, source in zip(column_names, sources, strict=True):
+            record_array[name] = source
+        return record_array
+    fields = record_dtype.fields
+    assert fields is not None  # a structured dtype always has fields
+    interleave_records(
+        record_array,
+        record_dtype.itemsize,
+        n_records,
+        np.array([s.ctypes.data for s in sources], dtype=np.int64),
+        np.array([s.dtype.itemsize for s in sources], dtype=np.int64),
+        np.array([fields[name][1] for name in column_names], dtype=np.int64),
+        config.get_gather_thread_cap(),
+    )
+    return record_array
 
 
 def _is_native_order(array: np.ndarray) -> bool:

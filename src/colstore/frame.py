@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from . import kernels
+
 if TYPE_CHECKING:
     from ._base import _ReaderBase
     from .reader import ColStoreReader
@@ -631,9 +633,10 @@ class ColStoreFrame:
     opening one seeds it with a native-passthrough leaf per source column.
     Indexing returns the expression for a column, which composes with operators
     and whitelisted NumPy ufuncs to build transformations; assignment, deletion,
-    and renaming edit the mapping. Nothing is read or written until :meth:`write`,
-    which streams the result to a new file and returns a reader for it. The source
-    store is never modified.
+    and renaming edit the mapping. Nothing is read until you materialize:
+    :meth:`compute` / :meth:`dict` / :meth:`recarray` evaluate columns into memory,
+    and :meth:`write` streams the result to a new file and returns a reader for it.
+    The source store is never modified.
 
     Assignment holds arrays by reference; pass ``copy=True`` to :meth:`assign`
     to snapshot them instead. A column length is checked eagerly on assignment
@@ -734,6 +737,29 @@ class ColStoreFrame:
     def compute(self, name: str) -> NDArray[Any]:
         """Eagerly materialize one column as an array, without writing a file."""
         return self[name].compute(self._n_rows)
+
+    def dict(self) -> dict[str, NDArray[Any]]:
+        """Compute every column into memory as a ``name -> array`` mapping; writes no file.
+
+        Columns share one evaluation memo, so a subexpression used by more than one
+        output column is computed once. The in-memory analogue of :meth:`write`.
+        """
+        memo: dict[tuple[Any, ...], NDArray[Any]] = {}
+        return {name: evaluate(expr, 0, self._n_rows, memo) for name, expr in self._columns.items()}
+
+    def recarray(self) -> NDArray[Any]:
+        """Compute every column into one structured (record) ndarray; writes no file.
+
+        Columns are interleaved into the record layout by the same parallel
+        ``interleave_records`` kernel the reader's :meth:`recarray` uses.
+        """
+        columns = self.dict()
+        if not columns:
+            return np.empty(self._n_rows, dtype=np.dtype([]))
+        names = list(columns)
+        sources = [np.ascontiguousarray(columns[name]) for name in names]
+        dtype = np.dtype([(name, src.dtype) for name, src in zip(names, sources, strict=True)])
+        return kernels.interleave_record_array(names, sources, dtype)
 
     def write(
         self, path: str | os.PathLike[str], *, memory_budget: int | None = None

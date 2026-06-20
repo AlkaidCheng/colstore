@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, overload
 import numpy as np
 from numpy.typing import NDArray
 
-from . import config, kernels
+from . import kernels
 from ._query import _Expr, parse_query, validate_predicate
 from ._render import Preview
 from .view import (
@@ -197,42 +197,20 @@ class _ReaderBase(abc.ABC):
         """Interleave a row selection of the named columns into a record array.
 
         Shared by :meth:`recarray` (whole store) and ``TableView.recarray`` (a
-        row/column subset). When the gather extension is built, each column's
-        contiguous native source -- a zero-copy view where one exists, else a
-        materialized gather -- is interleaved into the record layout by the
-        parallel ``interleave_records`` kernel (row-major, so the record array is
-        written once rather than once per column); a single-record native whole
-        read needs no intermediate column arrays at all. Without the extension it
-        falls back to the column-major assignment from a materialized column dict.
-        Assumes at least one column.
+        row/column subset). With the gather extension, each column's contiguous
+        native source -- a zero-copy view where one exists, else a materialized
+        gather -- feeds the parallel ``interleave_records`` kernel; without it, a
+        parallel multi-column gather is assembled per field. The assembly itself
+        lives in :func:`colstore.kernels.interleave_record_array`. Assumes at
+        least one column.
         """
         record_dtype = np.dtype([(name, self._native_dtype(name)) for name in column_names])
-        if not kernels.cpp_available():
+        if kernels.cpp_available():
+            sources = [self._contiguous_native_source(name, row_indexer) for name in column_names]
+        else:
             column_data = self._gather_many(column_names, row_indexer)
-            record_array: NDArray[Any] = np.empty(
-                column_data[column_names[0]].shape[0], dtype=record_dtype
-            )
-            for name in column_names:
-                record_array[name] = column_data[name]
-            return record_array
-
-        sources = [self._contiguous_native_source(name, row_indexer) for name in column_names]
-        n_records = sources[0].shape[0]
-        record_array = np.empty(n_records, dtype=record_dtype)
-        if n_records == 0:
-            return record_array
-        fields = record_dtype.fields
-        assert fields is not None  # a structured dtype always has fields
-        kernels.interleave_records(
-            record_array,
-            record_dtype.itemsize,
-            n_records,
-            np.array([source.ctypes.data for source in sources], dtype=np.int64),
-            np.array([source.dtype.itemsize for source in sources], dtype=np.int64),
-            np.array([fields[name][1] for name in column_names], dtype=np.int64),
-            config.get_gather_thread_cap(),
-        )
-        return record_array
+            sources = [column_data[name] for name in column_names]
+        return kernels.interleave_record_array(column_names, sources, record_dtype)
 
     def _contiguous_native_source(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
         """A contiguous, native-order array for one column over the row selection.
