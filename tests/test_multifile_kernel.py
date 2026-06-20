@@ -321,3 +321,81 @@ def test_parallel_copy_runs_non_int64_raises():
         _gather.parallel_copy_runs(
             out, bad, np.array([0], dtype=np.int64), np.array([32], dtype=np.int64), 0
         )
+
+
+# ---- interleave_records ------------------------------------------------
+
+
+def _interleave(out, n_rows, columns, record_dtype, names, cap):
+    """Drive the kernel from a list of column arrays into a record array."""
+    _gather.interleave_records(
+        out,
+        record_dtype.itemsize,
+        n_rows,
+        np.array([c.ctypes.data for c in columns], dtype=np.int64),
+        np.array([c.dtype.itemsize for c in columns], dtype=np.int64),
+        np.array([record_dtype.fields[name][1] for name in names], dtype=np.int64),
+        cap,
+    )
+
+
+@pytest.mark.parametrize("cap", [0, 1, 4])
+def test_interleave_records_matches_numpy(cap):
+    # Mixed itemsizes exercise every branch of the field-copy switch (8/4/2/1).
+    rng = np.random.default_rng(5)
+    n = 10_000
+    columns = [
+        rng.integers(0, 1000, n).astype(np.float64),
+        rng.integers(0, 1000, n).astype(np.int32),
+        rng.integers(0, 1000, n).astype(np.int16),
+        rng.integers(0, 1000, n).astype(np.int8),
+        rng.random(n),
+    ]
+    names = [f"c{i}" for i in range(len(columns))]
+    record_dtype = np.dtype([(name, col.dtype) for name, col in zip(names, columns, strict=True)])
+    oracle = np.empty(n, dtype=record_dtype)
+    for name, col in zip(names, columns, strict=True):
+        oracle[name] = col
+
+    out = np.empty(n, dtype=record_dtype)
+    _interleave(out, n, columns, record_dtype, names, cap)
+    np.testing.assert_array_equal(out, oracle)
+
+
+def test_interleave_records_empty_is_noop():
+    record_dtype = np.dtype([("a", np.float64), ("b", np.int32)])
+    out = np.zeros(0, dtype=record_dtype)
+    empty = np.empty(0, dtype=np.int64)
+    _gather.interleave_records(out, record_dtype.itemsize, 0, empty, empty, empty, 0)
+    assert out.shape == (0,)
+
+
+def test_interleave_records_length_mismatch_raises():
+    record_dtype = np.dtype([("a", np.float64)])
+    out = np.empty(4, dtype=record_dtype)
+    a = np.arange(4, dtype=np.float64)
+    with pytest.raises(ValueError, match="equal length"):
+        _gather.interleave_records(
+            out,
+            record_dtype.itemsize,
+            4,
+            np.array([a.ctypes.data], dtype=np.int64),
+            np.array([8, 8], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            0,
+        )
+
+
+def test_interleave_records_non_int64_raises():
+    record_dtype = np.dtype([("a", np.float64)])
+    out = np.empty(4, dtype=record_dtype)
+    with pytest.raises(TypeError, match="int64"):
+        _gather.interleave_records(
+            out,
+            record_dtype.itemsize,
+            4,
+            np.array([0], dtype=np.int32),
+            np.array([8], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            0,
+        )

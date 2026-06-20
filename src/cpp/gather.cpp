@@ -1481,6 +1481,62 @@ void colstore_parallel_copy_runs(std::uint8_t* output, const std::int64_t* src_a
   copy_logical_range(0, total);
 }
 
+namespace {
+
+// Copy one field. The switch hands the compiler a compile-time size for the
+// common widths, so each lowers to a single (unaligned) load/store instead of a
+// runtime memcpy call; packed record fields may be misaligned, so it stays a
+// memcpy rather than a typed dereference.
+inline void copy_field(std::uint8_t* dst, const std::uint8_t* src, std::int64_t itemsize) {
+  switch (itemsize) {
+    case 8:
+      std::memcpy(dst, src, 8);
+      break;
+    case 4:
+      std::memcpy(dst, src, 4);
+      break;
+    case 2:
+      std::memcpy(dst, src, 2);
+      break;
+    case 1:
+      *dst = *src;
+      break;
+    default:
+      std::memcpy(dst, src, static_cast<std::size_t>(itemsize));
+      break;
+  }
+}
+
+}  // namespace
+
+void colstore_interleave_records(std::uint8_t* output, std::int64_t record_itemsize,
+                                 std::int64_t n_rows, const std::int64_t* src_addrs,
+                                 const std::int64_t* src_itemsizes,
+                                 const std::int64_t* field_offsets,
+                                 std::int64_t n_cols, int thread_cap) {
+  if (n_rows <= 0 || n_cols <= 0) {
+    return;
+  }
+  const std::ptrdiff_t total = static_cast<std::ptrdiff_t>(n_rows) * record_itemsize;
+  const std::ptrdiff_t n_threads = colstore::resolve_thread_count(total, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::int64_t i = 0; i < n_rows; ++i) {
+    std::uint8_t* COLSTORE_RESTRICT rec = output + i * record_itemsize;
+    for (std::int64_t c = 0; c < n_cols; ++c) {
+      const std::int64_t itemsize = src_itemsizes[c];
+      copy_field(rec + field_offsets[c],
+                 reinterpret_cast<const std::uint8_t*>(
+                     static_cast<std::uintptr_t>(src_addrs[c] + i * itemsize)),
+                 itemsize);
+    }
+  }
+}
+
 int colstore_gather_multirecord_mask(
     const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
     std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,

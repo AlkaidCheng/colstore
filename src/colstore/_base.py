@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, overload
 import numpy as np
 from numpy.typing import NDArray
 
+from . import config, kernels
 from .view import ColumnView, TableView
 
 if TYPE_CHECKING:
@@ -109,6 +110,60 @@ class _ReaderBase(abc.ABC):
     def shape(self) -> tuple[int, int]:
         """``(n_rows, n_columns)``."""
         return self.n_rows, len(self._column_dtypes)
+
+    # ---- Whole-store materializer --------------------------------------
+
+    def recarray(self) -> NDArray[Any]:
+        """Materialize the whole store as a structured (record) ndarray.
+
+        One field per column, in stored order; ``result[name]`` is the column.
+        When the gather extension is built, the columns are interleaved into the
+        record layout by the parallel ``interleave_records`` kernel -- row-major,
+        so the record array is written once rather than once per column -- reading
+        each column straight from its memmap where a zero-copy view exists, and
+        otherwise from a materialized copy. A single-record native store thus
+        needs no intermediate column arrays at all. Without the extension it falls
+        back to the column-major assignment from a materialized column dict.
+        """
+        names = list(self._column_dtypes)
+        dtypes = self.dtypes
+        record_dtype = np.dtype([(name, dtypes[name]) for name in names])
+        record_array: NDArray[Any] = np.empty(self.n_rows, dtype=record_dtype)
+        if self.n_rows == 0 or not names:
+            return record_array
+
+        if not kernels.cpp_available():
+            column_data = self._gather_many(names, None)
+            for name in names:
+                record_array[name] = column_data[name]
+            return record_array
+
+        sources = [self._contiguous_native_source(name) for name in names]  # held alive
+        fields = record_dtype.fields
+        assert fields is not None  # a structured dtype always has fields
+        kernels.interleave_records(
+            record_array,
+            record_dtype.itemsize,
+            self.n_rows,
+            np.array([source.ctypes.data for source in sources], dtype=np.int64),
+            np.array([source.dtype.itemsize for source in sources], dtype=np.int64),
+            np.array([fields[name][1] for name in names], dtype=np.int64),
+            config.get_gather_thread_cap(),
+        )
+        return record_array
+
+    def _contiguous_native_source(self, column_name: str) -> NDArray[Any]:
+        """A contiguous, native-order array for one column for the interleave.
+
+        A zero-copy memmap view when the store can give one (single-record,
+        native dtype), otherwise a materialized copy (which byteswaps a
+        non-native dtype and stitches a multi-record or multi-file column). Both
+        are contiguous and native, so the kernel's raw field copy is exact.
+        """
+        try:
+            return self._view_one(column_name, None)
+        except ValueError:
+            return self._gather_one(column_name, None)
 
     # ---- Mapping protocol over column names ----------------------------
 

@@ -67,6 +67,8 @@ cdef extern from "colstore/gather.hpp" nogil:
                                          int, int, ptrdiff_t)
     void colstore_parallel_copy_runs(uint8_t*, const int64_t*, const int64_t*,
                                      const int64_t*, int64_t, int)
+    void colstore_interleave_records(uint8_t*, int64_t, int64_t, const int64_t*,
+                                     const int64_t*, const int64_t*, int64_t, int)
     int colstore_gather_multirecord_bins(
         const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
@@ -1094,6 +1096,38 @@ def parallel_copy_runs(cnp.ndarray output, cnp.ndarray src_addrs,
     cdef const int64_t* bl = <const int64_t*>cnp.PyArray_DATA(byte_lengths)
     with nogil:
         colstore_parallel_copy_runs(out_ptr, sa, do, bl, n_runs, thread_cap)
+
+
+def interleave_records(cnp.ndarray output, long long record_itemsize, long long n_rows,
+                       cnp.ndarray src_addrs, cnp.ndarray src_itemsizes,
+                       cnp.ndarray field_offsets, int thread_cap=0):
+    """Interleave columns into a record array (the SoA -> AoS transpose).
+
+    Row ``i`` of ``output`` (record stride ``record_itemsize`` bytes) gets each
+    column's element ``i`` at its field offset; column ``c``'s element ``i`` is
+    ``src_itemsizes[c]`` bytes at ``src_addrs[c] + i * src_itemsizes[c]`` (each
+    column contiguous, an absolute address so it may be a memmap). The work is
+    split over row ranges. The caller keeps the source buffers alive across the
+    call and guarantees native byte order (a raw field copy cannot byteswap).
+    """
+    _require_1d((src_addrs, src_itemsizes, field_offsets), "column arrays must be 1D.")
+    _require_int64(src_addrs, "src_addrs")
+    _require_int64(src_itemsizes, "src_itemsizes")
+    _require_int64(field_offsets, "field_offsets")
+    cdef long long n_cols = src_addrs.shape[0]
+    if src_itemsizes.shape[0] != n_cols or field_offsets.shape[0] != n_cols:
+        raise ValueError("src_addrs, src_itemsizes, and field_offsets must be equal length.")
+    if n_rows == 0 or n_cols == 0:
+        return
+    _require_c_contiguous((("output", output), ("src_addrs", src_addrs),
+                           ("src_itemsizes", src_itemsizes), ("field_offsets", field_offsets)))
+    cdef uint8_t* out_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* sa = <const int64_t*>cnp.PyArray_DATA(src_addrs)
+    cdef const int64_t* si = <const int64_t*>cnp.PyArray_DATA(src_itemsizes)
+    cdef const int64_t* fo = <const int64_t*>cnp.PyArray_DATA(field_offsets)
+    with nogil:
+        colstore_interleave_records(out_ptr, record_itemsize, n_rows, sa, si, fo,
+                                    n_cols, thread_cap)
 
 
 def gather_multifile_bins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray bins,

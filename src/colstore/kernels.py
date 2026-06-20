@@ -69,6 +69,28 @@ def parallel_copy_runs(
     _cpp_module.parallel_copy_runs(output, src_addrs, dst_offsets, byte_lengths, thread_cap)
 
 
+def interleave_records(
+    output: np.ndarray,
+    record_itemsize: int,
+    n_rows: int,
+    src_addrs: np.ndarray,
+    src_itemsizes: np.ndarray,
+    field_offsets: np.ndarray,
+    thread_cap: int,
+) -> None:
+    """Interleave columns into a record array via the C++ kernel (SoA -> AoS).
+
+    Row ``i`` of ``output`` gets each column's element ``i`` at its field offset;
+    column ``c``'s element ``i`` is ``src_itemsizes[c]`` bytes at
+    ``src_addrs[c] + i * src_itemsizes[c]``. The caller ensures the extension is
+    built (:func:`cpp_available`), keeps the source buffers alive across the
+    call, and guarantees native byte order.
+    """
+    _cpp_module.interleave_records(
+        output, record_itemsize, n_rows, src_addrs, src_itemsizes, field_offsets, thread_cap
+    )
+
+
 def _is_native_order(array: np.ndarray) -> bool:
     """Return whether `array` is in the host's native byte order."""
     byteorder = array.dtype.byteorder
