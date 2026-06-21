@@ -646,3 +646,68 @@ def test_closed_reader_rejects_new_views(single_record_store, tmp_path):
     dataset.close()
     with pytest.raises(ValueError, match="closed"):
         column_view.array(copy=False)
+
+
+# -- view.edit(): carry the view's row + column selection into an editing frame --
+
+
+def test_table_view_edit_carries_query_rows(small_store):
+    cf = small_store.query("id < 10").edit()
+    assert cf.n_rows == 10
+    assert cf.dict()["id"].tolist() == list(range(10))
+
+
+def test_table_view_edit_carries_fancy_rows(small_store):
+    cf = small_store[[2, 4, 6]].edit()
+    assert cf.dict()["id"].tolist() == [2, 4, 6]
+
+
+def test_table_view_edit_carries_mask(small_store, small_frame):
+    ids = small_frame["id"].to_numpy()
+    mask = ids % 100 == 0
+    cf = small_store[mask].edit()
+    assert cf.dict()["id"].tolist() == ids[mask].tolist()
+
+
+def test_table_view_edit_carries_col_predicate(small_store):
+    cf = small_store[colstore.col("id") >= 1020].edit()
+    assert cf.dict()["id"].tolist() == [1020, 1021, 1022, 1023]
+
+
+def test_table_view_edit_subrange_slice(small_store):
+    cf = small_store[100:105].edit()
+    assert cf.n_rows == 5
+    assert cf.dict()["id"].tolist() == [100, 101, 102, 103, 104]
+
+
+def test_table_view_edit_full_slice_stays_unfiltered(small_store):
+    cf = small_store[:].edit()
+    assert cf.n_rows == small_store.n_rows
+    assert cf._rows is None  # a full range keeps the unfiltered streaming-write path
+
+
+def test_table_view_edit_projects_columns(small_store):
+    cf = small_store[["price", "qty"]].edit()
+    assert cf.columns == ["price", "qty"]
+
+
+def test_table_view_select_then_edit(small_store):
+    cf = small_store.query("id < 5").select("id", "qty").edit()
+    assert cf.columns == ["id", "qty"]
+    assert cf.dict()["id"].tolist() == [0, 1, 2, 3, 4]
+
+
+def test_column_view_edit(small_store):
+    cf = small_store[10:13, "qty"].edit()
+    assert cf.columns == ["qty"]
+    assert cf.n_rows == 3
+
+
+def test_view_edit_then_transform_and_write(small_store, tmp_path):
+    cf = small_store[colstore.col("id") >= 1020].edit()
+    cf = cf.assign(twice=cf["id"] * 2)
+    reader = cf.write(tmp_path / "ve.cstore")
+    try:
+        assert reader.dict()["twice"].tolist() == [2040, 2042, 2044, 2046]
+    finally:
+        reader.close()

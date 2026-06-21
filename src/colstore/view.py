@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from ._base import _ReaderBase
+    from .frame import ColStoreFrame
 
 _RowIndexer = int | slice | np.ndarray | None
 
@@ -110,6 +111,29 @@ def resolve_drop(available: list[str], names: tuple[str, ...]) -> list[str]:
     validate_columns(available, list(names))
     dropped = set(names)
     return [c for c in available if c not in dropped]
+
+
+def edit_row_selection(indexer: _RowIndexer, n_rows: int) -> np.ndarray | None:
+    """Normalize a resolved row indexer into a frame's row selection.
+
+    ``None`` -- and a slice spanning every row -- means "all rows", which the
+    frame keeps as its unfiltered streaming-write path. Any narrower selector
+    (int, sub-range slice, fancy index, or boolean mask) becomes an explicit
+    int64 array of the chosen source rows, which the frame materializes.
+    """
+    if indexer is None:
+        return None
+    if isinstance(indexer, (int, np.integer)):
+        return np.array([int(indexer)], dtype=np.int64)
+    if isinstance(indexer, slice):
+        start, stop, step = indexer.indices(n_rows)
+        if step == 1 and start == 0 and stop == n_rows:
+            return None
+        return np.arange(start, stop, step, dtype=np.int64)
+    array = np.asarray(indexer)
+    if array.dtype == bool:
+        return np.flatnonzero(array).astype(np.int64, copy=False)
+    return array.astype(np.int64, copy=False)
 
 
 class _BaseView:
@@ -258,6 +282,24 @@ class _BaseView:
         """Resolve a preview row count for this view, warning if it would be large."""
         return resolve_preview_n(n, self._store.n_rows, self._row_width())
 
+    def _edit_columns(self) -> list[str]:
+        """The column names this view seeds an editing frame with."""
+        raise NotImplementedError
+
+    def edit(self) -> ColStoreFrame:
+        """Open a deferred editing frame over this view's columns and rows.
+
+        Seeds a :class:`~colstore.frame.ColStoreFrame` with this view's columns as
+        native leaves, carrying over its row selection -- the resolved ``col()`` /
+        ``query`` predicate, fancy index, slice, or mask -- so a gathered or
+        filtered view continues straight into the edit API. The source store is not
+        modified; :meth:`~colstore.frame.ColStoreFrame.write` produces a new file.
+        """
+        from .frame import ColStoreFrame
+
+        rows = edit_row_selection(self._resolve_row_indexer(), self._store.n_rows)
+        return ColStoreFrame(self._store, self._edit_columns(), rows)
+
 
 class ColumnView(_BaseView):
     """Lazy view of a single column produced by indexing with a string name.
@@ -289,6 +331,9 @@ class ColumnView(_BaseView):
     def column(self) -> str:
         """Name of the column selected by this view."""
         return self._column_name
+
+    def _edit_columns(self) -> list[str]:
+        return [self._column_name]
 
     @property
     def dtype(self) -> np.dtype:
@@ -393,6 +438,9 @@ class TableView(_BaseView):
     @property
     def columns(self) -> list[str]:
         """Names of the columns selected by this view, in selection order."""
+        return list(self._column_names)
+
+    def _edit_columns(self) -> list[str]:
         return list(self._column_names)
 
     @property

@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="500" viewBox="0 0 760 500" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>The frame's computational model</title>
+<desc>A ColStoreFrame holds two independent parts that meet at one evaluator. The column recipe (assign, with_columns, astype, drop, rename, select) is a per-column expression graph describing which columns to produce and how. The row selection (filter, where, and the rows carried in by view.edit) is either every row or a chosen set of row positions. Materializing evaluates each column over the selected rows through evaluate(node, rows, memo): leaves read exactly the selected rows and a subexpression shared by several columns is computed once. The result is delivered either in memory through dict, recarray, or compute, in one pass over the selected rows, or to a new .cstore by write, which streams bounded-memory row-range batches when unfiltered and materializes the selected rows when filtered.</desc>
+<style>
+ .recipe{fill:#E1F5EE;stroke:#0F6E56;stroke-width:1;} .recipeT{fill:#04342C;}
+ .rows{fill:#E6EEF4;stroke:#3F6E9E;stroke-width:1;} .rowsT{fill:#234567;}
+ .eval{fill:#EAE6F4;stroke:#6B5BA6;stroke-width:1.25;} .evalT{fill:#3A2F66;}
+ .out{fill:#FBF1DE;stroke:#B9852B;stroke-width:1;} .outT{fill:#6B4A12;}
+ .entry{fill:#F4F2EC;stroke:#5F5E5A;stroke-width:1;} .entryT{fill:#2C2C2A;}
+ .arr{stroke:#73726C;stroke-width:1.5;fill:none;}
+ .hd{fill:#2C2C2A;} .lbl{fill:#5F5E5A;}
+ @media (prefers-color-scheme: dark){
+  .recipe{fill:#04342C;stroke:#1D9E75;} .recipeT{fill:#9FE1CB;}
+  .rows{fill:#1B2A38;stroke:#5E8CBF;} .rowsT{fill:#BBD2EA;}
+  .eval{fill:#241F33;stroke:#9C8BD6;} .evalT{fill:#D6CCF0;}
+  .out{fill:#2E2613;stroke:#C9972F;} .outT{fill:#F0D9A6;}
+  .entry{fill:#26251F;stroke:#B4B2A9;} .entryT{fill:#F1EFE8;}
+  .arr{stroke:#B4B2A9;} .hd{fill:#F1EFE8;} .lbl{fill:#B4B2A9;}
+ }
+</style>
+<defs>
+ <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+  <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+ </marker>
+</defs>
+
+<text class="hd" x="40" y="30" font-size="15" font-weight="600">The frame's computational model</text>
+
+<!-- entry points -->
+<rect class="entry" x="180" y="50" width="400" height="32" rx="5"/>
+<text class="entryT" x="380" y="70" text-anchor="middle" font-size="12" font-family="ui-monospace,Menlo,Consolas,monospace">ds.edit()  &#183;  view.edit()  &#183;  ds[rows, cols].edit()</text>
+
+<path class="arr" d="M330 82 L252 104" marker-end="url(#ar)"/>
+<path class="arr" d="M430 82 L508 104" marker-end="url(#ar)"/>
+
+<!-- column recipe -->
+<rect class="recipe" x="70" y="106" width="300" height="104" rx="7"/>
+<text class="recipeT" x="220" y="132" text-anchor="middle" font-size="13" font-weight="600">COLUMN RECIPE</text>
+<text class="recipeT" x="220" y="153" text-anchor="middle" font-size="11">which columns to produce, and how</text>
+<text class="recipeT" x="220" y="177" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">assign &#183; with_columns &#183; astype</text>
+<text class="recipeT" x="220" y="196" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">drop &#183; rename &#183; select</text>
+
+<!-- row selection -->
+<rect class="rows" x="390" y="106" width="300" height="104" rx="7"/>
+<text class="rowsT" x="540" y="132" text-anchor="middle" font-size="13" font-weight="600">ROW SELECTION</text>
+<text class="rowsT" x="540" y="153" text-anchor="middle" font-size="11">all rows, or chosen row positions</text>
+<text class="rowsT" x="540" y="177" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">filter &#183; where</text>
+<text class="rowsT" x="540" y="196" text-anchor="middle" font-size="11">view.edit() carries a view's rows</text>
+
+<path class="arr" d="M222 210 L322 246" marker-end="url(#ar)"/>
+<path class="arr" d="M538 210 L438 246" marker-end="url(#ar)"/>
+
+<!-- evaluator -->
+<rect class="eval" x="190" y="248" width="380" height="74" rx="7"/>
+<text class="evalT" x="380" y="274" text-anchor="middle" font-size="13" font-weight="600" font-family="ui-monospace,Menlo,Consolas,monospace">evaluate(node, rows, memo)</text>
+<text class="evalT" x="380" y="296" text-anchor="middle" font-size="11">leaves read exactly the selected rows;</text>
+<text class="evalT" x="380" y="313" text-anchor="middle" font-size="11">a shared subexpression is computed once (memo)</text>
+
+<path class="arr" d="M330 322 L252 350" marker-end="url(#ar)"/>
+<path class="arr" d="M430 322 L508 350" marker-end="url(#ar)"/>
+
+<!-- in memory -->
+<rect class="out" x="70" y="352" width="300" height="92" rx="7"/>
+<text class="outT" x="220" y="378" text-anchor="middle" font-size="13" font-weight="600">IN MEMORY</text>
+<text class="outT" x="220" y="400" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">dict() &#183; recarray() &#183; compute()</text>
+<text class="outT" x="220" y="421" text-anchor="middle" font-size="11">one pass over the selected rows</text>
+
+<!-- write -->
+<rect class="out" x="390" y="352" width="300" height="92" rx="7"/>
+<text class="outT" x="540" y="378" text-anchor="middle" font-size="12.5" font-weight="600" font-family="ui-monospace,Menlo,Consolas,monospace">write()  &#8594;  a new .cstore</text>
+<text class="outT" x="540" y="400" text-anchor="middle" font-size="10.5">unfiltered: stream batches (bounded memory)</text>
+<text class="outT" x="540" y="421" text-anchor="middle" font-size="10.5">filtered: materialize selected rows, then write</text>
+
+<!-- legend -->
+<rect class="recipe" x="70" y="467" width="13" height="13"/><text class="lbl" x="89" y="478" font-size="11">column recipe</text>
+<rect class="rows" x="205" y="467" width="13" height="13"/><text class="lbl" x="224" y="478" font-size="11">row selection</text>
+<rect class="eval" x="338" y="467" width="13" height="13"/><text class="lbl" x="357" y="478" font-size="11">evaluator</text>
+<rect class="out" x="445" y="467" width="13" height="13"/><text class="lbl" x="464" y="478" font-size="11">result</text>
+</svg>

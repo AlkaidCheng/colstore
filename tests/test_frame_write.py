@@ -31,10 +31,11 @@ class _CountingColumn(MemoryColumn):
         super().__init__(array)
         self.reads = 0
 
-    def _read(self, start: int, stop: int) -> np.ndarray:
-        if stop > start:
+    def _read(self, rows: slice | np.ndarray) -> np.ndarray:
+        result = super()._read(rows)
+        if len(result):
             self.reads += 1
-        return super()._read(start, stop)
+        return result
 
 
 class _BoomColumn(MemoryColumn):
@@ -46,10 +47,11 @@ class _BoomColumn(MemoryColumn):
         super().__init__(array)
         self._boom_at = boom_at
 
-    def _read(self, start: int, stop: int) -> np.ndarray:
+    def _read(self, rows: slice | np.ndarray) -> np.ndarray:
+        start = (rows.start or 0) if isinstance(rows, slice) else 0
         if start >= self._boom_at:
             raise RuntimeError("boom")
-        return super()._read(start, stop)
+        return super()._read(rows)
 
 
 def _read_back(path) -> dict[str, np.ndarray]:

@@ -43,6 +43,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import kernels
+from ._query import _Expr, evaluate_mask, parse_query, validate_predicate
 
 if TYPE_CHECKING:
     from ._base import _ReaderBase
@@ -344,7 +345,20 @@ class Expr:
         length = declared_length(self) if n_rows is None else n_rows
         if length is None:
             raise ValueError("cannot infer the length of an all-constant column; pass n_rows.")
-        return evaluate(self, 0, length, {})
+        return evaluate(self, slice(0, length), {})
+
+
+# A row selector: a slice (a contiguous half-open range) or a 1-D integer index
+# array naming the chosen rows in order. The array's length is the number of
+# selected rows; a boolean mask is converted to indices before use.
+Rows = slice | np.ndarray
+
+
+def _row_count(rows: Rows) -> int:
+    """Number of rows a selector picks: a slice's span, or an index array's length."""
+    if isinstance(rows, slice):
+        return max(0, int(rows.stop or 0) - int(rows.start or 0))
+    return len(rows)
 
 
 class _Leaf(Expr):
@@ -365,7 +379,7 @@ class _Leaf(Expr):
     def _length(self) -> int | None:
         raise NotImplementedError
 
-    def _read(self, start: int, stop: int) -> NDArray[Any]:
+    def _read(self, rows: Rows) -> NDArray[Any]:
         raise NotImplementedError
 
 
@@ -403,10 +417,10 @@ class NativeColumn(_Leaf):
     def _length(self) -> int | None:
         return self._store.n_rows
 
-    def _read(self, start: int, stop: int) -> NDArray[Any]:
-        if stop <= start:
+    def _read(self, rows: Rows) -> NDArray[Any]:
+        if _row_count(rows) == 0:
             return np.empty(0, dtype=self._dtype)
-        return self._store._gather_one(self._name, slice(start, stop))
+        return self._store._gather_one(self._name, rows)
 
     def _fill_into(self, out: NDArray[Any], start: int, stop: int) -> None:
         """Write rows ``[start, stop)`` of the backing column straight into ``out``.
@@ -456,8 +470,8 @@ class MemoryColumn(_Leaf):
     def _length(self) -> int | None:
         return int(self._array.shape[0])
 
-    def _read(self, start: int, stop: int) -> NDArray[Any]:
-        return self._array[start:stop]
+    def _read(self, rows: Rows) -> NDArray[Any]:
+        return self._array[rows]
 
 
 class ConstColumn(_Leaf):
@@ -486,8 +500,8 @@ class ConstColumn(_Leaf):
     def _length(self) -> int | None:
         return None
 
-    def _read(self, start: int, stop: int) -> NDArray[Any]:
-        return np.full(stop - start, self._value, dtype=self._dtype)
+    def _read(self, rows: Rows) -> NDArray[Any]:
+        return np.full(_row_count(rows), self._value, dtype=self._dtype)
 
 
 class UFunc(Expr):
@@ -531,32 +545,32 @@ class Cast(Expr):
 
 def evaluate(
     node: Expr,
-    start: int,
-    stop: int,
+    rows: Rows,
     memo: dict[tuple[Any, ...], NDArray[Any]],
 ) -> NDArray[Any]:
-    """Materialize ``node`` over the half-open row range ``[start, stop)``.
+    """Materialize ``node`` over a row selection ``rows`` (a slice or index array).
 
-    ``memo`` maps a node's structural key to its already-computed result for this
-    range; pass the *same* memo across every column of one batch so a shared
-    subexpression is read or computed once, and a *fresh* memo per batch so each
-    batch's working set is released. A zero-length range (``start == stop``) runs
-    the whole graph on empty typed arrays without touching any backing store,
-    which is how :func:`result_dtype` recovers the output dtype for free.
+    A contiguous ``slice`` reads a row range; an index array reads exactly those
+    rows (e.g. a filtered selection). ``memo`` maps a node's structural key to its
+    already-computed result for this selection; pass the *same* memo across every
+    column of one batch so a shared subexpression is read or computed once, and a
+    *fresh* memo per batch so each batch's working set is released. A zero-length
+    selection runs the whole graph on empty typed arrays without touching any
+    backing store, which is how :func:`result_dtype` recovers the dtype for free.
     """
     cached = memo.get(node._key)
     if cached is not None:
         return cached
     if isinstance(node, _Leaf):
-        result = node._read(start, stop)
+        result = node._read(rows)
     elif isinstance(node, UFunc):
         args = [
-            evaluate(child, start, stop, memo) if isinstance(child, Expr) else child
+            evaluate(child, rows, memo) if isinstance(child, Expr) else child
             for child in node._inputs
         ]
         result = node._ufunc(*args)
     elif isinstance(node, Cast):
-        result = evaluate(node._input, start, stop, memo).astype(node._dtype)
+        result = evaluate(node._input, rows, memo).astype(node._dtype)
     else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast
         raise TypeError(f"cannot evaluate node of type {type(node).__name__!r}.")
     memo[node._key] = result
@@ -565,7 +579,7 @@ def evaluate(
 
 def result_dtype(node: Expr) -> np.dtype[Any]:
     """Output dtype of ``node`` via a zero-length evaluation; reads no data."""
-    return evaluate(node, 0, 0, {}).dtype
+    return evaluate(node, slice(0, 0), {}).dtype
 
 
 def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
@@ -671,17 +685,30 @@ class ColStoreFrame:
     against the frame's fixed row count.
     """
 
-    __slots__ = ("_columns", "_n_rows", "_store")
+    __slots__ = ("_columns", "_n_rows", "_rows", "_store")
 
-    def __init__(self, store: _ReaderBase) -> None:
+    def __init__(
+        self,
+        store: _ReaderBase,
+        columns: list[str] | None = None,
+        rows: NDArray[Any] | None = None,
+    ) -> None:
         self._store = store
         self._n_rows = store.n_rows
-        self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in store.columns}
+        self._rows = rows  # None -> all rows; else the selected source-row indices
+        names = store.columns if columns is None else columns
+        self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in names}
 
     @property
     def n_rows(self) -> int:
-        """Fixed row count this frame writes, inherited from the source store."""
-        return self._n_rows
+        """Rows this frame produces -- the source count, or the number of selected
+        rows once the frame is filtered."""
+        return self._n_rows if self._rows is None else len(self._rows)
+
+    def _resolve_rows(self) -> Rows:
+        """The selector materialization evaluates over: the full source range, or the
+        selected row indices when the frame is filtered."""
+        return slice(0, self._n_rows) if self._rows is None else self._rows
 
     @property
     def columns(self) -> list[str]:
@@ -731,6 +758,7 @@ class ColStoreFrame:
         clone = ColStoreFrame.__new__(ColStoreFrame)
         clone._store = self._store
         clone._n_rows = self._n_rows
+        clone._rows = self._rows
         clone._columns = dict(self._columns)
         return clone
 
@@ -808,9 +836,66 @@ class ColStoreFrame:
             frame._columns[name] = Cast(frame._columns[name], dtype)
         return frame
 
+    def select(self, *names: str, inplace: bool = False) -> ColStoreFrame:
+        """Project the frame to ``names`` in the given order, dropping the rest.
+
+        Returns a new frame by default; pass ``inplace=True`` to edit this one.
+        An unknown name raises ``KeyError`` and a repeated name ``ValueError``.
+        Only the column mapping is narrowed -- no data is read, and the row
+        selection is preserved.
+        """
+        missing = [name for name in names if name not in self._columns]
+        if missing:
+            raise KeyError(f"cannot select columns that are not in the frame: {missing}.")
+        repeated = sorted(name for name, count in Counter(names).items() if count > 1)
+        if repeated:
+            raise ValueError(f"duplicate column(s) in select(): {repeated}.")
+        frame = self if inplace else self.copy()
+        frame._columns = {name: frame._columns[name] for name in names}
+        return frame
+
+    def filter(
+        self,
+        predicate: str | _Expr,
+        *,
+        params: dict[str, Any] | None = None,
+        inplace: bool = False,
+    ) -> ColStoreFrame:
+        """Keep the rows matching ``predicate``; returns a new frame by default.
+
+        ``predicate`` is a :func:`~colstore.col` expression or a query string (the
+        grammar of :meth:`~colstore.ColStoreReader.query`), evaluated over the
+        store's columns; it cannot reference a column derived in the frame. It is
+        validated eagerly (an unknown column or a non-boolean condition raises
+        :class:`~colstore.QueryError`, reading no data), then evaluated over the
+        selected rows to a boolean mask that narrows the selection, so successive
+        filters compose. Pass ``inplace=True`` to edit this frame.
+        """
+        columns = frozenset(self._store.columns)
+        expr = (
+            predicate if isinstance(predicate, _Expr) else parse_query(predicate, columns, params)
+        )
+        validate_predicate(expr, columns, self._store._query_probe)
+        rows = self._resolve_rows()
+        mask = evaluate_mask(expr, lambda name: self._store._gather_one(name, rows), self.n_rows)
+        selected = np.flatnonzero(mask) if self._rows is None else self._rows[mask]
+        frame = self if inplace else self.copy()
+        frame._rows = selected
+        return frame
+
+    def where(
+        self,
+        predicate: str | _Expr,
+        *,
+        params: dict[str, Any] | None = None,
+        inplace: bool = False,
+    ) -> ColStoreFrame:
+        """Alias of :meth:`filter` -- keep the rows where ``predicate`` is true."""
+        return self.filter(predicate, params=params, inplace=inplace)
+
     def compute(self, name: str) -> NDArray[Any]:
         """Eagerly materialize one column as an array, without writing a file."""
-        return self[name].compute(self._n_rows)
+        return evaluate(self[name], self._resolve_rows(), {})
 
     def dict(self) -> dict[str, NDArray[Any]]:
         """Compute every column into memory as a ``name -> array`` mapping; writes no file.
@@ -819,7 +904,8 @@ class ColStoreFrame:
         output column is computed once. The in-memory analogue of :meth:`write`.
         """
         memo: dict[tuple[Any, ...], NDArray[Any]] = {}
-        return {name: evaluate(expr, 0, self._n_rows, memo) for name, expr in self._columns.items()}
+        rows = self._resolve_rows()
+        return {name: evaluate(expr, rows, memo) for name, expr in self._columns.items()}
 
     def recarray(self) -> NDArray[Any]:
         """Compute every column into one structured (record) ndarray; writes no file.
@@ -829,7 +915,7 @@ class ColStoreFrame:
         """
         columns = self.dict()
         if not columns:
-            return np.empty(self._n_rows, dtype=np.dtype([]))
+            return np.empty(self.n_rows, dtype=np.dtype([]))
         names = list(columns)
         sources = [np.ascontiguousarray(columns[name]) for name in names]
         dtype = np.dtype([(name, src.dtype) for name, src in zip(names, sources, strict=True)])
@@ -845,9 +931,18 @@ class ColStoreFrame:
         by ``memory_budget`` (bytes; ``None`` uses the configured default). The
         source store is not modified. Writing a frame with no columns is an
         error.
+
+        A filtered frame (see :meth:`filter`) cannot stream row ranges -- the
+        selected rows are scattered -- so it materializes its columns in one pass
+        and writes them; ``memory_budget`` bounds only the unfiltered path.
         """
         from .api import open as open_store
-        from .format import write_dataset_streaming
+        from .format import write_dataset, write_dataset_streaming
 
-        write_dataset_streaming(self._columns, self._n_rows, path, memory_budget=memory_budget)
+        if self._rows is None:
+            write_dataset_streaming(self._columns, self._n_rows, path, memory_budget=memory_budget)
+        else:
+            if not self._columns:
+                raise ValueError("Cannot write an empty column mapping.")
+            write_dataset(self.dict(), path, batch_size=None, show_progress=False)
         return open_store(path)
