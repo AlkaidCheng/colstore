@@ -466,7 +466,7 @@ def test_filter_col_expression(source, source_cols):
     cf = source.edit().filter(col("a") >= 128)
     expected = source_cols["a"][source_cols["a"] >= 128]
     assert cf.dict()["a"].tolist() == expected.tolist()
-    assert cf.n_rows == len(expected)
+    assert cf.n_rows == len(expected)  # where() is lazy -> n_rows resolves the selection
 
 
 def test_filter_query_string(source, source_cols):
@@ -529,6 +529,46 @@ def test_filter_empty_match(source):
     assert cf.n_rows == 0
     assert cf.dict()["a"].tolist() == []
     assert cf.recarray().shape[0] == 0
+
+
+def test_where_is_lazy_n_rows_resolves(source, source_cols):
+    cf = source.edit().where(col("a") >= 200)
+    expected = int((source_cols["a"] >= 200).sum())
+    assert cf.n_rows == expected  # a pending predicate is resolved on access, not thrown
+    assert cf.dict()["a"].tolist() == source_cols["a"][source_cols["a"] >= 200].tolist()
+    # composing where() does not evaluate until materialized
+    cf2 = cf.where(col("a") < 210)
+    assert cf2.dict()["a"].tolist() == [200, 201, 202, 203, 204, 205, 206, 207, 208, 209]
+
+
+# -- base-attach restriction: external data joins only at the base --
+
+
+def test_raw_array_on_filtered_frame_rejected(source):
+    cf = source.edit().where(col("a") >= 200)
+    with pytest.raises(ValueError, match="row selection"):
+        cf.assign(x=np.zeros(56))  # selected-length raw array onto a filtered frame
+    with pytest.raises(ValueError, match="row selection"):
+        cf.assign(x=np.zeros(source.n_rows))  # even source-length is rejected (ambiguous)
+
+
+def test_base_attached_array_cofilters(source, source_cols):
+    extra = np.arange(source.n_rows, dtype=np.int64) * 10
+    cf = source.edit().assign(x=extra).where(col("a") >= 200)  # attach at base, then filter
+    keep = source_cols["a"] >= 200
+    assert cf.dict()["x"].tolist() == extra[keep].tolist()  # x co-filtered with the rest
+
+
+def test_cross_frame_column_allowed_on_filtered_frame(source, source_cols, tmp_path):
+    y = np.arange(source.n_rows, dtype=np.int64) * 2
+    other = _make_store(tmp_path, {"y": y}, name="other2.cstore")
+    try:
+        # a column from another frame is a lazy Expr, not a raw array -> it co-filters
+        cf = source.edit().where(col("a") >= 200).assign(z=other.edit()["y"])
+        keep = source_cols["a"] >= 200
+        assert cf.dict()["z"].tolist() == y[keep].tolist()
+    finally:
+        other.close()
 
 
 def test_filter_unknown_column_raises(source):

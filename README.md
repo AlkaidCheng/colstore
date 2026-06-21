@@ -145,11 +145,12 @@ from colstore import col
 
 cf = ds.edit()                                   # a frame over every column, all rows
 cf = cf.assign(ratio=col("close") / col("open")) # col() builds a column value...
-cf = cf.filter(col("ratio") > 1.0)               # ...and the same col() selects rows
-cf = cf.filter("volume > @v", params={"v": 1e6}) # a query string works too; filters compose
+cf = cf.where(col("ratio") > 1.0)                # ...and the same col() selects rows (lazy)
+cf = cf.where("volume > @v", params={"v": 1e6})  # a query string works too; where()s compose
 cf = cf.astype({"open": "float32"}).drop("noise")
-cf = cf.select("close", "open", "ratio")         # project columns; where() aliases filter()
+cf = cf.select("close", "open", "ratio")         # project columns; filter() aliases where()
 
+cf.n_rows                                        # how many rows the frame selects (resolves it)
 cf.dict(); cf.recarray(); cf.compute("ratio")    # materialize the selected rows in memory
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
 
@@ -159,20 +160,23 @@ hot.assign(logpt=np.log(hot["pt"])).write("hot.cstore")
 ds[indices].select("pt", "eta").edit()           # a fancy index, slice, or mask carries over
 ```
 
-The columns form an expression graph: stored columns, in-memory arrays, and
+The columns form an expression graph: stored columns, expressions over them, and
 constants combined by elementwise operators and NumPy ufuncs. Only
 **row-independent** transforms are representable — each output row depends only on
-the input row at the same position — so reductions, sorts, and other row-coupling
-operations are rejected when the frame is built. The same `col()` expression
-builds a value (`assign`) or selects rows (`filter`); either way its names resolve
-against the frame's columns **in order**, so a column derived or renamed in an
-earlier step is what a later one sees.
+the input row at the same position — so reductions and sorts are rejected when the
+frame is built. The same `col()` expression builds a value (`assign`) or a row
+predicate (`where`); either way its names resolve against the frame's columns **in
+order**, so a column derived or renamed earlier is what a later step sees. Every
+column derives from the same base and stays the same length, so `assign` takes an
+expression (or a column from another frame); a raw array attaches only at the base,
+before any selection.
 
-The two parts meet at a single evaluator. Materializing a frame evaluates each
-column over the selected rows, computing a subexpression shared by several columns
-only once. In memory, all selected rows are produced in one pass; `write()`
-streams the result in bounded-memory row-range batches when the frame is
-unfiltered, and materializes the selected rows when it is filtered.
+`where` (alias `filter`) is **lazy** — it records the predicate and evaluates it
+only on materialization. `n_rows` is the source or selected count; a pending
+predicate is resolved on access (an O(n) scan). Materializing
+evaluates each column over the selected rows, sharing a subexpression once; `write()`
+streams bounded-memory row-range batches when the frame is unfiltered, and
+materializes the selected rows when it is filtered.
 
 ![The frame's computational model](docs/frame_computational_model.svg)
 
