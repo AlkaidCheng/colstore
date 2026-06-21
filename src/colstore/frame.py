@@ -724,12 +724,17 @@ class ColStoreFrame:
     and :meth:`write` streams the result to a new file and returns a reader for it.
     The source store is never modified.
 
-    Assignment holds arrays by reference; pass ``copy=True`` to :meth:`assign`
-    to snapshot them instead. A column length is checked eagerly on assignment
-    against the frame's fixed row count.
+    A frame may also carry a row selection -- a concrete index set (e.g. from
+    ``ds[idx].edit()``) and/or pending :meth:`where` predicates -- applied to
+    every column alike when the frame is materialized.
+
+    Assignment adds a column as an expression over the frame's columns, which
+    co-filters with any selection. An external array may be attached only on an
+    unfiltered frame, where its length is checked against the source row count;
+    it is held by reference unless ``copy=True`` is passed to :meth:`assign`.
     """
 
-    __slots__ = ("_columns", "_n_rows", "_rows", "_store")
+    __slots__ = ("_columns", "_n_rows", "_predicates", "_rows", "_store")
 
     def __init__(
         self,
@@ -739,20 +744,46 @@ class ColStoreFrame:
     ) -> None:
         self._store = store
         self._n_rows = store.n_rows
-        self._rows = rows  # None -> all rows; else the selected source-row indices
+        self._rows = rows
+        self._predicates: tuple[Expr, ...] = ()
         names = store.columns if columns is None else columns
         self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in names}
 
     @property
     def n_rows(self) -> int:
-        """Rows this frame produces -- the source count, or the number of selected
-        rows once the frame is filtered."""
-        return self._n_rows if self._rows is None else len(self._rows)
+        """Number of rows the frame selects: the source count, or the size of a
+        concrete selection (e.g. from ``ds[idx].edit()``).
+
+        A pending :meth:`where` predicate is evaluated on access -- an O(n) scan --
+        so the read is cheap only when the selection is already concrete or absent.
+        """
+        return self._row_count()
+
+    def _row_count(self) -> int:
+        selection = self._resolve_selection()
+        return self._n_rows if selection is None else len(selection)
+
+    def _resolve_selection(self) -> NDArray[Any] | None:
+        """The concrete row selection: the base rows narrowed by every pending
+        predicate (``None`` = all rows). Evaluating the predicates is the deferred
+        work :meth:`where` records."""
+        base = self._rows
+        if not self._predicates:
+            return base
+        base_rows: Rows = slice(0, self._n_rows) if base is None else base
+        memo: dict[tuple[Any, ...], NDArray[Any]] = {}
+        mask: NDArray[Any] | None = None
+        for node in self._predicates:
+            evaluated = np.asarray(evaluate(node, base_rows, memo))
+            mask = evaluated if mask is None else (mask & evaluated)
+        assert mask is not None  # _predicates is non-empty here
+        return np.flatnonzero(mask) if base is None else base[mask]
 
     def _resolve_rows(self) -> Rows:
         """The selector materialization evaluates over: the full source range, or the
-        selected row indices when the frame is filtered."""
-        return slice(0, self._n_rows) if self._rows is None else self._rows
+        resolved selected indices when a selection / predicate is in effect."""
+        selection = self._resolve_selection()
+        return slice(0, self._n_rows) if selection is None else selection
 
     @property
     def columns(self) -> list[str]:
@@ -799,6 +830,13 @@ class ColStoreFrame:
         if isinstance(value, _Expr):
             value = value._emit(_QueryValueBuilder(self._resolve_column))
         expr = as_expr(value, copy=copy)
+        if isinstance(expr, MemoryColumn) and (self._rows is not None or self._predicates):
+            raise ValueError(
+                "cannot attach a raw array to a frame that already has a row selection "
+                "(its length would be ambiguous against the selection); attach external "
+                "arrays at the base -- before any where() or index selection -- or pass a "
+                "col() expression, which derives from the frame and co-filters."
+            )
         validate_length(expr, self._n_rows)
         return expr
 
@@ -813,6 +851,7 @@ class ColStoreFrame:
         clone._store = self._store
         clone._n_rows = self._n_rows
         clone._rows = self._rows
+        clone._predicates = self._predicates
         clone._columns = dict(self._columns)
         return clone
 
@@ -908,16 +947,13 @@ class ColStoreFrame:
         frame._columns = {name: frame._columns[name] for name in names}
         return frame
 
-    def _predicate_mask(
-        self, predicate: str | _Expr, params: dict[str, Any] | None
-    ) -> NDArray[Any]:
-        """Resolve a ``col()`` / query-string predicate against the frame's columns
-        and evaluate it over the selected rows to a per-row boolean mask.
+    def _compile_predicate(self, predicate: str | _Expr, params: dict[str, Any] | None) -> Expr:
+        """Validate a ``col()`` / query-string predicate against the frame's columns
+        and compile it to a boolean frame-expression node -- reading no data.
 
         Names resolve in order, against the frame as it stands -- a column derived
-        earlier is a valid target, a dropped or renamed-away one is not -- the same
-        rule :meth:`assign` follows. Raises :class:`~colstore.QueryError` for an
-        unknown column or a non-boolean condition, reading no data for the checks.
+        earlier is a valid target, a dropped or renamed-away one is not. Raises
+        :class:`~colstore.QueryError` for an unknown column or a non-boolean condition.
         """
         columns = frozenset(self._columns)
         query = (
@@ -926,42 +962,13 @@ class ColStoreFrame:
         missing = sorted(name for name in set(query._columns()) if name not in self._columns)
         if missing:
             raise QueryError(
-                f"filter references unknown column(s) {missing}; have {sorted(self._columns)}."
+                f"where references unknown column(s) {missing}; have {sorted(self._columns)}."
             )
-        node = query._emit(_QueryValueBuilder(self._resolve_column))
+        node: Expr = query._emit(_QueryValueBuilder(self._resolve_column))
         dtype = result_dtype(node)
         if dtype.kind != "b":
-            raise QueryError(f"a filter predicate must be a boolean condition; got dtype {dtype}.")
-        mask = np.asarray(evaluate(node, self._resolve_rows(), {}))
-        if mask.ndim != 1 or mask.shape[0] != self.n_rows:
-            raise QueryError(
-                f"a filter predicate must reduce to one value per row ({self.n_rows}); "
-                f"got an array of shape {mask.shape}."
-            )
-        return mask
-
-    def filter(
-        self,
-        predicate: str | _Expr,
-        *,
-        params: dict[str, Any] | None = None,
-        inplace: bool = False,
-    ) -> ColStoreFrame:
-        """Keep the rows matching ``predicate``; returns a new frame by default.
-
-        ``predicate`` is a :func:`~colstore.col` expression or a query string (the
-        grammar of :meth:`~colstore.ColStoreReader.query`). It resolves against the
-        frame's columns in order -- so a column derived earlier is a valid target,
-        and a dropped or renamed-away one is not -- then evaluates over the selected
-        rows to a boolean mask that narrows the selection, so successive filters
-        compose. An unknown column or a non-boolean condition raises
-        :class:`~colstore.QueryError`. Pass ``inplace=True`` to edit this frame.
-        """
-        mask = self._predicate_mask(predicate, params)
-        selected = np.flatnonzero(mask) if self._rows is None else self._rows[mask]
-        frame = self if inplace else self.copy()
-        frame._rows = selected
-        return frame
+            raise QueryError(f"a where predicate must be a boolean condition; got dtype {dtype}.")
+        return node
 
     def where(
         self,
@@ -970,8 +977,37 @@ class ColStoreFrame:
         params: dict[str, Any] | None = None,
         inplace: bool = False,
     ) -> ColStoreFrame:
-        """Alias of :meth:`filter` -- keep the rows where ``predicate`` is true."""
-        return self.filter(predicate, params=params, inplace=inplace)
+        """Keep the rows where ``predicate`` is true; returns a new frame by default.
+
+        **Lazy**: the predicate -- a :func:`~colstore.col` expression or a query string
+        (the grammar of :meth:`~colstore.ColStoreReader.query`) -- is validated up front
+        (an unknown column or a non-boolean condition raises :class:`~colstore.QueryError`,
+        reading no data) but only evaluated when the frame is materialized. Names
+        resolve against the frame's columns in order, so a column derived earlier is a
+        valid target and a dropped or renamed-away one is not. Successive ``where``
+        calls compose (AND); reading :attr:`n_rows`, like any terminal, resolves them.
+        ``filter`` is an alias. Pass ``inplace=True`` to edit this frame.
+        """
+        node = self._compile_predicate(predicate, params)
+        frame = self if inplace else self.copy()
+        frame._predicates = (*self._predicates, node)
+        return frame
+
+    def filter(
+        self,
+        predicate: str | _Expr,
+        *,
+        params: dict[str, Any] | None = None,
+        inplace: bool = False,
+    ) -> ColStoreFrame:
+        """Alias of :meth:`where` -- keep the rows where ``predicate`` is true."""
+        return self.where(predicate, params=params, inplace=inplace)
+
+    def _materialize(self, rows: Rows) -> dict[str, NDArray[Any]]:
+        """Evaluate every column over ``rows`` into a ``name -> array`` mapping, sharing
+        one memo so a subexpression used by several columns is computed once."""
+        memo: dict[tuple[Any, ...], NDArray[Any]] = {}
+        return {name: evaluate(expr, rows, memo) for name, expr in self._columns.items()}
 
     def compute(self, name: str) -> NDArray[Any]:
         """Eagerly materialize one column as an array, without writing a file."""
@@ -980,12 +1016,11 @@ class ColStoreFrame:
     def dict(self) -> dict[str, NDArray[Any]]:
         """Compute every column into memory as a ``name -> array`` mapping; writes no file.
 
-        Columns share one evaluation memo, so a subexpression used by more than one
-        output column is computed once. The in-memory analogue of :meth:`write`.
+        Resolves any pending :meth:`where` predicate, then evaluates each column over
+        the selected rows (one shared memo, so a subexpression used by several columns
+        runs once). The in-memory analogue of :meth:`write`.
         """
-        memo: dict[tuple[Any, ...], NDArray[Any]] = {}
-        rows = self._resolve_rows()
-        return {name: evaluate(expr, rows, memo) for name, expr in self._columns.items()}
+        return self._materialize(self._resolve_rows())
 
     def recarray(self) -> NDArray[Any]:
         """Compute every column into one structured (record) ndarray; writes no file.
@@ -995,7 +1030,7 @@ class ColStoreFrame:
         """
         columns = self.dict()
         if not columns:
-            return np.empty(self.n_rows, dtype=np.dtype([]))
+            return np.empty(self._row_count(), dtype=np.dtype([]))
         names = list(columns)
         sources = [np.ascontiguousarray(columns[name]) for name in names]
         dtype = np.dtype([(name, src.dtype) for name, src in zip(names, sources, strict=True)])
@@ -1006,23 +1041,22 @@ class ColStoreFrame:
     ) -> ColStoreReader:
         """Stream the edited columns to a new ``.cstore`` and return a reader.
 
-        Evaluates every column one row range at a time into a new file (see
-        :func:`colstore.format.write_dataset_streaming`); peak memory is bounded
-        by ``memory_budget`` (bytes; ``None`` uses the configured default). The
-        source store is not modified. Writing a frame with no columns is an
-        error.
-
-        A filtered frame (see :meth:`filter`) cannot stream row ranges -- the
-        selected rows are scattered -- so it materializes its columns in one pass
-        and writes them; ``memory_budget`` bounds only the unfiltered path.
+        With no row selection, evaluates every column one row range at a time into the
+        new file (see :func:`colstore.format.write_dataset_streaming`); peak memory is
+        bounded by ``memory_budget`` (bytes; ``None`` uses the configured default). A
+        frame carrying a selection (an index set, or a resolved :meth:`where`) has
+        scattered rows that cannot stream as ranges, so it materializes its columns in
+        one pass and writes them. The source store is not modified; writing a frame
+        with no columns is an error.
         """
         from .api import open as open_store
         from .format import write_dataset, write_dataset_streaming
 
-        if self._rows is None:
+        selection = self._resolve_selection()
+        if selection is None:
             write_dataset_streaming(self._columns, self._n_rows, path, memory_budget=memory_budget)
         else:
             if not self._columns:
                 raise ValueError("Cannot write an empty column mapping.")
-            write_dataset(self.dict(), path, batch_size=None, show_progress=False)
+            write_dataset(self._materialize(selection), path, batch_size=None, show_progress=False)
         return open_store(path)
