@@ -152,6 +152,7 @@ cf = cf.select("close", "open", "ratio")         # project columns; filter() ali
 
 cf.n_rows                                        # how many rows the frame selects (resolves it)
 cf.dict(); cf.recarray(); cf.compute("ratio")    # materialize the selected rows in memory
+for batch in cf.iter_batches("256 MiB"):  ...    # or stream bounded in-memory frames (any format)
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
 
 # A filtered or gathered view continues straight into an edit:
@@ -173,10 +174,15 @@ before any selection.
 
 `where` (alias `filter`) is **lazy** — it records the predicate and evaluates it
 only on materialization. `n_rows` is the source or selected count; a pending
-predicate is resolved on access (an O(n) scan). Materializing
-evaluates each column over the selected rows, sharing a subexpression once; `write()`
-streams bounded-memory row-range batches when the frame is unfiltered, and
-materializes the selected rows when it is filtered.
+predicate is resolved on access (an O(n) scan). Materializing evaluates each column
+over the selected rows, sharing a subexpression once. Both `iter_batches` and `write()`
+are **bounded in memory**: they resolve the selection once, then process the selected
+rows one batch at a time (`batch_size` / `memory_budget` — an `int` row count or an IEC
+string like `"256 MiB"`), so a filtered frame streams its survivors rather than
+materializing them whole. `iter_batches` yields each batch as a **materialized,
+in-memory frame** (columns detached from the source), so the consumer converts it to any
+format — `dict()`, `recarray()`, `write()`, or further edits — much as `RDataFrame.Range`
+hands back another frame.
 
 ![The frame's computational model](docs/frame_computational_model.svg)
 

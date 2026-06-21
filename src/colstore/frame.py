@@ -42,8 +42,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
-from . import kernels
+from . import config, kernels
 from ._query import QueryError, _Expr, parse_query
+from ._sizes import resolve_batch_rows
 
 if TYPE_CHECKING:
     from ._base import _ReaderBase
@@ -736,6 +737,11 @@ class ColStoreFrame:
 
     __slots__ = ("_columns", "_n_rows", "_predicates", "_rows", "_store")
 
+    # The source store, or ``None`` for a materialized in-memory frame (one whose
+    # columns are concrete arrays, e.g. a batch from :meth:`iter_batches`); such a
+    # frame never reads a store, so the field is only ever along for the ride.
+    _store: _ReaderBase | None
+
     def __init__(
         self,
         store: _ReaderBase,
@@ -854,6 +860,24 @@ class ColStoreFrame:
         clone._predicates = self._predicates
         clone._columns = dict(self._columns)
         return clone
+
+    @classmethod
+    def _materialized(cls, columns: dict[str, NDArray[Any]], n_rows: int) -> ColStoreFrame:
+        """A store-detached frame whose columns are concrete in-memory arrays.
+
+        Each column becomes a :class:`MemoryColumn` over the given array, so the
+        result is a full frame -- same terminals (``dict`` / ``recarray`` /
+        ``write``) and edits -- but reads from memory rather than a source store.
+        :meth:`iter_batches` builds one per batch so the caller gets a frame to
+        convert to any format, not a fixed array type.
+        """
+        frame = cls.__new__(cls)
+        frame._store = None
+        frame._n_rows = n_rows
+        frame._rows = None
+        frame._predicates = ()
+        frame._columns = {name: MemoryColumn(array) for name, array in columns.items()}
+        return frame
 
     def assign(
         self, *, copy: bool = False, inplace: bool = False, **new_columns: Any
@@ -1036,27 +1060,58 @@ class ColStoreFrame:
         dtype = np.dtype([(name, src.dtype) for name, src in zip(names, sources, strict=True)])
         return kernels.interleave_record_array(names, sources, dtype)
 
+    def iter_batches(self, batch_size: int | str | None = None) -> Iterator[ColStoreFrame]:
+        """Yield the selected rows as materialized frames, bounded in memory.
+
+        The streaming counterpart of :meth:`recarray`: the selection is resolved
+        once, then each batch of the selected rows is evaluated with a fresh memo
+        into a **materialized, in-memory** :class:`ColStoreFrame` -- its columns
+        are concrete arrays detached from the source store -- so peak memory is one
+        batch rather than the whole frame, and the caller picks the format
+        (:meth:`dict` / :meth:`recarray` / :meth:`write`, or further edits) instead
+        of a fixed array type, much as ``RDataFrame.Range`` hands back another
+        frame. ``batch_size`` sizes each batch -- ``int`` rows, ``str`` an IEC
+        memory budget per batch (e.g. ``"256 MiB"``) converted from the per-row
+        byte size, ``None`` the configured default budget. A frame with no columns
+        or no selected rows yields nothing.
+        """
+        names = list(self._columns)
+        selection = self._resolve_selection()
+        n = self._n_rows if selection is None else len(selection)
+        if not names or n == 0:
+            return
+        bytes_per_row = sum(result_dtype(self._columns[name]).itemsize for name in names)
+        rows_per_batch = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
+        if rows_per_batch is None:
+            rows_per_batch = max(1, config.get_default_memory_budget() // bytes_per_row)
+        for start in range(0, n, rows_per_batch):
+            stop = min(start + rows_per_batch, n)
+            rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
+            memo: dict[tuple[Any, ...], NDArray[Any]] = {}
+            columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
+            yield ColStoreFrame._materialized(columns, stop - start)
+
     def write(
         self, path: str | os.PathLike[str], *, memory_budget: int | None = None
     ) -> ColStoreReader:
         """Stream the edited columns to a new ``.cstore`` and return a reader.
 
-        With no row selection, evaluates every column one row range at a time into the
-        new file (see :func:`colstore.format.write_dataset_streaming`); peak memory is
-        bounded by ``memory_budget`` (bytes; ``None`` uses the configured default). A
-        frame carrying a selection (an index set, or a resolved :meth:`where`) has
-        scattered rows that cannot stream as ranges, so it materializes its columns in
-        one pass and writes them. The source store is not modified; writing a frame
-        with no columns is an error.
+        Evaluates every column one batch at a time into the new file (see
+        :func:`colstore.format.write_dataset_streaming`); peak memory is bounded by
+        ``memory_budget`` (bytes; ``None`` uses the configured default). A frame
+        carrying a selection (an index set, or a resolved :meth:`where`) streams its
+        selected rows the same way -- each batch gathers the selected source rows
+        rather than a contiguous range. The source store is not modified; writing a
+        frame with no columns is an error.
         """
         from .api import open as open_store
-        from .format import write_dataset, write_dataset_streaming
+        from .format import write_dataset_streaming
 
         selection = self._resolve_selection()
         if selection is None:
             write_dataset_streaming(self._columns, self._n_rows, path, memory_budget=memory_budget)
         else:
-            if not self._columns:
-                raise ValueError("Cannot write an empty column mapping.")
-            write_dataset(self._materialize(selection), path, batch_size=None, show_progress=False)
+            write_dataset_streaming(
+                self._columns, len(selection), path, memory_budget=memory_budget, rows=selection
+            )
         return open_store(path)

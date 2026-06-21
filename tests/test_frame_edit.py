@@ -672,3 +672,108 @@ def test_col_value_streams_to_write(source, source_cols, tmp_path):
     out = _written(cf, tmp_path)
     assert np.allclose(out["s"], source_cols["a"] * source_cols["b"])
     assert out["m"].tolist() == np.isin(source_cols["a"], [5, 10, 15]).tolist()
+
+
+# -- iter_batches: bounded-memory generator yielding materialized frames --
+
+
+def test_iter_batches_yields_materialized_frames(source):
+    cf = source.edit().assign(s=col("a") + col("b"))
+    batches = list(cf.iter_batches(batch_size=100))
+    assert all(isinstance(b, ColStoreFrame) for b in batches)
+    assert [b.n_rows for b in batches] == [100, 100, 56]
+    full = cf.recarray()
+    assert batches[0].recarray().dtype == full.dtype
+    assert np.array_equal(np.concatenate([b.recarray() for b in batches]), full)
+
+
+def test_iter_batch_is_in_memory(source):
+    first = next(iter(source.edit().iter_batches(batch_size=10)))
+    assert first.n_rows == 10
+    assert first.dict()["a"].tolist() == list(range(10))
+
+
+def test_iter_batch_frame_is_composable(source):
+    # each batch is a full frame: edit it, then convert to any format
+    batch = next(iter(source.edit().iter_batches(batch_size=8)))
+    assert batch.assign(x=col("a") + 1).dict()["x"].tolist() == list(range(1, 9))
+
+
+def test_iter_batches_memory_string(source):
+    cf = source.edit().select("a")  # one int64 column, 8 bytes/row
+    batches = list(cf.iter_batches("1 KiB"))  # 1024 // 8 = 128 rows per batch
+    assert [b.n_rows for b in batches] == [128, 128]
+    assert np.concatenate([b.recarray() for b in batches]).tolist() == cf.recarray().tolist()
+
+
+def test_iter_batches_default_equals_recarray(source):
+    cf = source.edit()
+    got = np.concatenate([b.recarray() for b in cf.iter_batches()])
+    assert np.array_equal(got, cf.recarray())
+
+
+def test_iter_batches_single_batch_large_budget(source):
+    cf = source.edit()
+    batches = list(cf.iter_batches("1 GiB"))
+    assert len(batches) == 1 and batches[0].n_rows == cf.n_rows
+    assert np.array_equal(batches[0].recarray(), cf.recarray())
+
+
+def test_iter_batches_filtered_gathers_survivors(source, source_cols):
+    cf = source.edit().where(col("a") % 3 == 0)
+    batches = list(cf.iter_batches(batch_size=20))
+    assert sum(b.n_rows for b in batches) == int((source_cols["a"] % 3 == 0).sum())
+    assert np.array_equal(np.concatenate([b.recarray() for b in batches]), cf.recarray())
+
+
+def test_iter_batches_derived_column(source, source_cols):
+    cf = source.edit().assign(d=col("a") * 2)
+    got = np.concatenate([b.recarray() for b in cf.iter_batches(batch_size=64)])
+    assert got["d"].tolist() == (source_cols["a"] * 2).tolist()
+
+
+def test_iter_batches_empty_selection_yields_nothing(source):
+    assert list(source.edit().where(col("a") > 10_000).iter_batches()) == []
+
+
+def test_iter_batches_no_columns_yields_nothing(source):
+    assert list(source.edit().drop("a", "b", "c").iter_batches()) == []
+
+
+def test_iter_batches_invalid_size_raises(source):
+    cf = source.edit()
+    with pytest.raises(ValueError, match="must be positive"):
+        list(cf.iter_batches(0))
+    with pytest.raises(ValueError):  # unparseable memory string
+        list(cf.iter_batches("not a size"))
+    with pytest.raises(TypeError):  # wrong type
+        list(cf.iter_batches(1.5))
+
+
+# -- bounded filtered write: streams the selected rows, batch by batch --
+
+
+def test_filtered_write_matches_in_memory(source, source_cols, tmp_path):
+    cf = source.edit().where(col("a") >= 200)
+    out = _written(cf, tmp_path, memory_budget=64)  # tiny budget -> many gather batches
+    keep = source_cols["a"] >= 200
+    assert out["a"].tolist() == source_cols["a"][keep].tolist()
+    assert np.allclose(out["b"], source_cols["b"][keep])
+
+
+def test_filtered_write_with_derived_column(source, source_cols, tmp_path):
+    cf = source.edit().where(col("a") % 2 == 0).assign(d=col("a") * 10)
+    out = _written(cf, tmp_path, memory_budget=128)
+    keep = source_cols["a"] % 2 == 0
+    assert out["d"].tolist() == (source_cols["a"][keep] * 10).tolist()
+
+
+def test_filtered_write_empty_selection(source, tmp_path):
+    out = _written(source.edit().where(col("a") > 10_000), tmp_path)
+    assert out["a"].shape[0] == 0
+
+
+def test_filtered_write_no_columns_raises(source, tmp_path):
+    cf = source[np.arange(10)].edit().drop("a", "b", "c")
+    with pytest.raises(ValueError, match="empty column mapping"):
+        cf.write(tmp_path / "o.cstore")

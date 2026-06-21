@@ -26,9 +26,10 @@ from types import ModuleType
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from .. import api
+from .._sizes import resolve_batch_rows
 from ..progress import progress_bar
 from ..reader import ColStoreReader
-from .base import ColumnBatch, Parser, StrPath, resolve_batch_rows, write_column_batches
+from .base import ColumnBatch, Parser, StrPath, write_column_batches
 
 if TYPE_CHECKING:
     import ROOT

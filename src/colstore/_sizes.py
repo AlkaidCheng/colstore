@@ -83,3 +83,47 @@ def parse_byte_size(size: str) -> int:
     if result < 1:
         raise ValueError(f"Byte size must be at least 1 byte; {size!r} resolves to {result}.")
     return result
+
+
+def resolve_batch_rows(
+    batch_size: int | str | None,
+    *,
+    bytes_per_row: int | None = None,
+) -> int | None:
+    """Resolve a polymorphic ``batch_size`` to a number of rows per batch.
+
+    Parameters
+    ----------
+    batch_size : int, str, or None
+        ``None`` streams everything in a single batch. An ``int`` is a row
+        count. A ``str`` is a memory budget (see :func:`parse_byte_size`)
+        converted to rows using ``bytes_per_row``.
+    bytes_per_row : int or None, optional
+        Bytes occupied by one row, required only when ``batch_size`` is a
+        ``str``. Must be positive.
+
+    Returns
+    -------
+    int or None
+        Rows per batch, or ``None`` for a single-batch pass.
+
+    Raises
+    ------
+    ValueError
+        If an ``int`` ``batch_size`` is not positive, or a ``str`` budget is
+        given without a positive ``bytes_per_row``.
+    TypeError
+        If ``batch_size`` is not int, str, or None.
+    """
+    if batch_size is None:
+        return None
+    if isinstance(batch_size, bool) or not isinstance(batch_size, (int, str)):
+        raise TypeError(f"batch_size must be int, str, or None; got {type(batch_size).__name__}.")
+    if isinstance(batch_size, int):
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive; got {batch_size}.")
+        return batch_size
+    budget = parse_byte_size(batch_size.strip())
+    if bytes_per_row is None or bytes_per_row <= 0:
+        raise ValueError("A string batch_size needs a positive bytes_per_row to size the budget.")
+    return max(1, budget // bytes_per_row)

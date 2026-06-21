@@ -905,6 +905,7 @@ def _fill_streaming_mmap(
     body_offset: int,
     n_rows: int,
     batch_rows: int,
+    rows: np.ndarray[Any, np.dtype[Any]] | None = None,
 ) -> None:
     """Fill a preallocated file body via per-column memmaps, one batch at a time.
 
@@ -924,9 +925,14 @@ def _fill_streaming_mmap(
                 tmp_path, dtype=dtype, mode="r+", offset=offset, shape=(n_rows,)
             )
             offset += n_rows * dtype.itemsize
-        fusible = fusible_passthroughs(specs)
+        # A gather (``rows`` given) reads scattered source rows, so the contiguous
+        # passthrough fast path does not apply; every column evaluates the gather.
+        fusible = fusible_passthroughs(specs) if rows is None else {}
         for start in range(0, n_rows, batch_rows):
             stop = min(start + batch_rows, n_rows)
+            selector: slice | np.ndarray[Any, np.dtype[Any]] = (
+                slice(start, stop) if rows is None else rows[start:stop]
+            )
             memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
             for name in names:
                 target = views[name][start:stop]
@@ -937,7 +943,7 @@ def _fill_streaming_mmap(
                     # per-batch memo it would otherwise occupy).
                     passthrough._fill_into(target, start, stop)
                 else:
-                    target[:] = evaluate(specs[name], slice(start, stop), memo)
+                    target[:] = evaluate(specs[name], selector, memo)
         for name in names:
             views[name].flush()
     finally:
@@ -955,6 +961,7 @@ def _fill_streaming_pwrite(
     body_offset: int,
     n_rows: int,
     batch_rows: int,
+    rows: np.ndarray[Any, np.dtype[Any]] | None = None,
 ) -> None:
     """Fill a preallocated file body with ``os.pwrite``, batch by batch.
 
@@ -974,7 +981,9 @@ def _fill_streaming_pwrite(
     for name in names:
         column_offset[name] = offset
         offset += n_rows * on_disk_dtypes[name].itemsize
-    fusible = fusible_passthroughs(specs)
+    # A gather (``rows`` given) reads scattered source rows, so the contiguous
+    # passthrough fast path does not apply; every column evaluates the gather.
+    fusible = fusible_passthroughs(specs) if rows is None else {}
     workers = max(1, config.get_gather_thread_cap())
     fd = os.open(tmp_path, os.O_WRONLY)
 
@@ -984,6 +993,9 @@ def _fill_streaming_pwrite(
     try:
         for start in range(0, n_rows, batch_rows):
             stop = min(start + batch_rows, n_rows)
+            selector: slice | np.ndarray[Any, np.dtype[Any]] = (
+                slice(start, stop) if rows is None else rows[start:stop]
+            )
             memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
             # Evaluate the batch's columns serially through the shared memo (so a
             # shared subexpression is computed once), holding their bytes; the
@@ -999,9 +1011,7 @@ def _fill_streaming_pwrite(
                     batch = np.empty(stop - start, dtype=dtype)
                     passthrough._fill_into(batch, start, stop)
                 else:
-                    batch = np.ascontiguousarray(
-                        evaluate(specs[name], slice(start, stop), memo), dtype=dtype
-                    )
+                    batch = np.ascontiguousarray(evaluate(specs[name], selector, memo), dtype=dtype)
                 jobs.append(
                     write_job(
                         batch.view(np.uint8).data, column_offset[name] + start * dtype.itemsize
@@ -1026,19 +1036,22 @@ def _fill_streaming(
     body_offset: int,
     n_rows: int,
     batch_rows: int,
+    rows: np.ndarray[Any, np.dtype[Any]] | None = None,
 ) -> None:
     """Fill the preallocated body one batch at a time, with the best method.
 
     Defaults to sequential ``os.pwrite`` (large contiguous writes a parallel
     filesystem serves well), falling back to the per-column mmap store where
     ``os.pwrite`` is unavailable. ``_STREAMING_FILL_OVERRIDE`` forces a method.
+    When ``rows`` is given, each batch gathers those source indices instead of a
+    contiguous range.
     """
     fill = (
         _fill_streaming_pwrite
         if _resolve_write_method(_STREAMING_FILL_OVERRIDE) == "pwrite"
         else _fill_streaming_mmap
     )
-    fill(tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows)
+    fill(tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows, rows)
 
 
 # One merge-copy run: (source path, source byte offset, destination byte offset,
@@ -1258,6 +1271,7 @@ def write_dataset_streaming(
     path: PathLike,
     *,
     memory_budget: int | None = None,
+    rows: np.ndarray[Any, np.dtype[Any]] | None = None,
 ) -> None:
     """Serialize lazily-produced columns to a single-record ``.cstore`` file.
 
@@ -1278,6 +1292,13 @@ def write_dataset_streaming(
     renamed into place on success, so a failure part-way through -- including an
     error raised while evaluating a transform -- leaves any existing destination
     untouched.
+
+    ``rows`` selects a subset of source rows to write: when given (an int index
+    array over the source), each batch gathers ``rows[start:stop]`` rather than a
+    contiguous range, and ``n_rows`` is the output row count (``== len(rows)``).
+    The columns are evaluated over the gather, so they must be source-length
+    (the caller validates this); the no-transform merge-copy fast path does not
+    apply to a gather and is skipped.
     """
     if not specs:
         raise ValueError("Cannot write an empty column mapping.")
@@ -1285,8 +1306,11 @@ def write_dataset_streaming(
         raise ValueError(f"n_rows must be >= 0, got {n_rows}.")
 
     names = list(specs)
-    for name in names:
-        validate_length(specs[name], n_rows)
+    if rows is None:
+        for name in names:
+            validate_length(specs[name], n_rows)
+    elif len(rows) != n_rows:
+        raise ValueError(f"len(rows) ({len(rows)}) must equal n_rows ({n_rows}).")
 
     columns_meta, on_disk_dtypes, bytes_per_row = _resolve_streaming_layout(specs)
 
@@ -1320,14 +1344,27 @@ def write_dataset_streaming(
             # and ColStoreWriter, via the shared gate in _numa.
             with _numa.writer_policy_scope():
                 # A pure no-transform merge copies the sources' column bytes
-                # straight into the body; anything else materializes per batch.
-                plan = _merge_copy_plan(specs, names, on_disk_dtypes, body_offset, n_rows)
+                # straight into the body; anything else materializes per batch. A
+                # gather (``rows`` given) is never a contiguous full-column copy,
+                # so the merge plan does not apply.
+                plan = (
+                    None
+                    if rows is not None
+                    else _merge_copy_plan(specs, names, on_disk_dtypes, body_offset, n_rows)
+                )
                 if plan is not None:
                     workers = max(1, config.get_gather_thread_cap())
                     _execute_copy_plan(tmp_path, plan, workers)
                 else:
                     _fill_streaming(
-                        tmp_path, specs, names, on_disk_dtypes, body_offset, n_rows, batch_rows
+                        tmp_path,
+                        specs,
+                        names,
+                        on_disk_dtypes,
+                        body_offset,
+                        n_rows,
+                        batch_rows,
+                        rows,
                     )
 
         # Reopen read/write (not read-only) for the durability fsync: on Windows
