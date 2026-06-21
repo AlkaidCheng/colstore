@@ -651,14 +651,17 @@ def as_expr(value: Any, *, copy: bool = False) -> Expr:
 
 
 class ColStoreFrame:
-    """A mutable, deferred editing view over an opened store's columns.
+    """A deferred editing view over an opened store's columns.
 
     Created by :meth:`edit` on an opened reader or dataset. A frame holds an
     ordered mapping of output column name to an expression (:class:`Expr`);
     opening one seeds it with a native-passthrough leaf per source column.
     Indexing returns the expression for a column, which composes with operators
-    and whitelisted NumPy ufuncs to build transformations; assignment, deletion,
-    and renaming edit the mapping. Nothing is read until you materialize:
+    and whitelisted NumPy ufuncs to build transformations. The edit methods
+    (``assign`` / ``with_columns`` / ``drop`` / ``rename`` / ``astype``) return a
+    new frame by default -- pass ``inplace=True`` to edit this one -- so edits
+    branch cheaply off a shared base; ``frame[name] = ...`` and ``del`` always
+    edit in place. Nothing is read until you materialize:
     :meth:`compute` / :meth:`dict` / :meth:`recarray` evaluate columns into memory,
     and :meth:`write` streams the result to a new file and returns a reader for it.
     The source store is never modified.
@@ -718,34 +721,62 @@ class ColStoreFrame:
         validate_length(expr, self._n_rows)
         return expr
 
-    def assign(self, *, copy: bool = False, **new_columns: Any) -> ColStoreFrame:
-        """Add or replace columns from keyword arguments; returns ``self``.
+    def copy(self) -> ColStoreFrame:
+        """An independent copy of the frame -- a cheap branch point.
 
-        Each value may be an expression, array, or scalar. Arrays are held by
-        reference unless ``copy=True``. (A column literally named ``copy`` must
-        be set with ``frame[name] = ...`` instead.)
+        The expression nodes are immutable and shared; only the column mapping is
+        duplicated, so editing the copy never affects this frame. This is the
+        default result of every edit method below (see ``inplace``).
+        """
+        clone = ColStoreFrame.__new__(ColStoreFrame)
+        clone._store = self._store
+        clone._n_rows = self._n_rows
+        clone._columns = dict(self._columns)
+        return clone
+
+    def assign(
+        self, *, copy: bool = False, inplace: bool = False, **new_columns: Any
+    ) -> ColStoreFrame:
+        """Add or replace columns from keyword arguments.
+
+        Returns a new frame, leaving this one unchanged, unless ``inplace=True``.
+        Each value may be an expression, array, or scalar; arrays are held by
+        reference unless ``copy=True``. (Columns literally named ``copy`` or
+        ``inplace`` must be set with ``frame[name] = ...`` instead.)
         """
         coerced = {name: self._coerce(value, copy=copy) for name, value in new_columns.items()}
-        self._columns.update(coerced)
-        return self
+        frame = self if inplace else self.copy()
+        frame._columns.update(coerced)
+        return frame
 
-    def with_columns(self, *, copy: bool = False, **new_columns: Any) -> ColStoreFrame:
+    def with_columns(
+        self, *, copy: bool = False, inplace: bool = False, **new_columns: Any
+    ) -> ColStoreFrame:
         """Alias for :meth:`assign`, under a polars-style name."""
-        return self.assign(copy=copy, **new_columns)
+        return self.assign(copy=copy, inplace=inplace, **new_columns)
 
-    def drop(self, *names: str) -> ColStoreFrame:
-        """Remove one or more columns; returns ``self``."""
+    def drop(self, *names: str, inplace: bool = False) -> ColStoreFrame:
+        """Remove one or more columns.
+
+        Returns a new frame unless ``inplace=True``. Raises ``KeyError`` for a
+        name that is not in the frame, before changing anything.
+        """
+        missing = [name for name in names if name not in self._columns]
+        if missing:
+            raise KeyError(f"cannot drop columns that are not in the frame: {missing}.")
+        frame = self if inplace else self.copy()
         for name in names:
-            del self[name]
-        return self
+            del frame._columns[name]
+        return frame
 
-    def rename(self, columns: dict[str, str]) -> ColStoreFrame:
-        """Rename columns, resolving all mappings simultaneously; returns ``self``.
+    def rename(self, columns: dict[str, str], inplace: bool = False) -> ColStoreFrame:
+        """Rename columns, resolving all mappings simultaneously.
 
-        A swap such as ``{"a": "b", "b": "a"}`` exchanges the two names in one
-        step. Renames change output names only -- the underlying data, and any
-        expression already referencing a column, are unaffected. Raises if a
-        source name is missing or the result would contain duplicate names.
+        Returns a new frame unless ``inplace=True``. A swap such as
+        ``{"a": "b", "b": "a"}`` exchanges the two names in one step. Renames
+        change output names only -- the underlying data, and any expression
+        already referencing a column, are unaffected. Raises if a source name is
+        missing or the result would contain duplicate names.
         """
         missing = [src for src in columns if src not in self._columns]
         if missing:
@@ -756,25 +787,26 @@ class ColStoreFrame:
             if target in renamed:
                 raise ValueError(f"rename produces a duplicate column name {target!r}.")
             renamed[target] = expr
-        self._columns = renamed
-        return self
+        frame = self if inplace else self.copy()
+        frame._columns = renamed
+        return frame
 
-    def astype(self, dtypes: dict[str, Any]) -> ColStoreFrame:
-        """Cast the named columns to new dtypes (deferred); returns ``self``.
+    def astype(self, dtypes: dict[str, Any], inplace: bool = False) -> ColStoreFrame:
+        """Cast the named columns to new dtypes (deferred).
 
-        Each value is anything ``numpy.dtype`` accepts. Like every other edit the
-        cast is lazy -- evaluated by ``compute`` / ``dict`` / ``recarray`` /
-        ``write``. Raises ``KeyError`` for a name that is not in the frame, and
-        validates every dtype before changing anything, so a bad argument leaves
-        the frame untouched.
+        Returns a new frame unless ``inplace=True``. Each value is anything
+        ``numpy.dtype`` accepts; the cast is lazy -- evaluated by ``compute`` /
+        ``dict`` / ``recarray`` / ``write``. Raises ``KeyError`` for an unknown
+        name and validates every dtype before changing anything.
         """
         missing = [name for name in dtypes if name not in self._columns]
         if missing:
             raise KeyError(f"cannot cast columns that are not in the frame: {missing}.")
         resolved = {name: np.dtype(dtype) for name, dtype in dtypes.items()}
+        frame = self if inplace else self.copy()
         for name, dtype in resolved.items():
-            self._columns[name] = Cast(self._columns[name], dtype)
-        return self
+            frame._columns[name] = Cast(frame._columns[name], dtype)
+        return frame
 
     def compute(self, name: str) -> NDArray[Any]:
         """Eagerly materialize one column as an array, without writing a file."""

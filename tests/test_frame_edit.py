@@ -136,7 +136,7 @@ def test_assign_scalar_broadcasts(source, tmp_path):
 
 def test_with_columns_alias(source, source_cols, tmp_path):
     cf = source.edit()
-    cf.with_columns(d=cf["a"] + cf["a"])
+    cf = cf.with_columns(d=cf["a"] + cf["a"])
     assert "d" in cf
     out = _written(cf, tmp_path)
     np.testing.assert_array_equal(out["d"], source_cols["a"] * 2)
@@ -144,7 +144,7 @@ def test_with_columns_alias(source, source_cols, tmp_path):
 
 def test_assign_via_method(source, source_cols, tmp_path):
     cf = source.edit()
-    cf.assign(p=cf["b"] * 3.0)
+    cf = cf.assign(p=cf["b"] * 3.0)
     out = _written(cf, tmp_path)
     np.testing.assert_allclose(out["p"], source_cols["b"] * 3.0)
 
@@ -304,15 +304,14 @@ def test_frame_recarray_fields_and_values(source, source_cols):
 
 def test_frame_dict_reflects_derived_columns(source, source_cols):
     cf = source.edit()
-    cf.assign(a2=cf["a"] * 2, s=cf["a"] + cf["b"])
-    out = cf.dict()
+    out = cf.assign(a2=cf["a"] * 2, s=cf["a"] + cf["b"]).dict()
     assert np.array_equal(out["a2"], source_cols["a"] * 2)
     assert np.array_equal(out["s"], source_cols["a"] + source_cols["b"])
 
 
 def test_frame_in_memory_matches_write_roundtrip(source, source_cols, tmp_path):
     cf = source.edit()
-    cf.assign(s=cf["a"] + cf["b"]).drop("c").rename({"b": "bb"})
+    cf = cf.assign(s=cf["a"] + cf["b"]).drop("c").rename({"b": "bb"})
     in_memory = cf.dict()
     written = _written(cf, tmp_path)
     assert list(in_memory) == list(written)
@@ -330,7 +329,7 @@ def test_frame_recarray_fallback_matches_kernel(source, monkeypatch):
     from colstore import kernels
 
     cf = source.edit()
-    cf.assign(s=cf["a"] + cf["b"])
+    cf = cf.assign(s=cf["a"] + cf["b"])
     expected = cf.recarray()
     monkeypatch.setattr(kernels, "cpp_available", lambda: False)  # force per-field assembly
     fallback = cf.recarray()
@@ -353,8 +352,8 @@ def test_frame_astype_casts_named_columns(source, source_cols):
 
 def test_expr_astype_in_assign(source, source_cols):
     cf = source.edit()
-    cf.assign(a32=cf["a"].astype("int32"))
-    assert cf.dict()["a32"].dtype == np.int32
+    out = cf.assign(a32=cf["a"].astype("int32")).dict()
+    assert out["a32"].dtype == np.int32
 
 
 def test_astype_reflected_in_recarray_and_write(source, source_cols, tmp_path):
@@ -380,3 +379,51 @@ def test_astype_validates_before_mutating(source, source_cols):
     with pytest.raises(TypeError):
         cf.astype({"a": "int8", "b": "definitely_not_a_dtype"})
     assert cf.dict()["a"].dtype == source_cols["a"].dtype  # the valid cast was not applied
+
+
+# -- return-new default, inplace=True, and copy() --
+
+
+def test_assign_returns_new_frame_by_default(source):
+    cf = source.edit()
+    new = cf.assign(x=cf["a"] + 1)
+    assert new is not cf
+    assert "x" in new.columns
+    assert "x" not in cf.columns  # the original is untouched
+
+
+def test_drop_rename_astype_return_new_by_default(source):
+    cf = source.edit()
+    assert cf.drop("c") is not cf and "c" in cf.columns
+    assert cf.rename({"a": "x"}).columns[0] == "x" and "a" in cf.columns
+    assert cf.astype({"a": "float32"}) is not cf
+    assert cf.dict()["a"].dtype == source.dtypes["a"]  # original keeps its dtype
+
+
+def test_inplace_true_edits_in_place(source):
+    cf = source.edit()
+    assert cf.assign(x=cf["a"] + 1, inplace=True) is cf and "x" in cf.columns
+    assert cf.drop("c", inplace=True) is cf and "c" not in cf.columns
+    assert cf.rename({"a": "y"}, inplace=True) is cf and "y" in cf.columns
+    assert cf.astype({"y": "float32"}, inplace=True) is cf
+    assert cf.dict()["y"].dtype == np.float32
+
+
+def test_copy_is_independent(source):
+    base = source.edit()
+    base = base.assign(s=base["a"] + base["b"])
+    clone = base.copy()
+    clone.drop("s", inplace=True)
+    assert "s" not in clone.columns
+    assert "s" in base.columns  # the base is unaffected by the clone's in-place edit
+
+
+def test_branch_off_a_shared_base(source, source_cols):
+    base = source.edit()
+    base = base.assign(d=base["a"] * 2)
+    branch_a = base.astype({"a": "float32"})
+    branch_b = base.drop("b")
+    assert branch_a.dict()["a"].dtype == np.float32
+    assert "b" not in branch_b.columns
+    assert base.dict()["a"].dtype == source_cols["a"].dtype  # base unchanged by either branch
+    assert "b" in base.columns
