@@ -541,12 +541,32 @@ def test_filter_non_boolean_raises(source):
         source.edit().filter(col("a") + 1)
 
 
-def test_filter_on_dropped_source_column(source, source_cols):
-    # The predicate reads source columns, so filtering on a column removed from
-    # the output is still valid.
-    cf = source.edit().drop("a").filter(col("a") >= 128)
-    assert "a" not in cf.columns
-    assert cf.n_rows == int((source_cols["a"] >= 128).sum())
+def test_filter_on_dropped_column_raises(source):
+    # Filtering resolves against the frame's columns in order, so a column dropped
+    # earlier is no longer a valid predicate target.
+    with pytest.raises(colstore.QueryError):
+        source.edit().drop("a").filter(col("a") >= 128)
+
+
+def test_filter_on_derived_column(source, source_cols):
+    cf = source.edit().assign(r=col("a") + 1).filter(col("r") > 128)
+    a = source_cols["a"]
+    keep = (a + 1) > 128
+    assert cf.dict()["r"].tolist() == (a[keep] + 1).tolist()
+
+
+def test_filter_after_rename_uses_new_name(source, source_cols):
+    a = source_cols["a"]
+    cf = source.edit().rename({"a": "x"}).filter(col("x") >= 200)
+    assert cf.dict()["x"].tolist() == a[a >= 200].tolist()
+    with pytest.raises(colstore.QueryError):
+        source.edit().rename({"a": "x"}).filter(col("a") >= 200)
+
+
+def test_filter_after_reassign_sees_new_definition(source, source_cols):
+    cf = source.edit().assign(a=col("a") * 2).filter(col("a") > 200)
+    doubled = source_cols["a"] * 2
+    assert cf.dict()["a"].tolist() == doubled[doubled > 200].tolist()
 
 
 def test_filtered_write_roundtrip(source, source_cols, tmp_path):
@@ -557,3 +577,58 @@ def test_filtered_write_roundtrip(source, source_cols, tmp_path):
     keep = a % 10 == 0
     assert out["a"].tolist() == a[keep].tolist()
     assert out["d"].tolist() == (a[keep] * 2).tolist()
+
+
+# -- col() as an assign value (one col() for both filter and assign) --
+
+
+def test_assign_col_value_matches_native(source):
+    cf = source.edit()
+    via_col = cf.assign(s=col("a") + col("b")).dict()["s"]
+    via_native = cf.assign(s=cf["a"] + cf["b"]).dict()["s"]
+    assert np.array_equal(via_col, via_native)
+
+
+def test_assign_col_comparison_value(source, source_cols):
+    got = source.edit().assign(f=col("a") >= 128).dict()["f"]
+    assert got.dtype == np.bool_
+    assert got.tolist() == (source_cols["a"] >= 128).tolist()
+
+
+def test_assign_col_invert_value(source, source_cols):
+    got = source.edit().assign(n=~(col("a") >= 128)).dict()["n"]
+    assert got.tolist() == (~(source_cols["a"] >= 128)).tolist()
+
+
+def test_assign_col_alias(source, source_cols):
+    got = source.edit().assign(z=col("a")).dict()["z"]
+    assert got.tolist() == source_cols["a"].tolist()
+
+
+def test_assign_col_isin_value(source, source_cols):
+    got = source.edit().assign(m=col("a").isin([1, 2, 3])).dict()["m"]
+    assert got.tolist() == np.isin(source_cols["a"], [1, 2, 3]).tolist()
+
+
+def test_assign_col_references_derived_column(source, source_cols):
+    cf = source.edit().assign(r=col("a") + col("b"))
+    got = cf.assign(r2=col("r") * 2).dict()["r2"]
+    assert np.allclose(got, (source_cols["a"] + source_cols["b"]) * 2)
+
+
+def test_assign_col_mixed_with_frame_expr(source, source_cols):
+    cf = source.edit()
+    got = cf.assign(x=2 * col("a") + cf["b"]).dict()["x"]
+    assert np.allclose(got, 2 * source_cols["a"] + source_cols["b"])
+
+
+def test_assign_col_unknown_raises(source):
+    with pytest.raises(KeyError, match="not a column of this frame"):
+        source.edit().assign(z=col("nope"))
+
+
+def test_col_value_streams_to_write(source, source_cols, tmp_path):
+    cf = source.edit().assign(s=col("a") * col("b"), m=col("a").isin([5, 10, 15]))
+    out = _written(cf, tmp_path)
+    assert np.allclose(out["s"], source_cols["a"] * source_cols["b"])
+    assert out["m"].tolist() == np.isin(source_cols["a"], [5, 10, 15]).tolist()

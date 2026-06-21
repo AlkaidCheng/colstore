@@ -144,13 +144,11 @@ import numpy as np
 from colstore import col
 
 cf = ds.edit()                                   # a frame over every column, all rows
-cf = cf.assign(ratio=cf["close"] / cf["open"])   # add or replace columns
+cf = cf.assign(ratio=col("close") / col("open")) # col() builds a column value...
+cf = cf.filter(col("ratio") > 1.0)               # ...and the same col() selects rows
+cf = cf.filter("volume > @v", params={"v": 1e6}) # a query string works too; filters compose
 cf = cf.astype({"open": "float32"}).drop("noise")
-cf = cf.select("close", "open", "ratio")         # keep these columns, in this order
-
-# Row selection: filter on the stored columns (a col() expression or a string).
-cf = cf.filter(col("close") > 100)               # keep matching rows; where() is an alias
-cf = cf.filter("volume > @v", params={"v": 1e6}) # successive filters narrow further
+cf = cf.select("close", "open", "ratio")         # project columns; where() aliases filter()
 
 cf.dict(); cf.recarray(); cf.compute("ratio")    # materialize the selected rows in memory
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
@@ -165,9 +163,10 @@ The columns form an expression graph: stored columns, in-memory arrays, and
 constants combined by elementwise operators and NumPy ufuncs. Only
 **row-independent** transforms are representable — each output row depends only on
 the input row at the same position — so reductions, sorts, and other row-coupling
-operations are rejected when the frame is built. A predicate passed to `filter`
-is evaluated over the stored columns and cannot reference a column derived in the
-frame.
+operations are rejected when the frame is built. The same `col()` expression
+builds a value (`assign`) or selects rows (`filter`); either way its names resolve
+against the frame's columns **in order**, so a column derived or renamed in an
+earlier step is what a later one sees.
 
 The two parts meet at a single evaluator. Materializing a frame evaluates each
 column over the selected rows, computing a subexpression shared by several columns
