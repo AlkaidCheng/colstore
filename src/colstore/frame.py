@@ -37,13 +37,14 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import config, kernels
 from ._query import QueryError, _Expr, parse_query
+from ._render import render_table_html, render_table_text
 from ._sizes import resolve_batch_rows
 
 if TYPE_CHECKING:
@@ -53,6 +54,8 @@ if TYPE_CHECKING:
 __all__ = [
     "ColStoreFrame",
     "ConstColumn",
+    "CutInfo",
+    "CutflowReport",
     "Expr",
     "MemoryColumn",
     "NativeColumn",
@@ -654,7 +657,7 @@ def validate_length(node: Expr, n_rows: int) -> None:
     A length-agnostic expression (all-constant leaves) is accepted: it
     broadcast-fills ``n_rows``. A sized expression must match ``n_rows`` exactly.
     A length-1 array does *not* broadcast here -- only true scalars do -- so a
-    length-1 column against a wider frame is rejected, matching pandas. NumPy
+    length-1 column against a wider frame is rejected. NumPy
     would not catch this on its own: it raises only at evaluation, silently
     length-1-broadcasts, and is blind to length under the zero-length dtype
     probe, so length is checked here, eagerly, before any data is read.
@@ -709,6 +712,140 @@ class _QueryValueBuilder:
         return Isin(target, values)
 
 
+class _Cut(NamedTuple):
+    """One ``where`` / ``filter`` predicate in a frame's pipeline, with label and weight."""
+
+    label: str | None
+    node: Expr
+    weight: Expr | None
+
+
+class CutInfo(NamedTuple):
+    """One row of a :meth:`ColStoreFrame.report` cutflow.
+
+    ``entering`` is the number of rows reaching the cut (survivors of every earlier
+    cut) and ``passing`` how many satisfy it; ``efficiency`` is their ratio. When a
+    weight is in effect, ``weighted_entering`` / ``weighted_passing`` are the summed
+    weights over those same rows (else ``None``) and ``weighted_efficiency`` their ratio.
+    """
+
+    label: str
+    entering: int
+    passing: int
+    weighted_entering: float | None = None
+    weighted_passing: float | None = None
+
+    @property
+    def efficiency(self) -> float:
+        """Fraction of entering rows that pass this cut (``0.0`` if none entered)."""
+        return self.passing / self.entering if self.entering else 0.0
+
+    @property
+    def weighted_efficiency(self) -> float | None:
+        """Weighted pass fraction, or ``None`` when no weight was in effect."""
+        entering, passing = self.weighted_entering, self.weighted_passing
+        if entering is None or passing is None:
+            return None
+        return passing / entering if entering else 0.0
+
+
+class CutflowReport:
+    """The cutflow of a frame's ``where`` / ``filter`` pipeline: per-cut survivor counts.
+
+    Returned by :meth:`ColStoreFrame.report`. Iterate it for :class:`CutInfo` rows in
+    cut order, index it by position or by label, and print it for a table of each cut's
+    entering / passing counts and efficiency -- raw, weighted, or both, per ``show``.
+    """
+
+    __slots__ = ("_cuts", "_show")
+
+    def __init__(self, cuts: list[CutInfo], show: str | None = None) -> None:
+        self._cuts = cuts
+        self._show = show
+
+    def __len__(self) -> int:
+        return len(self._cuts)
+
+    def __iter__(self) -> Iterator[CutInfo]:
+        return iter(self._cuts)
+
+    def __getitem__(self, key: int | str) -> CutInfo:
+        if isinstance(key, str):
+            for cut in self._cuts:
+                if cut.label == key:
+                    return cut
+            raise KeyError(f"no cut labeled {key!r}; have {[c.label for c in self._cuts]}.")
+        return self._cuts[key]
+
+    def records(self) -> list[dict[str, Any]]:
+        """The cutflow as a list of per-cut dicts -- one dict per cut, for saving.
+
+        Each carries ``label``, the raw ``entering`` / ``passing`` / ``efficiency``, and
+        the ``weighted_*`` counterparts (``None`` when no weight was in effect), so the
+        report round-trips to JSON, CSV, or any tabular sink. Every dict has the same
+        keys, weighted or not.
+        """
+        return [
+            {
+                "label": c.label,
+                "entering": c.entering,
+                "passing": c.passing,
+                "efficiency": c.efficiency,
+                "weighted_entering": c.weighted_entering,
+                "weighted_passing": c.weighted_passing,
+                "weighted_efficiency": c.weighted_efficiency,
+            }
+            for c in self._cuts
+        ]
+
+    def _cells(self) -> tuple[list[str], list[list[str]]]:
+        """The header row and one preformatted string row per cut, honoring ``show``."""
+        weighted = any(c.weighted_entering is not None for c in self._cuts)
+        show = self._show or ("both" if weighted else "raw")
+        raw = show in ("raw", "both")
+        wt = show in ("weighted", "both") and weighted
+        if not raw and not wt:  # weighted asked for but none in effect
+            raw = True
+        headers = ["cut"]
+        if raw:
+            headers += ["entering", "passing", "eff"]
+        if wt:
+            headers += ["wt_entering", "wt_passing", "wt_eff"]
+        rows: list[list[str]] = []
+        for c in self._cuts:
+            row = [c.label]
+            if raw:
+                row += [str(c.entering), str(c.passing), f"{c.efficiency:.2%}"]
+            if wt:
+                eff = c.weighted_efficiency
+                row += [
+                    "-" if c.weighted_entering is None else f"{c.weighted_entering:.6g}",
+                    "-" if c.weighted_passing is None else f"{c.weighted_passing:.6g}",
+                    "-" if eff is None else f"{eff:.2%}",
+                ]
+            rows.append(row)
+        return headers, rows
+
+    def _caption(self) -> str:
+        n = len(self._cuts)
+        weighted = any(c.weighted_entering is not None for c in self._cuts)
+        return f"{'weighted ' if weighted else ''}cutflow ({n} cut{'' if n == 1 else 's'})"
+
+    def __repr__(self) -> str:
+        if not self._cuts:
+            return "CutflowReport(no cuts)"
+        return render_table_text(*self._cells())
+
+    def _repr_html_(self) -> str:
+        if not self._cuts:
+            return (
+                '<div style="font-family:ui-monospace,monospace;font-size:90%;'
+                'color:#57606a">CutflowReport: no cuts</div>'
+            )
+        headers, rows = self._cells()
+        return render_table_html(self._caption(), headers, rows)
+
+
 class ColStoreFrame:
     """A deferred editing view over an opened store's columns.
 
@@ -751,7 +888,7 @@ class ColStoreFrame:
         self._store = store
         self._n_rows = store.n_rows
         self._rows = rows
-        self._predicates: tuple[Expr, ...] = ()
+        self._predicates: tuple[_Cut, ...] = ()
         names = store.columns if columns is None else columns
         self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in names}
 
@@ -769,6 +906,41 @@ class ColStoreFrame:
         selection = self._resolve_selection()
         return self._n_rows if selection is None else len(selection)
 
+    def _apply_cuts(
+        self, base_rows: Rows, *, count: bool = False
+    ) -> tuple[NDArray[Any] | None, list[CutInfo]]:
+        """AND every ``where`` / ``filter`` predicate mask over ``base_rows``.
+
+        Returns the combined boolean mask (``None`` only when there are no
+        predicates) and, when ``count`` is set, a :class:`CutInfo` per cut tracking how
+        many rows -- and, where a weight is in effect, how much summed weight -- enter and
+        pass it. One memo is shared so a subexpression used by several cuts (or a cut and
+        its weight) runs once.
+        """
+        memo: dict[tuple[Any, ...], NDArray[Any]] = {}
+        mask: NDArray[Any] | None = None
+        cuts: list[CutInfo] = []
+        entering = (
+            base_rows.stop - base_rows.start if isinstance(base_rows, slice) else len(base_rows)
+        )
+        for i, cut in enumerate(self._predicates):
+            evaluated = np.asarray(evaluate(cut.node, base_rows, memo))
+            entering_mask = mask  # cumulative survivors before this cut (None = all rows)
+            mask = evaluated if mask is None else (mask & evaluated)
+            if count:
+                passing = int(np.count_nonzero(mask))
+                w_entering: float | None = None
+                w_passing: float | None = None
+                if cut.weight is not None:
+                    weights = np.asarray(evaluate(cut.weight, base_rows, memo))
+                    w_entering = float(
+                        weights.sum() if entering_mask is None else weights[entering_mask].sum()
+                    )
+                    w_passing = float(weights[mask].sum())
+                cuts.append(CutInfo(cut.label or f"#{i}", entering, passing, w_entering, w_passing))
+                entering = passing
+        return mask, cuts
+
     def _resolve_selection(self) -> NDArray[Any] | None:
         """The concrete row selection: the base rows narrowed by every pending
         predicate (``None`` = all rows). Evaluating the predicates is the deferred
@@ -777,13 +949,29 @@ class ColStoreFrame:
         if not self._predicates:
             return base
         base_rows: Rows = slice(0, self._n_rows) if base is None else base
-        memo: dict[tuple[Any, ...], NDArray[Any]] = {}
-        mask: NDArray[Any] | None = None
-        for node in self._predicates:
-            evaluated = np.asarray(evaluate(node, base_rows, memo))
-            mask = evaluated if mask is None else (mask & evaluated)
+        mask, _ = self._apply_cuts(base_rows)
         assert mask is not None  # _predicates is non-empty here
         return np.flatnonzero(mask) if base is None else base[mask]
+
+    def report(self, show: str | None = None) -> CutflowReport:
+        """Cutflow of the ``where`` / ``filter`` pipeline: per-cut survivor counts.
+
+        An action that evaluates each cut in order and returns a :class:`CutflowReport`
+        of how many rows enter and pass it (named by :meth:`where`'s ``label``, else by
+        position), plus the summed weight over those rows when a cut carries a ``where``
+        ``weight``. ``show`` picks what the report prints -- ``"raw"``, ``"weighted"``, or
+        ``"both"`` (the default shows both when any weight is in effect, else raw). A
+        frame with no cuts gives an empty report; a concrete base selection
+        (``ds[idx].edit()``) is the first cut's entering count.
+        """
+        if show not in (None, "raw", "weighted", "both"):
+            raise ValueError(f"show must be 'raw', 'weighted', 'both', or None; got {show!r}.")
+        base = self._rows
+        if not self._predicates:
+            return CutflowReport([], show)
+        base_rows: Rows = slice(0, self._n_rows) if base is None else base
+        _, cuts = self._apply_cuts(base_rows, count=True)
+        return CutflowReport(cuts, show)
 
     def _resolve_rows(self) -> Rows:
         """The selector materialization evaluates over: the full source range, or the
@@ -897,7 +1085,7 @@ class ColStoreFrame:
     def with_columns(
         self, *, copy: bool = False, inplace: bool = False, **new_columns: Any
     ) -> ColStoreFrame:
-        """Alias for :meth:`assign`, under a polars-style name."""
+        """Add or replace columns from keyword arguments; an alias for :meth:`assign`."""
         return self.assign(copy=copy, inplace=inplace, **new_columns)
 
     def drop(self, *names: str, inplace: bool = False) -> ColStoreFrame:
@@ -994,10 +1182,36 @@ class ColStoreFrame:
             raise QueryError(f"a where predicate must be a boolean condition; got dtype {dtype}.")
         return node
 
+    def _resolve_weight(self, weight: str | _Expr | Expr | None) -> Expr | None:
+        """Resolve a ``where`` weight to a numeric column expression (or ``None``).
+
+        A column name resolves against the frame's columns; a ``col()`` expression is
+        rebuilt onto the frame's graph. The weight is summed in the :meth:`report`
+        cutflow, never used for selection, so it must be numeric.
+        """
+        if weight is None:
+            return None
+        if isinstance(weight, str):
+            expr: Expr = self._resolve_column(weight)
+        elif isinstance(weight, _Expr):
+            expr = weight._emit(_QueryValueBuilder(self._resolve_column))
+        elif isinstance(weight, Expr):
+            expr = weight
+        else:
+            raise TypeError(
+                f"weight must be a column name, a col() expression, or None; "
+                f"got {type(weight).__name__}."
+            )
+        if result_dtype(expr).kind not in "iuf":
+            raise TypeError("a where() weight must be a numeric column.")
+        return expr
+
     def where(
         self,
         predicate: str | _Expr,
+        label: str | None = None,
         *,
+        weight: str | _Expr | Expr | None = None,
         params: dict[str, Any] | None = None,
         inplace: bool = False,
     ) -> ColStoreFrame:
@@ -1010,22 +1224,31 @@ class ColStoreFrame:
         resolve against the frame's columns in order, so a column derived earlier is a
         valid target and a dropped or renamed-away one is not. Successive ``where``
         calls compose (AND); reading :attr:`n_rows`, like any terminal, resolves them.
-        ``filter`` is an alias. Pass ``inplace=True`` to edit this frame.
+
+        Pass ``label`` to name this cut in the :meth:`report` cutflow, and ``weight`` (a
+        column name or expression) to sum a per-row weight entering and passing the cut in
+        the weighted cutflow. A weight is **sticky** -- it carries to later cuts until
+        another is given. ``filter`` is an alias. Pass ``inplace=True`` to edit this frame.
         """
         node = self._compile_predicate(predicate, params)
+        cut_weight = self._resolve_weight(weight)
+        if cut_weight is None and self._predicates:
+            cut_weight = self._predicates[-1].weight  # sticky: carry the most recent weight
         frame = self if inplace else self.copy()
-        frame._predicates = (*self._predicates, node)
+        frame._predicates = (*self._predicates, _Cut(label, node, cut_weight))
         return frame
 
     def filter(
         self,
         predicate: str | _Expr,
+        label: str | None = None,
         *,
+        weight: str | _Expr | Expr | None = None,
         params: dict[str, Any] | None = None,
         inplace: bool = False,
     ) -> ColStoreFrame:
         """Alias of :meth:`where` -- keep the rows where ``predicate`` is true."""
-        return self.where(predicate, params=params, inplace=inplace)
+        return self.where(predicate, label, weight=weight, params=params, inplace=inplace)
 
     def _materialize(self, rows: Rows) -> dict[str, NDArray[Any]]:
         """Evaluate every column over ``rows`` into a ``name -> array`` mapping, sharing
@@ -1069,8 +1292,7 @@ class ColStoreFrame:
         are concrete arrays detached from the source store -- so peak memory is one
         batch rather than the whole frame, and the caller picks the format
         (:meth:`dict` / :meth:`recarray` / :meth:`write`, or further edits) instead
-        of a fixed array type, much as ``RDataFrame.Range`` hands back another
-        frame. ``batch_size`` sizes each batch -- ``int`` rows, ``str`` an IEC
+        of a fixed array type. ``batch_size`` sizes each batch -- ``int`` rows, ``str`` an IEC
         memory budget per batch (e.g. ``"256 MiB"``) converted from the per-row
         byte size, ``None`` the configured default budget. A frame with no columns
         or no selected rows yields nothing.

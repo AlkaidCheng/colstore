@@ -80,7 +80,7 @@ on disk by transforming its columns. Starting from raw arrays, reach for a write
 
 ## Filtering with `query()` and `col()`
 
-Filter rows with a pandas-style predicate **string** or a composable **`col()`
+Filter rows with a predicate **string** or a composable **`col()`
 expression** — both return a **lazy view**. Nothing is read until you
 materialize: the predicate columns are read (and the row mask computed) on the
 first `.evaluate()` / `.frame()` / `.dict()` / `.recarray()` / `.array()`, and the
@@ -145,12 +145,13 @@ from colstore import col
 
 cf = ds.edit()                                   # a frame over every column, all rows
 cf = cf.assign(ratio=col("close") / col("open")) # col() builds a column value...
-cf = cf.where(col("ratio") > 1.0)                # ...and the same col() selects rows (lazy)
+cf = cf.where(col("ratio") > 1.0, "gains")       # ...and the same col() selects rows (lazy; name the cut)
 cf = cf.where("volume > @v", params={"v": 1e6})  # a query string works too; where()s compose
 cf = cf.astype({"open": "float32"}).drop("noise")
 cf = cf.select("close", "open", "ratio")         # project columns; filter() aliases where()
 
 cf.n_rows                                        # how many rows the frame selects (resolves it)
+cf.report()                                      # cutflow per named cut (raw / weighted / both)
 cf.dict(); cf.recarray(); cf.compute("ratio")    # materialize the selected rows in memory
 for batch in cf.iter_batches("256 MiB"):  ...    # or stream bounded in-memory frames (any format)
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
@@ -181,8 +182,15 @@ rows one batch at a time (`batch_size` / `memory_budget` — an `int` row count 
 string like `"256 MiB"`), so a filtered frame streams its survivors rather than
 materializing them whole. `iter_batches` yields each batch as a **materialized,
 in-memory frame** (columns detached from the source), so the consumer converts it to any
-format — `dict()`, `recarray()`, `write()`, or further edits — much as `RDataFrame.Range`
-hands back another frame.
+format — `dict()`, `recarray()`, `write()`, or further edits.
+
+A `where`/`filter` cut can be **named** and **weighted** — `where(col("pt") > 30, "trigger",
+weight="w")` — and `report()` returns the **cutflow**: the rows entering and passing each cut,
+in order, with efficiencies, and the summed weight too when one is in effect (a weight is sticky
+across later cuts). `report(show=...)` prints `"raw"`, `"weighted"`, or `"both"`; the report
+renders as a table in a terminal and as HTML in a notebook, and `report().records()` returns
+the cutflow as a list of per-cut dicts for saving (JSON, CSV, …). Unnamed cuts appear by
+position.
 
 ![The frame's computational model](docs/frame_computational_model.svg)
 
