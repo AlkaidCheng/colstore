@@ -852,8 +852,9 @@ class ColStoreFrame:
     Created by :meth:`edit` on an opened reader or dataset. A frame holds an
     ordered mapping of output column name to an expression (:class:`Expr`);
     opening one seeds it with a native-passthrough leaf per source column.
-    Indexing returns the expression for a column, which composes with operators
-    and whitelisted NumPy ufuncs to build transformations. The edit methods
+    Indexing by name returns the expression for a column, which composes with
+    operators and whitelisted NumPy ufuncs to build transformations; a frame does not
+    slice or index rows or columns (that is the reader's role). The edit methods
     (``assign`` / ``with_columns`` / ``drop`` / ``rename`` / ``astype``) return a
     new frame by default -- pass ``inplace=True`` to edit this one -- so edits
     branch cheaply off a shared base; ``frame[name] = ...`` and ``del`` always
@@ -993,12 +994,29 @@ class ColStoreFrame:
     def __contains__(self, name: object) -> bool:
         return name in self._columns
 
-    def __getitem__(self, name: str) -> Expr:
+    def __getitem__(self, key: Any) -> Expr:
+        """The named column's expression -- for building transforms, not data access.
+
+        ``frame["a"]`` returns column ``a``'s lazy expression, which composes with
+        operators and ufuncs (``frame["a"] * 2``, ``frame.assign(x=frame["a"] +
+        frame["b"])``). A frame does **not** slice or index rows or columns: filter with
+        :meth:`where`, project columns with :meth:`select`, and for positional or fancy
+        indexing :meth:`write` the frame to a ``.cstore`` and index the returned reader,
+        where the data is contiguous. (The reader / dataset is for viewing; the frame is
+        for filtering and editing.)
+        """
+        if not isinstance(key, str):
+            raise TypeError(
+                f"a frame indexes only a column by name (returning its expression); got "
+                f"{type(key).__name__}. It does not slice or index rows or columns -- filter "
+                f"with where(), pick columns with select(), and for positional or fancy indexing "
+                f"write() the frame and index the returned reader."
+            )
         try:
-            return self._columns[name]
+            return self._columns[key]
         except KeyError:
             raise KeyError(
-                f"column {name!r} is not in the frame; have {list(self._columns)}."
+                f"column {key!r} is not in the frame; have {list(self._columns)}."
             ) from None
 
     def __setitem__(self, name: str, value: Any) -> None:

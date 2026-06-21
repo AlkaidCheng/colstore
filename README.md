@@ -174,7 +174,9 @@ expression (or a column from another frame); a raw array attaches only at the ba
 before any selection.
 
 `where` (alias `filter`) is **lazy** — it records the predicate and evaluates it
-only on materialization. `n_rows` is the source or selected count; a pending
+only on materialization. A frame doesn't slice or index rows/columns — that's the
+reader's job (view a written file); the frame filters with `where`, projects with
+`select`, and edits with `assign`. `n_rows` is the source or selected count; a pending
 predicate is resolved on access (an O(n) scan). Materializing evaluates each column
 over the selected rows, sharing a subexpression once. Both `iter_batches` and `write()`
 are **bounded in memory**: they resolve the selection once, then process the selected
