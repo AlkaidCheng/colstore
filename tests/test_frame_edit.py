@@ -777,3 +777,168 @@ def test_filtered_write_no_columns_raises(source, tmp_path):
     cf = source[np.arange(10)].edit().drop("a", "b", "c")
     with pytest.raises(ValueError, match="empty column mapping"):
         cf.write(tmp_path / "o.cstore")
+
+
+# -- report(): labeled cuts + cutflow --
+
+
+def test_where_label_named_and_positional(source):
+    cf = source.edit().where(col("a") >= 100, "ge100").where(col("a") < 200, label="lt200")
+    assert [c.label for c in cf.report()] == ["ge100", "lt200"]
+
+
+def test_report_cutflow_counts_are_marginal(source, source_cols):
+    a = source_cols["a"]
+    cf = source.edit().where(col("a") >= 100, "ge100").where(col("a") % 2 == 0, "even")
+    rep = cf.report()
+    ge = a >= 100
+    assert (rep["ge100"].entering, rep["ge100"].passing) == (256, int(ge.sum()))  # all in, ge pass
+    assert rep["even"].entering == int(ge.sum())  # only ge100's survivors enter the next cut
+    assert rep["even"].passing == int((ge & (a % 2 == 0)).sum())
+
+
+def test_report_efficiency(source):
+    info = source.edit().where(col("a") < 64, "q").report()["q"]
+    assert info.efficiency == info.passing / info.entering == 64 / 256
+
+
+def test_report_unlabeled_cut_gets_positional_name(source):
+    rep = source.edit().where(col("a") >= 10).where(col("a") < 20, "win").report()
+    assert [c.label for c in rep] == ["#0", "win"]
+
+
+def test_report_empty_when_no_cuts(source):
+    rep = source.edit().report()
+    assert len(rep) == 0 and list(rep) == []
+    assert "no cuts" in repr(rep)
+
+
+def test_report_index_by_label_and_position(source):
+    rep = source.edit().where(col("a") >= 100, "ge").report()
+    assert rep[0] == rep["ge"]
+    with pytest.raises(KeyError, match="no cut labeled"):
+        _ = rep["missing"]
+
+
+def test_filter_label_feeds_report(source):
+    assert source.edit().filter(col("a") < 5, "small").report()["small"].passing == 5
+
+
+def test_report_over_concrete_base(source, source_cols):
+    # a concrete base selection (ds[idx].edit()) is the first cut's entering count
+    idx = np.arange(50)
+    rep = source[idx].edit().where(col("a") >= 20, "ge20").report()
+    assert rep["ge20"].entering == 50
+    assert rep["ge20"].passing == int((source_cols["a"][idx] >= 20).sum())
+
+
+def test_report_final_passing_matches_selection(source):
+    cf = source.edit().where(col("a") >= 100, "ge").where(col("a") < 200, "lt")
+    assert cf.report()[-1].passing == cf.n_rows == len(cf.dict()["a"])
+
+
+def test_report_repr_is_a_table(source):
+    text = repr(source.edit().where(col("a") >= 100, "ge100").report())
+    assert "ge100" in text and "entering" in text and "passing" in text
+
+
+# -- report(): weighted cutflow --
+
+
+def test_where_weight_sticky_and_sums(source, source_cols):
+    a = source_cols["a"]
+    wt = a.astype(np.float64) + 1.0
+    cf = (
+        source.edit()
+        .assign(w=col("a") + 1.0)
+        .where(col("a") >= 100, "ge", weight="w")
+        .where(col("a") % 2 == 0, "even")  # no weight -> inherits "w"
+    )
+    rep = cf.report()
+    ge = a >= 100
+    assert np.isclose(rep["ge"].weighted_entering, wt.sum())  # all rows enter
+    assert np.isclose(rep["ge"].weighted_passing, wt[ge].sum())
+    assert np.isclose(rep["even"].weighted_entering, wt[ge].sum())  # sticky weight carries
+    assert np.isclose(rep["even"].weighted_passing, wt[ge & (a % 2 == 0)].sum())
+
+
+def test_report_weighted_efficiency(source):
+    info = (
+        source.edit()
+        .assign(w=col("a") + 1.0)
+        .where(col("a") < 128, "half", weight="w")
+        .report()["half"]
+    )
+    assert info.weighted_efficiency == info.weighted_passing / info.weighted_entering
+
+
+def test_where_weight_by_expression(source, source_cols):
+    a = source_cols["a"]
+    info = source.edit().where(col("a") >= 100, "ge", weight=col("a") * 2).report()["ge"]
+    assert np.isclose(info.weighted_passing, (a[a >= 100] * 2).sum())
+
+
+def test_report_show_modes(source):
+    cf = source.edit().assign(w=col("a") + 1.0).where(col("a") >= 100, "ge", weight="w")
+    raw, weighted, both = (repr(cf.report(m)) for m in ("raw", "weighted", "both"))
+    assert "wt_entering" not in raw and "entering" in raw
+    assert weighted.splitlines()[0].split() == ["cut", "wt_entering", "wt_passing", "wt_eff"]
+    assert both.splitlines()[0].split() == [
+        "cut",
+        "entering",
+        "passing",
+        "eff",
+        "wt_entering",
+        "wt_passing",
+        "wt_eff",
+    ]
+
+
+def test_report_show_invalid_raises(source):
+    with pytest.raises(ValueError, match="show must be"):
+        source.edit().where(col("a") >= 100).report("bogus")
+
+
+def test_unweighted_cut_has_no_weighted_stats(source):
+    info = source.edit().where(col("a") >= 100, "ge").report()["ge"]
+    assert info.weighted_entering is None and info.weighted_efficiency is None
+
+
+def test_where_weight_non_numeric_raises(source):
+    with pytest.raises(TypeError, match="numeric"):
+        source.edit().where(col("a") >= 100, weight=col("a") >= 5)  # boolean expr is not numeric
+
+
+def test_report_repr_html(source):
+    cf = source.edit().assign(w=col("a") + 1.0).where(col("a") >= 100, "ge100", weight="w")
+    markup = cf.report()._repr_html_()
+    assert "cstore-tbl" in markup and "ge100" in markup and "wt_entering" in markup
+    assert "no cuts" in source.edit().report()._repr_html_()  # empty report still renders
+
+
+def test_report_records(source):
+    recs = (
+        source.edit()
+        .assign(w=col("a") + 1.0)
+        .where(col("a") >= 100, "ge", weight="w")
+        .report()
+        .records()
+    )
+    assert isinstance(recs, list) and isinstance(recs[0], dict)
+    assert set(recs[0]) == {
+        "label",
+        "entering",
+        "passing",
+        "efficiency",
+        "weighted_entering",
+        "weighted_passing",
+        "weighted_efficiency",
+    }
+    assert recs[0]["label"] == "ge" and recs[0]["entering"] == 256
+    for value in recs[0].values():  # JSON-friendly types only
+        assert value is None or isinstance(value, (str, int, float))
+
+
+def test_report_records_unweighted_has_none(source):
+    rec = source.edit().where(col("a") >= 100, "ge").report().records()[0]
+    assert rec["weighted_entering"] is None and rec["weighted_efficiency"] is None

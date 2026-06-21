@@ -200,6 +200,44 @@ def render_lazy_card(label: str, columns: list[str]) -> str:
     )
 
 
+def render_table_text(headers: list[str], rows: list[list[str]]) -> str:
+    """Render a table of preformatted string cells as fixed-width text (terminal repr).
+
+    The first column is left-aligned (a row label), the rest right-aligned (numbers).
+    """
+    table = [headers, *rows]
+    widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
+    return "\n".join(
+        "  ".join(
+            cell.ljust(widths[i]) if i == 0 else cell.rjust(widths[i]) for i, cell in enumerate(row)
+        )
+        for row in table
+    )
+
+
+def render_table_html(caption: str, headers: list[str], rows: list[list[str]]) -> str:
+    """Render a table of preformatted string cells as the house-style HTML table.
+
+    Matches the data-preview look (the ``cstore-tbl`` style); the first column of
+    each row is a row header, like the preview's positional index.
+    """
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+    body = "".join(
+        f"<tr><th>{html.escape(row[0])}</th>"
+        + "".join(f"<td>{html.escape(c)}</td>" for c in row[1:])
+        + "</tr>"
+        for row in rows
+    )
+    cap = (
+        '<div style="font-family:ui-monospace,monospace;font-size:90%;color:#57606a;'
+        f'margin-bottom:4px">{html.escape(caption)}</div>'
+    )
+    table = (
+        f'<table class="cstore-tbl"><thead><tr>{head}</tr></thead>' f"<tbody>{body}</tbody></table>"
+    )
+    return f'<div class="cstore-preview">{_STYLE}{cap}{table}</div>'
+
+
 class Preview:
     """A materialized head/tail peek that renders as a table in both reprs.
 
