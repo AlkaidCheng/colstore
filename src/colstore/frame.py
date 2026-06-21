@@ -36,14 +36,14 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
 
 from . import kernels
-from ._query import _Expr, evaluate_mask, parse_query, validate_predicate
+from ._query import QueryError, _Expr, parse_query
 
 if TYPE_CHECKING:
     from ._base import _ReaderBase
@@ -543,6 +543,22 @@ class Cast(Expr):
         self._key = ("cast", dtype.str, node._key)
 
 
+class Isin(Expr):
+    """An internal node testing membership of its input in a fixed set (``np.isin``).
+
+    Elementwise and row-independent like :class:`Cast`, so it evaluates one row
+    selection at a time. The structural key folds in the test values, so two equal
+    membership tests of the same input are computed once.
+    """
+
+    __slots__ = ("_key", "_target", "_values")
+
+    def __init__(self, target: Expr, values: Any) -> None:
+        self._target = target
+        self._values = np.asarray(values)
+        self._key = ("isin", target._key, self._values.dtype.str, self._values.tobytes())
+
+
 def evaluate(
     node: Expr,
     rows: Rows,
@@ -571,7 +587,9 @@ def evaluate(
         result = node._ufunc(*args)
     elif isinstance(node, Cast):
         result = evaluate(node._input, rows, memo).astype(node._dtype)
-    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast
+    elif isinstance(node, Isin):
+        result = np.isin(evaluate(node._target, rows, memo), node._values)
+    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast, Isin
         raise TypeError(f"cannot evaluate node of type {type(node).__name__!r}.")
     memo[node._key] = result
     return result
@@ -592,6 +610,8 @@ def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
                 yield from _iter_leaves(child)
     elif isinstance(node, Cast):
         yield from _iter_leaves(node._input)
+    elif isinstance(node, Isin):
+        yield from _iter_leaves(node._target)
 
 
 def fusible_passthroughs(specs: dict[str, Expr]) -> dict[str, NativeColumn]:
@@ -662,6 +682,30 @@ def as_expr(value: Any, *, copy: bool = False) -> Expr:
     if array.ndim == 0:
         return ConstColumn(array)
     return MemoryColumn(array, copy=copy)
+
+
+class _QueryValueBuilder:
+    """Rebuilds a ``col()`` predicate expression (:mod:`colstore._query`) as a frame
+    value graph, so one ``col()`` serves both the filter and the assign contexts.
+
+    ``column`` resolves a name against the frame's columns -- so a ``col()``
+    reference picks up a column derived in the frame, not only a stored one --
+    while ``op`` and ``isin`` build the matching graph nodes.
+    """
+
+    __slots__ = ("_resolve",)
+
+    def __init__(self, resolve: Callable[[str], Expr]) -> None:
+        self._resolve = resolve
+
+    def column(self, name: str) -> Expr:
+        return self._resolve(name)
+
+    def op(self, ufunc: np.ufunc, operands: list[Any]) -> Expr:
+        return UFunc(ufunc, tuple(operands))
+
+    def isin(self, target: Expr, values: Any) -> Expr:
+        return Isin(target, values)
 
 
 class ColStoreFrame:
@@ -743,7 +787,17 @@ class ColStoreFrame:
                 f"column {name!r} is not in the frame; have {list(self._columns)}."
             ) from None
 
+    def _resolve_column(self, name: str) -> Expr:
+        try:
+            return self._columns[name]
+        except KeyError:
+            raise KeyError(
+                f"col({name!r}) is not a column of this frame; have {list(self._columns)}."
+            ) from None
+
     def _coerce(self, value: Any, *, copy: bool) -> Expr:
+        if isinstance(value, _Expr):
+            value = value._emit(_QueryValueBuilder(self._resolve_column))
         expr = as_expr(value, copy=copy)
         validate_length(expr, self._n_rows)
         return expr
@@ -854,6 +908,38 @@ class ColStoreFrame:
         frame._columns = {name: frame._columns[name] for name in names}
         return frame
 
+    def _predicate_mask(
+        self, predicate: str | _Expr, params: dict[str, Any] | None
+    ) -> NDArray[Any]:
+        """Resolve a ``col()`` / query-string predicate against the frame's columns
+        and evaluate it over the selected rows to a per-row boolean mask.
+
+        Names resolve in order, against the frame as it stands -- a column derived
+        earlier is a valid target, a dropped or renamed-away one is not -- the same
+        rule :meth:`assign` follows. Raises :class:`~colstore.QueryError` for an
+        unknown column or a non-boolean condition, reading no data for the checks.
+        """
+        columns = frozenset(self._columns)
+        query = (
+            predicate if isinstance(predicate, _Expr) else parse_query(predicate, columns, params)
+        )
+        missing = sorted(name for name in set(query._columns()) if name not in self._columns)
+        if missing:
+            raise QueryError(
+                f"filter references unknown column(s) {missing}; have {sorted(self._columns)}."
+            )
+        node = query._emit(_QueryValueBuilder(self._resolve_column))
+        dtype = result_dtype(node)
+        if dtype.kind != "b":
+            raise QueryError(f"a filter predicate must be a boolean condition; got dtype {dtype}.")
+        mask = np.asarray(evaluate(node, self._resolve_rows(), {}))
+        if mask.ndim != 1 or mask.shape[0] != self.n_rows:
+            raise QueryError(
+                f"a filter predicate must reduce to one value per row ({self.n_rows}); "
+                f"got an array of shape {mask.shape}."
+            )
+        return mask
+
     def filter(
         self,
         predicate: str | _Expr,
@@ -864,20 +950,14 @@ class ColStoreFrame:
         """Keep the rows matching ``predicate``; returns a new frame by default.
 
         ``predicate`` is a :func:`~colstore.col` expression or a query string (the
-        grammar of :meth:`~colstore.ColStoreReader.query`), evaluated over the
-        store's columns; it cannot reference a column derived in the frame. It is
-        validated eagerly (an unknown column or a non-boolean condition raises
-        :class:`~colstore.QueryError`, reading no data), then evaluated over the
-        selected rows to a boolean mask that narrows the selection, so successive
-        filters compose. Pass ``inplace=True`` to edit this frame.
+        grammar of :meth:`~colstore.ColStoreReader.query`). It resolves against the
+        frame's columns in order -- so a column derived earlier is a valid target,
+        and a dropped or renamed-away one is not -- then evaluates over the selected
+        rows to a boolean mask that narrows the selection, so successive filters
+        compose. An unknown column or a non-boolean condition raises
+        :class:`~colstore.QueryError`. Pass ``inplace=True`` to edit this frame.
         """
-        columns = frozenset(self._store.columns)
-        expr = (
-            predicate if isinstance(predicate, _Expr) else parse_query(predicate, columns, params)
-        )
-        validate_predicate(expr, columns, self._store._query_probe)
-        rows = self._resolve_rows()
-        mask = evaluate_mask(expr, lambda name: self._store._gather_one(name, rows), self.n_rows)
+        mask = self._predicate_mask(predicate, params)
         selected = np.flatnonzero(mask) if self._rows is None else self._rows[mask]
         frame = self if inplace else self.copy()
         frame._rows = selected

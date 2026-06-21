@@ -103,6 +103,11 @@ def _operand_columns(value: Any) -> Iterator[str]:
         yield from value._columns()
 
 
+def _emit_operand(operand: Any, builder: Any) -> Any:
+    """Rebuild an operand through ``builder``; a scalar passes through unchanged."""
+    return operand._emit(builder) if isinstance(operand, _Expr) else operand
+
+
 class _Expr:
     """A node in a lazy column-expression tree built by :func:`col` and operators.
 
@@ -122,6 +127,14 @@ class _Expr:
 
     def _columns(self) -> Iterator[str]:
         return iter(())
+
+    def _emit(self, builder: Any) -> Any:
+        """Rebuild this expression through ``builder``, a node factory -- a fold
+        over the tree. ``builder`` supplies ``column(name)`` / ``op(ufunc,
+        operands)`` / ``isin(target, values)`` and gets back whatever it builds;
+        the frame uses it to splice a ``col()`` expression into its value graph.
+        """
+        raise NotImplementedError
 
     def __bool__(self) -> NoReturn:
         raise QueryError(
@@ -225,6 +238,9 @@ class _Col(_Expr):
     def _columns(self) -> Iterator[str]:
         yield self._name
 
+    def _emit(self, builder: Any) -> Any:
+        return builder.column(self._name)
+
 
 class _Op(_Expr):
     """A NumPy ufunc applied to one or more operands (arithmetic / boolean)."""
@@ -241,6 +257,9 @@ class _Op(_Expr):
     def _columns(self) -> Iterator[str]:
         for operand in self._operands:
             yield from _operand_columns(operand)
+
+    def _emit(self, builder: Any) -> Any:
+        return builder.op(self._ufunc, [_emit_operand(o, builder) for o in self._operands])
 
 
 class _Compare(_Expr):
@@ -263,6 +282,12 @@ class _Compare(_Expr):
         yield from _operand_columns(self._left)
         yield from _operand_columns(self._right)
 
+    def _emit(self, builder: Any) -> Any:
+        return builder.op(
+            self._ufunc,
+            [_emit_operand(self._left, builder), _emit_operand(self._right, builder)],
+        )
+
 
 class _Isin(_Expr):
     """A membership test ``target in values`` (``np.isin``)."""
@@ -280,6 +305,9 @@ class _Isin(_Expr):
 
     def _columns(self) -> Iterator[str]:
         yield from _operand_columns(self._target)
+
+    def _emit(self, builder: Any) -> Any:
+        return builder.isin(_emit_operand(self._target, builder), self._values)
 
 
 def col(name: str) -> _Expr:
