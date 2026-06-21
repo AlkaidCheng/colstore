@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import ColStoreFrame
+from colstore import ColStoreFrame, col
 from colstore.format import write_dataset
 
 
@@ -427,3 +427,133 @@ def test_branch_off_a_shared_base(source, source_cols):
     assert "b" not in branch_b.columns
     assert base.dict()["a"].dtype == source_cols["a"].dtype  # base unchanged by either branch
     assert "b" in base.columns
+
+
+# -- select: column projection --
+
+
+def test_select_projects_and_orders(source):
+    cf = source.edit().select("c", "a")
+    assert cf.columns == ["c", "a"]
+
+
+def test_select_returns_new_by_default(source):
+    base = source.edit()
+    base.select("a")
+    assert base.columns == ["a", "b", "c"]  # base unchanged
+
+
+def test_select_inplace(source):
+    cf = source.edit()
+    assert cf.select("b", "a", inplace=True) is cf
+    assert cf.columns == ["b", "a"]
+
+
+def test_select_unknown_raises(source):
+    with pytest.raises(KeyError):
+        source.edit().select("a", "nope")
+
+
+def test_select_duplicate_raises(source):
+    with pytest.raises(ValueError, match="duplicate"):
+        source.edit().select("a", "a")
+
+
+# -- filter / where: row selection --
+
+
+def test_filter_col_expression(source, source_cols):
+    cf = source.edit().filter(col("a") >= 128)
+    expected = source_cols["a"][source_cols["a"] >= 128]
+    assert cf.dict()["a"].tolist() == expected.tolist()
+    assert cf.n_rows == len(expected)
+
+
+def test_filter_query_string(source, source_cols):
+    cf = source.edit().filter("a % 4 == 1")
+    mask = source_cols["a"] % 4 == 1
+    assert cf.dict()["a"].tolist() == source_cols["a"][mask].tolist()
+
+
+def test_filter_query_params(source, source_cols):
+    cf = source.edit().filter("a >= @cut", params={"cut": 200})
+    assert cf.dict()["a"].tolist() == source_cols["a"][source_cols["a"] >= 200].tolist()
+
+
+def test_where_is_filter_alias(source):
+    via_where = source.edit().where(col("a") < 10).dict()["a"].tolist()
+    via_filter = source.edit().filter(col("a") < 10).dict()["a"].tolist()
+    assert via_where == via_filter == list(range(10))
+
+
+def test_filter_composes(source, source_cols):
+    cf = source.edit().filter(col("a") % 2 == 0).filter(col("a") > 250)
+    a = source_cols["a"]
+    expected = a[(a % 2 == 0) & (a > 250)]
+    assert cf.dict()["a"].tolist() == expected.tolist()
+
+
+def test_filter_returns_new_by_default(source):
+    base = source.edit()
+    base.filter(col("a") < 5)
+    assert base.n_rows == 256  # base unchanged
+
+
+def test_filter_inplace(source):
+    cf = source.edit()
+    assert cf.filter(col("a") < 5, inplace=True) is cf
+    assert cf.n_rows == 5
+
+
+def test_filtered_terminals_agree(source, source_cols):
+    cf = source.edit().filter(col("a") >= 250)
+    a = source_cols["a"]
+    keep = a >= 250
+    assert cf.compute("a").tolist() == a[keep].tolist()
+    assert cf.dict()["a"].tolist() == a[keep].tolist()
+    rec = cf.recarray()
+    assert rec["a"].tolist() == a[keep].tolist()
+    assert rec.shape[0] == int(keep.sum())
+
+
+def test_filter_then_derive(source, source_cols):
+    cf = source.edit().filter(col("a") >= 250)
+    cf = cf.assign(d=cf["a"] + 1)
+    a = source_cols["a"]
+    keep = a >= 250
+    assert cf.dict()["d"].tolist() == (a[keep] + 1).tolist()
+
+
+def test_filter_empty_match(source):
+    cf = source.edit().filter(col("a") > 10_000)
+    assert cf.n_rows == 0
+    assert cf.dict()["a"].tolist() == []
+    assert cf.recarray().shape[0] == 0
+
+
+def test_filter_unknown_column_raises(source):
+    with pytest.raises(colstore.QueryError):
+        source.edit().filter(col("nope") > 0)
+
+
+def test_filter_non_boolean_raises(source):
+    with pytest.raises(colstore.QueryError):
+        source.edit().filter(col("a") + 1)
+
+
+def test_filter_on_dropped_source_column(source, source_cols):
+    # The predicate reads source columns, so filtering on a column removed from
+    # the output is still valid.
+    cf = source.edit().drop("a").filter(col("a") >= 128)
+    assert "a" not in cf.columns
+    assert cf.n_rows == int((source_cols["a"] >= 128).sum())
+
+
+def test_filtered_write_roundtrip(source, source_cols, tmp_path):
+    cf = source.edit().filter(col("a") % 10 == 0)
+    cf = cf.assign(d=cf["a"] * 2)
+    out = _written(cf, tmp_path)
+    a = source_cols["a"]
+    keep = a % 10 == 0
+    assert out["a"].tolist() == a[keep].tolist()
+    assert out["d"].tolist() == (a[keep] * 2).tolist()

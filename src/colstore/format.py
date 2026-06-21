@@ -833,7 +833,7 @@ def _resolve_streaming_layout(
     columns_meta: list[dict[str, Any]] = []
     on_disk_dtypes: dict[str, np.dtype[Any]] = {}
     for name, spec in specs.items():
-        root = evaluate(spec, 0, 0, probe_memo)
+        root = evaluate(spec, slice(0, 0), probe_memo)
         kind = root.dtype.kind
         if kind == "O":
             raise TypeError(
@@ -937,7 +937,7 @@ def _fill_streaming_mmap(
                     # per-batch memo it would otherwise occupy).
                     passthrough._fill_into(target, start, stop)
                 else:
-                    target[:] = evaluate(specs[name], start, stop, memo)
+                    target[:] = evaluate(specs[name], slice(start, stop), memo)
         for name in names:
             views[name].flush()
     finally:
@@ -1000,7 +1000,7 @@ def _fill_streaming_pwrite(
                     passthrough._fill_into(batch, start, stop)
                 else:
                     batch = np.ascontiguousarray(
-                        evaluate(specs[name], start, stop, memo), dtype=dtype
+                        evaluate(specs[name], slice(start, stop), memo), dtype=dtype
                     )
                 jobs.append(
                     write_job(

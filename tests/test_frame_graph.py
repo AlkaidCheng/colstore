@@ -64,9 +64,9 @@ class _CountingColumn(MemoryColumn):
         super().__init__(array)
         self.reads = 0
 
-    def _read(self, start: int, stop: int) -> np.ndarray:
+    def _read(self, rows: slice | np.ndarray) -> np.ndarray:
         self.reads += 1
-        return super()._read(start, stop)
+        return super()._read(rows)
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def xy() -> tuple[np.ndarray, np.ndarray]:
 
 def _full(node: Expr, n: int) -> np.ndarray:
     """Evaluate a node over its whole range with a fresh memo."""
-    return evaluate(node, 0, n, {})
+    return evaluate(node, slice(0, n), {})
 
 
 # -- graph construction --
@@ -138,7 +138,7 @@ def test_comparison_yields_bool(xy):
 def test_partial_range_matches_slice(xy):
     x, y = xy
     a, b = MemoryColumn(x), MemoryColumn(y)
-    out = evaluate((a + b) * 2, 3, 7, {})
+    out = evaluate((a + b) * 2, slice(3, 7), {})
     np.testing.assert_array_equal(out, (x[3:7] + y[3:7]) * 2)
 
 
@@ -226,7 +226,7 @@ def test_native_column_range_read_delegates():
     x = np.arange(10, dtype=np.int64)
     store = _StubStore({"x": x})
     col = NativeColumn(store, "x")
-    out = col._read(2, 5)
+    out = col._read(slice(2, 5))
     np.testing.assert_array_equal(out, x[2:5])
     assert store.gather_calls == [("x", slice(2, 5))]
 
@@ -234,7 +234,7 @@ def test_native_column_range_read_delegates():
 def test_native_column_zero_length_read_is_data_free():
     store = _StubStore({"x": np.arange(10, dtype=np.int64)})
     col = NativeColumn(store, "x")
-    empty = col._read(0, 0)
+    empty = col._read(slice(0, 0))
     assert empty.shape == (0,)
     assert empty.dtype == np.int64
     assert store.gather_calls == []
@@ -266,7 +266,7 @@ def test_memory_column_rejects_non_1d():
 def test_const_column():
     c = ConstColumn(7)
     assert c._length() is None
-    np.testing.assert_array_equal(c._read(0, 3), np.full(3, 7))
+    np.testing.assert_array_equal(c._read(slice(0, 3)), np.full(3, 7))
     assert ConstColumn(1.5).dtype == np.float64
     assert ConstColumn(7, dtype=np.int16).dtype == np.int16
 
@@ -328,8 +328,8 @@ def test_cse_structural_dedup_across_columns(xy):
     c1 = (a + b) * 2
     c2 = (a + b) - 1
     memo: dict = {}
-    r1 = evaluate(c1, 0, n, memo)
-    r2 = evaluate(c2, 0, n, memo)
+    r1 = evaluate(c1, slice(0, n), memo)
+    r2 = evaluate(c2, slice(0, n), memo)
     np.testing.assert_array_equal(r1, (x + y) * 2)
     np.testing.assert_array_equal(r2, (x + y) - 1)
     assert a.reads == 1  # the shared a+b (and its leaves) computed once
@@ -339,15 +339,15 @@ def test_cse_structural_dedup_across_columns(xy):
 def test_no_cse_across_separate_memos(xy):
     x, _ = xy
     a = _CountingColumn(x)
-    evaluate(a + 1, 0, len(x), {})
-    evaluate(a + 2, 0, len(x), {})
+    evaluate(a + 1, slice(0, len(x)), {})
+    evaluate(a + 2, slice(0, len(x)), {})
     assert a.reads == 2  # a fresh memo per batch releases the working set
 
 
 def test_cse_dedup_within_one_expression(xy):
     x, _ = xy
     a = _CountingColumn(x)
-    evaluate(a + a, 0, len(x), {})
+    evaluate(a + a, slice(0, len(x)), {})
     assert a.reads == 1
 
 

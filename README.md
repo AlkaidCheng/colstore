@@ -129,6 +129,59 @@ can't be overloaded). An unknown column, an unsupported construct, or a
 non-boolean condition raises `colstore.QueryError` immediately, reading no data.
 Everything behaves the same on a single file and a multi-file dataset.
 
+## Editing: derive a new file with `edit()`
+
+`reader.edit()` returns a `ColStoreFrame`: a lazy specification of a new file,
+read only when you materialize it. A frame has two independent parts — the
+**columns** to produce (each an expression over the source columns) and the
+**rows** to keep — and nothing touches disk until you ask for the result, in
+memory with `dict()` / `recarray()` / `compute()`, or as a new file with
+`write()`. Every edit returns a new frame, so frames branch cheaply from a shared
+base; pass `inplace=True` to edit one in place.
+
+```python
+import numpy as np
+from colstore import col
+
+cf = ds.edit()                                   # a frame over every column, all rows
+cf = cf.assign(ratio=cf["close"] / cf["open"])   # add or replace columns
+cf = cf.astype({"open": "float32"}).drop("noise")
+cf = cf.select("close", "open", "ratio")         # keep these columns, in this order
+
+# Row selection: filter on the stored columns (a col() expression or a string).
+cf = cf.filter(col("close") > 100)               # keep matching rows; where() is an alias
+cf = cf.filter("volume > @v", params={"v": 1e6}) # successive filters narrow further
+
+cf.dict(); cf.recarray(); cf.compute("ratio")    # materialize the selected rows in memory
+reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
+
+# A filtered or gathered view continues straight into an edit:
+hot = ds.query("pt > 30").edit()                 # a frame over only the matching rows
+hot.assign(logpt=np.log(hot["pt"])).write("hot.cstore")
+ds[indices].select("pt", "eta").edit()           # a fancy index, slice, or mask carries over
+```
+
+The columns form an expression graph: stored columns, in-memory arrays, and
+constants combined by elementwise operators and NumPy ufuncs. Only
+**row-independent** transforms are representable — each output row depends only on
+the input row at the same position — so reductions, sorts, and other row-coupling
+operations are rejected when the frame is built. A predicate passed to `filter`
+is evaluated over the stored columns and cannot reference a column derived in the
+frame.
+
+The two parts meet at a single evaluator. Materializing a frame evaluates each
+column over the selected rows, computing a subexpression shared by several columns
+only once. In memory, all selected rows are produced in one pass; `write()`
+streams the result in bounded-memory row-range batches when the frame is
+unfiltered, and materializes the selected rows when it is filtered.
+
+![The frame's computational model](docs/frame_computational_model.svg)
+
+The [expression-graph diagram](docs/edit_expression_graph.svg) details the
+shared-subexpression reuse; the [edit lifecycle](docs/edit_lifecycle.svg) and
+[streaming commit](docs/edit_streaming_commit.svg) diagrams trace a frame from
+`edit()` to a written file.
+
 ## Writing
 
 `colstore.store(data, path)` is the one-shot path; it dispatches on the
