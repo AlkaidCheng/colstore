@@ -169,6 +169,16 @@ def test_col_reflected_arithmetic(qstore):
     assert _pts(ds[col("pt") / 10 >= 3]) == [30.0, 40.0, 50.0]
 
 
+def test_col_reflected_floordiv_mod_pow(qstore):
+    ds, _ = qstore
+    # __rfloordiv__: 100 // pt >= 5  ->  pt in {10, 20}
+    assert _pts(ds[100 // col("pt") >= 5]) == [10.0, 20.0]
+    # __rmod__: 100 % pt == 0  ->  pt in {10, 20, 50}
+    assert _pts(ds[100 % col("pt") == 0]) == [10.0, 20.0, 50.0]
+    # __rpow__: 2 ** flag > 1  ->  flag == 1  ->  pt in {20, 40}
+    assert _pts(ds[2 ** col("flag") > 1]) == [20.0, 40.0]
+
+
 def test_col_string_equality(qstore):
     ds, _ = qstore
     assert _pts(ds[col("region") == "SR"]) == [10.0, 30.0]
