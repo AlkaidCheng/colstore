@@ -486,6 +486,25 @@ def test_where_is_filter_alias(source):
     assert via_where == via_filter == list(range(10))
 
 
+# -- frame[...] is column-name access only (no row/column indexing) --
+
+
+def test_getitem_string_returns_column_expression(source, source_cols):
+    cf = source.edit()
+    assert cf["a"] is cf._columns["a"]  # the column's lazy expression, for building
+    assert (
+        cf.assign(s=cf["a"] + cf["b"]).dict()["s"].tolist()
+        == (source_cols["a"] + source_cols["b"]).tolist()
+    )
+
+
+def test_getitem_non_name_keys_raise(source):
+    cf = source.edit()
+    for bad in [col("a") > 0, slice(0, 10), np.array([0, 2, 4]), 0, (slice(None), ["a", "b"])]:
+        with pytest.raises(TypeError, match="does not slice or index rows or columns"):
+            _ = cf[bad]
+
+
 def test_filter_composes(source, source_cols):
     cf = source.edit().filter(col("a") % 2 == 0).filter(col("a") > 250)
     a = source_cols["a"]
