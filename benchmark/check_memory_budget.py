@@ -11,7 +11,8 @@ versus the fastest budget and versus one batch (effectively unlimited):
 * schema width -- narrow (1 col) vs standard (4) vs wide (12, mixed dtype) writes;
 * transform depth -- a couple of derived columns, and a deeper expression whose per-batch
   intermediates are NOT counted in the budget (the case most likely to want a smaller one);
-* the other budget-consuming paths -- a full-column reduction and an iter_batches consume;
+* the other budget-consuming paths -- a full-column reduction (its own small chunk; a
+  single-record bare column folds a zero-copy view instead) and an iter_batches consume;
 * a passthrough write as a control (the no-transform merge-copy ignores the budget).
 
 Filter thresholds are quantile-picked so selectivity is exact regardless of the data
@@ -32,6 +33,7 @@ import _common as _c
 import numpy as np
 
 import colstore
+import colstore.frame as cframe
 from colstore import col, config, testing
 from colstore.frame import result_dtype
 
@@ -96,7 +98,7 @@ def _op(frame, kind: str, out: Path, budget: int):
     if kind == "write":
         return lambda: frame.write(out, memory_budget=budget).close()
     if kind == "reduce":
-        return lambda: (config.set_default_memory_budget(budget), frame.sum("c0"))[1]
+        return lambda: (setattr(cframe, "_REDUCTION_CHUNK_BYTES", budget), frame.sum("c0"))[1]
     return lambda: (
         config.set_default_memory_budget(budget),
         [b.recarray() for b in frame.iter_batches()],
@@ -121,26 +123,28 @@ def _sweep(name: str, frame, kind: str, total: int, out: Path, args: argparse.Na
         baseline=0,
         throughput_rows=rows,
     )
-    config.set_default_memory_budget(32 << 20)  # restore after reduce/iter mutate it
+    config.set_default_memory_budget(32 << 20)  # restore after iter mutates it
+    cframe._REDUCTION_CHUNK_BYTES = 8 << 20  # restore after reduce mutates it
     walls = [r.wall_ms for r in results]
     labels = [lbl for lbl, _ in budgets]
     best = min(range(len(walls)), key=lambda i: walls[i])
-    i32 = labels.index(_DEFAULT)
-    return name, labels[best], walls[best] / walls[i32], walls[0] / walls[i32]
+    default = "8 MiB" if kind == "reduce" else _DEFAULT  # the op's actual default chunk/budget
+    idef = labels.index(default)
+    return name, labels[best], default, walls[best] / walls[idef], walls[0] / walls[idef]
 
 
 def _print_summary(summary) -> None:
-    print("\n" + "=" * 74)
-    print(f"SUMMARY (default = {_DEFAULT}; 32MiB/best <=1.0, 32MiB/1batch >1.0 means faster)")
-    print(f"{'scenario':<28}{'best':>10}{'32MiB/best':>13}{'32MiB/1batch':>14}")
-    print("-" * 74)
+    print("\n" + "=" * 80)
+    print("SUMMARY (op default; def/best <=1.0, def/1batch >1.0 means faster than one batch)")
+    print(f"{'scenario':<28}{'best':>9}{'default':>9}{'def/best':>11}{'def/1batch':>13}")
+    print("-" * 80)
     worst = 1.0
-    for name, best, r_best, r_1b in summary:
-        print(f"{name:<28}{best:>10}{r_best:>12.2f}x{r_1b:>13.2f}x")
+    for name, best, default, r_best, r_1b in summary:
+        print(f"{name:<28}{best:>9}{default:>9}{r_best:>10.2f}x{r_1b:>12.2f}x")
         worst = min(worst, r_best)
-    print("-" * 74)
+    print("-" * 80)
     verdict = "GOOD" if worst >= 0.95 else ("OK" if worst >= 0.90 else "REVISIT")
-    print(f"worst case: 32 MiB is {(1 - worst) * 100:.0f}% off the fastest budget -> {verdict}")
+    print(f"worst case: the op default is {(1 - worst) * 100:.0f}% off the fastest -> {verdict}")
 
 
 def check_correctness() -> None:
@@ -165,18 +169,21 @@ def check_correctness() -> None:
             else:
                 for name in ref:
                     assert np.array_equal(got[name], ref[name]), f"write {name}"
-        config.set_default_memory_budget(1 << 30)
+        cframe._REDUCTION_CHUNK_BYTES = 1 << 30
         big = store.edit().sum("c0")
+        cframe._REDUCTION_CHUNK_BYTES = 8 << 10
+        small = store.edit().sum("c0")
+        cframe._REDUCTION_CHUNK_BYTES = 8 << 20  # restore
+        config.set_default_memory_budget(1 << 30)
         big_iter = np.concatenate(
             [b.dict()["c0"] for b in store.edit().where(col("c0") > thr).iter_batches()]
         )
         config.set_default_memory_budget(8 << 10)
-        small = store.edit().sum("c0")
         small_iter = np.concatenate(
             [b.dict()["c0"] for b in store.edit().where(col("c0") > thr).iter_batches()]
         )
-        config.set_default_memory_budget(32 << 20)
-        assert np.isclose(big, small), "reduction not budget-invariant"
+        config.set_default_memory_budget(32 << 20)  # restore
+        assert np.isclose(big, small), "reduction not chunk-invariant"
         assert np.array_equal(big_iter, small_iter), "iter_batches not budget-invariant"
         store.close()
     print("  CORRECTNESS OK (write / reduction / iter_batches budget-invariant)\n")

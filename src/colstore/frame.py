@@ -413,6 +413,15 @@ def _wide_sum(batch: NDArray[Any]) -> Any:
     return batch.sum()
 
 
+# A reduction folds each materialized batch right after reading it, so a batch that spills
+# last-level cache costs a second DRAM pass over the same data. When a column must be
+# materialized to fold (a gather, a transform, or a non-native dtype) it is chunked to this
+# size to keep the batch cache-resident; a stored column that can be viewed zero-copy skips
+# chunking and folds in one pass. Kept small and fixed (not a user budget): a fold's
+# per-batch overhead is negligible, so cache-residency dominates.
+_REDUCTION_CHUNK_BYTES = 8 * 1024 * 1024
+
+
 class _Leaf(Expr):
     """A graph leaf: a named data source materialized by row range.
 
@@ -1635,18 +1644,30 @@ class ColStoreFrame:
     # ---- Reduction terminals (full pass, scalar result) ----------------
 
     def _stream_column(self, expr: Expr) -> Iterator[NDArray[Any]]:
-        """Yield the selected rows of one column expression, one budgeted batch at a time.
+        """Yield the selected rows of one column expression for a reduction to fold.
 
-        The full-pass counterpart the reductions share: the selection is resolved once and
-        each batch evaluates ``expr`` alone (a fresh memo), so peak memory is one batch of a
-        single column rather than the whole column.
+        A stored column with no fancy selection over a single-record native store yields one
+        read-only zero-copy view, so the fold is a single pass over the source with no copy.
+        Otherwise -- a gather (interleaved multi-record or a filtered index), a transform, or
+        a non-native dtype -- the column is materialized in cache-resident chunks so the fold
+        never re-reads a cache-spilling batch from DRAM; peak memory is one chunk of a single
+        column. A fresh memo per chunk releases each batch's working set.
         """
         selection = self._resolve_index_selection()
+        if isinstance(expr, NativeColumn) and not isinstance(selection, np.ndarray):
+            view_rows: Rows = slice(0, self._n_rows) if selection is None else selection
+            try:
+                view = expr._store._view_one(expr.name, view_rows)
+            except ValueError:
+                pass  # a copy is unavoidable (interleaved / non-native) -> chunk below
+            else:
+                if len(view):
+                    yield view
+                return
         n = self._n_rows if selection is None else len(selection)
         if n == 0:
             return
-        budget = config.get_default_memory_budget()
-        rows_per_batch = max(1, budget // max(1, result_dtype(expr).itemsize))
+        rows_per_batch = max(1, _REDUCTION_CHUNK_BYTES // max(1, result_dtype(expr).itemsize))
         for start in range(0, n, rows_per_batch):
             stop = min(start + rows_per_batch, n)
             rows: Rows = slice(start, stop) if selection is None else selection[start:stop]

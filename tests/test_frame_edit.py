@@ -762,28 +762,46 @@ def test_reductions_empty_selection(source):
 
 
 def test_reductions_combine_across_batches(source, source_cols, monkeypatch):
-    import colstore.config as config_mod
+    import colstore.frame as frame_mod
 
-    monkeypatch.setattr(config_mod, "get_default_memory_budget", lambda: 16)  # ~2 float64/batch
+    monkeypatch.setattr(frame_mod, "_REDUCTION_CHUNK_BYTES", 16)  # ~2 float64/batch
     b = source_cols["b"]
     cf = source.edit()
-    np.testing.assert_allclose(cf.sum("b"), b.sum())
-    np.testing.assert_allclose(cf.mean("b"), b.mean())
-    np.testing.assert_allclose(cf.min("b"), b.min())
-    np.testing.assert_allclose(cf.max("b"), b.max())
+    # A transform can't be a zero-copy view, so it folds in chunks; the per-batch
+    # partials must combine across batches (a bare column would fold one view instead).
+    expr = col("b") * 1
+    np.testing.assert_allclose(cf.sum(expr), b.sum())
+    np.testing.assert_allclose(cf.mean(expr), b.mean())
+    np.testing.assert_allclose(cf.min(expr), b.min())
+    np.testing.assert_allclose(cf.max(expr), b.max())
 
 
 def test_reductions_float32_wide_accumulator(source, source_cols, monkeypatch):
-    import colstore.config as config_mod
+    import colstore.frame as frame_mod
 
     c64 = source_cols["c"].astype(np.float64)  # the float32 column, promoted, for a reference
     cf = source.edit()
-    full = float(cf.sum("c"))
-    monkeypatch.setattr(config_mod, "get_default_memory_budget", lambda: 8)  # 2 float32 rows/batch
-    np.testing.assert_allclose(float(cf.sum("c")), full, rtol=1e-10)  # budget-independent
+    full = float(cf.sum("c"))  # bare column -> one zero-copy view, single pass
+    monkeypatch.setattr(frame_mod, "_REDUCTION_CHUNK_BYTES", 8)  # 2 float32 rows/batch
+    expr = col("c") * 1  # a transform -> chunked fold across batches
+    np.testing.assert_allclose(float(cf.sum(expr)), full, rtol=1e-10)  # chunk-independent
     np.testing.assert_allclose(full, c64.sum(), rtol=1e-10)  # matches a float64 single pass
-    np.testing.assert_allclose(cf.mean("c"), c64.mean(), rtol=1e-10)
-    assert np.asarray(cf.sum("c")).dtype == np.dtype(np.float64)  # float32 sums to float64
+    np.testing.assert_allclose(cf.mean(expr), c64.mean(), rtol=1e-10)
+    assert np.asarray(cf.sum(expr)).dtype == np.dtype(np.float64)  # float32 sums to float64
+
+
+def test_reduction_views_bare_column_without_chunking(source, source_cols, monkeypatch):
+    import colstore.frame as frame_mod
+
+    # A tiny chunk would force many batches if the column were materialized; a bare stored
+    # column on a single-record store folds one read-only zero-copy view instead, no copy.
+    monkeypatch.setattr(frame_mod, "_REDUCTION_CHUNK_BYTES", 8)
+    cf = source.edit()
+    expr = cf._resolve_value_column("b")
+    batches = list(cf._stream_column(expr))
+    assert len(batches) == 1  # one zero-copy view, not chunked
+    np.testing.assert_allclose(np.asarray(batches[0]), source_cols["b"])
+    np.testing.assert_allclose(cf.sum("b"), source_cols["b"].sum())
 
 
 def test_reductions_non_numeric_column(tmp_path):
