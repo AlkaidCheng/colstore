@@ -711,3 +711,47 @@ def test_view_edit_then_transform_and_write(small_store, tmp_path):
         assert reader.dict()["twice"].tolist() == [2040, 2042, 2044, 2046]
     finally:
         reader.close()
+
+
+def test_table_view_edit_predicate_is_lazy(small_store):
+    cf = small_store[colstore.col("id") >= 1020].edit()
+    assert cf._rows is None  # the predicate is not resolved to indices at the seam
+    assert len(cf._predicates) == 1  # it is carried as a pending where()
+    assert cf.n_rows == 4  # n_rows resolves the scan on access
+    assert cf.dict()["id"].tolist() == [1020, 1021, 1022, 1023]
+
+
+def test_table_view_edit_predicate_matches_frame_where(small_store):
+    pred = colstore.col("id") % 3 == 0
+    via_view = small_store[pred].edit().dict()["id"].tolist()
+    via_frame = small_store.edit().where(pred).dict()["id"].tolist()
+    assert via_view == via_frame
+
+
+def test_table_view_edit_predicate_in_report(small_store):
+    report = small_store[colstore.col("id") >= 1020].edit().report()
+    assert len(report) == 1
+    assert report[0].entering == small_store.n_rows
+    assert report[0].passing == 4
+
+
+def test_view_edit_predicate_composes_with_where(small_store):
+    cf = small_store[colstore.col("id") >= 1020].edit().where(colstore.col("id") < 1023)
+    assert cf.dict()["id"].tolist() == [1020, 1021, 1022]
+    assert len(cf.report()) == 2
+
+
+def test_view_edit_predicate_references_projected_away_column(small_store, small_frame):
+    qty = small_frame["qty"].to_numpy()
+    ids = small_frame["id"].to_numpy()
+    cf = small_store[colstore.col("qty") >= 500, "id"].edit()  # filter qty, keep only id
+    assert cf.columns == ["id"]
+    assert cf.dict()["id"].tolist() == ids[qty >= 500].tolist()
+
+
+def test_view_edit_evaluate_then_edit_is_eager(small_store):
+    cf = small_store[colstore.col("id") >= 1020].evaluate().edit()
+    assert cf._rows is not None  # the predicate is resolved to a fixed row set
+    assert cf._rows.tolist() == [1020, 1021, 1022, 1023]
+    assert len(cf._predicates) == 0  # nothing left pending
+    assert cf.n_rows == 4
