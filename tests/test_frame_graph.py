@@ -19,6 +19,7 @@ from colstore.frame import (
     MemoryColumn,
     NativeColumn,
     UFunc,
+    Where,
     as_expr,
     declared_length,
     evaluate,
@@ -163,11 +164,83 @@ def test_out_kwarg_rejected(xy):
         np.add(a, b, out=np.empty(len(x)))
 
 
-def test_non_whitelisted_ufunc_rejected(xy):
+def test_elementwise_ufuncs_defer(xy):
     x, y = xy
     a, b = MemoryColumn(x), MemoryColumn(y)
-    with pytest.raises(TypeError, match="not allowed"):
-        np.logaddexp(a, b)
+    # Any single-output elementwise ufunc builds a node and evaluates as numpy would
+    # (hypot / arctan2 / ... -- the kinematics path).
+    for node, expected in [
+        (np.hypot(a, b), np.hypot(x, y)),
+        (np.arctan2(a, b), np.arctan2(x, y)),
+        (np.logaddexp(a, b), np.logaddexp(x, y)),
+        (np.copysign(a, b), np.copysign(x, y)),
+    ]:
+        assert isinstance(node, Expr)
+        np.testing.assert_allclose(_full(node, len(x)), expected)
+
+
+def test_multi_output_ufunc_rejected(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    with pytest.raises(TypeError, match="multiple outputs"):
+        np.modf(a)
+
+
+def test_np_where_and_clip_defer(xy):
+    x, y = xy
+    a, b = MemoryColumn(x), MemoryColumn(y)
+    np.testing.assert_array_equal(_full(np.where(a > 0, a, b), len(x)), np.where(x > 0, x, y))
+    np.testing.assert_array_equal(_full(np.where(a > 0, a, 0.0), len(x)), np.where(x > 0, x, 0.0))
+    np.testing.assert_array_equal(_full(np.clip(a, -0.5, 0.5), len(x)), np.clip(x, -0.5, 0.5))
+
+
+def test_expr_where_method(xy):
+    x, y = xy
+    a, b = MemoryColumn(x), MemoryColumn(y)
+    np.testing.assert_array_equal(_full(a.where(a > 0, b), len(x)), np.where(x > 0, x, y))
+    np.testing.assert_array_equal(_full(a.where(a > 0), len(x)), np.where(x > 0, x, np.nan))
+
+
+def test_unsupported_array_function_rejected(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    with pytest.raises(TypeError, match="not supported in a column expression"):
+        np.cumsum(a)  # row-mixing, not in the elementwise dispatch table
+
+
+def test_generalized_ufunc_rejected(xy):
+    x, y = xy
+    a, b = MemoryColumn(x), MemoryColumn(y)
+    with pytest.raises(TypeError, match="generalized ufunc"):
+        np.matmul(a, b)  # __call__/nout==1 but mixes rows across a core dimension
+
+
+def test_np_clip_keyword_and_positional_bounds(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    kw = _full(np.clip(a, min=-0.5, max=0.5), len(x))  # keyword bounds
+    pos = _full(np.clip(a, -0.5, 0.5), len(x))  # positional bounds
+    np.testing.assert_array_equal(kw, pos)
+    np.testing.assert_array_equal(kw, np.clip(x, -0.5, 0.5))
+
+
+def test_np_clip_out_rejected(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    with pytest.raises(TypeError, match="out="):
+        np.clip(a, -0.5, 0.5, out=np.empty(len(x)))
+
+
+def test_np_where_single_arg_rejected(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    with pytest.raises(TypeError, match="requires both branches"):
+        np.where(a > 0)
+
+
+def test_where_all_scalar_rejected():
+    with pytest.raises(TypeError, match="at least one column operand"):
+        Where(True, 1, 2)
 
 
 def test_raw_ndarray_operand_rejected(xy):

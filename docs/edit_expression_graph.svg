@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="700" height="360" viewBox="0 0 700 360" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
 <title>Columns are expressions; a shared subexpression is computed once</title>
-<desc>Each output column is an expression over leaves: native columns read from the source, in-memory assigned arrays, and constants, combined by operators and whitelisted ufuncs. When several output columns reuse the same subexpression, it is one node with several parents. During a commit every column in a row range is evaluated through one shared memo, so that shared node is computed once per row range and reused by each column that references it, rather than recomputed once per column.</desc>
+<desc>Each output column is an expression over leaves: native columns read from the source, in-memory assigned arrays, and constants, combined by operators and elementwise ufuncs. When several output columns reuse the same subexpression, it is one node with several parents. During a commit every column in a row range is evaluated through one shared memo, so that shared node is computed once per row range and reused by each column that references it, rather than recomputed once per column.</desc>
 <style>
   .colA { fill:#E1F5EE; stroke:#0F6E56; stroke-width:0.75; } .colAt { fill:#04342C; font-size:11px; font-weight:500; }
   .colB { fill:#FBF1DE; stroke:#B9852B; stroke-width:0.75; } .colBt { fill:#6B4A12; font-size:12px; font-weight:500; }
