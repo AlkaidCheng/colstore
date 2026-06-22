@@ -885,18 +885,59 @@ def test_iter_batches_copy_false_returns_views(source, source_cols):
 
 
 def test_iter_batches_copy_false_matches_copy_true(source, source_cols):
+    # copy=False reuses per-column buffers on gathered batches, so a batch is valid only
+    # until the next is drawn: copy each one out before advancing (the streaming contract).
     cf = source.edit()
-    viewed = np.concatenate([b.dict()["b"] for b in cf.iter_batches(batch_size=100, copy=False)])
+    viewed = np.concatenate([b.dict()["b"].copy() for b in cf.iter_batches(100, copy=False)])
     np.testing.assert_array_equal(viewed, source_cols["b"])
     # a transform can't be a view -> still materialized correctly under copy=False
     derived = source.edit().assign(d=col("b") * 2)
-    got = np.concatenate([b.dict()["d"] for b in derived.iter_batches(batch_size=100, copy=False)])
+    got = np.concatenate([b.dict()["d"].copy() for b in derived.iter_batches(100, copy=False)])
     np.testing.assert_allclose(got, source_cols["b"] * 2)
-    # a filtered (fancy) selection can't be a view -> still gathered correctly
+    # a filtered (fancy) selection gathers into a reused buffer -> still correct per batch
     mask = source_cols["a"] >= 100
     filt = source.edit().where(col("a") >= 100)
-    got2 = np.concatenate([b.dict()["b"] for b in filt.iter_batches(batch_size=50, copy=False)])
+    got2 = np.concatenate([b.dict()["b"].copy() for b in filt.iter_batches(50, copy=False)])
     np.testing.assert_array_equal(got2, source_cols["b"][mask])
+
+
+def test_iter_batches_copy_false_reuses_buffer_multirecord(tmp_path):
+    from colstore import testing
+
+    # A multi-record store interleaves columns on disk, so copy=False cannot view -- it
+    # gathers into a per-column buffer reused across batches.
+    full = testing.make_columns(2000, 2, names=("a", "b"), seed=0)
+    testing.write_columns(tmp_path / "mr.cstore", full, records=50).close()
+    store = colstore.open(tmp_path / "mr.cstore")
+    try:
+        cf = store.edit()
+        it = iter(cf.iter_batches(200, copy=False))
+        first = next(it).dict()["a"]
+        second = next(it).dict()["a"]
+        assert np.shares_memory(first, second)  # the same buffer, reused across batches
+        got = np.concatenate([b.dict()["a"].copy() for b in cf.iter_batches(200, copy=False)])
+        np.testing.assert_array_equal(got, full["a"])
+    finally:
+        store.close()
+
+
+def test_iter_batches_copy_false_multifile(tmp_path):
+    from colstore import testing
+
+    # A multi-file dataset ignores the out= hint at a file boundary, so copy=False gathers a
+    # fresh array there (no reuse, no dead buffer) and must still produce correct values.
+    a = testing.make_columns(10, 2, names=("x", "y"), seed=1)
+    b = testing.make_columns(10, 2, names=("x", "y"), seed=2)
+    testing.write_columns(tmp_path / "part_0.cstore", a, records=1).close()
+    testing.write_columns(tmp_path / "part_1.cstore", b, records=1).close()
+    ds = colstore.open(str(tmp_path / "part_*.cstore"))
+    try:
+        got = np.concatenate(
+            [fr.dict()["x"].copy() for fr in ds.edit().iter_batches(7, copy=False)]
+        )
+        np.testing.assert_array_equal(got, np.concatenate([a["x"], b["x"]]))
+    finally:
+        ds.close()
 
 
 def test_iter_batches_filtered_gathers_survivors(source, source_cols):

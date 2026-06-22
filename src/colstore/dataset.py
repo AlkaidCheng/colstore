@@ -706,13 +706,17 @@ class ColStoreDataset(_ReaderBase):
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
 
     def _gather_one(
-        self, column_name: str, row_indexer: Any, thread_cap: int | None = None
+        self,
+        column_name: str,
+        row_indexer: Any,
+        thread_cap: int | None = None,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
         self._check_open()
         self._require_columns([column_name])
         children = self._children
         if len(children) == 1:
-            return children[0]._gather_one(column_name, row_indexer, thread_cap)
+            return children[0]._gather_one(column_name, row_indexer, thread_cap, out=out)
         kind, payload = self._classify_rows(row_indexer)
         if kind == "scalar":
             file_index, local = payload
@@ -721,9 +725,11 @@ class ColStoreDataset(_ReaderBase):
         if kind == "fancy":
             return self._fancy_one(column_name, payload)
         if kind == "whole":
-            out = np.empty(self._n_rows, dtype=self._native_dtype(column_name))
-            self._fill_contiguous_columns({column_name: out}, [column_name], self._offset_regions())
-            return out
+            whole = np.empty(self._n_rows, dtype=self._native_dtype(column_name))
+            self._fill_contiguous_columns(
+                {column_name: whole}, [column_name], self._offset_regions()
+            )
+            return whole
         parts, is_mask = payload
         return self._gather_one_contiguous(column_name, parts, is_mask)
 

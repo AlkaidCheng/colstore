@@ -139,6 +139,7 @@ def gather(
     *,
     backend: str = "cpp",
     thread_cap: int | None = None,
+    out: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return ``source[indices]`` as an owning ndarray using the chosen backend.
 
@@ -161,6 +162,11 @@ def gather(
         uses :func:`colstore.config.get_gather_thread_cap`. Callers running
         several gathers concurrently pass a reduced cap so outer threads x
         inner OpenMP threads does not oversubscribe the cores.
+    out : numpy.ndarray or None, optional
+        A contiguous buffer of length ``len(indices)`` and dtype ``dtype`` to fill
+        in place instead of allocating -- a reuse hint for streaming batches. The
+        compiled/JIT kernels fill it directly; the NumPy fallback copies into it. It
+        is returned as-is.
 
     Returns
     -------
@@ -181,7 +187,7 @@ def gather(
             # So when the kernel is compatible we always use it; the kernel's
             # own resolve_thread_count picks the right number of threads
             # (1 below the parallel threshold, scaling up from there).
-            output = np.empty(indices.shape[0], dtype=dtype)
+            output = out if out is not None else np.empty(indices.shape[0], dtype=dtype)
             # The O(K) sortedness check is only paid in "auto" mode, where it
             # is one of the two signals classifying the access regime; an
             # explicit setting skips it (resolve is a passthrough then).
@@ -206,7 +212,7 @@ def gather(
 
     if backend == "numba":
         if _NUMBA_AVAILABLE and kernel_compatible:
-            output = np.empty(indices.shape[0], dtype=dtype)
+            output = out if out is not None else np.empty(indices.shape[0], dtype=dtype)
             _numba_gather_kernel(source, indices, output)
             return output
         if not _NUMBA_AVAILABLE:
@@ -221,4 +227,8 @@ def gather(
         raise ValueError(
             f"Unknown gather backend {backend!r}; expected 'cpp', 'numpy', or 'numba'."
         )
-    return np.asarray(source[indices], dtype=dtype)
+    result = np.asarray(source[indices], dtype=dtype)
+    if out is not None:
+        out[:] = result
+        return out
+    return result

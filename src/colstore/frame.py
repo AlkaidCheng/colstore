@@ -344,6 +344,12 @@ Rows = slice | np.ndarray
 # class body, where it cannot be used directly as a parameter annotation.
 Memo = dict[tuple[Any, ...], NDArray[Any]]
 
+# Per-column reuse buffers for copy=False iter_batches: output name -> a buffer the gather
+# fills in place each batch, or ``None`` once a store is found not to honor the out= hint (a
+# multi-file boundary read), so later batches of that column skip the dead allocation. A name
+# absent from the dict has not been probed yet. Aliased like Memo (the shadowed ``dict``).
+Buffers = dict[str, NDArray[Any] | None]
+
 
 def _row_count(rows: Rows) -> int:
     """Rows a selector picks: a slice's span, a boolean mask's popcount, or an index
@@ -1754,15 +1760,36 @@ class ColStoreFrame:
             acc = batch_max if acc is None else np.maximum(acc, batch_max)
         return acc if acc is not None else float("nan")
 
-    def _batch_column(self, expr: Expr, rows: Rows, memo: Memo) -> NDArray[Any]:
-        """One ``copy=False`` batch column: a read-only zero-copy view when the source can
-        give one (a stored column over a contiguous range of a single-record native store),
-        else a materialized gather/compute shared through ``memo``."""
-        if isinstance(expr, NativeColumn) and not isinstance(rows, np.ndarray):
-            try:
-                return expr._store._view_one(expr.name, rows)
-            except ValueError:
-                pass  # interleaved, non-native, or fancy -> must materialize
+    def _batch_column(
+        self, name: str, expr: Expr, rows: Rows, memo: Memo, buffers: Buffers, rows_per_batch: int
+    ) -> NDArray[Any]:
+        """One ``copy=False`` batch column.
+
+        A read-only zero-copy view when the source can give one (a stored column over a
+        contiguous range of a single-record native store); else, for a bare stored column, a
+        gather into ``buffers[name]`` -- a per-column buffer reused across batches so the
+        streaming gather allocates nothing per batch; else (a transform) a freshly computed
+        array shared through ``memo``. The view and reused-buffer results are valid only until
+        the next batch and must not be held.
+        """
+        if isinstance(expr, NativeColumn):
+            if not isinstance(rows, np.ndarray):
+                try:
+                    return expr._store._view_one(expr.name, rows)
+                except ValueError:
+                    pass  # interleaved, non-native, or fancy -> gather into a reused buffer
+            if name not in buffers:
+                # First gather for this column: probe whether the store fills out= in place. A
+                # store that ignores the hint (a multi-file boundary read) returns a fresh array,
+                # so remember that and stop allocating a dead buffer for it.
+                probe = np.empty(rows_per_batch, result_dtype(expr))
+                got = expr._store._gather_one(expr.name, rows, out=probe[: _row_count(rows)])
+                buffers[name] = probe if np.shares_memory(got, probe) else None
+                return got
+            buf = buffers[name]
+            if buf is None:
+                return expr._store._gather_one(expr.name, rows)  # store ignores out=; gather fresh
+            return expr._store._gather_one(expr.name, rows, out=buf[: _row_count(rows)])
         return evaluate(expr, rows, memo)
 
     def iter_batches(
@@ -1781,13 +1808,15 @@ class ColStoreFrame:
         byte size, ``None`` the configured default budget. A frame with no columns
         or no selected rows yields nothing.
 
-        ``copy=False`` returns a batch column as a **read-only zero-copy view** of the source
-        wherever one is available (a stored column over a contiguous range of a single-record
-        native store), gathering only the columns that need it (a transform, a filtered/fancy
-        selection, or an interleaved multi-record column). The views are valid only while the
-        source store is open and must not be mutated -- a fast path for a read-only streaming
-        consume such as :meth:`dict`. Keep the default ``copy=True`` for owning arrays safe to
-        mutate or hold after the store closes.
+        ``copy=False`` is a fast path for read-only streaming consumers that finish with each
+        batch before drawing the next (accumulating a reduction, writing each batch out, feeding
+        a model): a batch column is a **read-only zero-copy view** of the source where available
+        (a stored column over a contiguous range of a single-record native store), or a gather
+        into a **per-column buffer reused across batches** (an interleaved multi-record column,
+        or a filtered/fancy selection) so the gather allocates nothing per batch; a transform
+        is freshly computed. Because the views and buffers are reused, a batch is valid only
+        until the next is drawn -- do not mutate or hold it. Keep the default ``copy=True`` for
+        owning arrays safe to mutate or hold after the store closes.
         """
         names = list(self._columns)
         selection = self._resolve_index_selection()
@@ -1798,15 +1827,19 @@ class ColStoreFrame:
         rows_per_batch = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
         if rows_per_batch is None:
             rows_per_batch = max(1, config.get_default_memory_budget() // bytes_per_row)
+        buffers: Buffers = {}  # copy=False: per-column gather buffers, reused across batches
         for start in range(0, n, rows_per_batch):
             stop = min(start + rows_per_batch, n)
             rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
-            memo: dict[tuple[Any, ...], NDArray[Any]] = {}
+            memo: Memo = {}
             if copy:
                 columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
             else:
                 columns = {
-                    name: self._batch_column(self._columns[name], rows, memo) for name in names
+                    name: self._batch_column(
+                        name, self._columns[name], rows, memo, buffers, rows_per_batch
+                    )
+                    for name in names
                 }
             yield ColStoreFrame._materialized(columns, stop - start)
 
