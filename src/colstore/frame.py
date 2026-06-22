@@ -342,6 +342,21 @@ def _row_count(rows: Rows) -> int:
     return len(rows)
 
 
+def _wide_sum(batch: NDArray[Any]) -> Any:
+    """Sum a batch in a wide accumulator so the total is independent of the batch size.
+
+    Floating inputs accumulate in float64 (complex in complex128); integer inputs already
+    widen to int64 in NumPy. Without this a float32 column would round differently at each
+    batch boundary, making the reduction's value depend on the memory budget.
+    """
+    kind = batch.dtype.kind
+    if kind == "f":
+        return batch.sum(dtype=np.float64)
+    if kind == "c":
+        return batch.sum(dtype=np.complex128)
+    return batch.sum()
+
+
 class _Leaf(Expr):
     """A graph leaf: a named data source materialized by row range.
 
@@ -1518,6 +1533,101 @@ class ColStoreFrame:
         sources = [np.ascontiguousarray(columns[name]) for name in names]
         dtype = np.dtype([(name, src.dtype) for name, src in zip(names, sources, strict=True)])
         return kernels.interleave_record_array(names, sources, dtype)
+
+    # ---- Reduction terminals (full pass, scalar result) ----------------
+
+    def _stream_column(self, expr: Expr) -> Iterator[NDArray[Any]]:
+        """Yield the selected rows of one column expression, one budgeted batch at a time.
+
+        The full-pass counterpart the reductions share: the selection is resolved once and
+        each batch evaluates ``expr`` alone (a fresh memo), so peak memory is one batch of a
+        single column rather than the whole column.
+        """
+        selection = self._resolve_selection()
+        n = self._n_rows if selection is None else len(selection)
+        if n == 0:
+            return
+        budget = config.get_default_memory_budget()
+        rows_per_batch = max(1, budget // max(1, result_dtype(expr).itemsize))
+        for start in range(0, n, rows_per_batch):
+            stop = min(start + rows_per_batch, n)
+            rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
+            yield evaluate(expr, rows, {})
+
+    def count(self) -> int:
+        """Number of selected rows (resolves any pending :meth:`where`)."""
+        return self._row_count()
+
+    def _reduction_expr(self, column: Any, op: str, kinds: str, requirement: str) -> Expr:
+        """Resolve a reduction's ``column`` and require a supported dtype, else a clear error.
+
+        ``kinds`` is the set of acceptable ``dtype.kind`` characters -- numeric for
+        ``sum``/``mean`` (NumPy has no string ``add``), numeric-or-datetime for
+        ``min``/``max`` (NumPy's ``minimum``/``maximum`` have no string loop either).
+        """
+        expr = self._resolve_value_column(column)
+        dtype = result_dtype(expr)
+        if dtype.kind not in kinds:
+            raise TypeError(f"{op}() needs a {requirement} column; got dtype {dtype}.")
+        return expr
+
+    def sum(self, column: Any) -> Any:
+        """Sum of ``column`` over the selected rows -- a full pass, returning a scalar.
+
+        ``column`` is a name, a :func:`~colstore.col` expression, or a frame expression.
+        The column is streamed in bounded-memory batches and the per-batch sums added.
+        Integer sums widen to int64; floating sums accumulate in float64 for a stable,
+        batch-size-independent result (so a float32 column sums to float64). A NaN in the
+        data propagates to the result (NumPy semantics, not NaN-skipping); an empty
+        selection sums to zero.
+        """
+        expr = self._reduction_expr(column, "sum", "biufc", "numeric")
+        total: Any = None
+        for batch in self._stream_column(expr):
+            partial = _wide_sum(batch)
+            total = partial if total is None else total + partial
+        return total if total is not None else _wide_sum(np.empty(0, result_dtype(expr)))
+
+    def mean(self, column: Any) -> Any:
+        """Mean of ``column`` over the selected rows -- a full pass, returning a float.
+
+        Streams the per-batch sum (a float64 accumulator) and the row count, dividing once
+        at the end. A NaN in the data propagates; an empty selection gives ``nan``.
+        """
+        expr = self._reduction_expr(column, "mean", "biufc", "numeric")
+        total: Any = None
+        n = 0
+        for batch in self._stream_column(expr):
+            partial = _wide_sum(batch)
+            total = partial if total is None else total + partial
+            n += len(batch)
+        return total / n if n else float("nan")
+
+    def min(self, column: Any) -> Any:
+        """Minimum of ``column`` over the selected rows -- a full pass.
+
+        A NaN in the data propagates to the result (NumPy semantics); an empty selection
+        returns a float ``nan`` regardless of the column's dtype.
+        """
+        expr = self._reduction_expr(column, "min", "biufMm", "numeric or datetime")
+        acc: Any = None
+        for batch in self._stream_column(expr):
+            batch_min = batch.min()
+            acc = batch_min if acc is None else np.minimum(acc, batch_min)
+        return acc if acc is not None else float("nan")
+
+    def max(self, column: Any) -> Any:
+        """Maximum of ``column`` over the selected rows -- a full pass.
+
+        A NaN in the data propagates to the result (NumPy semantics); an empty selection
+        returns a float ``nan`` regardless of the column's dtype.
+        """
+        expr = self._reduction_expr(column, "max", "biufMm", "numeric or datetime")
+        acc: Any = None
+        for batch in self._stream_column(expr):
+            batch_max = batch.max()
+            acc = batch_max if acc is None else np.maximum(acc, batch_max)
+        return acc if acc is not None else float("nan")
 
     def iter_batches(self, batch_size: int | str | None = None) -> Iterator[ColStoreFrame]:
         """Yield the selected rows as materialized frames, bounded in memory.

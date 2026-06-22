@@ -154,6 +154,7 @@ cf = cf.select("close", "open", "ratio")         # project columns; filter() ali
 cf.n_rows                                        # how many rows the frame selects (resolves it)
 cf.report()                                      # cutflow per named cut (raw / weighted / both)
 cf.dict(); cf.recarray(); cf.array("ratio")      # materialize the selected rows in memory
+cf.sum("ratio"); cf.mean("pt"); cf.max("eta"); cf.count()   # full-pass scalar reductions
 for batch in cf.iter_batches("256 MiB"):  ...    # or stream bounded in-memory frames (any format)
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
 

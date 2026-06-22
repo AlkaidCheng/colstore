@@ -731,6 +731,73 @@ def test_apply_no_columns_raises(source):
         source.edit().apply(lambda: np.array([]))
 
 
+def test_reductions_over_columns(source, source_cols):
+    a, b = source_cols["a"], source_cols["b"]
+    cf = source.edit()
+    assert cf.count() == len(a)
+    np.testing.assert_allclose(cf.sum("b"), b.sum())
+    np.testing.assert_allclose(cf.mean("b"), b.mean())
+    np.testing.assert_allclose(cf.min("b"), b.min())
+    np.testing.assert_allclose(cf.max("b"), b.max())
+    assert int(cf.sum("a")) == int(a.sum())  # integer column widens, no overflow
+
+
+def test_reductions_respect_where_and_expressions(source, source_cols):
+    a, b = source_cols["a"], source_cols["b"]
+    mask = a >= 100
+    cf = source.edit().where(col("a") >= 100)
+    assert cf.count() == int(mask.sum())
+    np.testing.assert_allclose(cf.sum("b"), b[mask].sum())
+    np.testing.assert_allclose(cf.mean("b"), b[mask].mean())
+    np.testing.assert_allclose(cf.sum(col("b") * 2), (b[mask] * 2).sum())  # derived expression
+
+
+def test_reductions_empty_selection(source):
+    cf = source.edit().where("a < 0")  # a = arange(n) >= 0, so nothing matches
+    assert cf.count() == 0
+    assert cf.sum("b") == 0
+    assert np.isnan(cf.mean("b"))
+    assert np.isnan(cf.min("b"))
+    assert np.isnan(cf.max("b"))
+
+
+def test_reductions_combine_across_batches(source, source_cols, monkeypatch):
+    import colstore.config as config_mod
+
+    monkeypatch.setattr(config_mod, "get_default_memory_budget", lambda: 16)  # ~2 float64/batch
+    b = source_cols["b"]
+    cf = source.edit()
+    np.testing.assert_allclose(cf.sum("b"), b.sum())
+    np.testing.assert_allclose(cf.mean("b"), b.mean())
+    np.testing.assert_allclose(cf.min("b"), b.min())
+    np.testing.assert_allclose(cf.max("b"), b.max())
+
+
+def test_reductions_float32_wide_accumulator(source, source_cols, monkeypatch):
+    import colstore.config as config_mod
+
+    c64 = source_cols["c"].astype(np.float64)  # the float32 column, promoted, for a reference
+    cf = source.edit()
+    full = float(cf.sum("c"))
+    monkeypatch.setattr(config_mod, "get_default_memory_budget", lambda: 8)  # 2 float32 rows/batch
+    np.testing.assert_allclose(float(cf.sum("c")), full, rtol=1e-10)  # budget-independent
+    np.testing.assert_allclose(full, c64.sum(), rtol=1e-10)  # matches a float64 single pass
+    np.testing.assert_allclose(cf.mean("c"), c64.mean(), rtol=1e-10)
+    assert np.asarray(cf.sum("c")).dtype == np.dtype(np.float64)  # float32 sums to float64
+
+
+def test_reductions_non_numeric_column(tmp_path):
+    store = _make_store(tmp_path, {"s": np.array(["a", "bb", "ccc"], "S3")}, name="strings.cstore")
+    try:
+        cf = store.edit()
+        # NumPy has no add/minimum loop for strings; every reduction gives a clear error.
+        for reduce in (cf.sum, cf.mean, cf.min, cf.max):
+            with pytest.raises(TypeError, match="column"):
+                reduce("s")
+    finally:
+        store.close()
+
+
 def test_assign_col_unknown_raises(source):
     with pytest.raises(KeyError, match="not a column of this frame"):
         source.edit().assign(z=col("nope"))
