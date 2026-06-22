@@ -565,6 +565,71 @@ class Where(Expr):
         )
 
 
+class Apply(Expr):
+    """A node applying an opaque user function to its input columns, batch by batch.
+
+    The function receives each input column as a NumPy array -- the whole batch,
+    treated as the whole array -- and returns a 1-D array of the same length. Any
+    NumPy is allowed, since the function is run rather than traced; it is the escape
+    hatch for a column that cannot be written as a NumPy expression over ``cf[...]``.
+    The output dtype is ``out_dtype`` when given, else inferred once at build time by
+    running the function on empty inputs (no store data is read, though the function is
+    executed). An inferred dtype must hold for every batch: a batch whose result dtype
+    differs raises rather than being silently cast, so a function whose output dtype
+    depends on the data must pass ``out_dtype`` -- which is then authoritative, each
+    batch cast to it. ``out_dtype`` is also required when the function cannot run on a
+    zero-length input. Every batch is checked to be a 1-D numeric array of the batch's
+    length.
+
+    Like every node, the function must be elementwise for a batched terminal
+    (:meth:`~ColStoreFrame.write` / :meth:`~ColStoreFrame.iter_batches`) to match a
+    single-pass result: batching only bounds memory, so each batch is the whole array
+    to the function, and one that mixes rows sees each batch on its own.
+    """
+
+    __slots__ = ("_declared", "_dtype", "_func", "_inputs", "_key")
+
+    def __init__(
+        self, func: Callable[..., Any], inputs: tuple[Expr, ...], out_dtype: Any = None
+    ) -> None:
+        self._func = func
+        self._inputs = inputs
+        self._declared = out_dtype is not None
+        self._dtype = _apply_output_dtype(func, inputs, out_dtype)
+        self._key = ("apply", id(func), self._dtype.str, tuple(inp._key for inp in inputs))
+
+
+def _apply_output_dtype(
+    func: Callable[..., Any], inputs: tuple[Expr, ...], out_dtype: Any
+) -> np.dtype[Any]:
+    """Resolve an :class:`Apply` node's output dtype, reading no data.
+
+    Returns ``out_dtype`` when given. Otherwise runs ``func`` once on empty arrays of
+    the inputs' dtypes -- NumPy resolves the output dtype shape-independently, so this
+    touches no store and is exact for NumPy-composed functions. Raises when the
+    function cannot run on empty input (pass ``out_dtype``) or yields a non-1-D or
+    unsupported (object / structured) result.
+    """
+    if out_dtype is not None:
+        declared: np.dtype[Any] = np.dtype(out_dtype)
+        return declared
+    sample = [np.empty(0, result_dtype(inp)) for inp in inputs]
+    try:
+        probed: NDArray[Any] = np.asarray(func(*sample))
+    except Exception as exc:
+        raise TypeError(
+            f"running apply()'s function on empty inputs to infer its dtype failed "
+            f"({type(exc).__name__}: {exc}); if it cannot accept a zero-length input, "
+            "pass out_dtype=, otherwise this is a bug in the function."
+        ) from exc
+    if probed.ndim != 1 or probed.dtype.kind in "OV":
+        raise TypeError(
+            f"apply()'s function gave an unsupported result on empty inputs (dtype "
+            f"{probed.dtype}, ndim {probed.ndim}); return a 1-D numeric array, or pass out_dtype=."
+        )
+    return probed.dtype
+
+
 def _np_where(condition: Any, *branches: Any) -> Expr:
     """``numpy.where(cond, x, y)`` builder for the column-expression dispatch table."""
     if len(branches) != 2:
@@ -634,7 +699,33 @@ def evaluate(
         a = evaluate(node._a, rows, memo) if isinstance(node._a, Expr) else node._a
         b = evaluate(node._b, rows, memo) if isinstance(node._b, Expr) else node._b
         result = np.where(cond, a, b)
-    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast, Isin, Where
+    elif isinstance(node, Apply):
+        n = _row_count(rows)
+        if n == 0:
+            result = np.empty(0, node._dtype)  # pinned dtype; never re-run func on empty
+        else:
+            out = np.asarray(node._func(*(evaluate(inp, rows, memo) for inp in node._inputs)))
+            if out.ndim != 1 or out.shape[0] != n:
+                raise ValueError(
+                    f"apply()'s function must return a 1-D array of length {n}; "
+                    f"got shape {out.shape}."
+                )
+            if out.dtype.kind in "OV":
+                raise TypeError(
+                    f"apply()'s function returned an unsupported dtype {out.dtype}; "
+                    "return a numeric array, or pass a concrete out_dtype=."
+                )
+            if out.dtype == node._dtype:
+                result = out
+            elif node._declared:
+                result = out.astype(node._dtype)  # the declared out_dtype is authoritative
+            else:
+                raise ValueError(
+                    f"apply()'s function returned dtype {out.dtype} on a batch but "
+                    f"{node._dtype} was inferred from empty inputs -- its output dtype "
+                    "depends on the data; pass out_dtype= to set the column dtype."
+                )
+    else:  # pragma: no cover - the Expr hierarchy is closed to its node types
         raise TypeError(f"cannot evaluate node of type {type(node).__name__!r}.")
     memo[node._key] = result
     return result
@@ -661,6 +752,9 @@ def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
         for child in (node._cond, node._a, node._b):
             if isinstance(child, Expr):
                 yield from _iter_leaves(child)
+    elif isinstance(node, Apply):
+        for inp in node._inputs:
+            yield from _iter_leaves(inp)
 
 
 def fusible_passthroughs(specs: dict[str, Expr]) -> dict[str, NativeColumn]:
@@ -1099,6 +1193,44 @@ class ColStoreFrame:
             )
         validate_length(expr, self._n_rows)
         return expr
+
+    def _resolve_value_column(self, value: Any) -> Expr:
+        """Resolve an :meth:`apply` input -- a column name, a :func:`~colstore.col`
+        expression, or a frame expression -- to a frame :class:`Expr`."""
+        if isinstance(value, str):
+            return self._resolve_column(value)
+        if isinstance(value, _Expr):
+            emitted: Expr = value._emit(_QueryValueBuilder(self._resolve_column))
+            return emitted
+        if isinstance(value, Expr):
+            return value
+        raise TypeError(
+            f"apply() columns must be column names or expressions; got "
+            f"{type(value).__name__}. Bake any constants into the function instead."
+        )
+
+    def apply(self, func: Callable[..., Any], *cols: Any, out_dtype: Any = None) -> Expr:
+        """Derive a column by running ``func`` on the named columns' arrays.
+
+        ``func`` receives each of ``cols`` -- column names, :func:`~colstore.col`
+        expressions, or frame expressions -- as a NumPy array (the whole batch) and
+        returns a 1-D array of the same length: the escape hatch for a column that
+        cannot be written as a NumPy expression over ``cf[...]``. Any NumPy is allowed
+        (the function is run, not traced). The result dtype is inferred by running
+        ``func`` once on empty inputs (reads no store data, but does execute ``func``,
+        so an effectful one should be pure) -- pass ``out_dtype`` when ``func`` cannot
+        run on a zero-length input, when its output dtype depends on the data, or to
+        skip that build-time call. The returned expression composes and is attached with
+        ``cf[name] = ...`` or :meth:`assign`.
+
+        Because batching only bounds memory, each batch is the whole array to ``func``;
+        a function that mixes rows (a running total, a sort) sees each batch on its own,
+        while elementwise (per-row) functions -- the common case -- are unaffected.
+        """
+        if not cols:
+            raise TypeError("apply() needs at least one column.")
+        inputs = tuple(self._resolve_value_column(c) for c in cols)
+        return Apply(func, inputs, out_dtype)
 
     def copy(self) -> ColStoreFrame:
         """An independent copy of the frame -- a cheap branch point.

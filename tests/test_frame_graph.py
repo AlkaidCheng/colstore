@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 
 from colstore.frame import (
+    Apply,
     ConstColumn,
     Expr,
     MemoryColumn,
@@ -241,6 +242,74 @@ def test_np_where_single_arg_rejected(xy):
 def test_where_all_scalar_rejected():
     with pytest.raises(TypeError, match="at least one column operand"):
         Where(True, 1, 2)
+
+
+def test_apply_runs_func_and_infers_dtype_from_empty(xy):
+    x, y = xy
+    a, b = MemoryColumn(x), MemoryColumn(y)
+    node = Apply(lambda u, v: np.hypot(u, v), (a, b))
+    assert result_dtype(node) == np.dtype(np.float64)  # empty-probe, reads no data
+    np.testing.assert_allclose(_full(node, len(x)), np.hypot(x, y))
+    assert declared_length(node) == len(x)  # length comes from the input leaves
+
+
+def test_apply_out_dtype_overrides_probe(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    node = Apply(lambda u: u * 2, (a,), out_dtype="float32")
+    assert result_dtype(node) == np.dtype(np.float32)
+    assert _full(node, len(x)).dtype == np.dtype(np.float32)
+
+
+def test_apply_length_changing_func_rejected_at_eval(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    node = Apply(lambda u: u[:3], (a,), out_dtype="float64")  # out_dtype skips the build probe
+    with pytest.raises(ValueError, match="1-D array of length"):
+        _full(node, len(x))
+
+
+def test_apply_reduction_rejected_at_build(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    with pytest.raises(TypeError, match="unsupported result"):
+        Apply(lambda u: u.sum(), (a,))  # collapses to 0-d on empty input
+
+
+def test_apply_empty_hostile_func_requires_out_dtype(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    with pytest.raises(TypeError, match="out_dtype"):
+        Apply(lambda u: u / u[0], (a,))  # indexes [0]; raises on empty input
+    node = Apply(lambda u: u / u[0], (a,), out_dtype="float64")  # ok once declared
+    np.testing.assert_allclose(_full(node, len(x)), x / x[0])
+
+
+def test_apply_value_dependent_dtype_rejected_at_eval(xy):
+    x, _ = xy
+    a = MemoryColumn(np.arange(len(x), dtype=np.int64))
+    # int8 on the empty probe, int64 on the real batch -> a data-dependent dtype.
+    node = Apply(lambda u: u.astype(np.int8) if u.size == 0 else u, (a,))
+    with pytest.raises(ValueError, match="depends on the data"):
+        _full(node, len(x))
+
+
+def test_apply_declared_out_dtype_coerces_batch(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    node = Apply(lambda u: u, (a,), out_dtype="float32")  # returns float64, declared float32
+    got = _full(node, len(x))
+    assert got.dtype == np.dtype(np.float32)
+    np.testing.assert_allclose(got, x.astype(np.float32), rtol=1e-6)
+
+
+def test_apply_object_return_rejected_at_eval(xy):
+    x, _ = xy
+    a = MemoryColumn(x)
+    # numeric on the empty probe, object on the real batch.
+    node = Apply(lambda u: u if u.size == 0 else np.array([object()] * len(u)), (a,))
+    with pytest.raises(TypeError, match="unsupported dtype"):
+        _full(node, len(x))
 
 
 def test_raw_ndarray_operand_rejected(xy):
