@@ -19,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import kernels
+from ._pandas import _make_dataframe_no_consolidate
 from ._query import _Expr, parse_query, validate_predicate
 from ._render import Preview
 from .view import (
@@ -33,6 +34,8 @@ from .view import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pandas as pd
 
     from .frame import ColStoreFrame
 
@@ -75,6 +78,10 @@ class _ReaderBase(abc.ABC):
     @abc.abstractmethod
     def _view_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         """Zero-copy read of several columns, or raise when a copy is unavoidable."""
+
+    @abc.abstractmethod
+    def _check_open(self) -> None:
+        """Raise ``ValueError`` if the store is closed."""
 
     def _gather_slice_into(
         self, out: NDArray[Any], column_name: str, start: int, stop: int
@@ -187,6 +194,7 @@ class _ReaderBase(abc.ABC):
         One field per column, in stored order; ``result[name]`` is the column.
         See :meth:`_build_recarray` for how the columns are interleaved.
         """
+        self._check_open()
         names = self.columns
         if not names or self.n_rows == 0:
             record_dtype = np.dtype([(name, self._native_dtype(name)) for name in names])
@@ -211,6 +219,7 @@ class _ReaderBase(abc.ABC):
         numpy.ndarray
             1-D array of the column in its stored dtype.
         """
+        self._check_open()
         return self[name].array(copy=copy)
 
     def _build_recarray(self, row_indexer: Any, column_names: list[str]) -> NDArray[Any]:
@@ -407,3 +416,42 @@ class _ReaderBase(abc.ABC):
     def _query_probe(self, name: str) -> NDArray[Any]:
         """An empty typed array for one column, for the data-free query dtype probe."""
         return np.empty(0, dtype=self._native_dtype(name))
+
+    # ---- Whole-store materialization shortcuts -------------------------
+    #
+    # ``dict`` / ``frame`` are kept at the bottom of the class so the method
+    # named ``dict`` does not shadow the builtin ``dict`` in the annotation
+    # scope of earlier methods (mypy resolves annotations in declaration order
+    # against the class namespace). ``recarray`` / ``array`` sit with the other
+    # materializers above -- their names collide with nothing.
+
+    def dict(self, copy: bool = True) -> dict[str, NDArray[Any]]:
+        """Materialize the whole store as a dict mapping column name to ndarray.
+
+        Parameters
+        ----------
+        copy : bool, optional
+            ``True`` (default): owning arrays. ``False``: READ-ONLY zero-copy
+            views over the store; supported only on single-record stores with
+            native-byte-order dtypes, raising ``ValueError`` otherwise. The views
+            stay valid after :meth:`close`.
+
+        Returns
+        -------
+        dict[str, numpy.ndarray]
+            Arrays in on-disk column order, stored dtypes preserved (native byte
+            order).
+        """
+        self._check_open()
+        names = self.columns
+        return self._view_many(names, None) if not copy else self._gather_many(names, None)
+
+    def frame(self, copy: bool = True) -> pd.DataFrame:
+        """Materialize the whole store as a pandas DataFrame.
+
+        Columns are in on-disk order with their stored dtypes preserved.
+        ``copy=False`` returns a READ-ONLY frame whose columns are zero-copy views,
+        under the same conditions and lifetime as :meth:`dict` (raising rather than
+        copying when any column cannot be viewed).
+        """
+        return _make_dataframe_no_consolidate(self.dict(copy=copy))

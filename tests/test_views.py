@@ -334,7 +334,7 @@ def test_make_dataframe_no_consolidate_handles_empty():
     degrade gracefully so that ``frame()`` on a future zero-column store
     or a test does not crash.
     """
-    from colstore.reader import _make_dataframe_no_consolidate
+    from colstore._pandas import _make_dataframe_no_consolidate
 
     df = _make_dataframe_no_consolidate({})
     assert isinstance(df, pd.DataFrame)

@@ -41,7 +41,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import Any, TypeAlias
 
 import numpy as np
 from numpy.typing import NDArray
@@ -49,10 +49,7 @@ from numpy.typing import NDArray
 from . import config
 from ._base import _ReaderBase
 from ._paths import expand_glob
-from .reader import ColStoreReader, _indices_are_sorted, _make_dataframe_no_consolidate
-
-if TYPE_CHECKING:
-    import pandas as pd
+from .reader import ColStoreReader, _indices_are_sorted
 
 # A single source: a path to open (owned), or an already-open reader/dataset
 # (borrowed). The constructor and append() accept one of these or a sequence.
@@ -830,25 +827,6 @@ class ColStoreDataset(_ReaderBase):
         if len(self._children) == 1:
             return self._children[0]._view_many(column_names, row_indexer)
         return {name: self._view_one(name, row_indexer) for name in column_names}
-
-    # ---- Whole-store materializers -------------------------------------
-
-    def dict(self, copy: bool = True) -> dict[str, NDArray[Any]]:
-        """Materialize every column as a mapping of name to ndarray."""
-        self._check_open()
-        column_names = list(self._column_dtypes)
-        if not copy:
-            return self._view_many(column_names, None)
-        return self._gather_many(column_names, None)
-
-    def frame(self, copy: bool = True) -> pd.DataFrame:
-        """Materialize the whole dataset as a pandas DataFrame.
-
-        ``copy=False`` returns a read-only frame whose columns are zero-copy
-        views over the open memmaps, under the same all-or-nothing conditions
-        as :meth:`dict` (raising rather than copying when unavailable).
-        """
-        return _make_dataframe_no_consolidate(self.dict(copy=copy))
 
     # ---- Combination ---------------------------------------------------
 

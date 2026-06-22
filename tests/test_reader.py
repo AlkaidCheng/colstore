@@ -56,6 +56,18 @@ def test_close_releases_memmaps(small_store):
         small_store["price"].array()
 
 
+def test_materializers_raise_after_close(small_store):
+    small_store.close()
+    for materialize in (
+        small_store.dict,
+        small_store.recarray,
+        small_store.frame,
+        lambda: small_store.array("price"),
+    ):
+        with pytest.raises(ValueError, match="closed"):
+            materialize()
+
+
 def test_close_is_idempotent(small_store):
     small_store.close()
     small_store.close()  # second call must not raise
