@@ -21,12 +21,12 @@ import numpy as np
 from . import config
 from ._query import _Expr, evaluate_mask
 from ._render import Preview, render_lazy_card
+from .frame import ColStoreFrame
 
 if TYPE_CHECKING:
     import pandas as pd
 
     from ._base import _ReaderBase
-    from .frame import ColStoreFrame
 
 _RowIndexer = int | slice | np.ndarray | None
 
@@ -290,15 +290,23 @@ class _BaseView:
         """Open a deferred editing frame over this view's columns and rows.
 
         Seeds a :class:`~colstore.frame.ColStoreFrame` with this view's columns as
-        native leaves, carrying over its row selection -- the resolved ``col()`` /
-        ``query`` predicate, fancy index, slice, or mask -- so a gathered or
-        filtered view continues straight into the edit API. The source store is not
-        modified; :meth:`~colstore.frame.ColStoreFrame.write` produces a new file.
+        native leaves and carries over its row selection. A concrete selector --
+        int, slice, fancy index, or boolean mask -- becomes the frame's fixed row
+        set; a lazy ``col()`` / ``query`` predicate is carried as a pending
+        :meth:`~colstore.frame.ColStoreFrame.where`, resolved (like the rest of the
+        graph) only when the frame is materialized. So ``ds[pred].edit()`` matches
+        ``ds.edit().where(pred)`` -- it stays lazy and the cut shows in
+        :meth:`~colstore.frame.ColStoreFrame.report`; call :meth:`evaluate` before
+        :meth:`edit` to resolve the predicate to a fixed row set first. The source
+        store is not modified; :meth:`~colstore.frame.ColStoreFrame.write` produces a
+        new file.
         """
-        from .frame import ColStoreFrame
-
+        columns = self._edit_columns()
+        row = self._row_part
+        if isinstance(row, _Expr):
+            return ColStoreFrame(self._store, columns, predicate=row)
         rows = edit_row_selection(self._resolve_row_indexer(), self._store.n_rows)
-        return ColStoreFrame(self._store, self._edit_columns(), rows)
+        return ColStoreFrame(self._store, columns, rows)
 
 
 class ColumnView(_BaseView):

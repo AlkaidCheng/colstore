@@ -885,6 +885,7 @@ class ColStoreFrame:
         store: _ReaderBase,
         columns: list[str] | None = None,
         rows: NDArray[Any] | None = None,
+        predicate: _Expr | None = None,
     ) -> None:
         self._store = store
         self._n_rows = store.n_rows
@@ -892,6 +893,8 @@ class ColStoreFrame:
         self._predicates: tuple[_Cut, ...] = ()
         names = store.columns if columns is None else columns
         self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in names}
+        if predicate is not None:
+            self._carry_reader_predicate(predicate)
 
     @property
     def n_rows(self) -> int:
@@ -1177,28 +1180,60 @@ class ColStoreFrame:
         frame._columns = {name: frame._columns[name] for name in names}
         return frame
 
-    def _compile_predicate(self, predicate: str | _Expr, params: dict[str, Any] | None) -> Expr:
-        """Validate a ``col()`` / query-string predicate against the frame's columns
+    def _compile_predicate(
+        self,
+        predicate: str | _Expr,
+        params: dict[str, Any] | None,
+        *,
+        resolve: Callable[[str], Expr] | None = None,
+        universe: frozenset[str] | None = None,
+    ) -> Expr:
+        """Validate a ``col()`` / query-string predicate against a column universe
         and compile it to a boolean frame-expression node -- reading no data.
 
-        Names resolve in order, against the frame as it stands -- a column derived
-        earlier is a valid target, a dropped or renamed-away one is not. Raises
+        By default names resolve in order against the frame's own columns -- a
+        column derived earlier is a valid target, a dropped or renamed-away one is
+        not. The :meth:`~colstore.view.TableView.edit` seam passes a store-backed
+        ``resolve`` and the store's columns as ``universe`` instead, so a carried
+        reader predicate keeps the reader's resolution scope. Raises
         :class:`~colstore.QueryError` for an unknown column or a non-boolean condition.
         """
-        columns = frozenset(self._columns)
+        resolve = self._resolve_column if resolve is None else resolve
+        universe = frozenset(self._columns) if universe is None else universe
         query = (
-            predicate if isinstance(predicate, _Expr) else parse_query(predicate, columns, params)
+            predicate if isinstance(predicate, _Expr) else parse_query(predicate, universe, params)
         )
-        missing = sorted(name for name in set(query._columns()) if name not in self._columns)
+        missing = sorted(name for name in set(query._columns()) if name not in universe)
         if missing:
             raise QueryError(
-                f"where references unknown column(s) {missing}; have {sorted(self._columns)}."
+                f"the where() predicate references unknown column(s) {missing}; "
+                f"have {sorted(universe)}."
             )
-        node: Expr = query._emit(_QueryValueBuilder(self._resolve_column))
+        node: Expr = query._emit(_QueryValueBuilder(resolve))
         dtype = result_dtype(node)
         if dtype.kind != "b":
-            raise QueryError(f"a where predicate must be a boolean condition; got dtype {dtype}.")
+            raise QueryError(f"a where() predicate must be a boolean condition; got dtype {dtype}.")
         return node
+
+    def _carry_reader_predicate(self, predicate: _Expr) -> None:
+        """Record a reader predicate from :meth:`~colstore.view.TableView.edit` as a
+        pending :meth:`where`.
+
+        The predicate's names resolve against the source store, not only the frame's
+        (possibly projected) columns, so a predicate referencing a column the view
+        dropped still filters -- matching ``ds[pred, cols]`` reader semantics and
+        ``ds.edit().where(pred).select(cols)``. Reads no data; the cut resolves with
+        the rest of the graph when the frame is materialized.
+        """
+        store = self._store
+        assert store is not None  # the view.edit() seam always carries a real store
+        node = self._compile_predicate(
+            predicate,
+            None,
+            resolve=lambda name: NativeColumn(store, name),
+            universe=frozenset(store.columns),
+        )
+        self._predicates = (*self._predicates, _Cut(None, node, None))
 
     def _resolve_weight(self, weight: str | _Expr | Expr | None) -> Expr | None:
         """Resolve a ``where`` weight to a numeric column expression (or ``None``).
