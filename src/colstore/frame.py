@@ -372,6 +372,32 @@ def _normalize_base_rows(
     return np.flatnonzero(rows)
 
 
+def _available_memory() -> int | None:
+    """Available system RAM in bytes, or ``None`` if psutil is unavailable."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    return int(psutil.virtual_memory().available)
+
+
+def _guard_index_memory(count: int) -> None:
+    """Raise before an int64 row index of ``count`` rows would exceed available RAM.
+
+    The resolved selection's row index is the irreducible cost of a full-selection
+    resolution; this fails fast with a clear message instead of an OOM kill when the whole
+    index cannot be materialized. Best-effort: skipped when available memory is unknown.
+    """
+    available = _available_memory()
+    nbytes = count * 8
+    if available is not None and nbytes > available:
+        raise MemoryError(
+            f"resolving this selection needs {nbytes / 2**30:.2f} GiB for its row index "
+            f"({count:,} rows) but only {available / 2**30:.2f} GiB is available; "
+            f"select fewer rows or free memory before materializing."
+        )
+
+
 def _wide_sum(batch: NDArray[Any]) -> Any:
     """Sum a batch in a wide accumulator so the total is independent of the batch size.
 
@@ -1091,8 +1117,13 @@ class ColStoreFrame:
         return self._row_count()
 
     def _row_count(self) -> int:
-        selection = self._resolve_selection()
-        return self._n_rows if selection is None else _row_count(selection)
+        # n_rows must never throw, so count via the predicate mask's popcount -- it never
+        # materializes the (potentially huge) row index, so the index-memory guard in
+        # _resolve_selection cannot fire here.
+        if not self._predicates:
+            return self._n_rows if self._rows is None else _row_count(self._rows)
+        _, mask = self._composed_mask()
+        return int(np.count_nonzero(mask))
 
     def _apply_cuts(
         self, base_rows: Rows, *, count: bool = False
@@ -1142,17 +1173,26 @@ class ColStoreFrame:
             return np.flatnonzero(base)
         return base
 
-    def _resolve_selection(self) -> NDArray[Any] | None:
-        """The concrete row selection: the base rows narrowed by every pending
-        predicate (``None`` = all rows). An un-composed boolean mask is returned as-is
-        so a terminal can gather it mask-natively; a predicate composes onto the lowered
-        indices. Evaluating the predicates is the deferred work :meth:`where` records."""
-        if not self._predicates:
-            return self._rows
+    def _composed_mask(self) -> tuple[NDArray[Any] | None, NDArray[Any]]:
+        """The base selection (a kept mask lowered to indices) and the AND-of-predicates
+        mask over it. Callers either count it (``count_nonzero``, for :attr:`n_rows`) or
+        materialize the surviving indices (``flatnonzero``, for a terminal)."""
         base = self._base_indices()
         base_rows: Rows = slice(0, self._n_rows) if base is None else base
         mask, _ = self._apply_cuts(base_rows)
         assert mask is not None  # _predicates is non-empty here
+        return base, mask
+
+    def _resolve_selection(self) -> NDArray[Any] | None:
+        """The concrete row selection: the base rows narrowed by every pending
+        predicate (``None`` = all rows). An un-composed boolean mask is returned as-is
+        so a terminal can gather it mask-natively; a predicate composes onto the lowered
+        indices, guarded so the row index is not materialized larger than available RAM.
+        Evaluating the predicates is the deferred work :meth:`where` records."""
+        if not self._predicates:
+            return self._rows
+        base, mask = self._composed_mask()
+        _guard_index_memory(int(np.count_nonzero(mask)))
         return np.flatnonzero(mask) if base is None else base[mask]
 
     def report(self, show: str | None = None) -> CutflowReport:
@@ -1191,6 +1231,7 @@ class ColStoreFrame:
         over a mask would slice mask positions, not selected source rows."""
         selection = self._resolve_selection()
         if selection is not None and selection.dtype == bool:
+            _guard_index_memory(int(np.count_nonzero(selection)))
             return np.flatnonzero(selection)
         return selection
 
