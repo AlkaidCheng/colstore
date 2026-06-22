@@ -12,7 +12,8 @@ versus the fastest budget and versus one batch (effectively unlimited):
 * transform depth -- a couple of derived columns, and a deeper expression whose per-batch
   intermediates are NOT counted in the budget (the case most likely to want a smaller one);
 * the other budget-consuming paths -- a full-column reduction (its own small chunk; a
-  single-record bare column folds a zero-copy view instead) and an iter_batches consume;
+  single-record bare column folds a zero-copy view) and an iter_batches dict consume with
+  copy=True (gather each batch) vs copy=False (zero-copy views where the source allows);
 * a passthrough write as a control (the no-transform merge-copy ignores the budget).
 
 Filter thresholds are quantile-picked so selectivity is exact regardless of the data
@@ -90,16 +91,17 @@ def _scenarios(thr50: float, thr05: float):
         ("transform (+2 derived)", transform, "write"),
         ("deep transform (sqrt sum)", deep, "write"),
         ("reduction sum", passthrough, "reduce"),
-        ("iter_batches consume", filt(list(_NAMES), thr50), "iter"),
+        ("iter all dict (copy=True)", passthrough, "iter"),
+        ("iter all dict (copy=False)", passthrough, "iter_nocopy"),
     ]
 
 
-def _iter_consume(frame, budget: int) -> None:
-    # Build and discard each batch -- the streaming use iter_batches exists for. Collecting
-    # them in a list instead holds the whole dataset (no memory bound) and churns page faults.
+def _iter_consume(frame, budget: int, *, copy: bool) -> None:
+    # Stream and discard each batch as a dict -- the column-major HEP consume (no row-major
+    # interleave); collecting the batches would hold the whole dataset and defeat the bound.
     config.set_default_memory_budget(budget)
-    for batch in frame.iter_batches():
-        batch.recarray()
+    for batch in frame.iter_batches(copy=copy):
+        batch.dict()
 
 
 def _op(frame, kind: str, out: Path, budget: int):
@@ -107,7 +109,9 @@ def _op(frame, kind: str, out: Path, budget: int):
         return lambda: frame.write(out, memory_budget=budget).close()
     if kind == "reduce":
         return lambda: (setattr(cframe, "_REDUCTION_CHUNK_BYTES", budget), frame.sum("c0"))[1]
-    return lambda: _iter_consume(frame, budget)
+    if kind == "iter":
+        return lambda: _iter_consume(frame, budget, copy=True)
+    return lambda: _iter_consume(frame, budget, copy=False)  # iter_nocopy
 
 
 def _sweep(name: str, frame, kind: str, total: int, out: Path, args: argparse.Namespace):

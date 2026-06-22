@@ -338,6 +338,12 @@ class Expr:
 # under _row_count.
 Rows = slice | np.ndarray
 
+# A per-batch evaluation cache: a node's structural key -> its computed array, so a shared
+# subexpression is read or computed once across the columns of one batch. Aliased at module
+# scope because the ``dict`` builtin is shadowed by the frame's ``dict()`` terminal in the
+# class body, where it cannot be used directly as a parameter annotation.
+Memo = dict[tuple[Any, ...], NDArray[Any]]
+
 
 def _row_count(rows: Rows) -> int:
     """Rows a selector picks: a slice's span, a boolean mask's popcount, or an index
@@ -1748,7 +1754,20 @@ class ColStoreFrame:
             acc = batch_max if acc is None else np.maximum(acc, batch_max)
         return acc if acc is not None else float("nan")
 
-    def iter_batches(self, batch_size: int | str | None = None) -> Iterator[ColStoreFrame]:
+    def _batch_column(self, expr: Expr, rows: Rows, memo: Memo) -> NDArray[Any]:
+        """One ``copy=False`` batch column: a read-only zero-copy view when the source can
+        give one (a stored column over a contiguous range of a single-record native store),
+        else a materialized gather/compute shared through ``memo``."""
+        if isinstance(expr, NativeColumn) and not isinstance(rows, np.ndarray):
+            try:
+                return expr._store._view_one(expr.name, rows)
+            except ValueError:
+                pass  # interleaved, non-native, or fancy -> must materialize
+        return evaluate(expr, rows, memo)
+
+    def iter_batches(
+        self, batch_size: int | str | None = None, *, copy: bool = True
+    ) -> Iterator[ColStoreFrame]:
         """Yield the selected rows as materialized frames, bounded in memory.
 
         The streaming counterpart of :meth:`recarray`: the selection is resolved
@@ -1761,6 +1780,14 @@ class ColStoreFrame:
         memory budget per batch (e.g. ``"256 MiB"``) converted from the per-row
         byte size, ``None`` the configured default budget. A frame with no columns
         or no selected rows yields nothing.
+
+        ``copy=False`` returns a batch column as a **read-only zero-copy view** of the source
+        wherever one is available (a stored column over a contiguous range of a single-record
+        native store), gathering only the columns that need it (a transform, a filtered/fancy
+        selection, or an interleaved multi-record column). The views are valid only while the
+        source store is open and must not be mutated -- a fast path for a read-only streaming
+        consume such as :meth:`dict`. Keep the default ``copy=True`` for owning arrays safe to
+        mutate or hold after the store closes.
         """
         names = list(self._columns)
         selection = self._resolve_index_selection()
@@ -1775,7 +1802,12 @@ class ColStoreFrame:
             stop = min(start + rows_per_batch, n)
             rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
             memo: dict[tuple[Any, ...], NDArray[Any]] = {}
-            columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
+            if copy:
+                columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
+            else:
+                columns = {
+                    name: self._batch_column(self._columns[name], rows, memo) for name in names
+                }
             yield ColStoreFrame._materialized(columns, stop - start)
 
     def write(

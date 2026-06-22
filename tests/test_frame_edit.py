@@ -873,6 +873,32 @@ def test_iter_batches_single_batch_large_budget(source):
     assert np.array_equal(batches[0].recarray(), cf.recarray())
 
 
+def test_iter_batches_copy_false_returns_views(source, source_cols):
+    # copy=False yields a read-only zero-copy view of a single-record native store: the
+    # batch column shares memory with the store's open column memmap, no gather.
+    cf = source.edit()
+    backing = source._memmaps["b"]
+    viewed = next(iter(cf.iter_batches(batch_size=100, copy=False))).dict()["b"]
+    assert np.shares_memory(viewed, backing)
+    owned = next(iter(cf.iter_batches(batch_size=100, copy=True))).dict()["b"]
+    assert not np.shares_memory(owned, backing)  # copy=True owns its arrays
+
+
+def test_iter_batches_copy_false_matches_copy_true(source, source_cols):
+    cf = source.edit()
+    viewed = np.concatenate([b.dict()["b"] for b in cf.iter_batches(batch_size=100, copy=False)])
+    np.testing.assert_array_equal(viewed, source_cols["b"])
+    # a transform can't be a view -> still materialized correctly under copy=False
+    derived = source.edit().assign(d=col("b") * 2)
+    got = np.concatenate([b.dict()["d"] for b in derived.iter_batches(batch_size=100, copy=False)])
+    np.testing.assert_allclose(got, source_cols["b"] * 2)
+    # a filtered (fancy) selection can't be a view -> still gathered correctly
+    mask = source_cols["a"] >= 100
+    filt = source.edit().where(col("a") >= 100)
+    got2 = np.concatenate([b.dict()["b"] for b in filt.iter_batches(batch_size=50, copy=False)])
+    np.testing.assert_array_equal(got2, source_cols["b"][mask])
+
+
 def test_iter_batches_filtered_gathers_survivors(source, source_cols):
     cf = source.edit().where(col("a") % 3 == 0)
     batches = list(cf.iter_batches(batch_size=20))
