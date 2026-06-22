@@ -179,7 +179,7 @@ class _ReaderBase(abc.ABC):
         """A whole-store preview over a concrete ``rows`` slice."""
         return build_preview(type(self).__name__, total_rows, self, self.columns, rows)
 
-    # ---- Whole-store materializer --------------------------------------
+    # ---- Materializers -------------------------------------------------
 
     def recarray(self) -> NDArray[Any]:
         """Materialize the whole store as a structured (record) ndarray.
@@ -192,6 +192,26 @@ class _ReaderBase(abc.ABC):
             record_dtype = np.dtype([(name, self._native_dtype(name)) for name in names])
             return np.empty(self.n_rows, dtype=record_dtype)
         return self._build_recarray(None, names)
+
+    def array(self, name: str, copy: bool = True) -> NDArray[Any]:
+        """Materialize one column as a 1-D array -- the shortcut for ``self[name].array()``.
+
+        Parameters
+        ----------
+        name : str
+            Column to read.
+        copy : bool, optional
+            ``True`` (default): an owning array. ``False``: a READ-ONLY zero-copy
+            view backed by the open memmap, under the same conditions and lifetime
+            as :meth:`~colstore.view.ColumnView.array` (raising rather than copying
+            when a view cannot be given).
+
+        Returns
+        -------
+        numpy.ndarray
+            1-D array of the column in its stored dtype.
+        """
+        return self[name].array(copy=copy)
 
     def _build_recarray(self, row_indexer: Any, column_names: list[str]) -> NDArray[Any]:
         """Interleave a row selection of the named columns into a record array.

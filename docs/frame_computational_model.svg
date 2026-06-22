@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="760" height="500" viewBox="0 0 760 500" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
 <title>The frame's computational model</title>
-<desc>A ColStoreFrame holds two independent parts that meet at one evaluator. The column recipe (assign, with_columns, astype, drop, rename, select) is a per-column expression graph describing which columns to produce and how. The row selection (filter, where, and the rows carried in by view.edit) is either every row or a chosen set of row positions. Materializing evaluates each column over the selected rows through evaluate(node, rows, memo): leaves read exactly the selected rows and a subexpression shared by several columns is computed once. The result is delivered either in memory through dict, recarray, or compute, in one pass over the selected rows, or to a new .cstore by write, which streams bounded-memory row-range batches when unfiltered and materializes the selected rows when filtered.</desc>
+<desc>A ColStoreFrame holds two independent parts that meet at one evaluator. The column recipe (assign, with_columns, astype, drop, rename, select) is a per-column expression graph describing which columns to produce and how. The row selection (filter, where, and the rows carried in by view.edit) is either every row or a chosen set of row positions. Materializing evaluates each column over the selected rows through evaluate(node, rows, memo): leaves read exactly the selected rows and a subexpression shared by several columns is computed once. The result is delivered either in memory through array, dict, or recarray, in one pass over the selected rows, or to a new .cstore by write, which streams bounded-memory row-range batches when unfiltered and materializes the selected rows when filtered.</desc>
 <style>
  .recipe{fill:#E1F5EE;stroke:#0F6E56;stroke-width:1;} .recipeT{fill:#04342C;}
  .rows{fill:#E6EEF4;stroke:#3F6E9E;stroke-width:1;} .rowsT{fill:#234567;}
@@ -62,7 +62,7 @@
 <!-- in memory -->
 <rect class="out" x="70" y="352" width="300" height="92" rx="7"/>
 <text class="outT" x="220" y="378" text-anchor="middle" font-size="13" font-weight="600">IN MEMORY</text>
-<text class="outT" x="220" y="400" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">dict() &#183; recarray() &#183; compute()</text>
+<text class="outT" x="220" y="400" text-anchor="middle" font-size="11" font-family="ui-monospace,Menlo,Consolas,monospace">array() &#183; dict() &#183; recarray()</text>
 <text class="outT" x="220" y="421" text-anchor="middle" font-size="11">one pass over the selected rows</text>
 
 <!-- write -->

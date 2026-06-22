@@ -859,7 +859,7 @@ class ColStoreFrame:
     new frame by default -- pass ``inplace=True`` to edit this one -- so edits
     branch cheaply off a shared base; ``frame[name] = ...`` and ``del`` always
     edit in place. Nothing is read until you materialize:
-    :meth:`compute` / :meth:`dict` / :meth:`recarray` evaluate columns into memory,
+    :meth:`array` / :meth:`dict` / :meth:`recarray` evaluate columns into memory,
     and :meth:`write` streams the result to a new file and returns a reader for it.
     The source store is never modified.
 
@@ -1149,7 +1149,7 @@ class ColStoreFrame:
         """Cast the named columns to new dtypes (deferred).
 
         Returns a new frame unless ``inplace=True``. Each value is anything
-        ``numpy.dtype`` accepts; the cast is lazy -- evaluated by ``compute`` /
+        ``numpy.dtype`` accepts; the cast is lazy -- evaluated by ``array`` /
         ``dict`` / ``recarray`` / ``write``. Raises ``KeyError`` for an unknown
         name and validates every dtype before changing anything.
         """
@@ -1309,8 +1309,14 @@ class ColStoreFrame:
         memo: dict[tuple[Any, ...], NDArray[Any]] = {}
         return {name: evaluate(expr, rows, memo) for name, expr in self._columns.items()}
 
-    def compute(self, name: str) -> NDArray[Any]:
-        """Eagerly materialize one column as an array, without writing a file."""
+    def array(self, name: str) -> NDArray[Any]:
+        """Materialize one column as a 1-D array over the selected rows; writes no file.
+
+        The single-column counterpart of :meth:`dict` / :meth:`recarray` -- resolves any
+        pending :meth:`where` predicate, then evaluates column ``name`` over the selected
+        rows. (``frame[name]`` returns the column's expression for building transforms;
+        evaluating that directly with ``Expr.compute`` ignores the frame's row selection.)
+        """
         return evaluate(self[name], self._resolve_rows(), {})
 
     def dict(self) -> dict[str, NDArray[Any]]:

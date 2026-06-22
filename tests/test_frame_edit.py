@@ -245,16 +245,16 @@ def test_cross_store_column(source, tmp_path):
 
 def test_compute_native_and_transform(source, source_cols):
     cf = source.edit()
-    np.testing.assert_array_equal(cf.compute("a"), source_cols["a"])
+    np.testing.assert_array_equal(cf.array("a"), source_cols["a"])
     cf["ret"] = cf["b"] * 2.0
-    np.testing.assert_allclose(cf.compute("ret"), source_cols["b"] * 2.0)
+    np.testing.assert_allclose(cf.array("ret"), source_cols["b"] * 2.0)
     np.testing.assert_allclose(cf["ret"].compute(), source_cols["b"] * 2.0)
 
 
 def test_compute_const_uses_frame_length(source):
     cf = source.edit()
     cf["flag"] = 1
-    np.testing.assert_array_equal(cf.compute("flag"), np.full(source.n_rows, 1))
+    np.testing.assert_array_equal(cf.array("flag"), np.full(source.n_rows, 1))
     with pytest.raises(ValueError, match="all-constant"):
         cf["flag"].compute()  # length indeterminate without the frame
 
@@ -528,7 +528,7 @@ def test_filtered_terminals_agree(source, source_cols):
     cf = source.edit().filter(col("a") >= 250)
     a = source_cols["a"]
     keep = a >= 250
-    assert cf.compute("a").tolist() == a[keep].tolist()
+    assert cf.array("a").tolist() == a[keep].tolist()
     assert cf.dict()["a"].tolist() == a[keep].tolist()
     rec = cf.recarray()
     assert rec["a"].tolist() == a[keep].tolist()

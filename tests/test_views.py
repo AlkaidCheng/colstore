@@ -755,3 +755,19 @@ def test_view_edit_evaluate_then_edit_is_eager(small_store):
     assert cf._rows.tolist() == [1020, 1021, 1022, 1023]
     assert len(cf._predicates) == 0  # nothing left pending
     assert cf.n_rows == 4
+
+
+# -- reader/dataset array(name) shortcut --
+
+
+def test_reader_array_shortcut_matches_column_view_and_dict(small_store):
+    np.testing.assert_array_equal(small_store.array("price"), small_store["price"].array())
+    np.testing.assert_array_equal(small_store.array("id"), small_store.dict()["id"])
+
+
+def test_reader_array_shortcut_zero_copy(single_record_store):
+    dataset, data = single_record_store
+    view = dataset.array("f8", copy=False)
+    assert np.shares_memory(view, dataset._memmaps["f8"])
+    assert not view.flags.writeable
+    np.testing.assert_array_equal(view, data["f8"])

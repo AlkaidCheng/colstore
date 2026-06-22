@@ -39,6 +39,7 @@ ds[[1, 5, 9], ['price', 'qty']]      # TableView (fancy rows + cols)
 
 # Materialize through one of the materialization methods.
 ds['price'].array()                          # 1D ndarray
+ds.array('price')                            # 1D ndarray (shortcut for ds['price'].array())
 ds[indices, ['price', 'qty']].dict()         # dict of 1D arrays
 ds[indices, ['price', 'qty']].recarray()     # structured ndarray
 ds[indices, ['price', 'qty']].frame()        # pandas DataFrame
@@ -68,7 +69,7 @@ colstore has three objects, one per job. Most code only ever needs
 - **`ColStoreFrame`** is the edit interface. `reader.edit()` returns one; update,
   add, drop, rename, cast (`astype({"pt": "float32"})`), or transform its columns
   — each edit returns a new frame (`inplace=True` to edit in place), so edits
-  branch cheaply off a shared base. Then materialize in memory (`compute(name)`
+  branch cheaply off a shared base. Then materialize in memory (`array(name)`
   for one column, `dict()` / `recarray()` for all) or `.write(path)` to stream the
   result to a new file. It never modifies the source store.
 
@@ -135,7 +136,7 @@ Everything behaves the same on a single file and a multi-file dataset.
 read only when you materialize it. A frame has two independent parts — the
 **columns** to produce (each an expression over the source columns) and the
 **rows** to keep — and nothing touches disk until you ask for the result, in
-memory with `dict()` / `recarray()` / `compute()`, or as a new file with
+memory with `array(name)` / `dict()` / `recarray()`, or as a new file with
 `write()`. Every edit returns a new frame, so frames branch cheaply from a shared
 base; pass `inplace=True` to edit one in place.
 
@@ -152,7 +153,7 @@ cf = cf.select("close", "open", "ratio")         # project columns; filter() ali
 
 cf.n_rows                                        # how many rows the frame selects (resolves it)
 cf.report()                                      # cutflow per named cut (raw / weighted / both)
-cf.dict(); cf.recarray(); cf.compute("ratio")    # materialize the selected rows in memory
+cf.dict(); cf.recarray(); cf.array("ratio")      # materialize the selected rows in memory
 for batch in cf.iter_batches("256 MiB"):  ...    # or stream bounded in-memory frames (any format)
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
 
