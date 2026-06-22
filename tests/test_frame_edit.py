@@ -1083,11 +1083,10 @@ def test_report_records_unweighted_has_none(source):
 # -- boolean-mask selection (kept as a mask; routed mask-native in test_calibration) --
 
 
-def test_edit_mask_selection_keeps_mask_and_counts(source, source_cols):
+def test_edit_mask_selection_terminals(source, source_cols):
     mask = source_cols["a"] % 3 == 0
     cf = source[mask].edit()
-    assert cf._rows.dtype == bool  # kept as a mask, not lowered to indices at the seam
-    assert cf.n_rows == int(mask.sum())  # popcount, not the mask length
+    assert cf.n_rows == int(mask.sum())  # popcount of the selected rows
     assert np.array_equal(cf.dict()["a"], source_cols["a"][mask])
     assert np.array_equal(cf.array("b"), source_cols["b"][mask])
     assert np.array_equal(cf.recarray()["c"], source_cols["c"][mask])

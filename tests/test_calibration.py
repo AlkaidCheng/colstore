@@ -501,3 +501,27 @@ def test_frame_edit_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch
         assert calls == ["mask", "mask"]  # one mask-native gather per column
     finally:
         store.close()
+
+
+def test_edit_base_mask_compacts_by_density(tmp_path, _isolated_gate):
+    # The frame keeps a dense base mask (it gathers mask-natively) but lowers a sparse one
+    # to indices at construction, so a sparse selection never holds an n_rows-byte mask.
+    n = 1000
+    full = {"a": np.arange(n, dtype=np.float64)}
+    path = tmp_path / "compact.cstore"
+    with colstore.create(path) as writer:
+        writer.write(full)
+    config.set_mask_density_gate(0.25)
+    positions = np.arange(n)
+    store = colstore.open(path)
+    try:
+        dense = store[positions % 2 == 0].edit()  # density 0.5 >= 0.25: kept as a mask
+        assert dense._rows.dtype == bool
+        assert dense.n_rows == 500
+        assert np.array_equal(dense.dict()["a"], full["a"][positions % 2 == 0])
+        sparse = store[positions % 100 == 0].edit()  # density 0.01 < 0.25: lowered to indices
+        assert sparse._rows.dtype == np.int64
+        assert sparse.n_rows == 10
+        assert np.array_equal(sparse.dict()["a"], full["a"][positions % 100 == 0])
+    finally:
+        store.close()
