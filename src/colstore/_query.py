@@ -210,11 +210,20 @@ class _Expr:
     def __floordiv__(self, other: Any) -> _Expr:
         return _Op(np.floor_divide, self, other)
 
+    def __rfloordiv__(self, other: Any) -> _Expr:
+        return _Op(np.floor_divide, other, self)
+
     def __mod__(self, other: Any) -> _Expr:
         return _Op(np.mod, self, other)
 
+    def __rmod__(self, other: Any) -> _Expr:
+        return _Op(np.mod, other, self)
+
     def __pow__(self, other: Any) -> _Expr:
         return _Op(np.power, self, other)
+
+    def __rpow__(self, other: Any) -> _Expr:
+        return _Op(np.power, other, self)
 
     def __neg__(self) -> _Expr:
         return _Op(np.negative, self)
