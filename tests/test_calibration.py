@@ -461,3 +461,70 @@ def test_reader_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch):
         assert calls == ["mask"]
     finally:
         dataset.close()
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
+def test_frame_edit_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch):
+    # ds[mask].edit() keeps the mask, so a dense-mask in-memory terminal routes to the
+    # same mask-native kernel as ds[mask], gated on the same resolved density.
+    rng = np.random.default_rng(71)
+    rows_per_record = [400, 700, 300, 600]
+    total = sum(rows_per_record)
+    full = {"a": rng.standard_normal(total), "b": rng.standard_normal(total)}
+    path = tmp_path / "edit_gate.cstore"
+    offset = 0
+    with colstore.create(path) as writer:
+        for rows in rows_per_record:
+            writer.write({k: v[offset : offset + rows] for k, v in full.items()})
+            offset += rows
+    mask = rng.random(total) < 0.5
+
+    calls: list[str] = []
+    original = _gather.gather_multirecord_mask
+
+    def spy(*args, **kwargs):
+        calls.append("mask")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_gather, "gather_multirecord_mask", spy)
+    store = colstore.open(path)
+    try:
+        config.set_mask_density_gate(2.0)  # explicit: route disabled -> lowered path
+        lowered = store[mask].edit().dict()
+        assert np.array_equal(lowered["a"], full["a"][mask])
+        assert calls == []
+        config.set_mask_density_gate("auto")
+        config._set_auto_mask_density(0.1)  # below this mask's ~0.5 density
+        native = store[mask].edit().dict()
+        for name in ("a", "b"):
+            assert np.array_equal(native[name], full[name][mask])
+        assert calls == ["mask", "mask"]  # one mask-native gather per column
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
+def test_edit_base_mask_compacts_by_density(tmp_path, _isolated_gate):
+    # On a multi-record store the frame keeps a dense base mask (it gathers mask-natively)
+    # but lowers a sparse one to indices at construction.
+    n = 1200
+    full = {"a": np.arange(n, dtype=np.float64)}
+    path = tmp_path / "multi.cstore"
+    off = 0
+    with colstore.create(path) as writer:
+        for r in (300, 300, 300, 300):
+            writer.write({"a": full["a"][off : off + r]})
+            off += r
+    config.set_mask_density_gate(0.25)
+    pos = np.arange(n)
+    store = colstore.open(path)
+    try:
+        assert store._is_multi_record
+        dense = store[pos % 2 == 0].edit()  # density 0.5 >= 0.25: kept as a mask
+        assert dense._rows.dtype == bool and dense.n_rows == 600
+        assert np.array_equal(dense.dict()["a"], full["a"][pos % 2 == 0])
+        sparse = store[pos % 100 == 0].edit()  # density 0.01 < 0.25: lowered to indices
+        assert sparse._rows.dtype == np.int64 and sparse.n_rows == 12
+        assert np.array_equal(sparse.dict()["a"], full["a"][pos % 100 == 0])
+    finally:
+        store.close()

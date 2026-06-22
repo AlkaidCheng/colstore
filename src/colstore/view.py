@@ -118,9 +118,10 @@ def edit_row_selection(indexer: _RowIndexer, n_rows: int) -> np.ndarray | None:
     """Normalize a resolved row indexer into a frame's row selection.
 
     ``None`` -- and a slice spanning every row -- means "all rows", which the
-    frame keeps as its unfiltered streaming-write path. Any narrower selector
-    (int, sub-range slice, fancy index, or boolean mask) becomes an explicit
-    int64 array of the chosen source rows, which the frame materializes.
+    frame keeps as its unfiltered streaming-write path. An int or sub-range slice
+    becomes an explicit int64 array of the chosen source rows; an integer fancy
+    index is kept as int64 indices, and a boolean mask is passed through for the
+    frame to store by density (kept when dense, lowered to indices when sparse).
     """
     if indexer is None:
         return None
@@ -133,7 +134,10 @@ def edit_row_selection(indexer: _RowIndexer, n_rows: int) -> np.ndarray | None:
         return np.arange(start, stop, step, dtype=np.int64)
     array = np.asarray(indexer)
     if array.dtype == bool:
-        return np.flatnonzero(array).astype(np.int64, copy=False)
+        # Pass the mask through; the frame (_normalize_base_rows) keeps it only when it
+        # is dense enough to gather through the mask-native kernel (as ds[mask] does),
+        # and lowers a sparse one to indices once. A where() composes onto indices.
+        return np.ascontiguousarray(array)
     return array.astype(np.int64, copy=False)
 
 
