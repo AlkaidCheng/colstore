@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from . import config
+from ._pandas import _make_dataframe_no_consolidate
 from ._query import _Expr, evaluate_mask
 from ._render import Preview, render_lazy_card
 from .frame import ColStoreFrame
@@ -516,24 +517,15 @@ class TableView(_BaseView):
         ----------
         copy : bool, optional
             ``True`` (default): owning columns. ``False``: a READ-ONLY
-            DataFrame whose columns are zero-copy views over the open
-            memmaps, forwarding the same all-or-nothing conditions and
-            lifetime semantics as :meth:`dict` (raising rather than copying
-            when any column cannot be viewed). The per-column block
-            construction already shares memory with its input arrays, so the
-            frame aliases the mapping with no extra copy.
+            DataFrame whose columns are zero-copy views, forwarding the same
+            conditions and lifetime as :meth:`dict` (raising rather than copying
+            when any column cannot be viewed).
 
         Returns
         -------
         pandas.DataFrame
             Columns are in selection order with their stored dtypes preserved.
-            The frame skips dtype-block consolidation (one ``Block`` per
-            column) -- see
-            :func:`colstore.reader._make_dataframe_no_consolidate` for
-            rationale and details.
         """
-        from .reader import _make_dataframe_no_consolidate
-
         return _make_dataframe_no_consolidate(self.dict(copy=copy))
 
     def evaluate(self) -> TableView:

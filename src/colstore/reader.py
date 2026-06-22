@@ -29,8 +29,6 @@ from . import _numa, config, format, kernels
 from ._base import _ReaderBase
 
 if TYPE_CHECKING:
-    import pandas as pd
-
     from .dataset import ColStoreDataset
 
 _MADVISE_FLAGS: dict[str, int] = {
@@ -206,62 +204,6 @@ def _parallel_copy(
         for future in futures:
             future.result()
     return out
-
-
-# ---- DataFrame construction --------------------------------------------
-
-
-def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataFrame:
-    """Build a pandas DataFrame from a column dict without dtype-block consolidation.
-
-    The result is "fragmented" relative to ``pd.DataFrame(columns)``: one
-    ``Block`` per column rather than per dtype group. The two are
-    functionally identical through the public DataFrame API (pandas
-    consolidates on demand); for the read-once-and-pass-along workload
-    this targets, eager consolidation is wasted work.
-
-    Uses the pandas private API ``create_block_manager_from_column_arrays``
-    plus ``DataFrame._from_mgr`` (both stable in pandas 2.0+). On
-    ``ImportError`` (symbol gone or moved), ``AttributeError`` (classmethod
-    or attribute gone), or ``TypeError`` (call signature shifted), the
-    helper falls back to ``pd.DataFrame(columns)`` -- functionally
-    identical but roughly an order of magnitude slower on whole-store
-    materialization -- and emits a one-shot ``UserWarning`` so the
-    regression is visible without breaking user code. ``ValueError`` is
-    intentionally NOT caught: it almost certainly signals a
-    data-validation problem the fallback would surface identically, and
-    catching it would mask the original error.
-    """
-    import pandas as pd
-
-    if not columns:
-        return pd.DataFrame(columns)
-
-    try:
-        from pandas import Index, RangeIndex
-        from pandas.core.internals.managers import (
-            create_block_manager_from_column_arrays,
-        )
-
-        arrays = list(columns.values())
-        n_rows = arrays[0].shape[0]
-        block_manager = create_block_manager_from_column_arrays(
-            arrays,
-            axes=[Index(list(columns)), RangeIndex(n_rows)],
-            consolidate=False,
-            refs=[None] * len(arrays),
-        )
-        return pd.DataFrame._from_mgr(block_manager, axes=block_manager.axes)
-    except (ImportError, AttributeError, TypeError) as exc:
-        warnings.warn(
-            f"colstore.frame() optimized construction unavailable on this "
-            f"pandas ({pd.__version__}); falling back to pd.DataFrame(dict). "
-            f"The result is functionally identical but slower for whole-store "
-            f"materialization. This usually indicates a pandas internal API "
-            f"change. Cause: {type(exc).__name__}: {exc}",
-            stacklevel=2,
-        )
-        return pd.DataFrame(columns)
 
 
 class ColStoreReader(_ReaderBase):
@@ -1431,63 +1373,6 @@ class ColStoreReader(_ReaderBase):
             for name in column_names
         }
 
-    # ---- Whole-store materialization shortcuts -------------------------
-    #
-    # Equivalent to ``self[:].dict()`` / ``.recarray()`` / ``.frame()`` but
-    # skip the intermediate ``TableView`` construction. The common
-    # "open and convert" idiom -- ``colstore.open(path).dict()`` -- doesn't
-    # need a row indexer or the lazy-view machinery, and these methods
-    # make that path direct. Placed at the bottom of the class so the
-    # method ``dict`` does not shadow the builtin ``dict`` in the
-    # annotation scope of earlier methods (mypy resolves annotations in
-    # declaration order against the class namespace).
-
-    def dict(self, copy: bool = True) -> dict[str, NDArray[Any]]:
-        """Materialize the whole store as a dict mapping column name to ndarray.
-
-        Parameters
-        ----------
-        copy : bool, optional
-            ``True`` (default): owning arrays. ``False``: READ-ONLY
-            zero-copy views backed by the open memmaps; supported only on
-            single-record stores with native-byte-order dtypes, raising
-            ``ValueError`` otherwise. Views stay valid after :meth:`close`
-            (they pin the mapping until garbage-collected).
-
-        Returns
-        -------
-        dict[str, numpy.ndarray]
-            Arrays in on-disk column order, stored dtypes preserved
-            (native byte order).
-        """
+    def _check_open(self) -> None:
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
-        if not copy:
-            return self._view_many(list(self._column_dtypes), None)
-        return self._gather_many(list(self._column_dtypes), None)
-
-    def frame(self, copy: bool = True) -> pd.DataFrame:
-        """Materialize the whole store as a pandas DataFrame.
-
-        Parameters
-        ----------
-        copy : bool, optional
-            ``True`` (default): owning columns, gathered out of the mapping.
-            ``False``: a READ-ONLY DataFrame whose columns are zero-copy
-            views over the open memmaps. The per-column block construction
-            already shares memory with its input arrays (see
-            :func:`_make_dataframe_no_consolidate`), so feeding it the
-            :meth:`dict` ``copy=False`` views aliases the mapping with no
-            extra copy. The same all-or-nothing preconditions and lifetime
-            semantics as :meth:`dict` apply: the call raises rather than
-            copying when any column cannot be viewed.
-
-        Returns
-        -------
-        pandas.DataFrame
-            Columns in on-disk order with their stored dtypes preserved.
-            The frame skips dtype-block consolidation (one ``Block`` per
-            column) -- see :func:`_make_dataframe_no_consolidate` for
-            rationale and details.
-        """
-        return _make_dataframe_no_consolidate(self.dict(copy=copy))
