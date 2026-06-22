@@ -697,6 +697,40 @@ def test_elementwise_numpy_idioms_defer_and_stream(source, source_cols, tmp_path
     np.testing.assert_allclose(out["r"], np.hypot(b, c))
 
 
+def test_apply_derives_column_and_streams(source, source_cols, tmp_path):
+    b, c = source_cols["b"], source_cols["c"]
+    cf = source.edit()
+    cf["r"] = cf.apply(lambda u, v: np.hypot(u, v), "b", "c")  # column names
+    cf = cf.assign(s=cf.apply(lambda u, v: np.sqrt(u**2 + v**2), col("b"), col("c")))  # col() refs
+    got = cf.dict()
+    np.testing.assert_allclose(got["r"], np.hypot(b, c))
+    np.testing.assert_allclose(got["s"], np.sqrt(b**2 + c**2))
+    out = _written(cf, tmp_path)  # the function runs per streamed batch
+    np.testing.assert_allclose(out["r"], np.hypot(b, c))
+
+
+def test_apply_out_dtype_and_composes(source, source_cols):
+    cf = source.edit()
+    expr = cf.apply(lambda u: np.sqrt(u.astype(np.float64)), "a", out_dtype="float32")
+    rooted = cf.assign(rooted=expr).dict()["rooted"]
+    assert rooted.dtype == np.dtype(np.float32)
+    np.testing.assert_allclose(
+        rooted, np.sqrt(source_cols["a"].astype(np.float64)).astype(np.float32), rtol=1e-6
+    )
+    scaled = cf.assign(scaled=expr * 2).dict()["scaled"]  # composes with operators
+    np.testing.assert_allclose(scaled, rooted * 2, rtol=1e-6)
+
+
+def test_apply_unknown_column_raises(source):
+    with pytest.raises(KeyError, match="not a column of this frame"):
+        source.edit().apply(lambda u: u, "nope")
+
+
+def test_apply_no_columns_raises(source):
+    with pytest.raises(TypeError, match="at least one column"):
+        source.edit().apply(lambda: np.array([]))
+
+
 def test_assign_col_unknown_raises(source):
     with pytest.raises(KeyError, match="not a column of this frame"):
         source.edit().assign(z=col("nope"))
