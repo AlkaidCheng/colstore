@@ -329,16 +329,21 @@ class Expr:
         return evaluate(self, slice(0, length), {})
 
 
-# A row selector: a slice (a contiguous half-open range) or a 1-D integer index
-# array naming the chosen rows in order. The array's length is the number of
-# selected rows; a boolean mask is converted to indices before use.
+# A row selector: a slice (a contiguous half-open range), a 1-D integer index array
+# naming the chosen rows in order, or a 1-D boolean mask over the source rows. The mask
+# form is kept only for an un-composed selection a terminal gathers in one shot, so the
+# reader's density gate can route a dense mask to the mask-native kernel; adding a
+# where() predicate lowers it to indices. All three are uniform under _row_count.
 Rows = slice | np.ndarray
 
 
 def _row_count(rows: Rows) -> int:
-    """Number of rows a selector picks: a slice's span, or an index array's length."""
+    """Rows a selector picks: a slice's span, a boolean mask's popcount, or an index
+    array's length."""
     if isinstance(rows, slice):
         return max(0, int(rows.stop or 0) - int(rows.start or 0))
+    if rows.dtype == bool:
+        return int(np.count_nonzero(rows))
     return len(rows)
 
 
@@ -1062,7 +1067,7 @@ class ColStoreFrame:
 
     def _row_count(self) -> int:
         selection = self._resolve_selection()
-        return self._n_rows if selection is None else len(selection)
+        return self._n_rows if selection is None else _row_count(selection)
 
     def _apply_cuts(
         self, base_rows: Rows, *, count: bool = False
@@ -1099,13 +1104,27 @@ class ColStoreFrame:
                 entering = passing
         return mask, cuts
 
+    def _base_indices(self) -> NDArray[Any] | None:
+        """:attr:`_rows` with a kept boolean mask lowered to its int64 positions.
+
+        The mask form survives only for an *un-composed* selection (so a terminal can
+        gather it mask-natively); a pending predicate composes onto a positional index
+        set -- ``flatnonzero(_rows)[passing]`` -- so the mask lowers to indices here
+        before the cut is applied.
+        """
+        base = self._rows
+        if base is not None and base.dtype == bool:
+            return np.flatnonzero(base)
+        return base
+
     def _resolve_selection(self) -> NDArray[Any] | None:
         """The concrete row selection: the base rows narrowed by every pending
-        predicate (``None`` = all rows). Evaluating the predicates is the deferred
-        work :meth:`where` records."""
-        base = self._rows
+        predicate (``None`` = all rows). An un-composed boolean mask is returned as-is
+        so a terminal can gather it mask-natively; a predicate composes onto the lowered
+        indices. Evaluating the predicates is the deferred work :meth:`where` records."""
         if not self._predicates:
-            return base
+            return self._rows
+        base = self._base_indices()
         base_rows: Rows = slice(0, self._n_rows) if base is None else base
         mask, _ = self._apply_cuts(base_rows)
         assert mask is not None  # _predicates is non-empty here
@@ -1124,18 +1143,31 @@ class ColStoreFrame:
         """
         if show not in (None, "raw", "weighted", "both"):
             raise ValueError(f"show must be 'raw', 'weighted', 'both', or None; got {show!r}.")
-        base = self._rows
         if not self._predicates:
             return CutflowReport([], show)
+        base = self._base_indices()
         base_rows: Rows = slice(0, self._n_rows) if base is None else base
         _, cuts = self._apply_cuts(base_rows, count=True)
         return CutflowReport(cuts, show)
 
     def _resolve_rows(self) -> Rows:
-        """The selector materialization evaluates over: the full source range, or the
-        resolved selected indices when a selection / predicate is in effect."""
+        """The selector the in-memory terminals (:meth:`dict` / :meth:`array` /
+        :meth:`recarray`) evaluate over: the full source range, or the resolved
+        selection. A kept boolean mask is passed straight through, so a one-shot gather
+        over the whole selection lets the reader's density gate route a dense mask to the
+        mask-native kernel rather than paying ``flatnonzero`` and the fancy path."""
         selection = self._resolve_selection()
         return slice(0, self._n_rows) if selection is None else selection
+
+    def _resolve_index_selection(self) -> NDArray[Any] | None:
+        """The selection as ``None`` or an int64 index array, for the batched paths that
+        slice and count it (:meth:`write` / :meth:`iter_batches` / the reductions). A kept
+        boolean mask is lowered to its positions: a per-batch ``selection[start:stop]``
+        over a mask would slice mask positions, not selected source rows."""
+        selection = self._resolve_selection()
+        if selection is not None and selection.dtype == bool:
+            return np.flatnonzero(selection)
+        return selection
 
     @property
     def columns(self) -> list[str]:
@@ -1543,7 +1575,7 @@ class ColStoreFrame:
         each batch evaluates ``expr`` alone (a fresh memo), so peak memory is one batch of a
         single column rather than the whole column.
         """
-        selection = self._resolve_selection()
+        selection = self._resolve_index_selection()
         n = self._n_rows if selection is None else len(selection)
         if n == 0:
             return
@@ -1644,7 +1676,7 @@ class ColStoreFrame:
         or no selected rows yields nothing.
         """
         names = list(self._columns)
-        selection = self._resolve_selection()
+        selection = self._resolve_index_selection()
         n = self._n_rows if selection is None else len(selection)
         if not names or n == 0:
             return
@@ -1675,7 +1707,7 @@ class ColStoreFrame:
         from .api import open as open_store
         from .format import write_dataset_streaming
 
-        selection = self._resolve_selection()
+        selection = self._resolve_index_selection()
         if selection is None:
             write_dataset_streaming(self._columns, self._n_rows, path, memory_budget=memory_budget)
         else:

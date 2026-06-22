@@ -461,3 +461,43 @@ def test_reader_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch):
         assert calls == ["mask"]
     finally:
         dataset.close()
+
+
+@pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
+def test_frame_edit_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch):
+    # ds[mask].edit() keeps the mask, so a dense-mask in-memory terminal routes to the
+    # same mask-native kernel as ds[mask], gated on the same resolved density.
+    rng = np.random.default_rng(71)
+    rows_per_record = [400, 700, 300, 600]
+    total = sum(rows_per_record)
+    full = {"a": rng.standard_normal(total), "b": rng.standard_normal(total)}
+    path = tmp_path / "edit_gate.cstore"
+    offset = 0
+    with colstore.create(path) as writer:
+        for rows in rows_per_record:
+            writer.write({k: v[offset : offset + rows] for k, v in full.items()})
+            offset += rows
+    mask = rng.random(total) < 0.5
+
+    calls: list[str] = []
+    original = _gather.gather_multirecord_mask
+
+    def spy(*args, **kwargs):
+        calls.append("mask")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(_gather, "gather_multirecord_mask", spy)
+    store = colstore.open(path)
+    try:
+        config.set_mask_density_gate(2.0)  # explicit: route disabled -> lowered path
+        lowered = store[mask].edit().dict()
+        assert np.array_equal(lowered["a"], full["a"][mask])
+        assert calls == []
+        config.set_mask_density_gate("auto")
+        config._set_auto_mask_density(0.1)  # below this mask's ~0.5 density
+        native = store[mask].edit().dict()
+        for name in ("a", "b"):
+            assert np.array_equal(native[name], full[name][mask])
+        assert calls == ["mask", "mask"]  # one mask-native gather per column
+    finally:
+        store.close()

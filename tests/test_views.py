@@ -666,6 +666,8 @@ def test_table_view_edit_carries_mask(small_store, small_frame):
     ids = small_frame["id"].to_numpy()
     mask = ids % 100 == 0
     cf = small_store[mask].edit()
+    assert cf._rows.dtype == bool  # kept as a mask (routed mask-native; see test_calibration)
+    assert cf.n_rows == int(mask.sum())  # popcount of the mask, not its length
     assert cf.dict()["id"].tolist() == ids[mask].tolist()
 
 
@@ -752,7 +754,8 @@ def test_view_edit_predicate_references_projected_away_column(small_store, small
 def test_view_edit_evaluate_then_edit_is_eager(small_store):
     cf = small_store[colstore.col("id") >= 1020].evaluate().edit()
     assert cf._rows is not None  # the predicate is resolved to a fixed row set
-    assert cf._rows.tolist() == [1020, 1021, 1022, 1023]
+    assert cf._rows.dtype == bool  # kept as a mask (still concrete; routed mask-native)
+    assert np.flatnonzero(cf._rows).tolist() == [1020, 1021, 1022, 1023]
     assert len(cf._predicates) == 0  # nothing left pending
     assert cf.n_rows == 4
 

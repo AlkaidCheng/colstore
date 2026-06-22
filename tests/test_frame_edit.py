@@ -1078,3 +1078,38 @@ def test_report_records(source):
 def test_report_records_unweighted_has_none(source):
     rec = source.edit().where(col("a") >= 100, "ge").report().records()[0]
     assert rec["weighted_entering"] is None and rec["weighted_efficiency"] is None
+
+
+# -- boolean-mask selection (kept as a mask; routed mask-native in test_calibration) --
+
+
+def test_edit_mask_selection_keeps_mask_and_counts(source, source_cols):
+    mask = source_cols["a"] % 3 == 0
+    cf = source[mask].edit()
+    assert cf._rows.dtype == bool  # kept as a mask, not lowered to indices at the seam
+    assert cf.n_rows == int(mask.sum())  # popcount, not the mask length
+    assert np.array_equal(cf.dict()["a"], source_cols["a"][mask])
+    assert np.array_equal(cf.array("b"), source_cols["b"][mask])
+    assert np.array_equal(cf.recarray()["c"], source_cols["c"][mask])
+
+
+def test_edit_mask_selection_streams_through_indices(source, source_cols, tmp_path):
+    mask = source_cols["a"] % 2 == 0
+    # write() / iter_batches() / the reductions lower the mask to indices so a
+    # per-batch slice selects source rows, not mask positions.
+    assert np.array_equal(_written(source[mask].edit(), tmp_path)["a"], source_cols["a"][mask])
+    batched = np.concatenate(
+        [b.dict()["a"] for b in source[mask].edit().iter_batches(batch_size=16)]
+    )
+    assert np.array_equal(batched, source_cols["a"][mask])
+    assert source[mask].edit().sum("a") == source_cols["a"][mask].sum()
+    assert source[mask].edit().min("b") == source_cols["b"][mask].min()
+
+
+def test_edit_mask_composes_with_where(source, source_cols):
+    mask = source_cols["a"] % 2 == 0
+    combined = mask & (source_cols["b"] > 0)
+    cf = source[mask].edit().where(col("b") > 0)
+    assert cf.n_rows == int(combined.sum())
+    assert np.array_equal(cf.dict()["a"], source_cols["a"][combined])
+    assert cf.report().records()[0]["entering"] == int(mask.sum())  # mask base = entering count
