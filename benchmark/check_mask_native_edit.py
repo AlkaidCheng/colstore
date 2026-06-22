@@ -1,19 +1,19 @@
 """Verify the mask-native gather on the *edit* path: correctness and timing.
 
-``ds[mask].edit()`` keeps the boolean mask as the frame's row selection, so an
-in-memory terminal (``dict`` / ``array`` / ``recarray``) gathers the selected
-rows through the reader's mask-native kernel -- the same route ``ds[mask]`` takes.
-Before this change the edit seam lowered the mask to int64 indices
-(``np.flatnonzero``) and took the sorted-fancy path, which is what
-``ds[flatnonzero(mask)].edit()`` still does.
+``ds[mask].edit()`` keeps a boolean mask as the frame's row selection only when it
+will gather mask-natively -- a multi-record store at or above the density gate --
+and otherwise (a single-record store, or a sparse selection) lowers it to int64
+indices at construction, the sorted-fancy path the pre-change seam always took.
+The mask-native kernel exists only for multi-record (interleaved) layouts; a
+single-record store is contiguous and gathered directly by index.
 
-This A/B times the two frames' terminal on a multi-record store across a mask
-density sweep -- ``index`` (the pre-change seam: a precomputed int64 index set,
-sorted-fancy gather) vs ``mask`` (the kept mask, mask-native gather). Both
-produce identical output; the only difference is the gather kernel. The selector
-is a fixed input to each timed cell, so the one-time index conversion is excluded
-(the seam paid it once at ``edit()``, amortized across terminal calls) and the
-measurement isolates the gather.
+This A/B times ``ds[...].edit()`` two ways across a density sweep -- ``lower``
+(convert the mask to indices with ``np.flatnonzero``, then gather: the pre-change
+behavior) vs ``mask`` (keep it where it gathers mask-natively). Each pays its own
+conversion inside the timed cell, so the comparison is apples-to-apples: on a
+multi-record store a dense mask wins (mask-native); a sparse selection, and any
+single-record store, read as parity (both lower to the same fancy gather). Both
+produce identical output (checked first).
 
 The mask route is gated on density (per-host calibrated via
 ``colstore calibrate mask-density``; compiled default 0.0 routes at every
@@ -46,6 +46,19 @@ def _build_store(directory: Path, n_records: int, rows: int):
     path = directory / f"r{n_records}.cstore"
     testing.write_columns(path, full, records=n_records).close()
     return path, full, total
+
+
+def _lower(store, mask, cols):
+    """The pre-change edit path: lower the mask to indices first, then gather."""
+    view = store[np.flatnonzero(mask), cols].edit()
+    return view.dict() if isinstance(cols, list) else view.array(cols)
+
+
+def _kept(store, mask, cols):
+    """The kept-mask edit path; the frame lowers it internally where it would not gather
+    mask-natively (a single-record store, or a selection below the density gate)."""
+    view = store[mask, cols].edit()
+    return view.dict() if isinstance(cols, list) else view.array(cols)
 
 
 def check_correctness() -> None:
@@ -84,15 +97,14 @@ def run_bench(args: argparse.Namespace) -> None:
                 )
             )
             for label, mask in cases:
-                idx = np.flatnonzero(mask)
                 store[mask].edit().dict()  # fault pages first
                 print(
                     f"R={n_records:<7} rows/rec={rows:<7} {label:<16} selected={int(mask.sum()):,}"
                 )
                 _c.compare(
                     [
-                        ("index 1col", lambda s=store, i=idx: s[i, "a"].edit().array("a")),
-                        ("mask  1col", lambda s=store, m=mask: s[m, "a"].edit().array("a")),
+                        ("lower 1col", lambda s=store, m=mask: _lower(s, m, "a")),
+                        ("mask  1col", lambda s=store, m=mask: _kept(s, m, "a")),
                     ],
                     repeat=args.repeat,
                     warmup=args.warmup,
@@ -100,8 +112,8 @@ def run_bench(args: argparse.Namespace) -> None:
                 )
                 _c.compare(
                     [
-                        ("index 2col", lambda s=store, i=idx: s[i].edit().dict()),
-                        ("mask  2col", lambda s=store, m=mask: s[m].edit().dict()),
+                        ("lower 2col", lambda s=store, m=mask: _lower(s, m, ["a", "b"])),
+                        ("mask  2col", lambda s=store, m=mask: _kept(s, m, ["a", "b"])),
                     ],
                     repeat=args.repeat,
                     warmup=args.warmup,

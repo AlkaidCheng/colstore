@@ -503,25 +503,28 @@ def test_frame_edit_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch
         store.close()
 
 
+@pytest.mark.skipif(not cpp_available(), reason="C++ extension not built")
 def test_edit_base_mask_compacts_by_density(tmp_path, _isolated_gate):
-    # The frame keeps a dense base mask (it gathers mask-natively) but lowers a sparse one
-    # to indices at construction, so a sparse selection never holds an n_rows-byte mask.
-    n = 1000
+    # On a multi-record store the frame keeps a dense base mask (it gathers mask-natively)
+    # but lowers a sparse one to indices at construction.
+    n = 1200
     full = {"a": np.arange(n, dtype=np.float64)}
-    path = tmp_path / "compact.cstore"
+    path = tmp_path / "multi.cstore"
+    off = 0
     with colstore.create(path) as writer:
-        writer.write(full)
+        for r in (300, 300, 300, 300):
+            writer.write({"a": full["a"][off : off + r]})
+            off += r
     config.set_mask_density_gate(0.25)
-    positions = np.arange(n)
+    pos = np.arange(n)
     store = colstore.open(path)
     try:
-        dense = store[positions % 2 == 0].edit()  # density 0.5 >= 0.25: kept as a mask
-        assert dense._rows.dtype == bool
-        assert dense.n_rows == 500
-        assert np.array_equal(dense.dict()["a"], full["a"][positions % 2 == 0])
-        sparse = store[positions % 100 == 0].edit()  # density 0.01 < 0.25: lowered to indices
-        assert sparse._rows.dtype == np.int64
-        assert sparse.n_rows == 10
-        assert np.array_equal(sparse.dict()["a"], full["a"][positions % 100 == 0])
+        assert store._is_multi_record
+        dense = store[pos % 2 == 0].edit()  # density 0.5 >= 0.25: kept as a mask
+        assert dense._rows.dtype == bool and dense.n_rows == 600
+        assert np.array_equal(dense.dict()["a"], full["a"][pos % 2 == 0])
+        sparse = store[pos % 100 == 0].edit()  # density 0.01 < 0.25: lowered to indices
+        assert sparse._rows.dtype == np.int64 and sparse.n_rows == 12
+        assert np.array_equal(sparse.dict()["a"], full["a"][pos % 100 == 0])
     finally:
         store.close()

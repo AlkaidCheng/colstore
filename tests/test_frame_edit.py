@@ -1112,3 +1112,15 @@ def test_edit_mask_composes_with_where(source, source_cols):
     assert cf.n_rows == int(combined.sum())
     assert np.array_equal(cf.dict()["a"], source_cols["a"][combined])
     assert cf.report().records()[0]["entering"] == int(mask.sum())  # mask base = entering count
+
+
+def test_edit_base_mask_lowered_on_single_record(source, source_cols):
+    # A single-record store has no mask-native kernel (it is contiguous, gathered by
+    # index), so a base mask -- even a dense one -- is lowered to indices at construction
+    # rather than kept (which would only repeat flatnonzero per column for no gain).
+    mask = source_cols["a"] % 2 == 0  # dense (0.5)
+    cf = source[mask].edit()
+    assert not source._is_multi_record
+    assert cf._rows.dtype == np.int64
+    assert cf.n_rows == int(mask.sum())
+    assert np.array_equal(cf.dict()["a"], source_cols["a"][mask])

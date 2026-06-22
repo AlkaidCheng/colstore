@@ -331,10 +331,11 @@ class Expr:
 
 # A row selector: a slice (a contiguous half-open range), a 1-D integer index array
 # naming the chosen rows in order, or a 1-D boolean mask over the source rows. A base
-# mask is kept (see _normalize_base_rows) only when it is dense enough to gather
-# mask-natively -- where a 1-byte/row mask is also no larger than an index array; a
-# sparse base mask is lowered to indices at construction, and a where() predicate
-# composes onto indices. The three forms are uniform under _row_count.
+# mask is kept (see _normalize_base_rows) only when it will gather mask-natively -- a
+# multi-record store at/above the density gate, where a 1-byte/row mask is also no larger
+# than an index array; a single-record store or a sparse selection lowers it to indices at
+# construction, and a where() predicate composes onto indices. The three forms are uniform
+# under _row_count.
 Rows = slice | np.ndarray
 
 
@@ -348,18 +349,24 @@ def _row_count(rows: Rows) -> int:
     return len(rows)
 
 
-def _normalize_base_rows(rows: NDArray[Any] | None, n_rows: int) -> NDArray[Any] | None:
+def _normalize_base_rows(
+    rows: NDArray[Any] | None, n_rows: int, store: _ReaderBase
+) -> NDArray[Any] | None:
     """Compact a base boolean mask, keeping it only when it will gather mask-natively.
 
-    A dense mask -- selected fraction at or above the gather's mask-density gate -- is
-    kept: the in-memory terminals gather it through the mask-native kernel, and at high
-    density a 1-byte-per-row mask is also smaller than an int64 index array. A sparse mask
-    would take the fancy path regardless, and an ``n_rows``-byte mask wastes memory
-    against the far smaller index set, so it is lowered to int64 indices once, here.
-    Non-mask selectors (``None`` or an index array) pass through unchanged.
+    The mask-native kernel exists only for a multi-record store; a single-record store
+    (a contiguous layout, gathered directly by index) and, conservatively, a multi-file
+    dataset lower a mask to indices in the gather regardless, so keeping it there would
+    only repeat ``flatnonzero`` per column for no gain. So the mask is kept only when it
+    routes mask-native -- a multi-record store whose selected fraction is at or above the
+    density gate, where a 1-byte/row mask is also no larger than an int64 index array --
+    and is otherwise lowered to indices once, here. Non-mask selectors (``None`` or an
+    index array) pass through unchanged.
     """
     if rows is None or rows.dtype != bool:
         return rows
+    if not getattr(store, "_is_multi_record", False):
+        return np.flatnonzero(rows)
     if int(np.count_nonzero(rows)) >= n_rows * config.resolve_mask_density_gate():
         return rows
     return np.flatnonzero(rows)
@@ -1066,7 +1073,7 @@ class ColStoreFrame:
     ) -> None:
         self._store = store
         self._n_rows = store.n_rows
-        self._rows = _normalize_base_rows(rows, self._n_rows)
+        self._rows = _normalize_base_rows(rows, self._n_rows, store)
         self._predicates: tuple[_Cut, ...] = ()
         names = store.columns if columns is None else columns
         self._columns: dict[str, Expr] = {name: NativeColumn(store, name) for name in names}
