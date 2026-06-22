@@ -94,15 +94,20 @@ def _scenarios(thr50: float, thr05: float):
     ]
 
 
+def _iter_consume(frame, budget: int) -> None:
+    # Build and discard each batch -- the streaming use iter_batches exists for. Collecting
+    # them in a list instead holds the whole dataset (no memory bound) and churns page faults.
+    config.set_default_memory_budget(budget)
+    for batch in frame.iter_batches():
+        batch.recarray()
+
+
 def _op(frame, kind: str, out: Path, budget: int):
     if kind == "write":
         return lambda: frame.write(out, memory_budget=budget).close()
     if kind == "reduce":
         return lambda: (setattr(cframe, "_REDUCTION_CHUNK_BYTES", budget), frame.sum("c0"))[1]
-    return lambda: (
-        config.set_default_memory_budget(budget),
-        [b.recarray() for b in frame.iter_batches()],
-    )[1]
+    return lambda: _iter_consume(frame, budget)
 
 
 def _sweep(name: str, frame, kind: str, total: int, out: Path, args: argparse.Namespace):
