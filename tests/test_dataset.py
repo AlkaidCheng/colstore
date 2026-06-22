@@ -946,3 +946,14 @@ def test_concat_schema_mismatch_raises(tmp_path):
     out = tmp_path / "bad.cstore"
     with pytest.raises(ValueError, match="Schema mismatch"):
         colstore.concat([good[0], narrow], out=out)
+
+
+def test_dataset_array_shortcut(tmp_path):
+    paths, ox, _ = _build_files(tmp_path, [4, 6])
+    ds = colstore.open(paths)
+    try:
+        np.testing.assert_array_equal(ds.array("x"), ox)  # gathers across files
+        np.testing.assert_array_equal(ds.array("x"), ds.dict()["x"])
+        np.testing.assert_array_equal(ds.array("x"), ds["x"].array())
+    finally:
+        ds.close()
