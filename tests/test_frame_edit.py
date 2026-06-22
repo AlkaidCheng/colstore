@@ -681,6 +681,22 @@ def test_assign_col_mixed_with_frame_expr(source, source_cols):
     assert np.allclose(got, 2 * source_cols["a"] + source_cols["b"])
 
 
+def test_elementwise_numpy_idioms_defer_and_stream(source, source_cols, tmp_path):
+    b, c = source_cols["b"], source_cols["c"]
+    cf = source.edit()
+    cf["r"] = np.hypot(cf["b"], cf["c"])  # __setitem__ with an elementwise ufunc
+    cf = cf.assign(phi=np.arctan2(cf["c"], cf["b"]))  # the assign idiom
+    cf["clipped"] = np.clip(cf["b"], -0.5, 0.5)  # np.clip via __array_function__
+    cf["pick"] = np.where(cf["b"] > 0, cf["b"], cf["c"])  # np.where
+    got = cf.dict()
+    np.testing.assert_allclose(got["r"], np.hypot(b, c))
+    np.testing.assert_allclose(got["phi"], np.arctan2(c, b))
+    np.testing.assert_allclose(got["clipped"], np.clip(b, -0.5, 0.5))
+    np.testing.assert_array_equal(got["pick"], np.where(b > 0, b, c))
+    out = _written(cf, tmp_path)  # and the same graph streams to a file
+    np.testing.assert_allclose(out["r"], np.hypot(b, c))
+
+
 def test_assign_col_unknown_raises(source):
     with pytest.raises(KeyError, match="not a column of this frame"):
         source.edit().assign(z=col("nope"))

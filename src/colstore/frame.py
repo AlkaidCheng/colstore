@@ -8,7 +8,7 @@ An :class:`Expr` is a node in a per-column computation graph. Leaf nodes name a
 data source -- :class:`NativeColumn` (a column in an open store, read by range),
 :class:`MemoryColumn` (an in-memory array), or :class:`ConstColumn` (a scalar
 broadcast to any length). :class:`UFunc` nodes apply an elementwise NumPy ufunc
-to other nodes. Python operators and whitelisted NumPy ufuncs invoked on an
+to other nodes. Python operators and elementwise NumPy ufuncs invoked on an
 ``Expr`` return new ``Expr`` nodes instead of computing, so a whole-column
 transformation such as ``(x + y) * 2`` is captured as a graph::
 
@@ -19,8 +19,10 @@ depends solely on the input row at the same position. That is exactly what makes
 range-at-a-time evaluation correct, so range-coupling operations -- reductions,
 accumulations, sorts -- are rejected when the graph is built, not silently
 mis-evaluated. Reductions and accumulations arrive through ``__array_ufunc__``
-with a ``method`` other than ``"__call__"`` and are refused there; ufuncs outside
-:data:`_ALLOWED_UFUNCS` are refused too.
+with a ``method`` other than ``"__call__"`` and are refused there. An elementwise
+call of a ufunc is admitted only when it maps one input row to one output row;
+multi-output ufuncs (``numpy.modf``) and generalized ufuncs that mix rows across a
+core dimension (``numpy.matmul``) are refused by their ``nout`` and ``signature``.
 
 Evaluation (:func:`evaluate`) walks the graph for a half-open row range against a
 caller-supplied ``memo``. The memo is keyed on each node's structural key, so a
@@ -67,59 +69,6 @@ __all__ = [
     "validate_length",
 ]
 
-# Elementwise ufuncs allowed inside a column expression. Membership is the
-# contract for "row-independent": every entry maps each output element to the
-# input element(s) at the same position. Reductions/accumulations are rejected
-# separately (by ufunc method), so only the elementwise *call* of these is ever
-# reached. Extend deliberately -- anything added here must preserve the
-# one-row-in, one-row-out property that range-at-a-time evaluation relies on.
-_ALLOWED_UFUNCS: frozenset[np.ufunc] = frozenset(
-    {
-        np.add,
-        np.subtract,
-        np.multiply,
-        np.true_divide,
-        np.floor_divide,
-        np.mod,
-        np.power,
-        np.negative,
-        np.positive,
-        np.absolute,
-        np.greater,
-        np.greater_equal,
-        np.less,
-        np.less_equal,
-        np.equal,
-        np.not_equal,
-        np.sin,
-        np.cos,
-        np.tan,
-        np.arcsin,
-        np.arccos,
-        np.arctan,
-        np.exp,
-        np.log,
-        np.log2,
-        np.log10,
-        np.sqrt,
-        np.cbrt,
-        np.square,
-        np.rint,
-        np.floor,
-        np.ceil,
-        np.trunc,
-        np.maximum,
-        np.minimum,
-        np.logical_and,
-        np.logical_or,
-        np.logical_not,
-        np.bitwise_and,
-        np.bitwise_or,
-        np.bitwise_xor,
-        np.invert,
-    }
-)
-
 # Python/NumPy scalar operand types accepted alongside expressions.
 _SCALAR_TYPES = (int, float, bool, complex)
 
@@ -159,7 +108,7 @@ def _check_operand(value: Any) -> None:
 class Expr:
     """A node in a deferred column computation graph.
 
-    Operators and whitelisted NumPy ufuncs called on an ``Expr`` build new
+    Operators and elementwise NumPy ufuncs called on an ``Expr`` build new
     ``Expr`` nodes rather than computing; materialization is deferred to
     :func:`evaluate`. Instances are intentionally not hashable and have no truth
     value -- ``==`` and ``<`` build comparison nodes, and a node is not a
@@ -186,11 +135,31 @@ class Expr:
             )
         if kwargs.get("out") is not None:
             raise TypeError("out= is not supported when building a column expression.")
-        if ufunc not in _ALLOWED_UFUNCS:
-            raise TypeError(f"ufunc {ufunc.__name__!r} is not allowed in a column expression.")
+        if ufunc.nout != 1:
+            raise TypeError(
+                f"ufunc {ufunc.__name__!r} returns multiple outputs, which a column "
+                "expression cannot represent; use single-output operations."
+            )
+        if ufunc.signature is not None:
+            raise TypeError(
+                f"ufunc {ufunc.__name__!r} is a generalized ufunc that mixes rows across "
+                "a core dimension; column expressions support only elementwise "
+                "(row-independent) operations."
+            )
         for value in inputs:
             _check_operand(value)
         return UFunc(ufunc, inputs)
+
+    def __array_function__(
+        self, func: Any, types: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Expr:
+        builder = _ARRAY_FUNCTIONS.get(func)
+        if builder is None:
+            raise TypeError(
+                f"numpy.{getattr(func, '__name__', func)} is not supported in a column "
+                "expression; build it from elementwise operations instead."
+            )
+        return builder(*args, **kwargs)
 
     def __array__(self, dtype: Any = None) -> NDArray[Any]:
         raise TypeError(
@@ -307,7 +276,7 @@ class Expr:
 
     # -- composed helpers for non-ufunc NumPy functions --
     def round(self, decimals: int = 0) -> Expr:
-        """Round to ``decimals`` places, expressed with whitelisted ufuncs.
+        """Round to ``decimals`` places, expressed with elementwise ufuncs.
 
         ``np.round`` is not a ufunc, so rather than route it through a separate
         protocol it is expanded into ``rint`` (and a scale/unscale pair when
@@ -336,6 +305,14 @@ class Expr:
         """Cast this column to ``dtype`` (anything ``numpy.dtype`` accepts), NumPy
         ``astype`` semantics."""
         return Cast(self, np.dtype(dtype))
+
+    def where(self, cond: Any, other: Any = np.nan) -> Expr:
+        """Keep this column where ``cond`` is true, else ``other`` (pandas ``Series.where``).
+
+        ``cond`` is a boolean column expression and ``other`` a column or scalar;
+        equivalent to ``numpy.where(cond, self, other)``.
+        """
+        return Where(cond, self, other)
 
     def compute(self, n_rows: int | None = None) -> NDArray[Any]:
         """Eagerly materialize this column as a NumPy array.
@@ -563,6 +540,65 @@ class Isin(Expr):
         self._key = ("isin", target._key, self._values.dtype.str, self._values.tobytes())
 
 
+class Where(Expr):
+    """An internal node selecting elementwise between two inputs by a condition (``numpy.where``).
+
+    Row-independent like the ufunc nodes -- each output row is ``a`` or ``b`` at that
+    row, chosen by ``cond`` at the same row -- so it evaluates one row range at a time.
+    Built when ``numpy.where`` is called on a column expression, or via
+    :meth:`Expr.where`. Each of ``cond`` / ``a`` / ``b`` is an :class:`Expr` or a scalar.
+    """
+
+    __slots__ = ("_a", "_b", "_cond", "_key")
+
+    def __init__(self, cond: Any, a: Any, b: Any) -> None:
+        for value in (cond, a, b):
+            _check_operand(value)
+        if not any(isinstance(value, Expr) for value in (cond, a, b)):
+            raise TypeError("numpy.where on a column expression needs at least one column operand.")
+        self._cond = cond
+        self._a = a
+        self._b = b
+        self._key = (
+            "where",
+            *(v._key if isinstance(v, Expr) else ("scalar", repr(v)) for v in (cond, a, b)),
+        )
+
+
+def _np_where(condition: Any, *branches: Any) -> Expr:
+    """``numpy.where(cond, x, y)`` builder for the column-expression dispatch table."""
+    if len(branches) != 2:
+        raise TypeError(
+            "numpy.where on a column expression requires both branches: "
+            "np.where(cond, x, y); the single-argument index form mixes rows and is "
+            "not supported."
+        )
+    return Where(condition, branches[0], branches[1])
+
+
+def _np_clip(a: Any, a_min: Any = None, a_max: Any = None, **kwargs: Any) -> Expr:
+    """``numpy.clip`` builder; routes to :meth:`Expr.clip` on the clipped column.
+
+    Accepts the bounds under either ``a_min`` / ``a_max`` or ``min`` / ``max`` (both
+    spellings NumPy's ``clip`` allows); ``out=`` and any other keyword are rejected.
+    """
+    if not isinstance(a, Expr):
+        raise TypeError("numpy.clip needs the clipped value to be a column expression.")
+    if kwargs.get("out") is not None:
+        raise TypeError("out= is not supported when building a column expression.")
+    unsupported = set(kwargs) - {"min", "max", "out"}
+    if unsupported:
+        raise TypeError(f"unsupported argument(s) to numpy.clip: {sorted(unsupported)}.")
+    low = a_min if a_min is not None else kwargs.get("min")
+    high = a_max if a_max is not None else kwargs.get("max")
+    return a.clip(low, high)
+
+
+# Non-ufunc NumPy functions admitted in a column expression, each mapped to the
+# node it builds. Anything outside this table raises in ``Expr.__array_function__``.
+_ARRAY_FUNCTIONS: dict[Any, Callable[..., Expr]] = {np.where: _np_where, np.clip: _np_clip}
+
+
 def evaluate(
     node: Expr,
     rows: Rows,
@@ -593,7 +629,12 @@ def evaluate(
         result = evaluate(node._input, rows, memo).astype(node._dtype)
     elif isinstance(node, Isin):
         result = np.isin(evaluate(node._target, rows, memo), node._values)
-    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast, Isin
+    elif isinstance(node, Where):
+        cond = evaluate(node._cond, rows, memo) if isinstance(node._cond, Expr) else node._cond
+        a = evaluate(node._a, rows, memo) if isinstance(node._a, Expr) else node._a
+        b = evaluate(node._b, rows, memo) if isinstance(node._b, Expr) else node._b
+        result = np.where(cond, a, b)
+    else:  # pragma: no cover - the Expr hierarchy is closed to _Leaf, UFunc, Cast, Isin, Where
         raise TypeError(f"cannot evaluate node of type {type(node).__name__!r}.")
     memo[node._key] = result
     return result
@@ -616,6 +657,10 @@ def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
         yield from _iter_leaves(node._input)
     elif isinstance(node, Isin):
         yield from _iter_leaves(node._target)
+    elif isinstance(node, Where):
+        for child in (node._cond, node._a, node._b):
+            if isinstance(child, Expr):
+                yield from _iter_leaves(child)
 
 
 def fusible_passthroughs(specs: dict[str, Expr]) -> dict[str, NativeColumn]:
@@ -853,7 +898,7 @@ class ColStoreFrame:
     ordered mapping of output column name to an expression (:class:`Expr`);
     opening one seeds it with a native-passthrough leaf per source column.
     Indexing by name returns the expression for a column, which composes with
-    operators and whitelisted NumPy ufuncs to build transformations; a frame does not
+    operators and elementwise NumPy ufuncs to build transformations; a frame does not
     slice or index rows or columns (that is the reader's role). The edit methods
     (``assign`` / ``with_columns`` / ``drop`` / ``rename`` / ``astype``) return a
     new frame by default -- pass ``inplace=True`` to edit this one -- so edits
