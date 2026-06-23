@@ -454,21 +454,8 @@ class ColStoreDataset(_ReaderBase):
 
         return job
 
-    def _mask_parts(self, mask: NDArray[np.bool_]) -> list[tuple[int, NDArray[np.bool_]]]:
-        """Split a global boolean mask into per-file sub-masks, skipping empties."""
-        parts: list[tuple[int, NDArray[np.bool_]]] = []
-        for file_index in range(len(self._children)):
-            lo = int(self._offsets[file_index])
-            hi = int(self._offsets[file_index + 1])
-            sub = mask[lo:hi]
-            if sub.any():
-                parts.append((file_index, sub))
-        return parts
-
-    def _contiguous_lengths(self, parts: list[tuple[int, Any]], is_mask: bool) -> list[int]:
-        """Per-part output lengths for a slice (range size) or mask (popcount)."""
-        if is_mask:
-            return [int(sub.sum()) for _, sub in parts]
+    def _contiguous_lengths(self, parts: list[tuple[int, Any]]) -> list[int]:
+        """Per-part output length: each forward slice's range size."""
         return [
             len(range(*sub.indices(self._children[file_index].n_rows))) for file_index, sub in parts
         ]
@@ -693,8 +680,9 @@ class ColStoreDataset(_ReaderBase):
         only the terminal materialization differs -- so it lives here once.
         ``kind`` is ``"whole"`` (payload ``None``), ``"scalar"`` (payload
         ``(file_index, local)``), ``"fancy"`` (an ``int64`` index array, also
-        covering a negative-step slice), or ``"contiguous"`` (payload
-        ``(parts, is_mask)`` for a forward slice or a boolean mask).
+        covering a negative-step slice or a boolean mask -- both lowered to
+        indices here), or ``"contiguous"`` (payload ``parts`` for a forward
+        slice).
         """
         if row_indexer is None:
             return "whole", None
@@ -704,10 +692,14 @@ class ColStoreDataset(_ReaderBase):
             start, stop, step = row_indexer.indices(self._n_rows)
             if step < 0:
                 return "fancy", np.arange(start, stop, step, dtype=np.int64)
-            return "contiguous", (self._slice_parts(row_indexer), False)
+            return "contiguous", self._slice_parts(row_indexer)
         if isinstance(row_indexer, np.ndarray):
             if row_indexer.dtype == np.bool_:
-                return "contiguous", (self._mask_parts(row_indexer), True)
+                # A boolean mask is lowered to sorted global indices and routed
+                # through the native multi-file fancy gather. flatnonzero is
+                # ascending, which is file order, so the gathered output order
+                # matches numpy's mask indexing.
+                return "fancy", np.flatnonzero(row_indexer).astype(np.int64, copy=False)
             return "fancy", row_indexer.astype(np.int64, copy=False)
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
 
@@ -740,8 +732,7 @@ class ColStoreDataset(_ReaderBase):
                 {column_name: whole}, [column_name], self._offset_regions()
             )
             return whole
-        parts, is_mask = payload
-        return self._gather_one_contiguous(column_name, parts, is_mask, out=out)
+        return self._gather_one_contiguous(column_name, payload, out=out)
 
     def _fill_contiguous(
         self,
@@ -768,17 +759,16 @@ class ColStoreDataset(_ReaderBase):
         self._check_open()
         self._require_columns([column_name])
         parts = self._slice_parts(slice(start, stop))
-        lengths = self._contiguous_lengths(parts, False)
+        lengths = self._contiguous_lengths(parts)
         self._fill_contiguous(out, column_name, parts, lengths)
 
     def _gather_one_contiguous(
         self,
         column_name: str,
         parts: list[tuple[int, Any]],
-        is_mask: bool,
         out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
-        lengths = self._contiguous_lengths(parts, is_mask)
+        lengths = self._contiguous_lengths(parts)
         dst = (
             out
             if out is not None
@@ -807,13 +797,12 @@ class ColStoreDataset(_ReaderBase):
             }
             self._fill_contiguous_columns(out, column_names, self._offset_regions())
             return out
-        parts, is_mask = payload
-        return self._gather_many_contiguous(column_names, parts, is_mask)
+        return self._gather_many_contiguous(column_names, payload)
 
     def _gather_many_contiguous(
-        self, column_names: list[str], parts: list[tuple[int, Any]], is_mask: bool
+        self, column_names: list[str], parts: list[tuple[int, Any]]
     ) -> dict[str, NDArray[Any]]:
-        lengths = self._contiguous_lengths(parts, is_mask)
+        lengths = self._contiguous_lengths(parts)
         total = sum(lengths)
         out = {name: np.empty(total, dtype=self._native_dtype(name)) for name in column_names}
         self._fill_contiguous_columns(out, column_names, self._contiguous_regions(parts, lengths))
