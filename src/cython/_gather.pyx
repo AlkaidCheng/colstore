@@ -67,6 +67,9 @@ cdef extern from "colstore/gather.hpp" nogil:
     int colstore_gather_multifile_sorted(const int64_t*, uint8_t*, ptrdiff_t,
                                          const int64_t*, const int64_t*, int64_t,
                                          int, int, ptrdiff_t)
+    int colstore_gather_multifile_mask(const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
+                                       const int64_t*, const int64_t*, int64_t,
+                                       int, int, ptrdiff_t)
     void colstore_parallel_copy_runs(uint8_t*, const int64_t*, const int64_t*,
                                      const int64_t*, int64_t, int)
     void colstore_interleave_records(uint8_t*, int64_t, int64_t, const int64_t*,
@@ -1075,6 +1078,58 @@ def gather_multifile_sorted(cnp.ndarray indices, cnp.ndarray output,
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "
             f"handles 1, 2, 4, and 8 byte elements."
         )
+
+
+def gather_multifile_mask(cnp.ndarray mask, cnp.ndarray output,
+                          cnp.ndarray segment_starts_rows, cnp.ndarray segment_base,
+                          int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Boolean-mask-native multi-file gather: no index materialization.
+
+    ``mask`` is a numpy bool array with one entry per global row (length must
+    equal ``segment_starts_rows[-1]``); selected rows are gathered in ascending
+    global-row order. ``output`` must be sized to exactly
+    ``np.count_nonzero(mask)`` -- the kernel re-counts internally to fix
+    per-thread offsets and raises if the caller's size disagrees, writing
+    nothing in that case. The segment arrays are :func:`gather_multifile`'s.
+    Native byte order required; other parameters match :func:`gather_multifile`.
+    """
+    _require_1d((mask, output, segment_starts_rows, segment_base),
+                "mask, output, and segment arrays must be 1D.")
+    if mask.dtype != np.bool_:
+        raise TypeError(f"mask must be bool; got {mask.dtype}.")
+    _require_int64(segment_starts_rows, "segment_starts_rows")
+    _require_int64(segment_base, "segment_base")
+
+    cdef long long n_segments = segment_base.shape[0]
+    if segment_starts_rows.shape[0] != n_segments + 1:
+        raise ValueError("segment_starts_rows length must be n_segments + 1.")
+    _require_c_contiguous((("mask", mask), ("output", output), ("segment_starts_rows", segment_starts_rows), ("segment_base", segment_base)))
+    cdef const int64_t* ssr = <const int64_t*>cnp.PyArray_DATA(segment_starts_rows)
+    cdef int64_t n_rows = ssr[n_segments]
+    if mask.shape[0] != n_rows:
+        raise ValueError(
+            f"mask length {mask.shape[0]} does not match the dataset's row count {n_rows}."
+        )
+    cdef ptrdiff_t n_out = output.shape[0]
+    if n_rows == 0 or n_out == 0:
+        if n_out == 0 and mask.shape[0] != 0 and bool(np.any(mask)):
+            raise ValueError("output length does not match the mask's selected count.")
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    cdef const uint8_t* mask_ptr = <const uint8_t*>cnp.PyArray_DATA(mask)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_multifile_mask(mask_ptr, output_ptr, n_rows, n_out, ssr, sb, n_segments, itemsize, thread_cap, pd)
+    if status == -1:
+        raise TypeError(f"unsupported itemsize {itemsize}.")
+    if status != 0:
+        raise ValueError("output length does not match the mask's selected count.")
 
 
 def parallel_copy_runs(cnp.ndarray output, cnp.ndarray src_addrs,

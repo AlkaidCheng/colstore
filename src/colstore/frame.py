@@ -372,20 +372,24 @@ def _normalize_base_rows(
 ) -> NDArray[Any] | None:
     """Compact a base boolean mask, keeping it only when it will gather mask-natively.
 
-    The mask-native kernel exists only for a multi-record store; a single-record store
-    (a contiguous layout, gathered directly by index) and, conservatively, a multi-file
-    dataset lower a mask to indices in the gather regardless, so keeping it there would
-    only repeat ``flatnonzero`` per column for no gain. So the mask is kept only when it
-    routes mask-native -- a multi-record store whose selected fraction is at or above the
-    density gate, where a 1-byte/row mask is also no larger than an int64 index array --
-    and is otherwise lowered to indices once, here. Non-mask selectors (``None`` or an
-    index array) pass through unchanged.
+    A mask-native kernel gathers a 1-byte/row mask without materializing an index
+    array. One exists for a multi-record single-file store (``_is_multi_record``) and,
+    across files, for a multi-file dataset (the native multi-file mask kernel). Either
+    keeps the mask only when its selected fraction is at or above the relevant density
+    gate -- where a 1-byte/row mask is no larger than an int64 index array. A sparser
+    mask, and a contiguous single-record store, lower to indices once here, since the
+    gather would otherwise repeat ``flatnonzero`` per column for no gain. Non-mask
+    selectors (``None`` or an index array) pass through unchanged.
     """
     if rows is None or rows.dtype != bool:
         return rows
-    if not getattr(store, "_is_multi_record", False):
+    selected = int(np.count_nonzero(rows))
+    if getattr(store, "_is_multi_record", False):
+        if selected >= n_rows * config.resolve_mask_density_gate():
+            return rows
         return np.flatnonzero(rows)
-    if int(np.count_nonzero(rows)) >= n_rows * config.resolve_mask_density_gate():
+    keeps_mask = getattr(store, "_keeps_boolean_mask", None)
+    if keeps_mask is not None and keeps_mask(selected, n_rows):
         return rows
     return np.flatnonzero(rows)
 
