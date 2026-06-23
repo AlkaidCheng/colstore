@@ -35,6 +35,11 @@ under Deferred). The multi-file dataset reads and the parallel-filesystem write
 path that landed between Round 3 and here are documented in the README and
 `performance.md` rather than as numbered stages.
 
+Round 5 carried two earlier wins onto surfaces that had not inherited them — the
+boolean-mask-native gather (Stage 12) onto the edit/frame path, and cache-resident batching
+onto the streaming read terminals (`iter_batches`, `write`, the scalar reductions), with a
+32 MiB default budget, reused gather buffers, and folded reductions.
+
 ---
 
 # Round 1 — Stages 1–6
@@ -728,6 +733,100 @@ interleaved A/B with output parity asserted each case: all-non-negative
 ~1.55–1.77× (K = 1k…10M), with-negatives ~1.04× (no regression). A below-range
 test (an index past `-n_rows` must still raise) locks in the post-fold recheck.
 
+# Round 5 — Edit-path mask routing and cache-resident streaming
+
+This round carried two earlier wins onto surfaces that had not inherited them — the
+boolean-mask-native gather (Stage 12) onto the edit/frame path, and cache-resident batching
+onto the streaming read terminals. Both were gated by an interleaved A/B, asserted
+output-identical to the route they replace, and ship a committed `benchmark/check_*.py`
+harness with a correctness gate that runs before timing.
+
+## Stage 15 — Mask-native gather on the edit path
+
+**Branch:** `feat/frame-mask-native-edit-gather`
+
+**Problem.** A boolean row selection entering the edit frame (`ds[mask].edit()`, a dense
+`filter`) was lowered to int64 indices at the view→frame seam (`flatnonzero`), so its
+materialization missed the Stage-12 mask-native kernel that the equivalent *read* (`ds[mask]`)
+already used — paying the O(N) conversion, the 8-byte-per-selected-row index allocation, and
+the sorted-fancy gather per column, the exact costs Stage 12 removed.
+
+**Change.** The frame keeps a boolean mask as its row selection when, and only when, that
+selection will gather mask-natively, decided once at construction (`_normalize_base_rows`):
+an un-composed base selection on a multi-record store at or above the mask-density gate
+passes the whole mask to the in-memory terminals, which route it through the reader's
+mask-native kernel. A single-record store (contiguous, no mask kernel), a sparse mask (below
+the gate, where a 1-byte/row mask is no smaller than an int64 index array), a pending
+`where()`, and the batched paths (`write` / `iter_batches` / reductions) lower the mask to
+indices once at construction rather than per column. `_row_count` reads the count from the
+mask's popcount, so `n_rows` / `count()` never materialize the index. Multi-file datasets
+lower conservatively; an uncalibrated host (gate 0.0) keeps every mask, unchanged.
+
+**Measured (deployment hardware).** The dense-mask edit now takes the Stage-12 route, so it
+carries that kernel's profile (4–6× single-column, 2–3× multi-column at realistic densities).
+The edit-path A/B (`benchmark/check_mask_native_edit.py`, whose baseline lowers the mask
+inside the timed cell — the prior per-column path — rather than receiving a precomputed index
+set) isolates the win to multi-record dense masks; single-record and sparse selections read
+at parity by design, and the output is identical to the index path.
+
+## Stage 16 — Cache-resident streaming read path
+
+**Branch:** `perf/streaming-copy-false-reductions`
+
+**Problem.** The streaming terminals (`iter_batches`, `write`, the scalar reductions)
+allocated a fresh array per batch and, at the 128 MiB default budget, sized each batch past
+last-level cache, so a multi-batch stream ran its gather and write out of cache
+(memory-bandwidth-bound) and churned page faults on the per-batch allocation. Reductions
+materialized the whole selection before folding; `count()` / `n_rows` materialized the row
+index only to size it.
+
+**Change (one branch, four parts).**
+
+* **Cache-resident default budget.** `_DEFAULT_MEMORY_BUDGET` 128 → 32 MiB, sizing each
+  streaming batch to roughly fit last-level cache so a batch's gather and write stay
+  cache-resident. Small edits still fit one batch; peak RAM stays bounded.
+* **Reused gather buffers.** The gather path accepts a caller-provided `out=` buffer and
+  fills it instead of allocating, threaded end-to-end through the single-file reader and the
+  multi-file dataset (scalar / fancy / contiguous / whole-store paths); the C++ kernels
+  already wrote into a caller buffer, so this was Python-side plumbing.
+  `iter_batches(copy=False)` reuses one buffer per column across the whole stream — a batch
+  column is a read-only zero-copy view of the source where available (a single-record native
+  contiguous range) or a gather into the reused buffer otherwise, so the stream allocates
+  nothing per batch. A probe on the first batch detects a store that ignores `out=` (a
+  multi-file boundary read) and stops allocating a dead buffer. `copy=True` (the default) is
+  unchanged; a `copy=False` batch is valid only until the next is drawn.
+* **Folded reductions.** `sum` / `mean` / `min` / `max` fold a zero-copy view of the source
+  where possible, else a fixed cache-resident chunk (`_REDUCTION_CHUNK_BYTES` = 8 MiB),
+  rather than materializing the full selection; floating sums accumulate in float64 so the
+  result is budget-independent. The chunk is fixed rather than the user budget: a reduction
+  batch spills cache well before 32 MiB (the sweep wants 8 MiB), and a fold's per-batch
+  overhead is negligible.
+* **popcount `count()` / `n_rows`.** The row count comes from the predicate mask's popcount,
+  never materializing the row index.
+
+**Measured (deployment hardware, via `benchmark/check_memory_budget.py`; speedup vs a single
+unbounded batch — the prior behavior).**
+
+| workload                          | lever                     | speedup                 |
+| --------------------------------- | ------------------------- | ----------------------- |
+| reduction (sum, 10M rows)         | 8 MiB cache-resident fold | up to 6.9×              |
+| deep transform (sqrt + sum, 5M)   | 32 MiB budget             | 1.70×                   |
+| transform (+2 derived, 5M)        | 32 MiB budget             | 1.33×                   |
+| filter 50%, 12 columns (5M)       | 32 MiB budget             | 1.17×                   |
+| write (100M rows)                 | 32 MiB budget             | 1.12–1.16×              |
+| full-pass iter, copy=False (100M) | reused buffers            | 1.88× (copy=True 1.55×) |
+
+Output is identical across budgets (the harness gates correctness before timing). The gains
+come from keeping each batch cache-resident and, for `copy=False`, from reusing one buffer
+per column.
+
+**Rejected with data.** An available-memory guard (`psutil.virtual_memory`) before each index
+materialization was prototyped and dropped: it guarded the row index, not the column data,
+while predicate evaluation already allocates an index-sized array upstream and the in-memory
+terminals allocate larger data unchecked — so a per-resolve syscall bought no proportionate
+bound. Explicit materialization fails naturally on a genuine OOM; streaming stays bounded by
+the budget.
+
 # Net effect
 
 For the motivating workload — multi-column selection-driven reads over
@@ -748,7 +847,10 @@ above 256K elements, load misaligned packed columns safely
 routing change sits behind a measured gate whose floor is the pre-change
 behavior. Streams of event-sized records write ~2.4x faster, and per-host
 calibration remains a one-command operation with fingerprint-guarded
-caches.
+caches. On the edit side, a dense-mask `ds[mask].edit()` takes the mask-native route rather
+than lowering to indices, and the streaming terminals are cache-resident by default (32 MiB),
+reuse one gather buffer per column under `copy=False`, and fold reductions in fixed 8 MiB
+chunks.
 
 # Rejected alternatives (do not re-propose without new evidence)
 
@@ -818,6 +920,17 @@ caches.
   can take; `_from_arrays` still consolidates and an Arrow path would add a copy.
   The one live frame lever — the gather copy — was taken by Stage 13. (Round 4
   investigation)
+* **Available-memory guard before index materialization** — a `psutil.virtual_memory`
+  check sized against the row index, prototyped and dropped: it guards the index, not the
+  column data, predicate evaluation already allocates an index-sized array upstream, and the
+  in-memory terminals allocate larger data unchecked, so the per-resolve syscall bought no
+  proportionate bound. Reopen only for a uniform memory-bounded contract across all
+  terminals. (Stage 16)
+* **`copy=` on the per-batch streaming terminal** (e.g. `batch.dict(copy=False)`) instead of
+  on `iter_batches` — the win is a buffer reused *across* batches, a whole-iteration property
+  a per-batch terminal cannot express; moving it there would drop the reuse for collectable
+  results, which `copy=True` and the reader's one-shot `dict(copy=False)` already provide.
+  (Stage 16)
 
 # Open / deferred items (recorded reasons)
 
