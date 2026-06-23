@@ -41,6 +41,7 @@ add_custom_command(
           "${CYTHON_PYX}"
   DEPENDS ${CYTHON_PYX}
           "${CMAKE_CURRENT_SOURCE_DIR}/include/colstore/gather.hpp"
+          "${CMAKE_CURRENT_SOURCE_DIR}/include/colstore/record_index.hpp"
   COMMENT "Cythonizing _gather.pyx -> _gather.cpp"
   VERBATIM)
 
@@ -48,6 +49,7 @@ add_custom_command(
 Python_add_library(_gather MODULE WITH_SOABI
   ${CYTHON_CPP}
   src/cpp/gather.cpp
+  src/cpp/record_index.cpp
 )
 
 target_include_directories(_gather PRIVATE

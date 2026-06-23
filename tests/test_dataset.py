@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import ColStoreDataset, ColStoreReader
+from colstore import ColStoreDataset, ColStoreReader, kernels, testing
 
 
 def _build_files(tmp_path, sizes):
@@ -957,3 +957,37 @@ def test_dataset_array_shortcut(tmp_path):
         np.testing.assert_array_equal(ds.array("x"), ds["x"].array())
     finally:
         ds.close()
+
+
+# ---- multi-file + multirecord open via the C++ record-index kernel ----------
+
+
+@pytest.mark.skipif(not kernels.cpp_available(), reason="multi-record reads need the gather kernel")
+def test_multifile_multirecord_open_and_read(tmp_path):
+    """A many-child, multi-record dataset opens and reads correctly.
+
+    Each child's per-record index is built by ``format.read_record_index`` (the
+    C++ kernel when the extension is built). A full read and a fancy read
+    spanning files and records are checked against the concatenated source.
+    """
+    blocks: dict[str, list[np.ndarray]] = {}
+    paths = []
+    for i in range(4):
+        cols = testing.make_columns(600, 3, dtype="float64", seed=i)
+        path = tmp_path / f"part_{i}.cstore"
+        testing.write_columns(path, cols, records=5).close()
+        paths.append(path)
+        for name, values in cols.items():
+            blocks.setdefault(name, []).append(values)
+    oracle = {name: np.concatenate(parts) for name, parts in blocks.items()}
+
+    with colstore.open(paths) as ds:
+        assert ds.n_rows == 4 * 600
+        full = ds.dict()
+        first = ds.columns[0]
+        idx = np.array([0, 599, 600, 1801, 2399], dtype=np.int64)  # spans files and records
+        picked = ds[idx, first].array()
+
+    for name, expected in oracle.items():
+        np.testing.assert_array_equal(full[name], expected)
+    np.testing.assert_array_equal(picked, oracle[first][idx])

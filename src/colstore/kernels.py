@@ -6,6 +6,7 @@ a one-time warning. NumPy is always available and is used for ``slice``
 and full-column reads where fancy indexing isn't required.
 """
 
+import os
 import warnings
 from typing import Any
 
@@ -51,6 +52,27 @@ def max_threads() -> int:
         # The compiled module has no stubs; cast its return through int().
         return int(_cpp_module.max_threads())
     return 1
+
+
+def read_record_index(
+    path: str | os.PathLike[str],
+    data_offset: int,
+    n_records: int,
+    itemsizes: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the per-record index with the C++ kernel.
+
+    Returns ``(record_starts_rows, record_starts_bytes, n_rows_per_record)`` as
+    int64 arrays. Requires the compiled extension, so callers gate on
+    :func:`cpp_available`; ``colstore.format.read_record_index`` falls back to a
+    pure-Python walk when it is not built. Raises
+    :class:`colstore.format.FormatError` on a corrupt or truncated record header.
+    """
+    # The compiled module has no stubs; bind through a typed local.
+    result: tuple[np.ndarray, np.ndarray, np.ndarray] = _cpp_module.read_record_index(
+        os.fspath(path), int(data_offset), int(n_records), int(sum(itemsizes))
+    )
+    return result
 
 
 def parallel_copy_runs(

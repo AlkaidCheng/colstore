@@ -171,10 +171,9 @@ def read_record_index(
     n_records: int,
     itemsizes: list[int],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Walk record headers to build the per-record index used by the reader.
+    """Build the per-record index used by the reader.
 
-    Returns three small int64 arrays (24 bytes per record total; built from
-    ``R`` 32-byte reads):
+    Returns three int64 arrays (24 bytes per record total):
 
     * ``record_starts_rows`` shape ``(R+1,)`` -- cumulative row counts,
       used to bin row indices to records.
@@ -183,6 +182,35 @@ def read_record_index(
     * ``n_rows_per_record`` shape ``(R,)`` -- per-record row counts, used
       to compute per-column offsets within a record
       (``column_prefix_bytes[j] * n_rows_per_record[record_id]``).
+
+    The compiled C++ kernel walks the headers when the extension is available;
+    otherwise :func:`_read_record_index_walk` produces the identical arrays in
+    pure Python.
+
+    Raises
+    ------
+    FormatError
+        On wrong record magic, mismatched record index, CRC mismatch, or a
+        file shorter than its records imply. All indicate file corruption.
+    """
+    from . import kernels
+
+    if kernels.cpp_available():
+        return kernels.read_record_index(path, data_offset, n_records, itemsizes)
+    return _read_record_index_walk(path, data_offset, n_records, itemsizes)
+
+
+def _read_record_index_walk(
+    path: PathLike,
+    data_offset: int,
+    n_records: int,
+    itemsizes: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Pure-Python fallback for :func:`read_record_index`.
+
+    Walks the record headers one at a time, validating each and accumulating
+    the same three int64 arrays. Used only when the compiled extension is not
+    available; the output is byte-identical to the C++ kernel.
 
     Raises
     ------
