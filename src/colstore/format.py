@@ -50,7 +50,7 @@ import tempfile
 import time
 import zlib
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import IO, Any
 
 import numpy as np
@@ -953,6 +953,14 @@ def _fill_streaming_mmap(
         views.clear()
 
 
+# Whether the streaming pwrite fill overlaps each batch's write with the next
+# batch's read+transform via a single background writer (a benchmark hook; False
+# writes each batch inline, the prior serial behavior). The compute is
+# memory-bandwidth-bound and the pwrite is filesystem-bound, so the next batch is
+# prepared while the current one is written.
+_STREAMING_OVERLAP_WRITE: bool = True
+
+
 def _fill_streaming_pwrite(
     tmp_path: str,
     specs: dict[str, Expr],
@@ -965,16 +973,22 @@ def _fill_streaming_pwrite(
 ) -> None:
     """Fill a preallocated file body with ``os.pwrite``, batch by batch.
 
-    Same per-batch evaluation as :func:`_fill_streaming_mmap` -- a fresh memo
-    shared across columns, so a subexpression feeding several columns is computed
-    once and released when the batch ends -- but each column's batch is written
-    to the destination with a large ``os.pwrite`` at its fixed offset instead of
-    stored through a per-column memmap. The columns of a batch write disjoint
-    regions, so their writes are issued concurrently across the gather thread
-    budget; a parallel filesystem serves several large writes in flight far
-    better than mmap's page-granular dirtying. Byte order is normalized to
-    little-endian when the batch is cast to the on-disk dtype (a no-op on a
-    little-endian host).
+    Each column's batch is written to the destination with a large ``os.pwrite``
+    at its fixed offset; the columns of a batch write disjoint regions, so their
+    writes are issued concurrently across the gather thread budget (a parallel
+    filesystem serves several large writes in flight far better than mmap's
+    page-granular dirtying). Each batch evaluates its columns through one shared
+    memo, so a subexpression feeding several columns is computed once and released
+    when the batch ends. Byte order is normalized to little-endian when the batch
+    is cast to the on-disk dtype (a no-op on a little-endian host).
+
+    With more than one batch, the writes run on a single background thread so the
+    next batch's read+transform proceeds while the current batch is written: the
+    compute is memory-bandwidth-bound and the ``pwrite`` is filesystem-bound, so
+    overlapping them hides the smaller phase under the larger. Waiting on the
+    previous write before submitting the next bounds memory to two batches in
+    flight and surfaces a write error at that handoff; the output is identical to
+    writing each batch inline.
     """
     column_offset: dict[str, int] = {}
     offset = body_offset
@@ -990,35 +1004,51 @@ def _fill_streaming_pwrite(
     def write_job(data: memoryview, dst_offset: int) -> Callable[[], None]:
         return lambda: _pwrite_all(fd, data, dst_offset)
 
-    try:
-        for start in range(0, n_rows, batch_rows):
-            stop = min(start + batch_rows, n_rows)
-            selector: slice | np.ndarray[Any, np.dtype[Any]] = (
-                slice(start, stop) if rows is None else rows[start:stop]
+    def build_jobs(start: int, stop: int) -> list[Callable[[], None]]:
+        """Read+transform one batch's columns into buffers; return their pwrite jobs.
+
+        The batch is sized to fit the memory budget, so holding all of one batch's
+        column buffers (kept alive by the returned jobs) stays within it.
+        """
+        selector: slice | np.ndarray[Any, np.dtype[Any]] = (
+            slice(start, stop) if rows is None else rows[start:stop]
+        )
+        memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
+        jobs: list[Callable[[], None]] = []
+        for name in names:
+            dtype = on_disk_dtypes[name]
+            passthrough = fusible.get(name)
+            if passthrough is not None:
+                # A plain native passthrough: fill a batch buffer straight from the
+                # source, then write it (one copy, as the mmap path).
+                batch = np.empty(stop - start, dtype=dtype)
+                passthrough._fill_into(batch, start, stop)
+            else:
+                batch = np.ascontiguousarray(evaluate(specs[name], selector, memo), dtype=dtype)
+            jobs.append(
+                write_job(batch.view(np.uint8).data, column_offset[name] + start * dtype.itemsize)
             )
-            memo: dict[tuple[Any, ...], np.ndarray[Any, np.dtype[Any]]] = {}
-            # Evaluate the batch's columns serially through the shared memo (so a
-            # shared subexpression is computed once), holding their bytes; the
-            # batch is sized to fit the memory budget, so holding all of one
-            # batch's buffers stays within it.
-            jobs: list[Callable[[], None]] = []
-            for name in names:
-                dtype = on_disk_dtypes[name]
-                passthrough = fusible.get(name)
-                if passthrough is not None:
-                    # A plain native passthrough: fill a batch buffer straight
-                    # from the source, then write it (one copy, as the mmap path).
-                    batch = np.empty(stop - start, dtype=dtype)
-                    passthrough._fill_into(batch, start, stop)
-                else:
-                    batch = np.ascontiguousarray(evaluate(specs[name], selector, memo), dtype=dtype)
-                jobs.append(
-                    write_job(
-                        batch.view(np.uint8).data, column_offset[name] + start * dtype.itemsize
-                    )
-                )
-            # The columns of a batch write disjoint regions; issue them at once.
-            _run_copy_jobs(jobs, workers)
+        return jobs
+
+    spans = [(start, min(start + batch_rows, n_rows)) for start in range(0, n_rows, batch_rows)]
+    try:
+        if _STREAMING_OVERLAP_WRITE and len(spans) > 1:
+            # One background writer drains completed batches while the main thread
+            # builds the next; the previous write is awaited before the next is
+            # submitted, so at most two batches are in flight and a write error is
+            # re-raised here (then the outer writer removes the temp file).
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="colstore-write") as writer:
+                pending: Future[None] | None = None
+                for start, stop in spans:
+                    jobs = build_jobs(start, stop)
+                    if pending is not None:
+                        pending.result()
+                    pending = writer.submit(_run_copy_jobs, jobs, workers)
+                if pending is not None:
+                    pending.result()
+        else:
+            for start, stop in spans:
+                _run_copy_jobs(build_jobs(start, stop), workers)
     finally:
         os.close(fd)
 

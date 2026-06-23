@@ -827,6 +827,54 @@ terminals allocate larger data unchecked — so a per-resolve syscall bought no 
 bound. Explicit materialization fails naturally on a genuine OOM; streaming stays bounded by
 the budget.
 
+# Round 6 — Overlapping the streaming write with compute
+
+Earlier rounds left the streaming write reading and transforming a batch, then
+writing it, then reading the next — the read+transform (memory-bandwidth-bound)
+and the parallel `os.pwrite` (filesystem-bound) running strictly in series. This
+round overlaps them, after a faithful profile of the end-to-end write path located
+the time and ruled out a tempting alternative on measured grounds.
+
+## Stage 17 — Background-writer I/O-compute overlap
+
+**Branch:** `perf/overlap-streaming-write`
+
+**Problem.** A decomposition of the real streaming-write path — wrapping the single
+per-batch write call and the durability `fsync` with no source change — found each
+batch's gather, per-column transform, and `pwrite` running in series, the cores idle
+during the write and the device idle during the compute. The durability `fsync` was
+under 1% of wall on the parallel filesystem (large sequential `pwrite` commits the
+data, so the write is not flush-bound, unlike the earlier mmap concat-write), which
+left overlapping the compute with the write as a live lever.
+
+**Change.** When a write spans more than one batch, each batch's parallel `pwrite`
+runs on a single background-writer thread while the main thread reads and transforms
+the next batch; the previous write is awaited before the next is submitted, so at
+most two batches are in flight (peak memory bounded) and a write error is re-raised
+at that handoff into the existing atomic-rename cleanup. The compute stays
+single-threaded — the gather over the source is unchanged — and each batch keeps
+freshly allocated buffers and a private memo, so no lock is required and the output
+is byte-identical to the inline write (pinned by the suite in both thread regimes and
+a repeat-plus-fault-injection probe).
+
+**Measured (deployment hardware, parallel filesystem, 50M x 12 f8).** Per-column
+transform writes ~2.0x, heavy-math derived writes ~3.4x, filtered writes ~1.1x;
+isolated single-route runs reproduce these. A second effect compounds the overlap:
+the serial path re-faulted its per-batch column buffers cold every batch (minor page
+faults ~1.7M-4.4M), while the sustained two-batch footprint keeps them warm
+(~10-20K), the larger share of the gain for transform-heavy writes. Confirmed not an
+allocator mmap-threshold artifact (forcing arena allocation did not help the serial
+path). Filtered writes, already low-fault, gain mostly from the overlap itself.
+
+**Rejected with data — per-column parallel evaluation.** Evaluating a batch's columns
+on a thread pool, instead of overlapping the write, was prototyped first and regressed
+the common transform on the deployment node: a `col + k` transform is
+memory-bandwidth-bound, so running the per-column gathers concurrently over interleaved
+memory added cross-socket contention — 0.86x, with +67% CPU for a worse wall, the same
+effect that shelved spread thread-binding. Only heavy-math transforms, where the
+arithmetic hides the contention, won (1.23x). Shelved for the overlap, which keeps the
+compute single-threaded and avoids the contention entirely.
+
 # Net effect
 
 For the motivating workload — multi-column selection-driven reads over
