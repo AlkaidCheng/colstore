@@ -31,10 +31,12 @@ Contracts shared by every entry point:
   negative uses the compiled default, :func:`default_prefetch_distance`.
 """
 
+import os
+
 import numpy as np
 
 cimport numpy as cnp
-from libc.stdint cimport int32_t, int64_t, uint8_t
+from libc.stdint cimport int32_t, int64_t, uint8_t, uint32_t
 
 cnp.import_array()
 
@@ -110,6 +112,13 @@ cdef extern from "colstore/gather.hpp" nogil:
 cdef extern from "colstore/gather.hpp" namespace "colstore" nogil:
     ptrdiff_t resolve_thread_count(ptrdiff_t n_indices, int cap)
     const ptrdiff_t DEFAULT_PREFETCH_DISTANCE
+
+
+cdef extern from "colstore/record_index.hpp" nogil:
+    int colstore_read_record_index(const char*, int64_t, int64_t, int64_t, int64_t,
+                                   int64_t*, int64_t*, int64_t*,
+                                   int64_t*, int64_t*, int64_t*,
+                                   uint32_t*, uint32_t*)
 
 
 def max_threads() -> int:
@@ -1238,3 +1247,86 @@ def resolve_thread_count(n_indices: int, thread_cap: int = 0) -> int:
     ``thread_cap <= 0`` means the OpenMP maximum).
     """
     return colstore_resolve_thread_count(n_indices, thread_cap)
+
+
+def read_record_index(path, int64_t data_offset, int64_t n_records, int64_t itemsize_sum,
+                       int64_t read_chunk=1 << 20):
+    """Build the per-record index by walking the record headers natively.
+
+    Reads each 32-byte record header at its position in ``path`` (skipping the
+    bodies), validates magic / sequential index / CRC32, and returns three
+    ``int64`` arrays: cumulative row counts ``(n_records + 1,)``, body byte
+    offsets ``(n_records,)``, and per-record row counts ``(n_records,)``.
+
+    Parameters
+    ----------
+    path :
+        File to read; accepts ``str``, ``bytes``, or ``os.PathLike``.
+    data_offset :
+        Byte offset of the first record header.
+    n_records :
+        Number of records to walk.
+    itemsize_sum :
+        Sum of the column itemsizes; a record body occupies
+        ``align_up(n_rows * itemsize_sum, 8)`` bytes.
+    read_chunk :
+        Size in bytes of the reused sliding read buffer (default 1 MiB).
+        Larger values amortize the syscall count across more records;
+        ``32`` reads each header in isolation.
+
+    Raises
+    ------
+    FormatError
+        On a corrupt or truncated record header (bad magic, mismatched record
+        index, CRC mismatch, or a file shorter than its records imply).
+    """
+    cdef cnp.ndarray record_starts_rows = np.empty(n_records + 1, dtype=np.int64)
+    cdef cnp.ndarray record_starts_bytes = np.empty(n_records, dtype=np.int64)
+    cdef cnp.ndarray n_rows_per_record = np.empty(n_records, dtype=np.int64)
+    cdef bytes path_bytes = os.fsencode(path)
+    cdef const char* path_c = path_bytes
+    cdef int64_t err_offset = 0
+    cdef int64_t err_record = 0
+    cdef int64_t err_stored = 0
+    cdef uint32_t err_crc_stored = 0
+    cdef uint32_t err_crc_actual = 0
+    cdef int64_t* rows_ptr = <int64_t*>cnp.PyArray_DATA(record_starts_rows)
+    cdef int64_t* bytes_ptr = <int64_t*>cnp.PyArray_DATA(record_starts_bytes)
+    cdef int64_t* nrows_ptr = <int64_t*>cnp.PyArray_DATA(n_rows_per_record)
+    cdef int status
+    with nogil:
+        status = colstore_read_record_index(
+            path_c, data_offset, n_records, itemsize_sum, read_chunk,
+            rows_ptr, bytes_ptr, nrows_ptr,
+            &err_offset, &err_record, &err_stored,
+            &err_crc_stored, &err_crc_actual,
+        )
+    if status != 0:
+        from colstore.format import FormatError
+
+        if status == -2:
+            raise FormatError(
+                f"Truncated record header at offset {err_offset}: "
+                f"expected 32 bytes, got {err_stored}."
+            )
+        if status == -3:
+            raise FormatError(
+                f"Bad record magic at offset {err_offset}: expected b'REC\\x01'."
+            )
+        if status == -4:
+            raise FormatError(
+                f"Record index mismatch at offset {err_offset}: manifest expects "
+                f"record {err_record}, header says {err_stored}."
+            )
+        if status == -5:
+            raise FormatError(
+                f"Record {err_record} header CRC mismatch "
+                f"(stored {err_crc_stored}, computed {err_crc_actual})."
+            )
+        if status == -6:
+            raise FormatError(
+                f"File is truncated: last record body ends at offset {err_offset} "
+                f"but file is only {err_stored} bytes."
+            )
+        raise FormatError(f"Could not read record index (status {status}).")
+    return record_starts_rows, record_starts_bytes, n_rows_per_record

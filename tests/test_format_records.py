@@ -34,7 +34,7 @@ import numpy as np
 import pytest
 from _format_fixture import expected_column_values, write_record_file
 
-from colstore import ColStoreReader
+from colstore import ColStoreReader, kernels
 from colstore import format as fmt
 from colstore.format import FormatError
 
@@ -473,3 +473,99 @@ def test_slice_across_zero_row_record(tmp_path):
         assert np.array_equal(got, truth[3:7])
         # Full read also has to walk past the zero-row record.
         assert np.array_equal(ds[:, "i32"].array(), truth)
+
+
+# ---- C++ record-index kernel ------------------------------------------------
+#
+# read_record_index dispatches to the compiled C++ kernel
+# (kernels.read_record_index) when the extension is available and otherwise
+# falls back to the pure-Python walk (_read_record_index_walk). The kernel output
+# must be byte-identical to the walk, and both must raise FormatError on the same
+# corruption.
+
+
+def _index_args(path: Path) -> tuple[int, int, list[int]]:
+    """The ``(data_offset, n_records, itemsizes)`` the reader passes to the index build."""
+    manifest, data_offset = fmt.read_header(path)
+    n_records = int(manifest["n_records"])
+    itemsizes = [np.dtype(col["dtype"]).itemsize for col in manifest["columns"]]
+    return data_offset, n_records, itemsizes
+
+
+def _uniform_record_list(n_records: int, n_rows: int, last_rows: int) -> list[dict]:
+    """Records sharing ``n_rows`` for 0..R-2, with ``last_rows`` for the last record."""
+    rng = np.random.default_rng(0)
+    records = []
+    for i in range(n_records):
+        n = n_rows if i < n_records - 1 else last_rows
+        records.append(
+            {
+                "i32": np.arange(n, dtype=np.int32),
+                "f64": rng.standard_normal(n).astype(np.float64),
+                "i8": (np.arange(n, dtype=np.int8) % 127),
+            }
+        )
+    return records
+
+
+@pytest.mark.skipif(not kernels.cpp_available(), reason="requires the compiled extension")
+@pytest.mark.parametrize(
+    "n_records,n_rows,last_rows",
+    [
+        (1, 10, 10),  # single record
+        (5, 10, 10),  # all records equal
+        (5, 10, 13),  # last larger -- remainder absorbed into the final record
+        (5, 10, 4),  # last smaller -- a streaming writer's partial final batch
+        (2, 8, 3),  # minimal multi-record, last smaller
+    ],
+)
+def test_record_index_cpp_matches_walk(tmp_path, n_records, n_rows, last_rows):
+    """The C++ kernel output is byte-identical to the Python walk."""
+    path = tmp_path / "ri.cstore"
+    write_record_file(path, _schema(), _uniform_record_list(n_records, n_rows, last_rows))
+    data_offset, n, itemsizes = _index_args(path)
+    cpp = kernels.read_record_index(path, data_offset, n, itemsizes)
+    walk = fmt._read_record_index_walk(path, data_offset, n, itemsizes)
+    for got, expected in zip(cpp, walk, strict=True):
+        assert got.dtype == expected.dtype
+        np.testing.assert_array_equal(got, expected)
+
+
+@pytest.mark.skipif(not kernels.cpp_available(), reason="requires the compiled extension")
+def test_record_index_cpp_matches_walk_variable(tmp_path):
+    """The kernel matches the walk on a non-uniform (varying-row) layout."""
+    path = tmp_path / "ri_var.cstore"
+    write_record_file(path, _schema(), _make_records(6))  # n_rows 7,10,13,16,19,22
+    data_offset, n, itemsizes = _index_args(path)
+    cpp = kernels.read_record_index(path, data_offset, n, itemsizes)
+    walk = fmt._read_record_index_walk(path, data_offset, n, itemsizes)
+    for got, expected in zip(cpp, walk, strict=True):
+        np.testing.assert_array_equal(got, expected)
+
+
+def test_record_index_fallback_to_walk(tmp_path, monkeypatch):
+    """With the extension disabled, the dispatcher uses the Python walk."""
+    path = tmp_path / "ri_fb.cstore"
+    records = _make_records(4)
+    write_record_file(path, _schema(), records)
+    data_offset, n, itemsizes = _index_args(path)
+    reference = fmt._read_record_index_walk(path, data_offset, n, itemsizes)
+
+    monkeypatch.setattr(kernels, "_CPP_AVAILABLE", False)
+    assert not kernels.cpp_available()
+    got = fmt.read_record_index(path, data_offset, n, itemsizes)
+    for array, expected in zip(got, reference, strict=True):
+        np.testing.assert_array_equal(array, expected)
+    with ColStoreReader(path) as ds:
+        assert ds.n_rows == sum(len(r["i32"]) for r in records)
+
+
+def test_record_index_fallback_raises_on_corruption(tmp_path, monkeypatch):
+    """The Python-walk fallback rejects a corrupt header just like the kernel."""
+    path = tmp_path / "ri_fb_bad.cstore"
+    write_record_file(path, _schema(), _make_records(3))
+    _, data_offset = fmt.read_header(path)
+    _corrupt_record_field(path, data_offset, 28, b"\xff\xff\xff\xff")  # record 0 CRC
+    monkeypatch.setattr(kernels, "_CPP_AVAILABLE", False)
+    with pytest.raises(FormatError, match="CRC"):
+        ColStoreReader(path)
