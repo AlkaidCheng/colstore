@@ -43,6 +43,7 @@ callers always see native-order arrays.
 
 import contextlib
 import json
+import mmap
 import os
 import struct
 import sys
@@ -96,6 +97,17 @@ _RECORD_HEADER_FMT = (
 _RECORD_HEADER_PACK_SIZE = struct.calcsize(_RECORD_HEADER_FMT)  # 32
 _RECORD_MAGIC = b"REC\x01"
 _RECORD_BODY_ALIGNMENT = 8
+# NumPy view of the 32-byte header (packed, little-endian; matches _RECORD_HEADER_FMT),
+# so all records' headers can be read in one strided pass on the uniform fast path.
+_RECORD_HEADER_DTYPE = np.dtype(
+    [("magic", "S4"), ("index", "<i8"), ("n_rows", "<i8"), ("reserved", "<i8"), ("crc", "<u4")]
+)
+
+# Whether read_record_index tries the vectorized uniform-stride fast path before the
+# per-record sequential walk. A benchmark hook; default off pending a node A/B. The fast
+# path returns the same index arrays for a uniform store and falls back (returns None) to
+# the walk for any non-uniform / unvalidated layout, so the walk stays authoritative.
+_VECTORIZED_RECORD_INDEX: bool = False
 
 # Default per-column metadata. Recorded on write so future readers/writers can
 # branch on these keys without a format break; today only the defaults are
@@ -166,6 +178,97 @@ def record_body_size(n_rows: int, itemsizes: list[int]) -> int:
 
 
 def read_record_index(
+    path: PathLike,
+    data_offset: int,
+    n_records: int,
+    itemsizes: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the per-record index (cumulative rows, body byte offsets, per-record rows).
+
+    A uniform-record store -- the common high-record-count case -- lays records at a fixed
+    stride, so :func:`_read_record_index_uniform` reads all headers in one strided pass and
+    builds the index with NumPy. Anything it cannot validate as uniform, and every genuine
+    corruption, falls through to :func:`_read_record_index_walk` -- the authoritative
+    per-record sequential walk, which raises the canonical :class:`FormatError`.
+    """
+    if _VECTORIZED_RECORD_INDEX and n_records > 1:
+        fast = _read_record_index_uniform(path, data_offset, n_records, itemsizes)
+        if fast is not None:
+            return fast
+    return _read_record_index_walk(path, data_offset, n_records, itemsizes)
+
+
+def _read_record_index_uniform(
+    path: PathLike,
+    data_offset: int,
+    n_records: int,
+    itemsizes: list[int],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Vectorized record-index build, assuming a uniform record stride.
+
+    Reads record 0's row count, assumes every record shares it (so the stride between record
+    headers is constant), and reads all ``n_records`` 32-byte headers in one strided pass over a
+    read-only mmap -- no per-record Python except the CRC check. Returns the same three arrays
+    as :func:`_read_record_index_walk` when the headers validate as a uniform layout (magic,
+    sequential index, CRC, no final-body truncation); returns ``None`` otherwise -- a
+    non-uniform stride lands the strided read on body bytes and fails the magic/index/CRC check,
+    so the caller falls back to the authoritative walk (which raises on genuine corruption).
+    """
+    itemsize_sum = sum(itemsizes)
+    with open(path, "rb") as input_file:
+        file_size = os.fstat(input_file.fileno()).st_size
+        if data_offset + _RECORD_HEADER_SIZE > file_size:
+            return None
+        with mmap.mmap(input_file.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            # n_rows of record 0 lives 12 bytes into its header (after magic(4) + index(8)).
+            n_rows_0 = int(np.frombuffer(mapped, dtype="<i8", count=1, offset=data_offset + 12)[0])
+            stride = _RECORD_HEADER_SIZE + align_up(n_rows_0 * itemsize_sum, _RECORD_BODY_ALIGNMENT)
+            if stride < _RECORD_HEADER_SIZE:
+                return None
+            if data_offset + (n_records - 1) * stride + _RECORD_HEADER_SIZE > file_size:
+                return None  # not a uniform stride (or truncated) -> let the walk decide
+            try:
+                headers = np.ndarray(
+                    (n_records,),
+                    dtype=_RECORD_HEADER_DTYPE,
+                    buffer=mapped,
+                    offset=data_offset,
+                    strides=(stride,),
+                )
+                header_bytes = np.ndarray(
+                    (n_records, _RECORD_HEADER_SIZE),
+                    dtype=np.uint8,
+                    buffer=mapped,
+                    offset=data_offset,
+                    strides=(stride, 1),
+                )
+            except (ValueError, TypeError):
+                return None
+            if not bool((headers["magic"] == _RECORD_MAGIC).all()):
+                return None
+            if not np.array_equal(headers["index"], np.arange(n_records, dtype="<i8")):
+                return None
+            stored_crc = headers["crc"]
+            for index in range(n_records):
+                computed_crc = zlib.crc32(header_bytes[index, :28].tobytes()) & 0xFFFFFFFF
+                if computed_crc != int(stored_crc[index]):
+                    return None
+            n_rows_per_record = np.array(headers["n_rows"], dtype=np.int64)
+            record_starts_bytes = (
+                data_offset + np.arange(n_records, dtype=np.int64) * stride + _RECORD_HEADER_SIZE
+            )
+            record_starts_rows = np.empty(n_records + 1, dtype=np.int64)
+            record_starts_rows[0] = 0
+            np.cumsum(n_rows_per_record, out=record_starts_rows[1:])
+            last_body_end = int(record_starts_bytes[-1]) + align_up(
+                int(n_rows_per_record[-1]) * itemsize_sum, _RECORD_BODY_ALIGNMENT
+            )
+            if file_size < last_body_end:
+                return None  # final body truncated -> the walk raises the canonical error
+    return record_starts_rows, record_starts_bytes, n_rows_per_record
+
+
+def _read_record_index_walk(
     path: PathLike,
     data_offset: int,
     n_records: int,

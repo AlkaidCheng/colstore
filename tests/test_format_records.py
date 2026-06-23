@@ -473,3 +473,112 @@ def test_slice_across_zero_row_record(tmp_path):
         assert np.array_equal(got, truth[3:7])
         # Full read also has to walk past the zero-row record.
         assert np.array_equal(ds[:, "i32"].array(), truth)
+
+
+# ---- Vectorized record-index fast path --------------------------------------
+#
+# read_record_index dispatches to a strided, NumPy-vectorized build for uniform
+# record layouts (format._VECTORIZED_RECORD_INDEX, off by default) and falls back
+# to the per-record walk -- the authoritative path -- for any non-uniform or
+# corrupt file. These tests pin the fast path byte-identical to the walk, confirm
+# it engages only for uniform layouts, and confirm corruption still raises.
+
+
+@pytest.fixture
+def record_index_flag():
+    """Save/restore ``_VECTORIZED_RECORD_INDEX`` so a test can toggle it freely."""
+    previous = fmt._VECTORIZED_RECORD_INDEX
+    try:
+        yield
+    finally:
+        fmt._VECTORIZED_RECORD_INDEX = previous
+
+
+def _index_inputs(path: Path, n_records: int) -> tuple[int, int, list[int]]:
+    """The ``(data_offset, n_records, itemsizes)`` the reader passes to the index build."""
+    _, data_offset = fmt.read_header(path)
+    itemsizes = [np.dtype(dt).itemsize for _, dt in _schema()]
+    return data_offset, n_records, itemsizes
+
+
+def _uniform_record_list(n_records: int, n_rows: int, last_rows: int) -> list[dict]:
+    """Records sharing ``n_rows`` for 0..R-2, with ``last_rows`` for the last record.
+
+    This is the uniform-stride layout the fast path targets: records 0..R-2 are
+    one fixed size (so the header stride is constant), and the last record may
+    differ -- larger (a remainder absorbed into the last) or smaller (a
+    streaming writer's partial final batch).
+    """
+    rng = np.random.default_rng(0)
+    records = []
+    for i in range(n_records):
+        n = n_rows if i < n_records - 1 else last_rows
+        records.append(
+            {
+                "i32": np.arange(n, dtype=np.int32),
+                "f64": rng.standard_normal(n).astype(np.float64),
+                "i8": (np.arange(n, dtype=np.int8) % 127),
+            }
+        )
+    return records
+
+
+@pytest.mark.parametrize(
+    "n_records,n_rows,last_rows",
+    [
+        (5, 10, 10),  # all records equal
+        (5, 10, 13),  # last larger -- remainder absorbed into the final record
+        (5, 10, 4),  # last smaller -- a streaming writer's partial final batch
+        (2, 10, 3),  # minimal multi-record, last smaller
+    ],
+)
+def test_vectorized_record_index_matches_walk(
+    tmp_path, record_index_flag, n_records, n_rows, last_rows
+):
+    """The vectorized fast path engages and is byte-identical to the walk."""
+    path = tmp_path / "uniform.cstore"
+    write_record_file(path, _schema(), _uniform_record_list(n_records, n_rows, last_rows))
+    data_offset, n, itemsizes = _index_inputs(path, n_records)
+
+    fmt._VECTORIZED_RECORD_INDEX = False
+    walk = fmt.read_record_index(path, data_offset, n, itemsizes)
+    fmt._VECTORIZED_RECORD_INDEX = True
+    vectorized = fmt.read_record_index(path, data_offset, n, itemsizes)
+
+    # The fast path actually engaged (did not silently fall back to the walk).
+    assert fmt._read_record_index_uniform(path, data_offset, n, itemsizes) is not None
+    for got, expected in zip(vectorized, walk, strict=True):
+        assert got.dtype == expected.dtype
+        np.testing.assert_array_equal(got, expected)
+
+
+def test_vectorized_record_index_falls_back_for_variable(tmp_path, record_index_flag):
+    """A non-uniform record layout declines the fast path but stays correct."""
+    path = tmp_path / "variable.cstore"
+    write_record_file(path, _schema(), _make_records(5))  # n_rows 7,10,13,16,19
+    data_offset, n, itemsizes = _index_inputs(path, 5)
+
+    # A non-uniform stride lands the strided read off the headers -> declines.
+    assert fmt._read_record_index_uniform(path, data_offset, n, itemsizes) is None
+
+    fmt._VECTORIZED_RECORD_INDEX = False
+    walk = fmt.read_record_index(path, data_offset, n, itemsizes)
+    fmt._VECTORIZED_RECORD_INDEX = True
+    dispatched = fmt.read_record_index(path, data_offset, n, itemsizes)
+    for got, expected in zip(dispatched, walk, strict=True):
+        np.testing.assert_array_equal(got, expected)
+
+
+def test_vectorized_record_index_corrupt_uniform_raises(tmp_path, record_index_flag):
+    """Corruption in a uniform store: the fast path declines, the walk raises."""
+    path = tmp_path / "uniform_bad.cstore"
+    write_record_file(path, _schema(), _uniform_record_list(4, 10, 10))
+    data_offset, n, itemsizes = _index_inputs(path, 4)
+    # Corrupt record 1's CRC (its header sits one stride past data_offset).
+    stride = 32 + fmt.record_body_size(10, itemsizes)
+    _corrupt_record_field(path, data_offset + stride, 28, b"\xff\xff\xff\xff")
+
+    fmt._VECTORIZED_RECORD_INDEX = True
+    assert fmt._read_record_index_uniform(path, data_offset, n, itemsizes) is None
+    with pytest.raises(FormatError, match="CRC"):
+        ColStoreReader(path)
