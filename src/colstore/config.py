@@ -411,6 +411,36 @@ def resolve_mask_density_gate() -> float:
     return _auto_mask_density
 
 
+# Minimum selected fraction for a multi-file boolean-mask read to take the
+# native mask kernel (colstore_gather_multifile_mask) instead of the per-file
+# fan-out. A deployment-node sweep found the kernel faster at every density: it
+# word-skips unselected runs, so a sparse mask -- where the per-file path still
+# pays full per-(file, column) threadpool orchestration -- is its largest win
+# (~7.6x at 0.5% selected), not a loss. So it defaults to 0: always take the
+# kernel when the columns are native. Kept settable for a deployment that
+# measures a regime where the per-file path wins.
+_MULTIFILE_MASK_DENSITY_GATE_DEFAULT = 0.0
+_multifile_mask_density_gate: float = _MULTIFILE_MASK_DENSITY_GATE_DEFAULT
+
+
+def get_multifile_mask_density_gate() -> float:
+    """Return the minimum mask density for the native multi-file mask kernel."""
+    return _multifile_mask_density_gate
+
+
+def set_multifile_mask_density_gate(gate: float) -> None:
+    """Set the multi-file mask-kernel density gate (a selected fraction >= 0).
+
+    A read selecting at least this fraction of the dataset's rows takes the
+    native mask kernel; a sparser read takes the per-file path. ``0`` always
+    takes the kernel.
+    """
+    global _multifile_mask_density_gate
+    if gate < 0:
+        raise ValueError(f"multifile_mask_density_gate must be >= 0, got {gate!r}.")
+    _multifile_mask_density_gate = float(gate)
+
+
 def get_default_madvise() -> MadviseOption | None:
     """Return the default ``madvise`` hint applied to new ``ColStoreReader`` opens."""
     return _default_madvise

@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import ColStoreDataset, ColStoreReader, kernels, testing
+from colstore import ColStoreDataset, ColStoreReader, col, config, kernels, testing
 
 
 def _build_files(tmp_path, sizes):
@@ -991,3 +991,80 @@ def test_multifile_multirecord_open_and_read(tmp_path):
     for name, expected in oracle.items():
         np.testing.assert_array_equal(full[name], expected)
     np.testing.assert_array_equal(picked, oracle[first][idx])
+
+
+# ---- multi-file mask-native kernel ------------------------------------------
+#
+# A dense boolean mask on a multi-file dataset gathers through the native
+# multi-file mask kernel (colstore_gather_multifile_mask) over the cached segment
+# table; a sparse mask, a non-native dtype, or no extension declines to the
+# per-file path. Both must be byte-identical to numpy mask indexing.
+
+
+def _build_multifile_mask(tmp_path, n_files, rows, cols, records):
+    """Write ``n_files`` multi-record files; return paths and the concatenated oracle."""
+    paths = []
+    blocks: dict[str, list[np.ndarray]] = {}
+    for i in range(n_files):
+        columns = testing.make_columns(rows, cols, dtype="float64", seed=i)
+        path = tmp_path / f"mk_{i}.cstore"
+        testing.write_columns(path, columns, records=records).close()
+        paths.append(path)
+        for name, values in columns.items():
+            blocks.setdefault(name, []).append(values)
+    return paths, {name: np.concatenate(v) for name, v in blocks.items()}
+
+
+@pytest.mark.skipif(not kernels.cpp_available(), reason="needs the compiled extension")
+@pytest.mark.parametrize("records", [1, 20])
+@pytest.mark.parametrize("fraction", [0.5, 1.0])
+def test_multifile_mask_kernel_matches_per_file(tmp_path, records, fraction):
+    """The native mask kernel and the per-file path are both byte-identical to numpy."""
+    paths, oracle = _build_multifile_mask(tmp_path, 5, 4000, 4, records)
+    names = list(oracle)
+    rng = np.random.default_rng(records)
+    with colstore.open(paths) as ds:
+        mask = np.ones(ds.n_rows, bool) if fraction == 1.0 else (rng.random(ds.n_rows) < fraction)
+        saved = config.get_multifile_mask_density_gate()
+        try:
+            config.set_multifile_mask_density_gate(0.0)  # force the kernel
+            kern = ds[mask, names].dict()
+            config.set_multifile_mask_density_gate(2.0)  # force the per-file path
+            per_file = ds[mask, names].dict()
+        finally:
+            config.set_multifile_mask_density_gate(saved)
+        for name in names:
+            expected = oracle[name][mask]
+            np.testing.assert_array_equal(kern[name], expected)
+            np.testing.assert_array_equal(per_file[name], expected)
+            assert kern[name].dtype == expected.dtype
+
+
+@pytest.mark.skipif(not kernels.cpp_available(), reason="needs the compiled extension")
+def test_multifile_mask_density_gate_declines_sparse(tmp_path):
+    """_mask_native takes the kernel for a dense mask and declines a sparse one."""
+    paths, oracle = _build_multifile_mask(tmp_path, 4, 4000, 3, 10)
+    names = list(oracle)
+    with colstore.open(paths) as ds:
+        saved = config.get_multifile_mask_density_gate()
+        try:
+            config.set_multifile_mask_density_gate(0.25)
+            dense = np.ones(ds.n_rows, bool)
+            sparse = np.zeros(ds.n_rows, bool)
+            sparse[::100] = True  # 1% selected, below the 0.25 gate
+            assert ds._mask_native(names, dense) is not None
+            assert ds._mask_native(names, sparse) is None
+        finally:
+            config.set_multifile_mask_density_gate(saved)
+
+
+@pytest.mark.skipif(not kernels.cpp_available(), reason="needs the compiled extension")
+def test_multifile_mask_frame_filter_matches_oracle(tmp_path):
+    """frame.filter on a multi-file dataset keeps a dense mask and matches numpy."""
+    paths, oracle = _build_multifile_mask(tmp_path, 5, 4000, 3, 20)
+    names = list(oracle)
+    with colstore.open(paths) as ds:
+        keep = oracle[names[0]] > 0.0  # ~50% dense
+        got = ds.edit().filter(col(names[0]) > 0.0).dict()
+        for name in names:
+            np.testing.assert_array_equal(got[name], oracle[name][keep])

@@ -1071,7 +1071,6 @@ void gather_multirecord_uniform_withbins_typed(const std::uint8_t* COLSTORE_REST
 // run detection costs nothing extra here because the mask byte is the
 // datum being scanned anyway.
 namespace {
-constexpr std::int64_t MASK_RUN_COPY_MIN_BYTES = 32;
 constexpr std::uint64_t MASK_ALL_ONES = 0x0101010101010101ULL;
 
 inline std::int64_t count_mask_range(const std::uint8_t* mask, std::int64_t lo,
@@ -1206,6 +1205,125 @@ int gather_multirecord_mask_typed(const std::uint8_t* COLSTORE_RESTRICT base,
   }
 #endif
   walk_range(0, n_rows, 0, static_cast<std::int64_t>(n_out));
+  return 0;
+}
+
+// Multi-file analogue of gather_multirecord_mask_typed: identical pass-1 count /
+// prefix-offset and pass-2 word-at-a-time scan, but the per-record base is
+// replaced by the segment cursor over the (files x records) segment table --
+// segment_base[s] is the folded absolute base, so a global row i in segment s
+// reads at segment_base[s] + i * itemsize. The chunk-to-thread mapping uses an
+// explicit parallel-for over all n_threads chunks (not omp_get_thread_num), so
+// every chunk's output region is filled even if the team is granted fewer
+// threads than requested.
+template <typename T>
+int gather_multifile_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
+                                std::uint8_t* COLSTORE_RESTRICT output,
+                                std::int64_t n_rows,
+                                std::ptrdiff_t n_out,
+                                const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
+                                const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                std::int64_t n_segments,
+                                int thread_cap,
+                                std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  const std::int64_t len = n_segments + 1;
+  T* dst = reinterpret_cast<T*>(output);
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_rows, thread_cap);
+  const std::int64_t chunk = (n_rows + n_threads - 1) / n_threads;
+
+  // Pass 1: per-chunk selected-row counts -> exclusive prefix offsets. The
+  // chunk size here is reused verbatim by pass 2 so the offsets and the gather
+  // partition agree.
+  std::vector<std::int64_t> offsets(static_cast<std::size_t>(n_threads) + 1, 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#endif
+  for (std::ptrdiff_t t = 0; t < n_threads; ++t) {
+    const std::int64_t lo = static_cast<std::int64_t>(t) * chunk;
+    const std::int64_t hi = std::min(n_rows, lo + chunk);
+    offsets[static_cast<std::size_t>(t) + 1] = (lo < hi) ? count_mask_range(mask, lo, hi) : 0;
+  }
+  for (std::ptrdiff_t t = 0; t < n_threads; ++t) {
+    offsets[static_cast<std::size_t>(t) + 1] += offsets[static_cast<std::size_t>(t)];
+  }
+  if (offsets[static_cast<std::size_t>(n_threads)] != static_cast<std::int64_t>(n_out)) {
+    return 1;  // caller-sized output disagrees with the mask; write nothing
+  }
+
+  const auto seg_addr = [](std::int64_t base, std::int64_t byte_offset) {
+    return reinterpret_cast<const std::uint8_t*>(
+        static_cast<std::uintptr_t>(base + byte_offset));
+  };
+
+  // Pass 2: each chunk seeds a segment cursor (one bin_record) and walks its
+  // rows monotonically; consecutive global rows in different segments live in
+  // different mmaps, so seg_end clips both the copy-run and the branchless
+  // window to the current segment. The over-store guard (out + 8 <= quota)
+  // keeps the branchless form inside the thread's own output region, exactly
+  // as the single-file mask kernel.
+  const auto walk_range = [&](std::int64_t lo, std::int64_t hi, std::int64_t out,
+                              std::int64_t quota) {
+    if (lo >= hi) {
+      return;
+    }
+    std::int64_t s = bin_record(segment_starts_rows, len, lo);
+    std::int64_t i = lo;
+    while (i < hi) {
+      while (i >= segment_starts_rows[s + 1]) {
+        ++s;
+      }
+      const std::int64_t seg_end = std::min(hi, segment_starts_rows[s + 1]);
+      const std::int64_t seg_base = segment_base[s];
+      while (i < seg_end) {
+        if (i + 8 <= seg_end) {
+          const std::uint64_t word = load_unaligned<std::uint64_t>(mask + i);
+          if (word == 0) {
+            i += 8;
+            continue;
+          }
+          if (word == MASK_ALL_ONES) {
+            std::int64_t j = i + 8;
+            while (j + 8 <= seg_end &&
+                   load_unaligned<std::uint64_t>(mask + j) == MASK_ALL_ONES) {
+              j += 8;
+            }
+            std::memcpy(dst + out, seg_addr(seg_base, i * itemsize),
+                        static_cast<std::size_t>((j - i) * itemsize));
+            out += j - i;
+            i = j;
+            continue;
+          }
+          if (out + 8 <= quota) {
+            for (int b = 0; b < 8; ++b) {
+              dst[out] = load_unaligned<T>(seg_addr(seg_base, (i + b) * itemsize));
+              out += mask[i + b];
+            }
+            i += 8;
+            continue;
+          }
+        }
+        if (mask[i]) {
+          dst[out] = load_unaligned<T>(seg_addr(seg_base, i * itemsize));
+          ++out;
+        }
+        ++i;
+      }
+    }
+    (void)prefetch_distance;  // linear walk: hardware prefetch covers it
+  };
+
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#endif
+  for (std::ptrdiff_t t = 0; t < n_threads; ++t) {
+    const std::int64_t lo = static_cast<std::int64_t>(t) * chunk;
+    const std::int64_t hi = std::min(n_rows, lo + chunk);
+    walk_range(lo, hi, offsets[static_cast<std::size_t>(t)],
+               offsets[static_cast<std::size_t>(t) + 1]);
+  }
   return 0;
 }
 
@@ -1547,6 +1665,22 @@ int colstore_gather_multirecord_mask(
   colstore::dispatch_itemsize(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
     status = colstore::gather_multirecord_mask_typed<T>(base, mask, output, n_rows, n_out, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
+  });
+  return status;
+}
+
+int colstore_gather_multifile_mask(const std::uint8_t* mask, std::uint8_t* output,
+                                   std::int64_t n_rows, std::ptrdiff_t n_out,
+                                   const std::int64_t* segment_starts_rows,
+                                   const std::int64_t* segment_base, std::int64_t n_segments,
+                                   int itemsize, int thread_cap,
+                                   std::ptrdiff_t prefetch_distance) {
+  int status = -1;
+  colstore::dispatch_itemsize(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    status = colstore::gather_multifile_mask_typed<T>(mask, output, n_rows, n_out,
+                                                      segment_starts_rows, segment_base,
+                                                      n_segments, thread_cap, prefetch_distance);
   });
   return status;
 }

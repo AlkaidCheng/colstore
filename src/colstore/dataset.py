@@ -684,6 +684,55 @@ class ColStoreDataset(_ReaderBase):
             out[name][order] = buffer
         return out
 
+    def _mask_native(
+        self, column_names: list[str], mask: NDArray[np.bool_]
+    ) -> dict[str, NDArray[Any]] | None:
+        """Gather a boolean mask with the native multi-file mask kernel, or ``None``.
+
+        Returns ``None`` to decline -- the caller then takes the per-file path --
+        when the selection is too sparse for the kernel's full-mask scan to pay
+        off (below :func:`config.get_multifile_mask_density_gate`), or when any
+        column cannot supply a native segment table (the same gate the fancy path
+        uses: extension unavailable, unsupported itemsize, or a non-native on-disk
+        dtype). The kernel scans the mask once for lock-free output offsets and
+        once to gather, so the output is byte-identical to numpy mask indexing.
+        """
+        if self._n_rows == 0:
+            return None
+        selected = int(np.count_nonzero(mask))
+        if selected < self._n_rows * config.get_multifile_mask_density_gate():
+            return None
+        tables = [self._native_segment_table(name) for name in column_names]
+        if any(table is None for table in tables):
+            return None
+
+        from . import _gather as _cpp_module  # type: ignore[attr-defined]
+
+        contiguous_mask = np.ascontiguousarray(mask)
+        out: dict[str, NDArray[Any]] = {}
+        for name, table in zip(column_names, tables, strict=True):
+            assert table is not None  # filtered above
+            segment_starts_rows, segment_base = table
+            column = np.empty(selected, dtype=self._native_dtype(name))
+            _cpp_module.gather_multifile_mask(
+                contiguous_mask, column, segment_starts_rows, segment_base
+            )
+            out[name] = column
+        return out
+
+    def _keeps_boolean_mask(self, selected: int, n_rows: int) -> bool:
+        """Whether a base boolean mask should reach the gather as a mask, not indices.
+
+        True for a multi-file dataset whose selection is dense enough to take the
+        native mask kernel (the same density gate :meth:`_mask_native` applies); the
+        gather then makes the final native-vs-per-file choice. A sparse mask is lowered
+        to indices by the caller, where the per-file path serves it well. A single-file
+        dataset short-circuits to its child, so it does not keep the mask here.
+        """
+        if len(self._children) <= 1:
+            return False
+        return selected >= n_rows * config.get_multifile_mask_density_gate()
+
     # ---- Copying seam --------------------------------------------------
 
     def _classify_rows(self, row_indexer: Any) -> tuple[str, Any]:
@@ -723,6 +772,14 @@ class ColStoreDataset(_ReaderBase):
         children = self._children
         if len(children) == 1:
             return children[0]._gather_one(column_name, row_indexer, thread_cap, out=out)
+        if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
+            native = self._mask_native([column_name], row_indexer)
+            if native is not None:
+                result = native[column_name]
+                if out is None:
+                    return result
+                out[:] = result
+                return out
         kind, payload = self._classify_rows(row_indexer)
         if kind == "scalar":
             file_index, local = payload
@@ -793,6 +850,10 @@ class ColStoreDataset(_ReaderBase):
         children = self._children
         if len(children) == 1:
             return children[0]._gather_many(column_names, row_indexer)
+        if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
+            native = self._mask_native(column_names, row_indexer)
+            if native is not None:
+                return native
         kind, payload = self._classify_rows(row_indexer)
         if kind == "scalar":
             file_index, local = payload
