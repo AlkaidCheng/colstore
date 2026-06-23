@@ -181,15 +181,25 @@ def run_bench(directory: Path, args: argparse.Namespace) -> None:
             frame = shape.build(store, rows)
             n_out = shape.out_rows(rows)
             print(f"=== {shape.label}  ({n_out:,} rows) ===")
+            all_variants = [
+                ("inline  ", lambda f=frame: _write_with(f, out, overlap=False)),
+                ("overlap ", lambda f=frame: _write_with(f, out, overlap=True)),
+            ]
+            # --variant isolates one route per process. The two routes have
+            # different allocator footprints (overlap holds two batches), so
+            # interleaving them in one process can cross-contaminate page-fault
+            # state; run each alone in a fresh process for a clean baseline.
+            variants = (
+                all_variants
+                if args.variant == "both"
+                else [v for v in all_variants if v[0].strip() == args.variant]
+            )
             _c.compare(
-                [
-                    ("inline  ", lambda f=frame: _write_with(f, out, overlap=False)),
-                    ("overlap ", lambda f=frame: _write_with(f, out, overlap=True)),
-                ],
+                variants,
                 repeat=args.repeat,
                 warmup=args.warmup,
                 baseline=0,
-                setups=[lambda: out.unlink(missing_ok=True)] * 2,
+                setups=[lambda: out.unlink(missing_ok=True)] * len(variants),
                 throughput_rows=n_out,
             )
             print()
@@ -212,6 +222,12 @@ def main() -> None:
         tmpdir=True,
     )
     parser.add_argument("--records", type=int, default=1000, help="records in the source store")
+    parser.add_argument(
+        "--variant",
+        choices=["both", "inline", "overlap"],
+        default="both",
+        help="run only one route (in a fresh process) for an allocator-clean baseline",
+    )
     args = parser.parse_args()
     _c.apply_runtime_config(args)
 
