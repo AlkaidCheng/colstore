@@ -97,6 +97,12 @@ def _check_operand(value: Any) -> None:
     """
     if isinstance(value, Expr) or _is_scalar_operand(value):
         return
+    if isinstance(value, _Expr):
+        raise TypeError(
+            "cannot use a col() expression as an operand of a frame (cf[...]) expression; "
+            "build the expression entirely with col(), or replace the col() reference with "
+            "the matching cf[...] column."
+        )
     if isinstance(value, np.ndarray):
         raise TypeError(
             "cannot use a raw ndarray inside a column expression; attach it as a "
@@ -915,6 +921,9 @@ class _QueryValueBuilder:
 
     def isin(self, target: Expr, values: Any) -> Expr:
         return Isin(target, values)
+
+    def where(self, cond: Any, a: Any, b: Any) -> Expr:
+        return Where(cond, a, b)
 
 
 class _Cut(NamedTuple):

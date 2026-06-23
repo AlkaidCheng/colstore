@@ -265,3 +265,46 @@ def test_col_on_multifile_dataset(tmp_path):
         ).close()
     with colstore.open([str(tmp_path / "p0.cstore"), str(tmp_path / "p1.cstore")]) as ds:
         assert _pts(ds[col("pt") > 50]) == [60.0, 110.0, 160.0]
+
+
+# ---- NumPy functions on col() ----------------------------------------------
+
+
+def test_col_numpy_ufunc_predicate(qstore):
+    ds, _ = qstore
+    # np.sqrt(col("pt")) > 5 keeps pt > 25.
+    assert _pts(ds[np.sqrt(col("pt")) > 5.0]) == [30.0, 40.0, 50.0]
+
+
+def test_col_numpy_ufunc_matches_operator(qstore):
+    ds, _ = qstore
+    assert _pts(ds[np.divide(col("pt"), 10.0) >= 3.0]) == _pts(ds[col("pt") / 10.0 >= 3.0])
+
+
+def test_col_numpy_reduction_rejected():
+    with pytest.raises(TypeError, match="reduction or accumulation"):
+        np.add.reduce(col("pt"))
+
+
+def test_col_numpy_gufunc_rejected():
+    with pytest.raises(TypeError, match="generalized ufunc"):
+        np.matmul(col("a"), col("b"))
+
+
+def test_col_rejects_raw_array_operand():
+    arr = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    with pytest.raises(TypeError, match="raw array"):
+        _ = col("pt") + arr
+    with pytest.raises(TypeError, match="raw array"):
+        np.add(col("pt"), arr)
+    with pytest.raises(TypeError, match="raw array"):
+        _ = arr + col("pt")
+    with pytest.raises(TypeError, match="raw array"):
+        _ = col("pt") > arr
+
+
+def test_col_scalar_and_isin_array_still_work(qstore):
+    ds, _ = qstore
+    assert _pts(ds[col("pt") + 0 > 25]) == [30.0, 40.0, 50.0]  # scalar operand
+    assert _pts(ds[col("pt") + np.array(0.0) > 25]) == [30.0, 40.0, 50.0]  # 0-d operand
+    assert _pts(ds[col("pt").isin(np.array([10.0, 50.0]))]) == [10.0, 50.0]  # array members

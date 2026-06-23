@@ -56,6 +56,9 @@ _UNARY_OPS: dict[type[ast.unaryop], np.ufunc] = {
     ast.Invert: np.invert,
     ast.Not: np.logical_not,
 }
+# Comparison ufuncs rebuild as ``_Compare`` (which aligns str/bytes operands) rather
+# than ``_Op``, consistent with the comparison operators.
+_COMPARE_UFUNCS = frozenset(_COMPARE_OPS.values())
 
 ReadColumn = Callable[[str], NDArray[Any]]
 
@@ -108,6 +111,21 @@ def _emit_operand(operand: Any, builder: Any) -> Any:
     return operand._emit(builder) if isinstance(operand, _Expr) else operand
 
 
+def _check_operand(value: Any) -> None:
+    """Reject a raw row-length array as an arithmetic or comparison operand.
+
+    A 1-D-or-higher array has no guarantee of matching the column's rows -- and
+    would not under a filtered view or a streamed batch -- so it cannot be an
+    operand. A scalar, a 0-d array, another column expression, or ``.isin(...)``
+    for membership are the supported forms.
+    """
+    if isinstance(value, np.ndarray) and value.ndim >= 1:
+        raise TypeError(
+            "cannot use a raw array as an operand in a col() expression; use a scalar, "
+            "another col() expression, or .isin(...) for membership."
+        )
+
+
 class _Expr:
     """A node in a lazy column-expression tree built by :func:`col` and operators.
 
@@ -131,8 +149,9 @@ class _Expr:
     def _emit(self, builder: Any) -> Any:
         """Rebuild this expression through ``builder``, a node factory -- a fold
         over the tree. ``builder`` supplies ``column(name)`` / ``op(ufunc,
-        operands)`` / ``isin(target, values)`` and gets back whatever it builds;
-        the frame uses it to splice a ``col()`` expression into its value graph.
+        operands)`` / ``isin(target, values)`` / ``where(cond, a, b)`` and gets back
+        whatever it builds; the frame uses it to splice a ``col()`` expression into
+        its value graph.
         """
         raise NotImplementedError
 
@@ -143,6 +162,41 @@ class _Expr:
         )
 
     __hash__ = None  # type: ignore[assignment]
+
+    # The ufunc and array-function protocols build the same nodes as the operator
+    # methods; only elementwise (single-output, non-generalized) operations are admitted.
+    def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any) -> _Expr:
+        if method != "__call__":
+            raise TypeError(
+                f"{ufunc.__name__}.{method} is a reduction or accumulation; column "
+                "expressions support only elementwise (row-independent) operations."
+            )
+        if kwargs.get("out") is not None:
+            raise TypeError("out= is not supported when building a column expression.")
+        if ufunc.nout != 1:
+            raise TypeError(
+                f"ufunc {ufunc.__name__!r} returns multiple outputs, which a column "
+                "expression cannot represent; use single-output operations."
+            )
+        if ufunc.signature is not None:
+            raise TypeError(
+                f"ufunc {ufunc.__name__!r} is a generalized ufunc that mixes rows across "
+                "a core dimension; column expressions support only elementwise operations."
+            )
+        if ufunc in _COMPARE_UFUNCS and len(inputs) == 2:
+            return _Compare(ufunc, inputs[0], inputs[1])
+        return _Op(ufunc, *inputs)
+
+    def __array_function__(
+        self, func: Any, types: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> _Expr:
+        builder = _ARRAY_FUNCTIONS.get(func)
+        if builder is None:
+            raise TypeError(
+                f"numpy.{getattr(func, '__name__', func)} is not supported in a column "
+                "expression; build it from elementwise operations instead."
+            )
+        return builder(*args, **kwargs)
 
     # -- comparisons (Python derives the reflected forms, e.g. 30 < col -> col > 30) --
     def __lt__(self, other: Any) -> _Expr:
@@ -257,6 +311,8 @@ class _Op(_Expr):
     __slots__ = ("_operands", "_ufunc")
 
     def __init__(self, ufunc: np.ufunc, *operands: Any) -> None:
+        for operand in operands:
+            _check_operand(operand)
         self._ufunc = ufunc
         self._operands = operands
 
@@ -277,6 +333,8 @@ class _Compare(_Expr):
     __slots__ = ("_left", "_right", "_ufunc")
 
     def __init__(self, ufunc: np.ufunc, left: Any, right: Any) -> None:
+        _check_operand(left)
+        _check_operand(right)
         self._ufunc = ufunc
         self._left = left
         self._right = right
@@ -317,6 +375,76 @@ class _Isin(_Expr):
 
     def _emit(self, builder: Any) -> Any:
         return builder.isin(_emit_operand(self._target, builder), self._values)
+
+
+class _Where(_Expr):
+    """A ``numpy.where(cond, a, b)`` elementwise choice between two operands."""
+
+    __slots__ = ("_a", "_b", "_cond")
+
+    def __init__(self, cond: Any, a: Any, b: Any) -> None:
+        for value in (cond, a, b):
+            _check_operand(value)
+        self._cond = cond
+        self._a = a
+        self._b = b
+
+    def _evaluate(self, read_column: ReadColumn) -> Any:
+        return np.where(
+            _operand(self._cond, read_column),
+            _operand(self._a, read_column),
+            _operand(self._b, read_column),
+        )
+
+    def _columns(self) -> Iterator[str]:
+        for operand in (self._cond, self._a, self._b):
+            yield from _operand_columns(operand)
+
+    def _emit(self, builder: Any) -> Any:
+        return builder.where(
+            _emit_operand(self._cond, builder),
+            _emit_operand(self._a, builder),
+            _emit_operand(self._b, builder),
+        )
+
+
+def _np_where(condition: Any, *branches: Any) -> _Expr:
+    """``numpy.where(cond, x, y)`` builder for the column-expression dispatch table."""
+    if len(branches) != 2:
+        raise TypeError(
+            "numpy.where on a column expression requires both branches: "
+            "np.where(cond, x, y); the single-argument index form mixes rows and is "
+            "not supported."
+        )
+    return _Where(condition, branches[0], branches[1])
+
+
+def _np_clip(a: Any, a_min: Any = None, a_max: Any = None, **kwargs: Any) -> _Expr:
+    """``numpy.clip`` builder, expressed with ``maximum`` / ``minimum`` ufuncs.
+
+    Accepts the bounds under either ``a_min`` / ``a_max`` or ``min`` / ``max`` (both
+    spellings NumPy's ``clip`` allows); ``out=`` and any other keyword are rejected.
+    """
+    if kwargs.get("out") is not None:
+        raise TypeError("out= is not supported when building a column expression.")
+    unsupported = set(kwargs) - {"min", "max", "out"}
+    if unsupported:
+        raise TypeError(f"unsupported argument(s) to numpy.clip: {sorted(unsupported)}.")
+    low = a_min if a_min is not None else kwargs.get("min")
+    high = a_max if a_max is not None else kwargs.get("max")
+    node: Any = a
+    if low is not None:
+        node = _Op(np.maximum, node, low)
+    if high is not None:
+        node = _Op(np.minimum, node, high)
+    if not isinstance(node, _Expr):
+        raise TypeError("numpy.clip needs the clipped value to be a column expression.")
+    return node
+
+
+# Non-ufunc NumPy functions admitted in a column expression, each mapped to the node
+# it builds. Anything outside this table raises in ``_Expr.__array_function__``.
+_ARRAY_FUNCTIONS: dict[Any, Callable[..., _Expr]] = {np.where: _np_where, np.clip: _np_clip}
 
 
 def col(name: str) -> _Expr:
