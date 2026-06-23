@@ -1020,7 +1020,7 @@ def gather_multifile_sorted(cnp.ndarray indices, cnp.ndarray output,
 def gather_segment_mask(cnp.ndarray mask, cnp.ndarray output,
                           cnp.ndarray segment_starts_rows, cnp.ndarray segment_base,
                           int thread_cap=0, Py_ssize_t prefetch_distance=-1):
-    """Boolean-mask-native multi-file gather: no index materialization.
+    """Boolean-mask-native gather over a segment table, single- or multi-file: no index array.
 
     ``mask`` is a numpy bool array with one entry per global row (length must
     equal ``segment_starts_rows[-1]``); selected rows are gathered in ascending

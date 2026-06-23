@@ -424,16 +424,16 @@ _multifile_mask_density_gate: float = _MULTIFILE_MASK_DENSITY_GATE_DEFAULT
 
 
 def get_multifile_mask_density_gate() -> float:
-    """Return the minimum mask density for the native multi-file mask kernel."""
+    """Return the minimum mask density for a multi-file dataset to take the mask kernel."""
     return _multifile_mask_density_gate
 
 
 def set_multifile_mask_density_gate(gate: float) -> None:
-    """Set the multi-file mask-kernel density gate (a selected fraction >= 0).
+    """Set the multi-file mask density gate (a selected fraction >= 0).
 
-    A read selecting at least this fraction of the dataset's rows takes the
-    native mask kernel; a sparser read takes the per-file path. ``0`` always
-    takes the kernel.
+    A multi-file dataset read selecting at least this fraction of its rows takes
+    the native segment mask kernel; a sparser read takes the per-file path. ``0``
+    always takes the kernel.
     """
     global _multifile_mask_density_gate
     if gate < 0:

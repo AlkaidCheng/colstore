@@ -1138,8 +1138,7 @@ int gather_segment_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
   // rows monotonically; consecutive global rows in different segments live in
   // different mmaps, so seg_end clips both the copy-run and the branchless
   // window to the current segment. The over-store guard (out + 8 <= quota)
-  // keeps the branchless form inside the thread's own output region, exactly
-  // as the single-file mask kernel.
+  // keeps the branchless form inside the thread's own output region.
   const auto walk_range = [&](std::int64_t lo, std::int64_t hi, std::int64_t out,
                               std::int64_t quota) {
     if (lo >= hi) {

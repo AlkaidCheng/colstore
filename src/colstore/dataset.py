@@ -687,7 +687,7 @@ class ColStoreDataset(_ReaderBase):
     def _mask_native(
         self, column_names: list[str], mask: NDArray[np.bool_]
     ) -> dict[str, NDArray[Any]] | None:
-        """Gather a boolean mask with the native multi-file mask kernel, or ``None``.
+        """Gather a boolean mask with the native segment mask kernel, or ``None``.
 
         Returns ``None`` to decline -- the caller then takes the per-file path --
         when the selection is too sparse for the kernel's full-mask scan to pay

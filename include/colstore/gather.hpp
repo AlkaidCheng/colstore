@@ -10,10 +10,12 @@
 //   multi-record reader where addresses are non-uniform.
 //
 // The multi-record kernels below them serve range, strided, sorted,
-// unsorted, bin-reuse, uniform-layout, and boolean-mask reads. All are
-// templated on element size only -- a single set of four instantiations
-// (sizes 1/2/4/8) covers every fixed-width numeric dtype plus fixed-width
-// strings, datetime64, and timedelta64.
+// unsorted, bin-reuse, and uniform-layout reads. All are templated on
+// element size only -- a single set of four instantiations (sizes 1/2/4/8)
+// covers every fixed-width numeric dtype plus fixed-width strings,
+// datetime64, and timedelta64. A single segment-mask kernel (see
+// colstore_gather_segment_mask) serves all boolean-mask reads, single-file
+// and multi-file alike, over a segment table.
 //
 // Measurements and the history behind each kernel are recorded in
 // docs/optimization_series.md; comments here state the contracts and the
