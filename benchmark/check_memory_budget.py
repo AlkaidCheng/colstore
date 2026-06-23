@@ -96,12 +96,17 @@ def _scenarios(thr50: float, thr05: float):
     ]
 
 
-def _iter_consume(frame, budget: int, *, copy: bool) -> None:
-    # Stream and discard each batch as a dict -- the column-major HEP consume (no row-major
-    # interleave); collecting the batches would hold the whole dataset and defeat the bound.
+def _iter_consume(frame, budget: int, *, copy: bool) -> float:
+    # Read each column of each batch (a float64 fold). Touching the data is what forces
+    # copy=False's lazy zero-copy views to actually fault the bytes in, so the measurement is
+    # the real streaming read -- not just view creation (a no-op for views, otherwise ~Inf
+    # rows/s). Collecting the batches instead would hold the whole dataset and defeat the bound.
     config.set_default_memory_budget(budget)
+    total = 0.0
     for batch in frame.iter_batches(copy=copy):
-        batch.dict()
+        for column in batch.dict().values():
+            total += float(column.sum())
+    return total
 
 
 def _op(frame, kind: str, out: Path, budget: int):
