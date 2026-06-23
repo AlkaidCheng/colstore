@@ -10,7 +10,7 @@ byte-identical output, swept over the file count:
   fancy gather. This is the rejected PR #196 reroute, kept here as the reference
   it regressed against (materializes an int64 index array + a per-index segment
   search).
-* ``kernel``    -- the native multi-file mask kernel (``colstore_gather_multifile_mask``)
+* ``kernel``    -- the native segment mask kernel (``colstore_gather_segment_mask``)
   over the cached segment table: a 1-byte/row mask, a monotonic segment cursor, and
   popcount/prefix-sum output offsets, in one parallel pass -- no index array, no
   per-row search.

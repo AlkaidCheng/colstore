@@ -412,7 +412,7 @@ def resolve_mask_density_gate() -> float:
 
 
 # Minimum selected fraction for a multi-file boolean-mask read to take the
-# native mask kernel (colstore_gather_multifile_mask) instead of the per-file
+# native mask kernel (colstore_gather_segment_mask) instead of the per-file
 # fan-out. A deployment-node sweep found the kernel faster at every density: it
 # word-skips unselected runs, so a sparse mask -- where the per-file path still
 # pays full per-(file, column) threadpool orchestration -- is its largest win

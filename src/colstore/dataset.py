@@ -714,7 +714,7 @@ class ColStoreDataset(_ReaderBase):
             assert table is not None  # filtered above
             segment_starts_rows, segment_base = table
             column = np.empty(selected, dtype=self._native_dtype(name))
-            _cpp_module.gather_multifile_mask(
+            _cpp_module.gather_segment_mask(
                 contiguous_mask, column, segment_starts_rows, segment_base
             )
             out[name] = column

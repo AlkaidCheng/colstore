@@ -524,6 +524,38 @@ fancy, unsorted fancy).
 
 ![Single-record vs multi-record column layout](docs/assets/record_layout.svg)
 
+## The segment table
+
+A logical column is one contiguous index space to the reader, but on disk its
+bytes are scattered: a multi-record file holds one run of the column per record
+(interleaved with the other columns), and a multi-file dataset spreads those
+runs across files. Reads bridge that gap with a **segment table**, the one
+structure the mask and fancy-gather kernels address through.
+
+A **segment** is one column's run inside one record of one file — the smallest
+unit that is contiguous on disk. The table is two `int64` arrays per column:
+
+- `start_rows` — the `n_segments + 1` cumulative row boundaries, so segment `s`
+  owns global rows `[start_rows[s], start_rows[s + 1])`.
+- `segment_base` — one **folded absolute byte address** per segment. It bakes in
+  the file's mapping base, the record's body offset, this column's prefix within
+  the record, and the segment's row origin, so that the value at global row `i`
+  is simply `segment_base[s] + i * itemsize`. The `start_rows[s]` shift is folded
+  into the base, so the *global* row index plugs in directly — no per-segment
+  rebasing in the inner loop.
+
+To read global row `i`: binary-search `start_rows` for its segment `s`, then read
+at `segment_base[s] + i * itemsize`.
+
+![The segment table](docs/assets/segment_table.svg)
+
+The encoding is the same whichever way the rows are split, which is why one
+kernel serves every case: a **single-file multi-record** store is the records of
+one file; a **multi-file dataset** stitches every file's records into one global
+table (`ColStoreDataset` memoizes it per column, since it depends only on the
+column and the mappings, not the rows a read requests). A single-record file is
+the degenerate case — one segment over the column's own memmap.
+
 ## Supported dtypes
 
 All fixed-size NumPy dtypes are supported: `float32`/`float64`,

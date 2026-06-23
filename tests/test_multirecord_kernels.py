@@ -523,6 +523,19 @@ def test_rbase_kernel_validates_inputs():
         )
 
 
+def _segment_table(lay, itemsize):
+    """Segment table (start_rows, absolute segment_base) for gather_segment_mask.
+
+    One segment per record, the row-to-byte fold of :func:`_record_base` plus the
+    buffer's base address -- exactly what reader._column_segment_table builds.
+    """
+    start_rows = np.ascontiguousarray(lay.rsr, dtype=np.int64)
+    segment_base = lay.buf.ctypes.data + _record_base(
+        lay.rsr, lay.rsb, lay.nrr, lay.prefix, itemsize
+    )
+    return start_rows, np.ascontiguousarray(segment_base, dtype=np.int64)
+
+
 # ---- Boolean-mask-native kernel ---------------------------------------------
 
 
@@ -533,9 +546,8 @@ def test_mask_kernel_matches_boolean_indexing(dtype, density, thread_cap):
     lay = build_layout([137, 64, 350, 99, 470, 261], dtype, col_prefix_rows=2)
     mask = np.random.default_rng(1).random(lay.total) < density
     output = np.empty(int(mask.sum()), dtype=dtype)
-    _gather.gather_multirecord_mask(
-        lay.buf, mask, output, lay.rsr, lay.rsb, lay.nrr, lay.prefix, thread_cap, 8
-    )
+    start_rows, segment_base = _segment_table(lay, np.dtype(dtype).itemsize)
+    _gather.gather_segment_mask(mask, output, start_rows, segment_base, thread_cap, 8)
     assert np.array_equal(output, lay.column[mask])
 
 
@@ -555,9 +567,8 @@ def test_mask_kernel_edge_masks(prefetch):
     masks["head_run_only"][:9] = True
     for name, mask in masks.items():
         output = np.empty(int(mask.sum()), dtype=np.float64)
-        _gather.gather_multirecord_mask(
-            lay.buf, mask, output, lay.rsr, lay.rsb, lay.nrr, lay.prefix, 2, prefetch
-        )
+        start_rows, segment_base = _segment_table(lay, 8)
+        _gather.gather_segment_mask(mask, output, start_rows, segment_base, 2, prefetch)
         assert np.array_equal(output, lay.column[mask]), (name, prefetch)
 
 
@@ -571,9 +582,8 @@ def test_mask_kernel_quota_boundaries_threaded():
     for boundary in range(chunk, total, chunk):
         mask[boundary - 11 : boundary + 11] = True
     output = np.empty(int(mask.sum()), dtype=np.float64)
-    _gather.gather_multirecord_mask(
-        lay.buf, mask, output, lay.rsr, lay.rsb, lay.nrr, lay.prefix, 4, 8
-    )
+    start_rows, segment_base = _segment_table(lay, 8)
+    _gather.gather_segment_mask(mask, output, start_rows, segment_base, 4, 8)
     assert np.array_equal(output, lay.column[mask])
 
 
@@ -583,7 +593,7 @@ def test_mask_kernel_count_mismatch_rejected():
     mask[::3] = True
     wrong = np.empty(int(mask.sum()) + 1, dtype=np.float64)
     with pytest.raises(ValueError, match="selected count"):
-        _gather.gather_multirecord_mask(lay.buf, mask, wrong, lay.rsr, lay.rsb, lay.nrr, lay.prefix)
+        _gather.gather_segment_mask(mask, wrong, *_segment_table(lay, 8))
 
 
 def test_mask_kernel_validates_inputs():
@@ -591,17 +601,11 @@ def test_mask_kernel_validates_inputs():
     mask = np.zeros(lay.total, dtype=bool)
     output = np.empty(0, dtype=np.float64)
     with pytest.raises(TypeError, match="bool"):
-        _gather.gather_multirecord_mask(
-            lay.buf, mask.astype(np.uint8), output, lay.rsr, lay.rsb, lay.nrr, lay.prefix
-        )
+        _gather.gather_segment_mask(mask.astype(np.uint8), output, *_segment_table(lay, 8))
     with pytest.raises(ValueError, match="row count"):
-        _gather.gather_multirecord_mask(
-            lay.buf, mask[:-1], output, lay.rsr, lay.rsb, lay.nrr, lay.prefix
-        )
+        _gather.gather_segment_mask(mask[:-1], output, *_segment_table(lay, 8))
     with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_multirecord_mask(
-            lay.buf, np.repeat(mask, 2)[::2], output, lay.rsr, lay.rsb, lay.nrr, lay.prefix
-        )
+        _gather.gather_segment_mask(np.repeat(mask, 2)[::2], output, *_segment_table(lay, 8))
 
 
 # ---- Contiguity rejection across all pointer-interpreting entries -----------
@@ -708,10 +712,10 @@ def _entry_contiguity_cases():
             ["source", "output", *rec],
         ),
         (
-            "gather_multirecord_mask",
-            _gather.gather_multirecord_mask,
-            dict(source=lay.buf, mask=mask, output=output, col_prefix_bytes=0, **rec),
-            ["source", "mask", "output", *rec],
+            "gather_segment_mask",
+            _gather.gather_segment_mask,
+            dict(mask=mask, output=output, segment_starts_rows=lay.rsr, segment_base=record_base),
+            ["mask", "output", "segment_starts_rows", "segment_base"],
         ),
         (
             "gather_multirecord_uniform",
