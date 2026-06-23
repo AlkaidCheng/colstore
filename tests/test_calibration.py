@@ -443,13 +443,13 @@ def test_reader_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch):
     mask = rng.random(total) < 0.5
 
     calls: list[str] = []
-    original = _gather.gather_multirecord_mask
+    original = _gather.gather_segment_mask
 
     def spy(*args, **kwargs):
         calls.append("mask")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(_gather, "gather_multirecord_mask", spy)
+    monkeypatch.setattr(_gather, "gather_segment_mask", spy)
     dataset = colstore.open(path)
     try:
         config.set_mask_density_gate(2.0)  # explicit: route disabled
@@ -480,13 +480,13 @@ def test_frame_edit_consults_resolved_gate(tmp_path, _isolated_gate, monkeypatch
     mask = rng.random(total) < 0.5
 
     calls: list[str] = []
-    original = _gather.gather_multirecord_mask
+    original = _gather.gather_segment_mask
 
     def spy(*args, **kwargs):
         calls.append("mask")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(_gather, "gather_multirecord_mask", spy)
+    monkeypatch.setattr(_gather, "gather_segment_mask", spy)
     store = colstore.open(path)
     try:
         config.set_mask_density_gate(2.0)  # explicit: route disabled -> lowered path

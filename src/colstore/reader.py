@@ -257,6 +257,10 @@ class ColStoreReader(_ReaderBase):
         self._manifest, data_offset = format.read_header(self._path)
         self._closed = False
 
+        # Per-column segment table for the mask kernel, row-independent so it is
+        # memoized (see _column_segment_table); also reused by the dataset stitch.
+        self._segment_table_cache: dict[str, tuple[NDArray[np.int64], NDArray[np.int64]]] = {}
+
         self._n_rows = int(self._manifest["committed_rows"])
         n_records = int(self._manifest["n_records"])
         self._is_multi_record = n_records > 1
@@ -613,7 +617,7 @@ class ColStoreReader(_ReaderBase):
     def _column_segment_table(
         self, column_name: str
     ) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-        """Local segment table for one column, for the multi-file gather kernel.
+        """Local segment table for one column, for the segment mask/gather kernel.
 
         Returns ``(start_rows, segment_base)`` where, for the segment ``s`` with
         ``start_rows[s] <= idx < start_rows[s + 1]``, this column's value at
@@ -624,15 +628,22 @@ class ColStoreReader(_ReaderBase):
         the record's row-to-byte shift folded in. ``start_rows`` has
         ``n_segments + 1`` entries; ``segment_base`` has ``n_segments``.
 
+        The table is row-independent (it depends only on the column and the
+        mapping bases, stable for the reader's life), so it is memoized; the
+        reader's own mask reads and the dataset stitch both reuse it.
+
         Raises ``ValueError`` for a non-native on-disk dtype, which the
         raw-load kernel cannot byteswap (the caller falls back).
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
+        cached = self._segment_table_cache.get(column_name)
+        if cached is not None:
+            return cached
         disk_dtype = self._column_dtypes[column_name]
         if not _dtype_is_native(disk_dtype):
             raise ValueError(
-                f"Native multi-file gather requires native byte order; column "
+                f"Native segment gather requires native byte order; column "
                 f"{column_name!r} has dtype {disk_dtype}."
             )
         itemsize = disk_dtype.itemsize
@@ -643,13 +654,16 @@ class ColStoreReader(_ReaderBase):
             col_prefix = int(self._column_prefix_bytes[column_name])
             base = self._file_mmap.ctypes.data
             segment_base = base + rsb + col_prefix * nrr - rsr[:-1] * itemsize
-            return (
+            table = (
                 np.ascontiguousarray(rsr, dtype=np.int64),
                 np.ascontiguousarray(segment_base, dtype=np.int64),
             )
-        base = self._memmaps[column_name].ctypes.data
-        start_rows = np.array([0, self._n_rows], dtype=np.int64)
-        return start_rows, np.array([base], dtype=np.int64)
+        else:
+            base = self._memmaps[column_name].ctypes.data
+            start_rows = np.array([0, self._n_rows], dtype=np.int64)
+            table = (start_rows, np.array([base], dtype=np.int64))
+        self._segment_table_cache[column_name] = table
+        return table
 
     def _column_disk_runs(self, column_name: str) -> list[tuple[Path, int, int]]:
         """On-disk byte runs for one column, for a raw passthrough merge copy.
@@ -739,7 +753,7 @@ class ColStoreReader(_ReaderBase):
         docs/optimization_series.md):
 
         * **Boolean mask** at/above the density gate, native dtype:
-          mask-native kernel (``gather_multirecord_mask``). Below the gate
+          mask-native kernel (``gather_segment_mask``). Below the gate
           or non-native: lower to ``np.flatnonzero`` and continue below.
 
         * **Slice** (``None`` / ``slice`` / contiguous range): per-record
@@ -785,14 +799,12 @@ class ColStoreReader(_ReaderBase):
                 output = np.empty(selected, dtype=disk_dtype)
                 if selected:
                     effective_cap = config.resolve_gather_thread_cap(thread_cap)
-                    _cpp_module.gather_multirecord_mask(
-                        self._file_mmap,
+                    start_rows, segment_base = self._column_segment_table(column_name)
+                    _cpp_module.gather_segment_mask(
                         mask,
                         output,
-                        self._record_starts_rows,
-                        self._record_starts_bytes,
-                        self._n_rows_per_record,
-                        col_prefix,
+                        start_rows,
+                        segment_base,
                         effective_cap,
                         config.resolve_prefetch_distance(
                             self._file_mmap.nbytes, indices_sorted=True
@@ -1216,16 +1228,9 @@ class ColStoreReader(_ReaderBase):
             disk_dtype = self._column_dtypes[name]
             output = np.empty(selected, dtype=disk_dtype)
             if selected:
-                _cpp_module.gather_multirecord_mask(
-                    self._file_mmap,
-                    mask,
-                    output,
-                    self._record_starts_rows,
-                    self._record_starts_bytes,
-                    self._n_rows_per_record,
-                    int(self._column_prefix_bytes[name]),
-                    effective_cap,
-                    prefetch,
+                start_rows, segment_base = self._column_segment_table(name)
+                _cpp_module.gather_segment_mask(
+                    mask, output, start_rows, segment_base, effective_cap, prefetch
                 )
             gathered[name] = output.astype(disk_dtype.newbyteorder("="), copy=False)
         if len(gathered) < len(column_names):

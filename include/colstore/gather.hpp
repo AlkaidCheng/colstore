@@ -10,10 +10,12 @@
 //   multi-record reader where addresses are non-uniform.
 //
 // The multi-record kernels below them serve range, strided, sorted,
-// unsorted, bin-reuse, uniform-layout, and boolean-mask reads. All are
-// templated on element size only -- a single set of four instantiations
-// (sizes 1/2/4/8) covers every fixed-width numeric dtype plus fixed-width
-// strings, datetime64, and timedelta64.
+// unsorted, bin-reuse, and uniform-layout reads. All are templated on
+// element size only -- a single set of four instantiations (sizes 1/2/4/8)
+// covers every fixed-width numeric dtype plus fixed-width strings,
+// datetime64, and timedelta64. A single segment-mask kernel (see
+// colstore_gather_segment_mask) serves all boolean-mask reads, single-file
+// and multi-file alike, over a segment table.
 //
 // Measurements and the history behind each kernel are recorded in
 // docs/optimization_series.md; comments here state the contracts and the
@@ -365,48 +367,27 @@ int colstore_gather_multirecord_withbins_rbase(
 // Exposed for diagnostics.
 int colstore_max_threads();
 
-// Boolean-mask-native gather: reads the (uint8 0/1) mask directly -- 1 byte
-// per row, linearly; row order is sorted by construction, so the record
-// cursor advances monotonically like the sorted walk. Runs of set bits are
-// visible in the mask at no extra cost and are served by memcpy (clipped at
-// record boundaries); sparse spans are skipped 8 mask bytes at a time. Two
-// internal passes: a parallel per-chunk popcount fixes each thread's output
-// offset, then each thread gathers its row range. Returns 0 on success, 1 if
-// the mask's selected count does not equal ``n_out`` (nothing is written in
-// that case) -- the caller sizes ``output`` with np.count_nonzero and the
-// kernel verifies rather than trusting. ``mask`` has one byte per row
-// (``n_rows`` total, normalized 0/1 as numpy bool guarantees); other
-// arguments match the sorted kernel. Native byte order required.
-// Boolean-mask-native gather; see colstore_gather_multirecord_mask.
-int colstore_gather_multirecord_mask(
-    const std::uint8_t* base, const std::uint8_t* mask, std::uint8_t* output,
-    std::int64_t n_rows, std::ptrdiff_t n_out, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-
-// Mask-native gather across files: the multi-file analogue of
-// colstore_gather_multirecord_mask, over colstore_gather_multifile's segment
-// table (a segment is one record of one file; ``segment_base[s]`` is the folded
-// absolute base, so this column's value at global row ``i`` in segment ``s`` is
-// at ``segment_base[s] + i * itemsize``). ``mask`` is one uint8 (0/1) per global
-// row, ``n_rows`` total; ``n_out`` is the caller's output length
-// (``np.count_nonzero(mask)``). ``output[k]`` is the k-th selected element in
-// ascending global-row order (file, then record, then row) -- byte-identical to
-// numpy mask indexing. Pass 1 counts each row-chunk's selected rows for exact
-// lock-free output offsets; pass 2 walks each chunk with a monotonic segment
-// cursor, word-at-a-time (skip/copy-run/branchless-compact), so the cost is
-// O(n_rows + n_segments) with no per-row segment search and no index array.
-// ``segment_starts_rows`` has ``n_segments + 1`` entries; ``segment_base`` has
-// ``n_segments``. Native byte order required. Returns 0 on success, 1 if
-// ``n_out`` disagrees with the mask popcount (writing nothing), -1 on
-// unsupported itemsize.
-int colstore_gather_multifile_mask(const std::uint8_t* mask, std::uint8_t* output,
-                                   std::int64_t n_rows, std::ptrdiff_t n_out,
-                                   const std::int64_t* segment_starts_rows,
-                                   const std::int64_t* segment_base, std::int64_t n_segments,
-                                   int itemsize, int thread_cap,
-                                   std::ptrdiff_t prefetch_distance);
+// Boolean-mask-native gather over a segment table -- the one mask kernel for
+// both single-file and multi-file reads (a single-file store is just one record
+// per segment; a multi-file dataset stitches all files' records into one table).
+// ``segment_base[s]`` is the folded absolute base, so this column's value at row
+// ``i`` in segment ``s`` is at ``segment_base[s] + i * itemsize``. ``mask`` is
+// one uint8 (0/1) per row, ``n_rows`` total; ``n_out`` is the caller's output
+// length (``np.count_nonzero(mask)``). ``output[k]`` is the k-th selected element
+// in ascending row order -- byte-identical to numpy mask indexing. Pass 1 counts
+// each row-chunk's selected rows for exact lock-free output offsets; pass 2 walks
+// each chunk with a monotonic segment cursor, word-at-a-time (skip/copy-run/
+// branchless-compact), so the cost is O(n_rows + n_segments) with no per-row
+// segment search and no index array. ``segment_starts_rows`` has
+// ``n_segments + 1`` entries; ``segment_base`` has ``n_segments``. Native byte
+// order required. Returns 0 on success, 1 if ``n_out`` disagrees with the mask
+// popcount (writing nothing), -1 on unsupported itemsize.
+int colstore_gather_segment_mask(const std::uint8_t* mask, std::uint8_t* output,
+                                 std::int64_t n_rows, std::ptrdiff_t n_out,
+                                 const std::int64_t* segment_starts_rows,
+                                 const std::int64_t* segment_base, std::int64_t n_segments,
+                                 int itemsize, int thread_cap,
+                                 std::ptrdiff_t prefetch_distance);
 
 // Pin OpenMP worker threads to specific CPUs at runtime. In a parallel region
 // of ``n`` threads, worker ``t`` is pinned to ``cpus[t]`` via

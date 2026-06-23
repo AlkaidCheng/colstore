@@ -996,7 +996,7 @@ def test_multifile_multirecord_open_and_read(tmp_path):
 # ---- multi-file mask-native kernel ------------------------------------------
 #
 # A dense boolean mask on a multi-file dataset gathers through the native
-# multi-file mask kernel (colstore_gather_multifile_mask) over the cached segment
+# multi-file mask kernel (colstore_gather_segment_mask) over the cached segment
 # table; a sparse mask, a non-native dtype, or no extension declines to the
 # per-file path. Both must be byte-identical to numpy mask indexing.
 

@@ -608,7 +608,7 @@ def test_rbase_route_matches_forced_generic_route(rbase_irregular_store, monkeyp
 # or any calibration cache on the dev machine.
 GATE = 0.15
 
-MASK_SPIED = ["gather_multirecord_mask", "gather_multirecord_sorted", "gather_multirecord_bins"]
+MASK_SPIED = ["gather_segment_mask", "gather_multirecord_sorted", "gather_multirecord_bins"]
 
 
 @pytest.fixture()
@@ -624,10 +624,10 @@ def test_dense_mask_routes_to_mask_kernel(mask_irregular_store, monkeypatch):
     mask = np.random.default_rng(62).random(total) < 0.5
     with opened(path) as dataset:
         assert np.array_equal(dataset[mask, "f8"].array(), full["f8"][mask])
-        assert calls == ["gather_multirecord_mask"]
+        assert calls == ["gather_segment_mask"]
         calls.clear()
         result = dataset[mask, ["f8", "f4", "i2"]].dict()
-        assert calls == ["gather_multirecord_mask"] * 3
+        assert calls == ["gather_segment_mask"] * 3
         for name in ("f8", "f4", "i2"):
             assert np.array_equal(result[name], full[name][mask]), name
 
@@ -925,7 +925,7 @@ def test_single_record_store_never_routes_to_multirecord_kernels(tmp_path, monke
             "gather_multirecord_uniform",
             "gather_multirecord_uniform_bins",
             "gather_multirecord_uniform_withbins",
-            "gather_multirecord_mask",
+            "gather_segment_mask",
             "gather_multirecord_strided",
         ],
     )

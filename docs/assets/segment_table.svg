@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="486" viewBox="0 0 760 486" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>The segment table</title>
+<desc>A logical column spans a 12-row index space split into three segments (rows 0-4, 4-7, 7-12). On disk those segments are not contiguous: each is one column's run inside one record of one file -- segments 0 and 1 are two records of File A, segment 2 is the one record of File B, and within every record body the column is interleaved with the others. The segment table maps the logical rows back to bytes with two arrays: start_rows (the 4 cumulative row boundaries) and segment_base (the 3 folded absolute byte addresses, one per segment). To read global row i, binary-search start_rows for its segment s, then read at segment_base[s] + i*itemsize -- the start_rows[s] term is folded into segment_base[s], so the GLOBAL row index plugs in directly. A single-file multi-record store is the records of one file; a multi-file dataset is every file's records stitched into one table; the same table and the same kernel serve both.</desc>
+<style>
+  .seg0 { fill: #E1F5EE; stroke: #0F6E56; stroke-width: 1; } .seg0t { fill: #04342C; font-size: 12px; font-weight: 600; }
+  .seg1 { fill: #FBF1DE; stroke: #B9852B; stroke-width: 1; } .seg1t { fill: #6B4A12; font-size: 12px; font-weight: 600; }
+  .seg2 { fill: #E6EEF4; stroke: #3F6E9E; stroke-width: 1; } .seg2t { fill: #234567; font-size: 12px; font-weight: 600; }
+  .ghost { fill: #F1F0EC; stroke: #CAC8C0; stroke-width: 0.7; } .ghostt { fill: #9C9A90; font-size: 11px; }
+  .file { fill: none; stroke: #5F5E5A; stroke-width: 1; stroke-dasharray: 4 3; }
+  .cell { fill: #FAFAF7; stroke: #8A887F; stroke-width: 1; }
+  .hd { fill: #2C2C2A; font-size: 14px; font-weight: 600; }
+  .lbl { fill: #5F5E5A; font-size: 12px; }
+  .tick { fill: #5F5E5A; font-size: 11px; }
+  .arr { stroke: #9A988F; stroke-width: 1.2; fill: none; }
+  .mono { font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace; }
+  .code { fill: #2C2C2A; font-size: 12.5px; }
+  .key { fill: #0F6E56; font-size: 12.5px; font-weight: 600; }
+  @media (prefers-color-scheme: dark) {
+    .seg0 { fill: #04342C; stroke: #1D9E75; } .seg0t { fill: #9FE1CB; }
+    .seg1 { fill: #2E2613; stroke: #C9972F; } .seg1t { fill: #F0D9A6; }
+    .seg2 { fill: #1B2A38; stroke: #5E8CBF; } .seg2t { fill: #BBD2EA; }
+    .ghost { fill: #232220; stroke: #4A4944; } .ghostt { fill: #7C7A72; }
+    .file { stroke: #B4B2A9; } .cell { fill: #232220; stroke: #B4B2A9; }
+    .hd { fill: #F1EFE8; } .lbl { fill: #B4B2A9; } .tick { fill: #B4B2A9; } .arr { stroke: #8A887F; }
+    .code { fill: #E7E5DE; } .key { fill: #1D9E75; }
+  }
+</style>
+<defs>
+  <marker id="ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+    <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  </marker>
+</defs>
+
+<!-- ===== 1. Logical column ===== -->
+<text class="hd" x="40" y="28">Logical column B &#8212; one 12-row index space</text>
+<rect class="seg0" x="40"  y="40" width="160" height="34"/>
+<text class="seg0t" x="120" y="61" text-anchor="middle">rows 0&#8211;3</text>
+<rect class="seg1" x="200" y="40" width="120" height="34"/>
+<text class="seg1t" x="260" y="61" text-anchor="middle">rows 4&#8211;6</text>
+<rect class="seg2" x="320" y="40" width="200" height="34"/>
+<text class="seg2t" x="420" y="61" text-anchor="middle">rows 7&#8211;11</text>
+<text class="tick" x="40"  y="88">0</text>
+<text class="tick" x="196" y="88">4</text>
+<text class="tick" x="316" y="88">7</text>
+<text class="tick" x="512" y="88">12</text>
+<text class="lbl" x="540" y="62">contiguous to the reader</text>
+
+<!-- ===== 2. Physical: two files, records, column interleaved ===== -->
+<text class="hd" x="40" y="128">On disk &#8212; each segment is column B inside one record of one file</text>
+
+<!-- File A: two records -->
+<rect class="file" x="40" y="140" width="300" height="74"/>
+<text class="lbl" x="46" y="156">File A</text>
+<!-- record A0 -->
+<rect class="ghost" x="50"  y="162" width="26" height="40"/><text class="ghostt" x="63"  y="186" text-anchor="middle">hdr</text>
+<rect class="ghost" x="76"  y="162" width="24" height="40"/><text class="ghostt" x="88"  y="186" text-anchor="middle">A</text>
+<rect class="seg0"  x="100" y="162" width="40" height="40"/><text class="seg0t" x="120" y="186" text-anchor="middle">B</text>
+<rect class="ghost" x="140" y="162" width="24" height="40"/><text class="ghostt" x="152" y="186" text-anchor="middle">C</text>
+<text class="lbl" x="107" y="213">record 0</text>
+<!-- record A1 -->
+<rect class="ghost" x="180" y="162" width="26" height="40"/><text class="ghostt" x="193" y="186" text-anchor="middle">hdr</text>
+<rect class="ghost" x="206" y="162" width="24" height="40"/><text class="ghostt" x="218" y="186" text-anchor="middle">A</text>
+<rect class="seg1"  x="230" y="162" width="34" height="40"/><text class="seg1t" x="247" y="186" text-anchor="middle">B</text>
+<rect class="ghost" x="264" y="162" width="24" height="40"/><text class="ghostt" x="276" y="186" text-anchor="middle">C</text>
+<text class="lbl" x="237" y="213">record 1</text>
+
+<!-- File B: one record -->
+<rect class="file" x="410" y="140" width="270" height="74"/>
+<text class="lbl" x="416" y="156">File B</text>
+<rect class="ghost" x="420" y="162" width="26" height="40"/><text class="ghostt" x="433" y="186" text-anchor="middle">hdr</text>
+<rect class="ghost" x="446" y="162" width="44" height="40"/><text class="ghostt" x="468" y="186" text-anchor="middle">A</text>
+<rect class="seg2"  x="490" y="162" width="62" height="40"/><text class="seg2t" x="521" y="186" text-anchor="middle">B</text>
+<rect class="ghost" x="552" y="162" width="44" height="40"/><text class="ghostt" x="574" y="186" text-anchor="middle">C</text>
+<text class="lbl" x="497" y="213">record 0</text>
+
+<!-- ===== 3. The segment table ===== -->
+<text class="hd" x="40" y="262">The segment table (one column)</text>
+
+<text class="lbl mono" x="40" y="292">start_rows</text>
+<rect class="cell" x="150" y="278" width="48" height="26"/><text class="code mono" x="174" y="296" text-anchor="middle">0</text>
+<rect class="cell" x="198" y="278" width="48" height="26"/><text class="code mono" x="222" y="296" text-anchor="middle">4</text>
+<rect class="cell" x="246" y="278" width="48" height="26"/><text class="code mono" x="270" y="296" text-anchor="middle">7</text>
+<rect class="cell" x="294" y="278" width="48" height="26"/><text class="code mono" x="318" y="296" text-anchor="middle">12</text>
+<text class="lbl" x="356" y="296">n_segments + 1 row boundaries</text>
+
+<text class="lbl mono" x="40" y="334">segment_base</text>
+<rect class="seg0" x="150" y="320" width="64" height="26"/><text class="seg0t mono" x="182" y="338" text-anchor="middle">&amp;A0.B</text>
+<rect class="seg1" x="214" y="320" width="64" height="26"/><text class="seg1t mono" x="246" y="338" text-anchor="middle">&amp;A1.B</text>
+<rect class="seg2" x="278" y="320" width="64" height="26"/><text class="seg2t mono" x="310" y="338" text-anchor="middle">&amp;B0.B</text>
+<text class="lbl" x="356" y="338">one folded absolute byte address per segment</text>
+
+<!-- arrows: physical B-runs -> segment_base cells -->
+<path class="arr" d="M120 202 C 120 250, 182 280, 182 318" marker-end="url(#ar)"/>
+<path class="arr" d="M247 202 C 247 250, 246 280, 246 318" marker-end="url(#ar)"/>
+<path class="arr" d="M521 202 C 521 260, 312 290, 310 318" marker-end="url(#ar)"/>
+
+<!-- ===== 4. The lookup ===== -->
+<rect x="40" y="372" width="680" height="92" rx="6" fill="none" stroke="#8A887F" stroke-width="1"/>
+<text class="hd" x="56" y="396">Read global row i of column B</text>
+<text class="code mono" x="56" y="420"><tspan class="key">s</tspan>       = searchsorted(start_rows, i, side='right') &#8722; 1     <tspan class="lbl">// which segment owns row i</tspan></text>
+<text class="code mono" x="56" y="440"><tspan class="key">address</tspan> = segment_base[s] + i &#215; itemsize             <tspan class="lbl">// start_rows[s] is folded in, so global i plugs in directly</tspan></text>
+<text class="code mono" x="56" y="458"><tspan class="lbl">e.g. i = 5 &#8594; 4 &#8804; 5 &lt; 7 &#8594; s = 1 &#8594; address = &amp;A1.B + 5 &#215; 8</tspan></text>
+</svg>

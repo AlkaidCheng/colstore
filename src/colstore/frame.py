@@ -338,8 +338,8 @@ class Expr:
 # A row selector: a slice (a contiguous half-open range), a 1-D integer index array
 # naming the chosen rows in order, or a 1-D boolean mask over the source rows. A base
 # mask is kept (see _normalize_base_rows) only when it will gather mask-natively -- a
-# multi-record store at/above the density gate, where a 1-byte/row mask is also no larger
-# than an index array; a single-record store or a sparse selection lowers it to indices at
+# multi-record single-file store, or a multi-file dataset, at/above its density gate
+# (default 0.0); a single-record store or a below-gate selection lowers it to indices at
 # construction, and a where() predicate composes onto indices. The three forms are uniform
 # under _row_count.
 Rows = slice | np.ndarray
@@ -372,14 +372,15 @@ def _normalize_base_rows(
 ) -> NDArray[Any] | None:
     """Compact a base boolean mask, keeping it only when it will gather mask-natively.
 
-    A mask-native kernel gathers a 1-byte/row mask without materializing an index
-    array. One exists for a multi-record single-file store (``_is_multi_record``) and,
-    across files, for a multi-file dataset (the native multi-file mask kernel). Either
+    A single mask-native kernel (``gather_segment_mask``) gathers a 1-byte/row mask over
+    a per-column segment table without materializing an index array; it serves both a
+    multi-record single-file store (``_is_multi_record``) and a multi-file dataset. It
     keeps the mask only when its selected fraction is at or above the relevant density
-    gate -- where a 1-byte/row mask is no larger than an int64 index array. A sparser
-    mask, and a contiguous single-record store, lower to indices once here, since the
-    gather would otherwise repeat ``flatnonzero`` per column for no gain. Non-mask
-    selectors (``None`` or an index array) pass through unchanged.
+    gate (default 0.0: kept at every density, since the kernel word-skips unselected runs
+    and wins even on a sparse mask). A below-gate mask, and a contiguous single-record
+    store, lower to indices once here, since the gather would otherwise repeat
+    ``flatnonzero`` per column for no gain. Non-mask selectors (``None`` or an index
+    array) pass through unchanged.
     """
     if rows is None or rows.dtype != bool:
         return rows

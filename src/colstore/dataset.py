@@ -687,7 +687,7 @@ class ColStoreDataset(_ReaderBase):
     def _mask_native(
         self, column_names: list[str], mask: NDArray[np.bool_]
     ) -> dict[str, NDArray[Any]] | None:
-        """Gather a boolean mask with the native multi-file mask kernel, or ``None``.
+        """Gather a boolean mask with the native segment mask kernel, or ``None``.
 
         Returns ``None`` to decline -- the caller then takes the per-file path --
         when the selection is too sparse for the kernel's full-mask scan to pay
@@ -714,7 +714,7 @@ class ColStoreDataset(_ReaderBase):
             assert table is not None  # filtered above
             segment_starts_rows, segment_base = table
             column = np.empty(selected, dtype=self._native_dtype(name))
-            _cpp_module.gather_multifile_mask(
+            _cpp_module.gather_segment_mask(
                 contiguous_mask, column, segment_starts_rows, segment_base
             )
             out[name] = column
