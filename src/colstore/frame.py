@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
@@ -1771,8 +1772,36 @@ class ColStoreFrame:
             return expr._store._gather_one(expr.name, rows, out=buf[: _row_count(rows)])
         return evaluate(expr, rows, memo)
 
+    def _materialize_batch(
+        self,
+        names: list[str],
+        rows: Rows,
+        n_rows: int,
+        *,
+        copy: bool,
+        buffers: Buffers,
+        rows_per_batch: int,
+    ) -> ColStoreFrame:
+        """Build one batch of the selection into a materialized, store-detached frame.
+
+        ``copy=True`` evaluates each column into a fresh owning array; ``copy=False``
+        routes through :meth:`_batch_column` (zero-copy view or a gather into the
+        reused ``buffers``). One fresh memo is shared across the batch's columns.
+        """
+        memo: Memo = {}
+        if copy:
+            columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
+        else:
+            columns = {
+                name: self._batch_column(
+                    name, self._columns[name], rows, memo, buffers, rows_per_batch
+                )
+                for name in names
+            }
+        return ColStoreFrame._materialized(columns, n_rows)
+
     def iter_batches(
-        self, batch_size: int | str | None = None, *, copy: bool = True
+        self, batch_size: int | str | None = None, *, copy: bool = True, prefetch: bool = False
     ) -> Iterator[ColStoreFrame]:
         """Yield the selected rows as materialized frames, bounded in memory.
 
@@ -1796,6 +1825,14 @@ class ColStoreFrame:
         is freshly computed. Because the views and buffers are reused, a batch is valid only
         until the next is drawn -- do not mutate or hold it. Keep the default ``copy=True`` for
         owning arrays safe to mutate or hold after the store closes.
+
+        ``prefetch=True`` gathers the next batch on a single background thread while the consumer
+        holds the current one, overlapping the read (the gather releases the GIL) with the
+        consumer's work -- it helps when the consumer is slower than the gather (feeding a model,
+        a ROOT export, a re-write) and is a no-op otherwise. Two batches are then in flight, so
+        peak memory is two batches rather than one; under ``copy=False`` the gather alternates
+        between two buffer sets so the prefetched batch never overwrites the one the consumer is
+        still viewing, preserving the valid-until-the-next-is-drawn contract.
         """
         names = list(self._columns)
         selection = self._resolve_index_selection()
@@ -1806,21 +1843,48 @@ class ColStoreFrame:
         rows_per_batch = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
         if rows_per_batch is None:
             rows_per_batch = max(1, config.get_default_memory_budget() // bytes_per_row)
-        buffers: Buffers = {}  # copy=False: per-column gather buffers, reused across batches
-        for start in range(0, n, rows_per_batch):
-            stop = min(start + rows_per_batch, n)
-            rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
-            memo: Memo = {}
-            if copy:
-                columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
-            else:
-                columns = {
-                    name: self._batch_column(
-                        name, self._columns[name], rows, memo, buffers, rows_per_batch
-                    )
-                    for name in names
-                }
-            yield ColStoreFrame._materialized(columns, stop - start)
+        spans = [(start, min(start + rows_per_batch, n)) for start in range(0, n, rows_per_batch)]
+
+        def rows_of(span: tuple[int, int]) -> Rows:
+            return slice(span[0], span[1]) if selection is None else selection[span[0] : span[1]]
+
+        if not prefetch:
+            buffers: Buffers = {}  # copy=False: per-column gather buffers, reused across batches
+            for span in spans:
+                yield self._materialize_batch(
+                    names,
+                    rows_of(span),
+                    span[1] - span[0],
+                    copy=copy,
+                    buffers=buffers,
+                    rows_per_batch=rows_per_batch,
+                )
+            return
+
+        # Depth-1 read-ahead: one background thread gathers batch i+1 while the consumer
+        # holds batch i. Under copy=False the two in-flight batches need separate gather
+        # buffers, so two buffer sets alternate -- the prefetched batch never overwrites the
+        # one the consumer is still viewing, keeping the same valid-until-next-drawn contract.
+        buffer_sets: list[Buffers] = [{}, {}] if not copy else [{}]
+
+        def build(index: int) -> ColStoreFrame:
+            span = spans[index]
+            return self._materialize_batch(
+                names,
+                rows_of(span),
+                span[1] - span[0],
+                copy=copy,
+                buffers=buffer_sets[index % len(buffer_sets)],
+                rows_per_batch=rows_per_batch,
+            )
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="colstore-prefetch") as pool:
+            pending = pool.submit(build, 0)
+            for i in range(len(spans)):
+                batch = pending.result()
+                if i + 1 < len(spans):
+                    pending = pool.submit(build, i + 1)
+                yield batch
 
     def write(
         self, path: str | os.PathLike[str], *, memory_budget: int | None = None
