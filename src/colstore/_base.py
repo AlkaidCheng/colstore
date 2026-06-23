@@ -63,9 +63,19 @@ class _ReaderBase(abc.ABC):
 
     @abc.abstractmethod
     def _gather_one(
-        self, column_name: str, row_indexer: Any, thread_cap: int | None = None
+        self,
+        column_name: str,
+        row_indexer: Any,
+        thread_cap: int | None = None,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
-        """Copying read of one column for an already-normalized row selector."""
+        """Copying read of one column for an already-normalized row selector.
+
+        ``out``, when given, is a contiguous native-dtype buffer the read may fill
+        in place instead of allocating -- a reuse hint for streaming batches. It is
+        only a hint: callers use the RETURN value, which is ``out`` when the buffer
+        was honored, or a freshly allocated array otherwise (a non-native dtype, or a
+        path that does not support filling)."""
 
     @abc.abstractmethod
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:

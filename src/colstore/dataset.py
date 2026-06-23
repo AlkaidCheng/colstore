@@ -622,7 +622,9 @@ class ColStoreDataset(_ReaderBase):
             _, segment_base = table
             _cpp_module.gather_multifile_withbins(indices, out[name], bins, segment_base, cap, -1)
 
-    def _fancy_one(self, column_name: str, indices: NDArray[np.int64]) -> NDArray[Any]:
+    def _fancy_one(
+        self, column_name: str, indices: NDArray[np.int64], out: NDArray[Any] | None = None
+    ) -> NDArray[Any]:
         """Gather arbitrary global rows across files, preserving requested order.
 
         Uses the native fused multi-file kernel (one pass over the indices, each
@@ -631,13 +633,17 @@ class ColStoreDataset(_ReaderBase):
         fills a sorted buffer concurrently (disjoint regions, no locking), then
         un-sorts into the requested order with one scatter.
         """
-        out = np.empty(len(indices), dtype=self._native_dtype(column_name))
+        dst = (
+            out
+            if out is not None
+            else np.empty(len(indices), dtype=self._native_dtype(column_name))
+        )
         if indices.size == 0:
-            return out
+            return dst
         table = self._native_segment_table(column_name)
         if table is not None:
-            self._native_gather(out, indices, table, _indices_are_sorted(indices))
-            return out
+            self._native_gather(dst, indices, table, _indices_are_sorted(indices))
+            return dst
         order, blocks = self._sorted_blocks(indices)
         buffer = np.empty(len(indices), dtype=self._native_dtype(column_name))
         jobs = [
@@ -645,8 +651,8 @@ class ColStoreDataset(_ReaderBase):
             for file_index, lo, hi, local in blocks
         ]
         self._run_fill_jobs(jobs)
-        out[order] = buffer
-        return out
+        dst[order] = buffer
+        return dst
 
     def _fancy_many(
         self, column_names: list[str], indices: NDArray[np.int64]
@@ -706,26 +712,36 @@ class ColStoreDataset(_ReaderBase):
         raise TypeError(f"Unsupported row indexer of type {type(row_indexer).__name__}.")
 
     def _gather_one(
-        self, column_name: str, row_indexer: Any, thread_cap: int | None = None
+        self,
+        column_name: str,
+        row_indexer: Any,
+        thread_cap: int | None = None,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
         self._check_open()
         self._require_columns([column_name])
         children = self._children
         if len(children) == 1:
-            return children[0]._gather_one(column_name, row_indexer, thread_cap)
+            return children[0]._gather_one(column_name, row_indexer, thread_cap, out=out)
         kind, payload = self._classify_rows(row_indexer)
         if kind == "scalar":
             file_index, local = payload
             child: ColStoreReader = children[file_index]
-            return child._gather_one(column_name, local, thread_cap)
+            return child._gather_one(column_name, local, thread_cap, out=out)
         if kind == "fancy":
-            return self._fancy_one(column_name, payload)
+            return self._fancy_one(column_name, payload, out=out)
         if kind == "whole":
-            out = np.empty(self._n_rows, dtype=self._native_dtype(column_name))
-            self._fill_contiguous_columns({column_name: out}, [column_name], self._offset_regions())
-            return out
+            whole = (
+                out
+                if out is not None
+                else np.empty(self._n_rows, dtype=self._native_dtype(column_name))
+            )
+            self._fill_contiguous_columns(
+                {column_name: whole}, [column_name], self._offset_regions()
+            )
+            return whole
         parts, is_mask = payload
-        return self._gather_one_contiguous(column_name, parts, is_mask)
+        return self._gather_one_contiguous(column_name, parts, is_mask, out=out)
 
     def _fill_contiguous(
         self,
@@ -756,12 +772,20 @@ class ColStoreDataset(_ReaderBase):
         self._fill_contiguous(out, column_name, parts, lengths)
 
     def _gather_one_contiguous(
-        self, column_name: str, parts: list[tuple[int, Any]], is_mask: bool
+        self,
+        column_name: str,
+        parts: list[tuple[int, Any]],
+        is_mask: bool,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
         lengths = self._contiguous_lengths(parts, is_mask)
-        out = np.empty(sum(lengths), dtype=self._native_dtype(column_name))
-        self._fill_contiguous(out, column_name, parts, lengths)
-        return out
+        dst = (
+            out
+            if out is not None
+            else np.empty(sum(lengths), dtype=self._native_dtype(column_name))
+        )
+        self._fill_contiguous(dst, column_name, parts, lengths)
+        return dst
 
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
         self._check_open()
