@@ -924,8 +924,9 @@ def test_iter_batches_copy_false_reuses_buffer_multirecord(tmp_path):
 def test_iter_batches_copy_false_multifile(tmp_path):
     from colstore import testing
 
-    # A multi-file dataset ignores the out= hint at a file boundary, so copy=False gathers a
-    # fresh array there (no reuse, no dead buffer) and must still produce correct values.
+    # A boundary-spanning batch on a multi-file dataset gathers across the file seam. copy=False
+    # must yield correct values there, and the dataset fills the caller's out= buffer (so the
+    # per-column reuse works across the seam too, not just within a single file).
     a = testing.make_columns(10, 2, names=("x", "y"), seed=1)
     b = testing.make_columns(10, 2, names=("x", "y"), seed=2)
     testing.write_columns(tmp_path / "part_0.cstore", a, records=1).close()
@@ -936,6 +937,10 @@ def test_iter_batches_copy_false_multifile(tmp_path):
             [fr.dict()["x"].copy() for fr in ds.edit().iter_batches(7, copy=False)]
         )
         np.testing.assert_array_equal(got, np.concatenate([a["x"], b["x"]]))
+        buf = np.empty(7, dtype=ds.dtypes["x"])  # a slice [7, 14) crossing the file seam
+        filled = ds._gather_one("x", slice(7, 14), out=buf)
+        assert np.shares_memory(filled, buf)  # the dataset filled the buffer; reuse works
+        np.testing.assert_array_equal(filled, np.concatenate([a["x"], b["x"]])[7:14])
     finally:
         ds.close()
 
