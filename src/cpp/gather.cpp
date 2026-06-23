@@ -492,7 +492,7 @@ inline int run_sized(int itemsize, F&& f) {
 // fused multi-record kernel; the search is cheap against the DRAM latency it
 // hides.
 template <typename T>
-inline void gather_multifile_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+inline void gather_segment_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::ptrdiff_t n_indices,
                                    const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
@@ -523,12 +523,12 @@ inline void gather_multifile_typed(const std::int64_t* COLSTORE_RESTRICT indices
   }
 }
 
-// Bin-recording multi-file gather: gather_multifile_typed plus bins[i] = s.
+// Bin-recording multi-file gather: gather_segment_typed plus bins[i] = s.
 // The prefetch search does NOT write bins (the look-ahead element may belong to
 // another thread's chunk -- a write there would race), matching the single-file
 // bins policy.
 template <typename T>
-inline void gather_multifile_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+inline void gather_segment_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                         std::uint8_t* COLSTORE_RESTRICT output,
                                         std::int32_t* COLSTORE_RESTRICT bins,
                                         std::ptrdiff_t n_indices,
@@ -565,7 +565,7 @@ inline void gather_multifile_bins_typed(const std::int64_t* COLSTORE_RESTRICT in
 // search; the prefetch look-ahead reads its bin too. ``segment_base`` is this
 // column's bases.
 template <typename T>
-inline void gather_multifile_withbins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+inline void gather_segment_withbins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                             std::uint8_t* COLSTORE_RESTRICT output,
                                             const std::int32_t* COLSTORE_RESTRICT bins,
                                             std::ptrdiff_t n_indices,
@@ -603,7 +603,7 @@ inline void gather_multifile_withbins_typed(const std::int64_t* COLSTORE_RESTRIC
 // when the look-ahead index still lies in the current segment, mirroring the
 // single-file sorted kernel.
 template <typename T>
-void gather_multifile_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+void gather_segment_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::ptrdiff_t n_indices,
                                    const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
@@ -1362,7 +1362,7 @@ int colstore_gather_multirecord_withbins_rbase(
       itemsize, base, output, n, thread_cap, prefetch_distance, indices, bins, record_base);
 }
 
-int colstore_gather_multifile(const std::int64_t* indices,
+int colstore_gather_segment(const std::int64_t* indices,
                               std::uint8_t* output, std::ptrdiff_t n,
                               const std::int64_t* segment_starts_rows,
                               const std::int64_t* segment_base,
@@ -1370,43 +1370,43 @@ int colstore_gather_multifile(const std::int64_t* indices,
                               std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_typed<T>(indices, output, n, segment_starts_rows, segment_base,
+    colstore::gather_segment_typed<T>(indices, output, n, segment_starts_rows, segment_base,
                                         n_segments, thread_cap, prefetch_distance);
   });
 }
 
-int colstore_gather_multifile_bins(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_bins(const std::int64_t* indices, std::uint8_t* output,
                                    std::int32_t* bins, std::ptrdiff_t n,
                                    const std::int64_t* segment_starts_rows,
                                    const std::int64_t* segment_base, std::int64_t n_segments,
                                    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_bins_typed<T>(indices, output, bins, n, segment_starts_rows,
+    colstore::gather_segment_bins_typed<T>(indices, output, bins, n, segment_starts_rows,
                                              segment_base, n_segments, thread_cap,
                                              prefetch_distance);
   });
 }
 
-int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_withbins(const std::int64_t* indices, std::uint8_t* output,
                                        const std::int32_t* bins, std::ptrdiff_t n,
                                        const std::int64_t* segment_base, int itemsize,
                                        int thread_cap, std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_withbins_typed<T>(indices, output, bins, n, segment_base,
+    colstore::gather_segment_withbins_typed<T>(indices, output, bins, n, segment_base,
                                                  thread_cap, prefetch_distance);
   });
 }
 
-int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* output,
                                      std::ptrdiff_t n, const std::int64_t* segment_starts_rows,
                                      const std::int64_t* segment_base, std::int64_t n_segments,
                                      int itemsize, int thread_cap,
                                      std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_sorted_typed<T>(indices, output, n, segment_starts_rows,
+    colstore::gather_segment_sorted_typed<T>(indices, output, n, segment_starts_rows,
                                                segment_base, n_segments, thread_cap,
                                                prefetch_distance);
   });
