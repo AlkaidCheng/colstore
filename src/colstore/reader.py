@@ -491,7 +491,11 @@ class ColStoreReader(_ReaderBase):
     # ---- Gather (called by views) --------------------------------------
 
     def _gather_one(
-        self, column_name: str, row_indexer: Any, thread_cap: int | None = None
+        self,
+        column_name: str,
+        row_indexer: Any,
+        thread_cap: int | None = None,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
         """Read one column with the given row selector; return owning ndarray.
 
@@ -501,7 +505,10 @@ class ColStoreReader(_ReaderBase):
         gather (OpenMP) and the contiguous parallel copy (Python
         threadpool); ``None`` uses the package default, and
         :meth:`_gather_many` passes a divided budget so concurrent column
-        reads do not oversubscribe.
+        reads do not oversubscribe. ``out`` is an optional contiguous
+        native-dtype buffer to fill in place (a reuse hint for streaming
+        batches); it is honored on the multi-record and single-record fancy
+        kernel paths, and the caller uses the return value either way.
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
@@ -515,7 +522,7 @@ class ColStoreReader(_ReaderBase):
             # fancy reads, and lowering here preserves it exactly.
             row_indexer = np.flatnonzero(row_indexer)
         if self._is_multi_record:
-            return self._gather_one_multi_record(column_name, row_indexer, thread_cap)
+            return self._gather_one_multi_record(column_name, row_indexer, thread_cap, out=out)
         # Single-record fast path: one per-column memmap; the read is a
         # simple slice / copy / kernel gather against that memmap.
         source = self._memmaps[column_name]
@@ -543,7 +550,7 @@ class ColStoreReader(_ReaderBase):
             return _parallel_copy(source[row_indexer], native_dtype, thread_cap=effective_cap)
         # Integer ndarray (fancy index): dispatch to chosen backend.
         return kernels.gather(
-            source, row_indexer, native_dtype, backend=self._backend, thread_cap=thread_cap
+            source, row_indexer, native_dtype, backend=self._backend, thread_cap=thread_cap, out=out
         )
 
     # ---- Zero-copy read path --------------------------------------------
@@ -720,7 +727,11 @@ class ColStoreReader(_ReaderBase):
         return self._uniform_layout_cache
 
     def _gather_one_multi_record(
-        self, column_name: str, row_indexer: Any, thread_cap: int | None
+        self,
+        column_name: str,
+        row_indexer: Any,
+        thread_cap: int | None,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
         """Read one column from a file with multiple records.
 
@@ -794,19 +805,25 @@ class ColStoreReader(_ReaderBase):
         # Handle them with one path that avoids the gather kernel entirely.
         if row_indexer is None:
             return self._read_contiguous_range_multi_record(
-                0, self._n_rows, disk_dtype, native_dtype, col_prefix, itemsize
+                0, self._n_rows, disk_dtype, native_dtype, col_prefix, itemsize, out=out
             )
         if isinstance(row_indexer, int):
             # Folding negative indices was already done by the view layer.
             return self._read_contiguous_range_multi_record(
-                row_indexer, row_indexer + 1, disk_dtype, native_dtype, col_prefix, itemsize
+                row_indexer,
+                row_indexer + 1,
+                disk_dtype,
+                native_dtype,
+                col_prefix,
+                itemsize,
+                out=out,
             )
         if isinstance(row_indexer, slice):
             start, stop, step = row_indexer.indices(self._n_rows)
             if step == 1:
                 # The hot case: one memcpy per overlapping record.
                 return self._read_contiguous_range_multi_record(
-                    start, stop, disk_dtype, native_dtype, col_prefix, itemsize
+                    start, stop, disk_dtype, native_dtype, col_prefix, itemsize, out=out
                 )
             if _dtype_is_native(disk_dtype):
                 # Non-unit step, native byte order: strided walk kernel; no
@@ -840,7 +857,15 @@ class ColStoreReader(_ReaderBase):
         # little-endian hosts (the dtypes compare equal) and a byteswapping
         # copy on big-endian ones. The fused native kernel branch is only
         # taken when disk == native, where the distinction vanishes.
-        output = np.empty(n, dtype=disk_dtype)
+        #
+        # Fill the caller's reuse buffer only when it can take the raw kernel
+        # output directly -- a native dtype, so disk == native and no byteswap
+        # stands between the kernel and ``out``; otherwise allocate the disk-typed
+        # temporary the byteswapping ``astype`` below needs.
+        if out is not None and _dtype_is_native(disk_dtype):
+            output = out
+        else:
+            output = np.empty(n, dtype=disk_dtype)
         effective_cap = config.resolve_gather_thread_cap(thread_cap)
 
         # Sortedness gate: sampled rejection short-circuits the full O(K)
@@ -958,6 +983,7 @@ class ColStoreReader(_ReaderBase):
         native_dtype: np.dtype[Any],
         col_prefix: int,
         itemsize: int,
+        out: NDArray[Any] | None = None,
     ) -> NDArray[Any]:
         """Read rows ``[start, stop)`` for one column across records via memcpy.
 
@@ -975,7 +1001,7 @@ class ColStoreReader(_ReaderBase):
         :meth:`_copy_multirecord_range_python`.
         """
         n = stop - start
-        output: NDArray[Any] = np.empty(n, dtype=native_dtype)
+        output: NDArray[Any] = out if out is not None else np.empty(n, dtype=native_dtype)
         if n == 0:
             return output
 
