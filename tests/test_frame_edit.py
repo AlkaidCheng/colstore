@@ -1223,3 +1223,56 @@ def test_n_rows_and_count_via_popcount(source, source_cols):
     cf = source[col("a") >= 0].edit()
     assert cf.n_rows == expected
     assert cf.count() == expected
+
+
+# ---- NumPy functions on col() in the frame ---------------------------------
+
+
+def test_col_numpy_ufunc_matches_operator(tmp_path):
+    ds = _make_store(tmp_path, {"a": np.array([1.0, 4.0, 9.0]), "b": np.array([1.0, 2.0, 4.0])})
+    via_op = ds.edit().assign(r=col("a") / col("b")).dict()["r"]
+    via_np = ds.edit().assign(r=np.divide(col("a"), col("b"))).dict()["r"]
+    assert np.array_equal(via_op, via_np)
+    assert np.array_equal(via_np, np.array([1.0, 2.0, 2.25]))
+
+
+def test_col_numpy_unary_ufunc(tmp_path):
+    ds = _make_store(tmp_path, {"a": np.array([1.0, 4.0, 9.0])})
+    out = ds.edit().assign(r=np.sqrt(col("a"))).dict()["r"]
+    assert np.array_equal(out, np.array([1.0, 2.0, 3.0]))
+
+
+def test_col_numpy_setitem(tmp_path):
+    ds = _make_store(tmp_path, {"a": np.array([1.0, 4.0, 9.0])})
+    cf = ds.edit()
+    cf["r"] = np.log(col("a"))
+    assert np.allclose(cf.dict()["r"], np.log(np.array([1.0, 4.0, 9.0])))
+
+
+def test_col_numpy_where(tmp_path):
+    ds = _make_store(tmp_path, {"a": np.array([1.0, 4.0, 9.0])})
+    out = ds.edit().assign(r=np.where(col("a") > 3, 1, 0)).dict()["r"]
+    assert np.array_equal(out, np.array([0, 1, 1]))
+
+
+def test_col_numpy_clip(tmp_path):
+    ds = _make_store(tmp_path, {"a": np.array([1.0, 4.0, 9.0])})
+    out = ds.edit().assign(r=np.clip(col("a"), 2.0, 5.0)).dict()["r"]
+    assert np.array_equal(out, np.array([2.0, 4.0, 5.0]))
+
+
+def test_frame_expr_rejects_col_operand(tmp_path):
+    # A frame (cf[...]) expression does not take a col() operand; the two styles do
+    # not mix in one expression.
+    ds = _make_store(tmp_path, {"a": np.array([2.0, 4.0, 6.0]), "b": np.array([1.0, 2.0, 3.0])})
+    cf = ds.edit()
+    with pytest.raises(TypeError, match="entirely with col"):
+        _ = cf["a"] / col("b")
+
+
+def test_col_operand_with_frame_expr_resolves(tmp_path):
+    # A col()-led expression accepts a cf[...] operand and resolves against the frame.
+    ds = _make_store(tmp_path, {"a": np.array([2.0, 4.0, 6.0]), "b": np.array([1.0, 2.0, 3.0])})
+    cf = ds.edit()
+    out = cf.assign(r=col("a") / cf["b"]).dict()["r"]
+    assert np.array_equal(out, np.array([2.0, 2.0, 2.0]))
