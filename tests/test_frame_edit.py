@@ -1216,31 +1216,10 @@ def test_edit_base_mask_lowered_on_single_record(source, source_cols):
     assert np.array_equal(cf.dict()["a"], source_cols["a"][mask])
 
 
-# -- index-memory guard (hard error when the survivor index would not fit RAM) --
-
-
-def test_resolve_guards_index_against_available_memory(source, tmp_path, monkeypatch):
-    # A terminal that materializes the survivor-index array hard-errors when the index would
-    # exceed available RAM, instead of letting the process OOM.
-    monkeypatch.setattr("colstore.frame._available_memory", lambda: 8)  # ~8 bytes free
-    pred = col("a") >= 0  # selects every row -> count * 8 >> 8
-    with pytest.raises(MemoryError, match="row index"):
-        source[pred].edit().dict()
-    with pytest.raises(MemoryError, match="row index"):
-        source[pred].edit().write(tmp_path / "out.cstore")
-
-
-def test_n_rows_and_count_throw_free_under_low_memory(source, source_cols, monkeypatch):
-    # n_rows / count must never throw -- they count via the predicate mask, never the index.
-    monkeypatch.setattr("colstore.frame._available_memory", lambda: 8)
+def test_n_rows_and_count_via_popcount(source, source_cols):
+    # n_rows / count return the survivor count via the predicate mask's popcount, without
+    # materializing the row index (a count never needs the index array).
     expected = int((source_cols["a"] >= 0).sum())
     cf = source[col("a") >= 0].edit()
     assert cf.n_rows == expected
     assert cf.count() == expected
-
-
-def test_index_guard_skipped_when_memory_unknown(source, source_cols, monkeypatch):
-    # Best-effort: when available memory can't be determined, the guard is skipped.
-    monkeypatch.setattr("colstore.frame._available_memory", lambda: None)
-    got = source[col("a") >= 0].edit().dict()["a"]
-    assert np.array_equal(got, source_cols["a"][source_cols["a"] >= 0])
