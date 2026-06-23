@@ -338,6 +338,18 @@ class Expr:
 # under _row_count.
 Rows = slice | np.ndarray
 
+# A per-batch evaluation cache: a node's structural key -> its computed array, so a shared
+# subexpression is read or computed once across the columns of one batch. Aliased at module
+# scope because the ``dict`` builtin is shadowed by the frame's ``dict()`` terminal in the
+# class body, where it cannot be used directly as a parameter annotation.
+Memo = dict[tuple[Any, ...], NDArray[Any]]
+
+# Per-column reuse buffers for copy=False iter_batches: output name -> a buffer the gather
+# fills in place each batch, or ``None`` once a store is found not to honor the out= hint (a
+# multi-file boundary read), so later batches of that column skip the dead allocation. A name
+# absent from the dict has not been probed yet. Aliased like Memo (the shadowed ``dict``).
+Buffers = dict[str, NDArray[Any] | None]
+
 
 def _row_count(rows: Rows) -> int:
     """Rows a selector picks: a slice's span, a boolean mask's popcount, or an index
@@ -385,6 +397,15 @@ def _wide_sum(batch: NDArray[Any]) -> Any:
     if kind == "c":
         return batch.sum(dtype=np.complex128)
     return batch.sum()
+
+
+# A reduction folds each materialized batch right after reading it, so a batch that spills
+# last-level cache costs a second DRAM pass over the same data. When a column must be
+# materialized to fold (a gather, a transform, or a non-native dtype) it is chunked to this
+# size to keep the batch cache-resident; a stored column that can be viewed zero-copy skips
+# chunking and folds in one pass. Kept small and fixed (not a user budget): a fold's
+# per-batch overhead is negligible, so cache-residency dominates.
+_REDUCTION_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 class _Leaf(Expr):
@@ -1091,8 +1112,12 @@ class ColStoreFrame:
         return self._row_count()
 
     def _row_count(self) -> int:
-        selection = self._resolve_selection()
-        return self._n_rows if selection is None else _row_count(selection)
+        # n_rows must never throw, so count via the predicate mask's popcount -- it never
+        # materializes the (potentially huge) row index a terminal would.
+        if not self._predicates:
+            return self._n_rows if self._rows is None else _row_count(self._rows)
+        _, mask = self._composed_mask()
+        return int(np.count_nonzero(mask))
 
     def _apply_cuts(
         self, base_rows: Rows, *, count: bool = False
@@ -1142,6 +1167,16 @@ class ColStoreFrame:
             return np.flatnonzero(base)
         return base
 
+    def _composed_mask(self) -> tuple[NDArray[Any] | None, NDArray[Any]]:
+        """The base selection (a kept mask lowered to indices) and the AND-of-predicates
+        mask over it. Callers either count it (``count_nonzero``, for :attr:`n_rows`) or
+        materialize the surviving indices (``flatnonzero``, for a terminal)."""
+        base = self._base_indices()
+        base_rows: Rows = slice(0, self._n_rows) if base is None else base
+        mask, _ = self._apply_cuts(base_rows)
+        assert mask is not None  # _predicates is non-empty here
+        return base, mask
+
     def _resolve_selection(self) -> NDArray[Any] | None:
         """The concrete row selection: the base rows narrowed by every pending
         predicate (``None`` = all rows). An un-composed boolean mask is returned as-is
@@ -1149,10 +1184,7 @@ class ColStoreFrame:
         indices. Evaluating the predicates is the deferred work :meth:`where` records."""
         if not self._predicates:
             return self._rows
-        base = self._base_indices()
-        base_rows: Rows = slice(0, self._n_rows) if base is None else base
-        mask, _ = self._apply_cuts(base_rows)
-        assert mask is not None  # _predicates is non-empty here
+        base, mask = self._composed_mask()
         return np.flatnonzero(mask) if base is None else base[mask]
 
     def report(self, show: str | None = None) -> CutflowReport:
@@ -1594,18 +1626,30 @@ class ColStoreFrame:
     # ---- Reduction terminals (full pass, scalar result) ----------------
 
     def _stream_column(self, expr: Expr) -> Iterator[NDArray[Any]]:
-        """Yield the selected rows of one column expression, one budgeted batch at a time.
+        """Yield the selected rows of one column expression for a reduction to fold.
 
-        The full-pass counterpart the reductions share: the selection is resolved once and
-        each batch evaluates ``expr`` alone (a fresh memo), so peak memory is one batch of a
-        single column rather than the whole column.
+        A stored column with no fancy selection over a single-record native store yields one
+        read-only zero-copy view, so the fold is a single pass over the source with no copy.
+        Otherwise -- a gather (interleaved multi-record or a filtered index), a transform, or
+        a non-native dtype -- the column is materialized in cache-resident chunks so the fold
+        never re-reads a cache-spilling batch from DRAM; peak memory is one chunk of a single
+        column. A fresh memo per chunk releases each batch's working set.
         """
         selection = self._resolve_index_selection()
+        if isinstance(expr, NativeColumn) and not isinstance(selection, np.ndarray):
+            view_rows: Rows = slice(0, self._n_rows) if selection is None else selection
+            try:
+                view = expr._store._view_one(expr.name, view_rows)
+            except ValueError:
+                pass  # a copy is unavoidable (interleaved / non-native) -> chunk below
+            else:
+                if len(view):
+                    yield view
+                return
         n = self._n_rows if selection is None else len(selection)
         if n == 0:
             return
-        budget = config.get_default_memory_budget()
-        rows_per_batch = max(1, budget // max(1, result_dtype(expr).itemsize))
+        rows_per_batch = max(1, _REDUCTION_CHUNK_BYTES // max(1, result_dtype(expr).itemsize))
         for start in range(0, n, rows_per_batch):
             stop = min(start + rows_per_batch, n)
             rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
@@ -1686,7 +1730,41 @@ class ColStoreFrame:
             acc = batch_max if acc is None else np.maximum(acc, batch_max)
         return acc if acc is not None else float("nan")
 
-    def iter_batches(self, batch_size: int | str | None = None) -> Iterator[ColStoreFrame]:
+    def _batch_column(
+        self, name: str, expr: Expr, rows: Rows, memo: Memo, buffers: Buffers, rows_per_batch: int
+    ) -> NDArray[Any]:
+        """One ``copy=False`` batch column.
+
+        A read-only zero-copy view when the source can give one (a stored column over a
+        contiguous range of a single-record native store); else, for a bare stored column, a
+        gather into ``buffers[name]`` -- a per-column buffer reused across batches so the
+        streaming gather allocates nothing per batch; else (a transform) a freshly computed
+        array shared through ``memo``. The view and reused-buffer results are valid only until
+        the next batch and must not be held.
+        """
+        if isinstance(expr, NativeColumn):
+            if not isinstance(rows, np.ndarray):
+                try:
+                    return expr._store._view_one(expr.name, rows)
+                except ValueError:
+                    pass  # interleaved, non-native, or fancy -> gather into a reused buffer
+            if name not in buffers:
+                # First gather for this column: probe whether the store fills out= in place. A
+                # store that ignores the hint (a multi-file boundary read) returns a fresh array,
+                # so remember that and stop allocating a dead buffer for it.
+                probe = np.empty(rows_per_batch, result_dtype(expr))
+                got = expr._store._gather_one(expr.name, rows, out=probe[: _row_count(rows)])
+                buffers[name] = probe if np.shares_memory(got, probe) else None
+                return got
+            buf = buffers[name]
+            if buf is None:
+                return expr._store._gather_one(expr.name, rows)  # store ignores out=; gather fresh
+            return expr._store._gather_one(expr.name, rows, out=buf[: _row_count(rows)])
+        return evaluate(expr, rows, memo)
+
+    def iter_batches(
+        self, batch_size: int | str | None = None, *, copy: bool = True
+    ) -> Iterator[ColStoreFrame]:
         """Yield the selected rows as materialized frames, bounded in memory.
 
         The streaming counterpart of :meth:`recarray`: the selection is resolved
@@ -1699,6 +1777,16 @@ class ColStoreFrame:
         memory budget per batch (e.g. ``"256 MiB"``) converted from the per-row
         byte size, ``None`` the configured default budget. A frame with no columns
         or no selected rows yields nothing.
+
+        ``copy=False`` is a fast path for read-only streaming consumers that finish with each
+        batch before drawing the next (accumulating a reduction, writing each batch out, feeding
+        a model): a batch column is a **read-only zero-copy view** of the source where available
+        (a stored column over a contiguous range of a single-record native store), or a gather
+        into a **per-column buffer reused across batches** (an interleaved multi-record column,
+        or a filtered/fancy selection) so the gather allocates nothing per batch; a transform
+        is freshly computed. Because the views and buffers are reused, a batch is valid only
+        until the next is drawn -- do not mutate or hold it. Keep the default ``copy=True`` for
+        owning arrays safe to mutate or hold after the store closes.
         """
         names = list(self._columns)
         selection = self._resolve_index_selection()
@@ -1709,11 +1797,20 @@ class ColStoreFrame:
         rows_per_batch = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
         if rows_per_batch is None:
             rows_per_batch = max(1, config.get_default_memory_budget() // bytes_per_row)
+        buffers: Buffers = {}  # copy=False: per-column gather buffers, reused across batches
         for start in range(0, n, rows_per_batch):
             stop = min(start + rows_per_batch, n)
             rows: Rows = slice(start, stop) if selection is None else selection[start:stop]
-            memo: dict[tuple[Any, ...], NDArray[Any]] = {}
-            columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
+            memo: Memo = {}
+            if copy:
+                columns = {name: evaluate(self._columns[name], rows, memo) for name in names}
+            else:
+                columns = {
+                    name: self._batch_column(
+                        name, self._columns[name], rows, memo, buffers, rows_per_batch
+                    )
+                    for name in names
+                }
             yield ColStoreFrame._materialized(columns, stop - start)
 
     def write(

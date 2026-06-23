@@ -762,28 +762,46 @@ def test_reductions_empty_selection(source):
 
 
 def test_reductions_combine_across_batches(source, source_cols, monkeypatch):
-    import colstore.config as config_mod
+    import colstore.frame as frame_mod
 
-    monkeypatch.setattr(config_mod, "get_default_memory_budget", lambda: 16)  # ~2 float64/batch
+    monkeypatch.setattr(frame_mod, "_REDUCTION_CHUNK_BYTES", 16)  # ~2 float64/batch
     b = source_cols["b"]
     cf = source.edit()
-    np.testing.assert_allclose(cf.sum("b"), b.sum())
-    np.testing.assert_allclose(cf.mean("b"), b.mean())
-    np.testing.assert_allclose(cf.min("b"), b.min())
-    np.testing.assert_allclose(cf.max("b"), b.max())
+    # A transform can't be a zero-copy view, so it folds in chunks; the per-batch
+    # partials must combine across batches (a bare column would fold one view instead).
+    expr = col("b") * 1
+    np.testing.assert_allclose(cf.sum(expr), b.sum())
+    np.testing.assert_allclose(cf.mean(expr), b.mean())
+    np.testing.assert_allclose(cf.min(expr), b.min())
+    np.testing.assert_allclose(cf.max(expr), b.max())
 
 
 def test_reductions_float32_wide_accumulator(source, source_cols, monkeypatch):
-    import colstore.config as config_mod
+    import colstore.frame as frame_mod
 
     c64 = source_cols["c"].astype(np.float64)  # the float32 column, promoted, for a reference
     cf = source.edit()
-    full = float(cf.sum("c"))
-    monkeypatch.setattr(config_mod, "get_default_memory_budget", lambda: 8)  # 2 float32 rows/batch
-    np.testing.assert_allclose(float(cf.sum("c")), full, rtol=1e-10)  # budget-independent
+    full = float(cf.sum("c"))  # bare column -> one zero-copy view, single pass
+    monkeypatch.setattr(frame_mod, "_REDUCTION_CHUNK_BYTES", 8)  # 2 float32 rows/batch
+    expr = col("c") * 1  # a transform -> chunked fold across batches
+    np.testing.assert_allclose(float(cf.sum(expr)), full, rtol=1e-10)  # chunk-independent
     np.testing.assert_allclose(full, c64.sum(), rtol=1e-10)  # matches a float64 single pass
-    np.testing.assert_allclose(cf.mean("c"), c64.mean(), rtol=1e-10)
-    assert np.asarray(cf.sum("c")).dtype == np.dtype(np.float64)  # float32 sums to float64
+    np.testing.assert_allclose(cf.mean(expr), c64.mean(), rtol=1e-10)
+    assert np.asarray(cf.sum(expr)).dtype == np.dtype(np.float64)  # float32 sums to float64
+
+
+def test_reduction_views_bare_column_without_chunking(source, source_cols, monkeypatch):
+    import colstore.frame as frame_mod
+
+    # A tiny chunk would force many batches if the column were materialized; a bare stored
+    # column on a single-record store folds one read-only zero-copy view instead, no copy.
+    monkeypatch.setattr(frame_mod, "_REDUCTION_CHUNK_BYTES", 8)
+    cf = source.edit()
+    expr = cf._resolve_value_column("b")
+    batches = list(cf._stream_column(expr))
+    assert len(batches) == 1  # one zero-copy view, not chunked
+    np.testing.assert_allclose(np.asarray(batches[0]), source_cols["b"])
+    np.testing.assert_allclose(cf.sum("b"), source_cols["b"].sum())
 
 
 def test_reductions_non_numeric_column(tmp_path):
@@ -853,6 +871,78 @@ def test_iter_batches_single_batch_large_budget(source):
     batches = list(cf.iter_batches("1 GiB"))
     assert len(batches) == 1 and batches[0].n_rows == cf.n_rows
     assert np.array_equal(batches[0].recarray(), cf.recarray())
+
+
+def test_iter_batches_copy_false_returns_views(source, source_cols):
+    # copy=False yields a read-only zero-copy view of a single-record native store: the
+    # batch column shares memory with the store's open column memmap, no gather.
+    cf = source.edit()
+    backing = source._memmaps["b"]
+    viewed = next(iter(cf.iter_batches(batch_size=100, copy=False))).dict()["b"]
+    assert np.shares_memory(viewed, backing)
+    owned = next(iter(cf.iter_batches(batch_size=100, copy=True))).dict()["b"]
+    assert not np.shares_memory(owned, backing)  # copy=True owns its arrays
+
+
+def test_iter_batches_copy_false_matches_copy_true(source, source_cols):
+    # copy=False reuses per-column buffers on gathered batches, so a batch is valid only
+    # until the next is drawn: copy each one out before advancing (the streaming contract).
+    cf = source.edit()
+    viewed = np.concatenate([b.dict()["b"].copy() for b in cf.iter_batches(100, copy=False)])
+    np.testing.assert_array_equal(viewed, source_cols["b"])
+    # a transform can't be a view -> still materialized correctly under copy=False
+    derived = source.edit().assign(d=col("b") * 2)
+    got = np.concatenate([b.dict()["d"].copy() for b in derived.iter_batches(100, copy=False)])
+    np.testing.assert_allclose(got, source_cols["b"] * 2)
+    # a filtered (fancy) selection gathers into a reused buffer -> still correct per batch
+    mask = source_cols["a"] >= 100
+    filt = source.edit().where(col("a") >= 100)
+    got2 = np.concatenate([b.dict()["b"].copy() for b in filt.iter_batches(50, copy=False)])
+    np.testing.assert_array_equal(got2, source_cols["b"][mask])
+
+
+def test_iter_batches_copy_false_reuses_buffer_multirecord(tmp_path):
+    from colstore import testing
+
+    # A multi-record store interleaves columns on disk, so copy=False cannot view -- it
+    # gathers into a per-column buffer reused across batches.
+    full = testing.make_columns(2000, 2, names=("a", "b"), seed=0)
+    testing.write_columns(tmp_path / "mr.cstore", full, records=50).close()
+    store = colstore.open(tmp_path / "mr.cstore")
+    try:
+        cf = store.edit()
+        it = iter(cf.iter_batches(200, copy=False))
+        first = next(it).dict()["a"]
+        second = next(it).dict()["a"]
+        assert np.shares_memory(first, second)  # the same buffer, reused across batches
+        got = np.concatenate([b.dict()["a"].copy() for b in cf.iter_batches(200, copy=False)])
+        np.testing.assert_array_equal(got, full["a"])
+    finally:
+        store.close()
+
+
+def test_iter_batches_copy_false_multifile(tmp_path):
+    from colstore import testing
+
+    # A boundary-spanning batch on a multi-file dataset gathers across the file seam. copy=False
+    # must yield correct values there, and the dataset fills the caller's out= buffer (so the
+    # per-column reuse works across the seam too, not just within a single file).
+    a = testing.make_columns(10, 2, names=("x", "y"), seed=1)
+    b = testing.make_columns(10, 2, names=("x", "y"), seed=2)
+    testing.write_columns(tmp_path / "part_0.cstore", a, records=1).close()
+    testing.write_columns(tmp_path / "part_1.cstore", b, records=1).close()
+    ds = colstore.open(str(tmp_path / "part_*.cstore"))
+    try:
+        got = np.concatenate(
+            [fr.dict()["x"].copy() for fr in ds.edit().iter_batches(7, copy=False)]
+        )
+        np.testing.assert_array_equal(got, np.concatenate([a["x"], b["x"]]))
+        buf = np.empty(7, dtype=ds.dtypes["x"])  # a slice [7, 14) crossing the file seam
+        filled = ds._gather_one("x", slice(7, 14), out=buf)
+        assert np.shares_memory(filled, buf)  # the dataset filled the buffer; reuse works
+        np.testing.assert_array_equal(filled, np.concatenate([a["x"], b["x"]])[7:14])
+    finally:
+        ds.close()
 
 
 def test_iter_batches_filtered_gathers_survivors(source, source_cols):
@@ -1124,3 +1214,12 @@ def test_edit_base_mask_lowered_on_single_record(source, source_cols):
     assert cf._rows.dtype == np.int64
     assert cf.n_rows == int(mask.sum())
     assert np.array_equal(cf.dict()["a"], source_cols["a"][mask])
+
+
+def test_n_rows_and_count_via_popcount(source, source_cols):
+    # n_rows / count return the survivor count via the predicate mask's popcount, without
+    # materializing the row index (a count never needs the index array).
+    expected = int((source_cols["a"] >= 0).sum())
+    cf = source[col("a") >= 0].edit()
+    assert cf.n_rows == expected
+    assert cf.count() == expected
