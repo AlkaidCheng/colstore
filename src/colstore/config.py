@@ -77,9 +77,10 @@ _PREFETCH_DISTANCE_CEILING = 1 << 14
 # (see ``format.write_dataset_streaming``). The writer sizes each batch so the
 # live arrays for one row-range pass over all output columns stay within this
 # budget; the memory-mapped output is file-backed and is not counted against it.
-# 128 MiB keeps small edits single-batch while bounding peak RAM on wide schemas
-# or deep expression graphs.
-_DEFAULT_MEMORY_BUDGET = 128 * 1024 * 1024
+# 32 MiB sizes each streaming batch to roughly fit last-level cache, keeping a
+# batch's gather/write cache-resident; small edits still fit one batch, and peak RAM
+# stays bounded on wide schemas or deep expression graphs.
+_DEFAULT_MEMORY_BUDGET = 32 * 1024 * 1024
 
 
 def _default_gather_thread_cap() -> int:
