@@ -413,12 +413,13 @@ def resolve_mask_density_gate() -> float:
 
 # Minimum selected fraction for a multi-file boolean-mask read to take the
 # native mask kernel (colstore_gather_multifile_mask) instead of the per-file
-# fan-out. The kernel scans the whole 1-byte/row mask once for offsets and once
-# to gather; below this density the per-file path -- which lowers each file's
-# sparse sub-mask straight to its few selected indices -- moves less, so it is
-# preferred. The crossover is hardware-dependent; this conservative default is
-# the starting point until a deployment-node sweep tunes it.
-_MULTIFILE_MASK_DENSITY_GATE_DEFAULT = 0.0625
+# fan-out. A deployment-node sweep found the kernel faster at every density: it
+# word-skips unselected runs, so a sparse mask -- where the per-file path still
+# pays full per-(file, column) threadpool orchestration -- is its largest win
+# (~7.6x at 0.5% selected), not a loss. So it defaults to 0: always take the
+# kernel when the columns are native. Kept settable for a deployment that
+# measures a regime where the per-file path wins.
+_MULTIFILE_MASK_DENSITY_GATE_DEFAULT = 0.0
 _multifile_mask_density_gate: float = _MULTIFILE_MASK_DENSITY_GATE_DEFAULT
 
 
