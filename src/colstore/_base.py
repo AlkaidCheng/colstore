@@ -22,6 +22,7 @@ from . import kernels
 from ._pandas import _make_dataframe_no_consolidate
 from ._query import _Expr, parse_query, validate_predicate
 from ._render import Preview
+from .interop import InteropMixin
 from .view import (
     ColumnView,
     TableView,
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
     from .frame import ColStoreFrame
 
 
-class _ReaderBase(abc.ABC):
+class _ReaderBase(InteropMixin, abc.ABC):
     """Column and row indexing shared by every colstore reader.
 
     Subclasses must provide ``_column_dtypes`` (column name -> on-disk dtype,
@@ -124,6 +125,23 @@ class _ReaderBase(abc.ABC):
         preserve values (a non-native on-disk dtype, which cannot be byteswapped
         by a copy); the merge-copy caller treats that as "not a pure merge" and
         falls back to the materializing write.
+        """
+
+    @abc.abstractmethod
+    def _column_chunks(self, column_name: str) -> list[NDArray[Any]]:
+        """Zero-copy native views of one column, one per contiguous segment.
+
+        Returns read-only ndarrays aliasing the open mapping(s) -- the in-memory
+        counterpart to the file-coordinate runs :meth:`_column_disk_runs`
+        produces, used to build a zero-copy Arrow array (one chunk per segment).
+        A single-record file yields one view spanning the column; a multi-record
+        or multi-file source yields one per record, in global row order. Each
+        view holds a reference to its mapping, so it stays valid after
+        :meth:`close`.
+
+        Implementations raise ``ValueError`` for a non-native on-disk dtype,
+        which a view cannot byteswap; the Arrow caller then falls back to a
+        materializing gather.
         """
 
     # ---- Column metadata -----------------------------------------------
@@ -490,3 +508,8 @@ class _ReaderBase(abc.ABC):
         copying when any column cannot be viewed).
         """
         return _make_dataframe_no_consolidate(self.dict(copy=copy))
+
+    def _interop_target(self) -> tuple[_ReaderBase, list[str], Any, bool]:
+        """Whole store, every column, no row selection -- the export seam (see InteropMixin)."""
+        self._check_open()
+        return self, self.columns, None, False

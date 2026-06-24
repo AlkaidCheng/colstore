@@ -599,6 +599,22 @@ class ColStoreDataset(_ReaderBase):
                 runs.extend(child._column_disk_runs(column_name))
         return runs
 
+    def _column_chunks(self, column_name: str) -> list[NDArray[Any]]:
+        """Zero-copy native views of one column across all files, in row order.
+
+        Concatenates each child's :meth:`ColStoreReader._column_chunks`, so each
+        chunk aliases its own file's mapping and keeps it alive. Propagates a
+        child's ``ValueError`` for a non-native dtype, so the Arrow caller falls
+        back to a materializing gather.
+        """
+        self._check_open()
+        self._require_columns([column_name])
+        chunks: list[NDArray[Any]] = []
+        for child in self._children:
+            if child.n_rows:
+                chunks.extend(child._column_chunks(column_name))
+        return chunks
+
     def _uniform_segment_grid(self, starts: NDArray[np.int64]) -> int | None:
         """The common segment row count if the segment table is a uniform grid,
         else ``None``.

@@ -56,7 +56,7 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from . import parsers, profiling, testing
+from . import interop, parsers, profiling, testing
 from ._query import QueryError, col
 from .api import (
     ColStoreInfo,
@@ -121,6 +121,7 @@ __all__ = [
     "get_gather_thread_cap",
     "get_max_workers",
     "info",
+    "interop",
     "max_threads",
     "numba_available",
     "open",

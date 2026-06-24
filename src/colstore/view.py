@@ -23,6 +23,7 @@ from ._pandas import _make_dataframe_no_consolidate
 from ._query import _Expr, evaluate_mask
 from ._render import Preview, render_lazy_card
 from .frame import ColStoreFrame
+from .interop import InteropMixin
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -141,7 +142,7 @@ def edit_row_selection(indexer: _RowIndexer, n_rows: int) -> np.ndarray | None:
     return array.astype(np.int64, copy=False)
 
 
-class _BaseView:
+class _BaseView(InteropMixin):
     """Shared row-indexer plumbing for the two view types.
 
     Not part of the public API: users should construct views via
@@ -389,6 +390,10 @@ class ColumnView(_BaseView):
         """
         return ColumnView(self._store, self._resolve_row_indexer(), self._column_name)
 
+    def _interop_target(self) -> tuple[_ReaderBase, list[str], Any, bool]:
+        """This single column and its resolved rows -- the export seam (see InteropMixin)."""
+        return self._store, [self._column_name], self._resolve_row_indexer(), True
+
     def head(self, n: int | None = None) -> Preview:
         """First ``n`` values of the column as a previewable peek (default config rows)."""
         return self._preview(self._head_rows(self._preview_n(n)))
@@ -542,6 +547,10 @@ class TableView(_BaseView):
         selection. The selected columns are not materialized.
         """
         return TableView(self._store, self._resolve_row_indexer(), self._column_names)
+
+    def _interop_target(self) -> tuple[_ReaderBase, list[str], Any, bool]:
+        """These columns and their resolved rows -- the export seam (see InteropMixin)."""
+        return self._store, self._column_names, self._resolve_row_indexer(), False
 
     def head(self, n: int | None = None) -> Preview:
         """First ``n`` rows of the selection as a previewable peek (default config rows)."""
