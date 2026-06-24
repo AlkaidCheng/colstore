@@ -702,6 +702,26 @@ class ColStoreReader(_ReaderBase):
         column_offset, _ = self._layout[column_name]
         return [(self._path, int(column_offset), self._n_rows * itemsize)]
 
+    def _column_chunks(self, column_name: str) -> list[NDArray[Any]]:
+        """Zero-copy native views of one column, one per record.
+
+        A single-record file is one view over the column's memmap; a
+        multi-record file is one ``np.frombuffer`` view per record over the
+        shared file mapping, at the byte runs :meth:`_column_disk_runs` reports.
+        Each view's ``base`` keeps the mapping alive past :meth:`close`. Raises
+        ``ValueError`` for a non-native on-disk dtype (a view cannot byteswap).
+        """
+        if not self._is_multi_record:
+            return [self._view_one(column_name, None)]
+        disk_dtype = self._column_dtypes[column_name]
+        itemsize = disk_dtype.itemsize
+        return [
+            np.frombuffer(
+                self._file_mmap, dtype=disk_dtype, count=nbytes // itemsize, offset=offset
+            )
+            for _path, offset, nbytes in self._column_disk_runs(column_name)
+        ]
+
     # ---- Multi-record read path -----------------------------------------
 
     def _detect_uniform_record_layout(self) -> tuple[int, int, int, int] | None:
