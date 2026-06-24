@@ -64,6 +64,12 @@ cdef extern from "colstore/gather.hpp" nogil:
     int colstore_gather_segment_sorted(const int64_t*, uint8_t*, ptrdiff_t,
                                          const int64_t*, const int64_t*, int64_t,
                                          int, int, ptrdiff_t)
+    int colstore_gather_segment_uniform(const int64_t*, uint8_t*, ptrdiff_t,
+                                          int64_t, const int64_t*, int64_t,
+                                          int, int, ptrdiff_t)
+    int colstore_gather_segment_uniform_bins(const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
+                                               int64_t, const int64_t*, int64_t,
+                                               int, int, ptrdiff_t)
     int colstore_gather_segment_mask(const uint8_t*, uint8_t*, int64_t, ptrdiff_t,
                                        const int64_t*, const int64_t*, int64_t,
                                        int, int, ptrdiff_t)
@@ -661,6 +667,99 @@ def gather_segment(cnp.ndarray indices, cnp.ndarray output,
     cdef int status
     with nogil:
         status = colstore_gather_segment(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+
+def gather_segment_uniform(cnp.ndarray indices, cnp.ndarray output,
+                             long long rows_per_segment, cnp.ndarray segment_base,
+                             int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Uniform-grid multi-file fancy gather: ``s = idx / rows_per_segment``.
+
+    Specialization of :func:`gather_segment` for a segment table whose every
+    segment holds ``rows_per_segment`` rows (the global-last may be partial).
+    The per-index segment is a magic-reciprocal division instead of the
+    branchless binary search; the address is the same
+    ``segment_base[s] + idx * itemsize``, so no ``segment_starts_rows`` array is
+    needed. The caller (the dataset detects the grid) guarantees every index in
+    ``[0, n_segments * rows_per_segment)`` and native byte order.
+    """
+    _require_1d((indices, output, segment_base), "indices, output, and segment_base must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int64(segment_base, "segment_base")
+    if rows_per_segment <= 0:
+        raise ValueError("rows_per_segment must be positive.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    _require_output_len(output, n, "indices")
+    cdef long long n_segments = segment_base.shape[0]
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("indices", indices), ("output", output), ("segment_base", segment_base)))
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_segment_uniform(indices_ptr, output_ptr, n, rows_per_segment, sb, n_segments, itemsize, thread_cap, pd)
+    if status != 0:
+        raise TypeError(
+            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
+            f"handles 1, 2, 4, and 8 byte elements."
+        )
+
+
+def gather_segment_uniform_bins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray bins,
+                                  long long rows_per_segment, cnp.ndarray segment_base,
+                                  int thread_cap=0, Py_ssize_t prefetch_distance=-1):
+    """Uniform-grid multi-file gather that also records each index's segment bin.
+
+    Identical addressing and output to :func:`gather_segment_uniform`, plus
+    ``bins[i]`` is filled with the segment index (``int32``) that ``indices[i]``
+    binned to -- a multi-column read computes the grid division once here and
+    reuses it via :func:`gather_segment_withbins`. ``bins`` must be 1D ``int32``
+    of the same length as ``indices``; the caller guarantees
+    ``n_segments <= 2**31 - 1``.
+    """
+    _require_1d((indices, output, bins, segment_base), "indices, output, bins, and segment_base must be 1D.")
+    _require_int64(indices, "indices")
+    _require_int32(bins, "bins")
+    _require_int64(segment_base, "segment_base")
+    if rows_per_segment <= 0:
+        raise ValueError("rows_per_segment must be positive.")
+
+    cdef ptrdiff_t n = indices.shape[0]
+    if output.shape[0] != n or bins.shape[0] != n:
+        raise ValueError(
+            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
+            f"match indices length {n}."
+        )
+    cdef long long n_segments = segment_base.shape[0]
+    if n == 0:
+        return
+
+    cdef int itemsize = output.dtype.itemsize
+    _require_c_contiguous((("indices", indices), ("output", output), ("bins", bins), ("segment_base", segment_base)))
+    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
+    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
+    cdef int32_t* bins_ptr = <int32_t*>cnp.PyArray_DATA(bins)
+    cdef const int64_t* sb = <const int64_t*>cnp.PyArray_DATA(segment_base)
+
+    cdef ptrdiff_t pd = (
+        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
+    )
+    cdef int status
+    with nogil:
+        status = colstore_gather_segment_uniform_bins(indices_ptr, output_ptr, bins_ptr, n, rows_per_segment, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
             f"Unsupported element size: {itemsize} bytes. The C++ kernel "

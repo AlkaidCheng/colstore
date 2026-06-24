@@ -194,6 +194,34 @@ int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* ou
                                      int itemsize, int thread_cap,
                                      std::ptrdiff_t prefetch_distance);
 
+// Uniform-grid multi-file gather: colstore_gather_segment specialized for a
+// segment table whose every segment holds the same ``rows_per_segment`` rows (the
+// global-last may be partial, <= rows_per_segment). The per-index segment is then
+// the closed form ``s = idx / rows_per_segment`` (one magic-reciprocal multiply,
+// no binary search), then the same ``segment_base[s] + idx * itemsize`` load --
+// ``segment_base`` stays an array because the segments live in different mmaps, so
+// no ``segment_starts_rows`` is needed. The caller (the dataset detects the grid)
+// guarantees every index in ``[0, n_segments * rows_per_segment)`` and native byte
+// order. Dispatched on itemsize (1/2/4/8 bytes; any other returns -1).
+int colstore_gather_segment_uniform(const std::int64_t* indices, std::uint8_t* output,
+                                      std::ptrdiff_t n, std::int64_t rows_per_segment,
+                                      const std::int64_t* segment_base, std::int64_t n_segments,
+                                      int itemsize, int thread_cap,
+                                      std::ptrdiff_t prefetch_distance);
+
+// Bin-recording uniform-grid gather: colstore_gather_segment_uniform that also
+// writes ``bins[i]`` = the segment of ``indices[i]``, so a multi-column read
+// computes the grid division once here and the trailing columns reuse it via
+// colstore_gather_segment_withbins. ``bins`` has length ``n`` and requires
+// ``n_segments <= INT32_MAX`` (the caller guards). Other arguments match
+// colstore_gather_segment_uniform.
+int colstore_gather_segment_uniform_bins(const std::int64_t* indices, std::uint8_t* output,
+                                           std::int32_t* bins, std::ptrdiff_t n,
+                                           std::int64_t rows_per_segment,
+                                           const std::int64_t* segment_base,
+                                           std::int64_t n_segments, int itemsize, int thread_cap,
+                                           std::ptrdiff_t prefetch_distance);
+
 // Parallel byte copy of runs into one output buffer. Run ``r`` copies
 // ``byte_lengths[r]`` bytes from absolute source address ``src_addrs[r]`` to
 // ``output + dst_offsets[r]``. The runs' lengths are split across threads in one

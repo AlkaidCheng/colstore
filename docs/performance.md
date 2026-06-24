@@ -377,7 +377,25 @@ single-file multi-record store (each record is one segment) and a multi-file
 dataset (every file's records stitched into one table), so one kernel family —
 `gather_segment*` — covers both instead of separate single- and multi-file paths.
 
-### 6.3 Sampled-rejection sortedness check
+### 6.3 Uniform-grid multi-file division
+
+The reciprocal divide of §6.1 collapses the per-record search on a single file; the
+same trick applies one level up. When a multi-file dataset's segment table is a
+*uniform grid* — every segment the same row count `R`, except possibly the
+global-last — a row's segment is `s = idx / R` in closed form (the §6.1 magic
+reciprocal), with no binary search over the segment table at all. The address is
+still `segment_base[s] + idx*itemsize` (§6.2): the bases stay an array, because
+multi-file segments live in different mmaps, but the *search* for `s` is gone.
+
+The win grows with the segment count, since that is the search depth the division
+replaces — `log2(n_segments)` comparisons per row become one multiply. The grid
+holds for the common sharded-write layout (N equal-sized files, the last possibly
+short); it is detected once per dataset by an O(n_segments) vectorized pass over the
+start rows (`_uniform_segment_rows`, memoized like the segment table), and is a
+no-op fallback to the searching kernel when it does not hold. Sorted reads are
+unaffected — the cursor walk already has no per-row search to amortize.
+
+### 6.4 Sampled-rejection sortedness check
 
 Routing depends on whether a fancy index is sorted, but the exact check is an
 O(K) pass (and allocates a K−1-byte temporary) that is pure overhead when the

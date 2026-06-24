@@ -759,6 +759,133 @@ def test_segment_table_memoized_across_reads(tmp_path):
         assert ds._native_segment_table("x") is cached  # same object, not rebuilt
 
 
+# ---- Uniform-grid multi-file routing ----------------------------------------
+# Equal-sized files (or equal records) make the global segment table a uniform
+# grid, so an unsorted native gather divides (s = idx / rows_per_segment) instead
+# of binary-searching. The route is a no-op fallback to the searching kernel when
+# the grid does not hold, is taken only for unsorted reads (sorted keeps the
+# cursor walk), and the grid test is memoized and reset on append.
+
+_UNIFORM_SPY = [
+    "gather_segment_uniform",
+    "gather_segment_uniform_bins",
+    "gather_segment",
+    "gather_segment_bins",
+    "gather_segment_sorted",
+]
+
+
+def test_uniform_grid_routes_to_division_binning(tmp_path, monkeypatch):
+    from _helpers import kernel_spy
+
+    if not kernels.cpp_available():
+        pytest.skip("native gather requires the compiled extension")
+    paths, ox, oy = _build_files(tmp_path, [5000] * 6)  # equal files: a uniform grid
+    rng = np.random.default_rng(0)
+    index = rng.integers(0, ox.size, size=8000, dtype=np.int64)
+    with colstore.open(paths) as ds:
+        calls = kernel_spy(monkeypatch, _UNIFORM_SPY)
+        np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+        assert calls == ["gather_segment_uniform"]
+        calls.clear()
+        both = ds[index, ["x", "y"]].dict()
+        assert calls == ["gather_segment_uniform_bins"]  # trailing column unspied (withbins)
+        np.testing.assert_array_equal(both["x"], ox[index])
+        np.testing.assert_array_equal(both["y"], oy[index])
+
+
+def test_non_uniform_dataset_keeps_searching_kernel(tmp_path, monkeypatch):
+    from _helpers import kernel_spy
+
+    if not kernels.cpp_available():
+        pytest.skip("native gather requires the compiled extension")
+    paths, ox, oy = _build_files(tmp_path, [3000, 5000, 1000, 4000])  # unequal: not a grid
+    rng = np.random.default_rng(1)
+    index = rng.integers(0, ox.size, size=6000, dtype=np.int64)
+    with colstore.open(paths) as ds:
+        calls = kernel_spy(monkeypatch, _UNIFORM_SPY)
+        np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+        assert calls == ["gather_segment"]
+        calls.clear()
+        both = ds[index, ["x", "y"]].dict()
+        assert calls == ["gather_segment_bins"]
+        np.testing.assert_array_equal(both["x"], ox[index])
+        np.testing.assert_array_equal(both["y"], oy[index])
+
+
+def test_uniform_grid_partial_global_tail_routes(tmp_path, monkeypatch):
+    from _helpers import kernel_spy
+
+    if not kernels.cpp_available():
+        pytest.skip("native gather requires the compiled extension")
+    paths, ox, _ = _build_files(tmp_path, [4000, 4000, 4000, 1500])  # last smaller: still a grid
+    rng = np.random.default_rng(2)
+    index = rng.integers(0, ox.size, size=6000, dtype=np.int64)
+    with colstore.open(paths) as ds:
+        calls = kernel_spy(monkeypatch, _UNIFORM_SPY)
+        np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+        assert calls == ["gather_segment_uniform"]
+
+
+def test_uniform_grid_sorted_keeps_cursor_walk(tmp_path, monkeypatch):
+    from _helpers import kernel_spy
+
+    if not kernels.cpp_available():
+        pytest.skip("native gather requires the compiled extension")
+    paths, ox, _ = _build_files(tmp_path, [2000] * 5)
+    index = np.sort(np.random.default_rng(3).integers(0, ox.size, size=4000)).astype(np.int64)
+    with colstore.open(paths) as ds:
+        calls = kernel_spy(monkeypatch, _UNIFORM_SPY)
+        np.testing.assert_array_equal(ds[index, "x"].array(), ox[index])
+        assert calls == ["gather_segment_sorted"]  # sorted: cursor walk, not division
+
+
+def test_uniform_grid_memo_reset_on_append(tmp_path, monkeypatch):
+    from _helpers import kernel_spy
+
+    if not kernels.cpp_available():
+        pytest.skip("native gather requires the compiled extension")
+    # A larger trailing file breaks the grid (a partial last segment would not);
+    # appending it must reset the memo so the read switches to the searching kernel.
+    paths, ox, _ = _build_files(tmp_path, [1000, 1000, 1500])
+    rng = np.random.default_rng(4)
+    ds = ColStoreDataset(paths[:2])  # two equal files: a grid
+    try:
+        idx1 = rng.integers(0, 2000, size=3000, dtype=np.int64)
+        calls = kernel_spy(monkeypatch, _UNIFORM_SPY)
+        np.testing.assert_array_equal(ds[idx1, "x"].array(), ox[idx1])
+        assert calls == ["gather_segment_uniform"]  # grid holds
+
+        ds.append(paths[2])  # 1500-row file: last segment larger than R, grid broken
+        calls.clear()
+        idx2 = rng.integers(0, ds.n_rows, size=3000, dtype=np.int64)
+        np.testing.assert_array_equal(ds[idx2, "x"].array(), ox[idx2])
+        assert calls == ["gather_segment"]  # now searches
+    finally:
+        ds.close()
+
+
+def test_uniform_grid_route_matches_fallback_and_oracle(tmp_path, monkeypatch):
+    # The division route and the portable sort-once fallback must agree, and both
+    # equal the oracle, including duplicate indices.
+    paths, ox, oy = _build_files(tmp_path, [4000] * 5)
+    rng = np.random.default_rng(5)
+    index = rng.integers(0, ox.size, size=7000, dtype=np.int64)
+    index[::7] = index[0]  # duplicates
+    with colstore.open(paths) as ds:
+        native_x = ds[index, "x"].array()
+        native_both = ds[index, ["x", "y"]].dict()
+    monkeypatch.setattr(kernels, "cpp_available", lambda: False)
+    with colstore.open(paths) as ds:
+        fallback_x = ds[index, "x"].array()
+        fallback_both = ds[index, ["x", "y"]].dict()
+    for result in (native_x, fallback_x):
+        np.testing.assert_array_equal(result, ox[index])
+    for both in (native_both, fallback_both):
+        np.testing.assert_array_equal(both["x"], ox[index])
+        np.testing.assert_array_equal(both["y"], oy[index])
+
+
 # ---- Zero-copy seam rules ----------------------------------------------
 
 
