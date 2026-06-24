@@ -875,6 +875,126 @@ effect that shelved spread thread-binding. Only heavy-math transforms, where the
 arithmetic hides the contention, won (1.23x). Shelved for the overlap, which keeps the
 compute single-threaded and avoids the contention entirely.
 
+# Round 7 — One gather, layout specializations, and the bandwidth-bound frontier
+
+Rounds 1–6 grew two parallel fancy-gather kernel families — one over a single file's
+records, one over a multi-file dataset's segments — computing the same addressing.
+This round collapses them to one segment-table family, adds the multi-file layout
+specialization the merge exposed, hardens the sorted walk so its speed hint can never
+compromise memory safety, and then — with the kernels unified — profiles the whole
+read/write surface to find what is left. The answer settles the series: the hot paths
+are memory-bandwidth-bound, and the remaining wins are the serial per-read overheads,
+not the kernels.
+
+## Stage 18 — Fancy/index gather unified onto the segment kernels
+
+**Branch:** `refactor/unify-fancy-gather`
+
+**Problem.** A single-file store is one record per segment, so the single-file
+multirecord fancy kernels (`gather_multirecord` and its sorted / bins / withbins /
+withbins_rbase variants) were a special case of the multi-file segment kernels —
+duplicated addressing, duplicated tests, and a record-base size gate that existed only
+to fold a per-record base the segment table already carries.
+
+**Change.** Route the reader's three non-uniform fancy paths through the segment
+kernels (renamed `gather_multifile*` → `gather_segment*`), remove the five multirecord
+duplicates from the C++ kernel / Cython / header, and drop the record-base gate:
+`segment_base[s]` is the pre-folded base it computed, so the multi-column trailing path
+is one size-independent route. The uniform-record and strided kernels stay as the
+layout specializations the reader picks in front of the general path. Net −878 lines;
+output byte-identical (kernel-level parity probe, 0.98–1.04x). A perf-neutral refactor
+that makes the segment table the one addressing abstraction.
+
+## Stage 19 — Uniform-grid multi-file division
+
+**Branch:** `perf/uniform-multifile-gather`
+
+**Problem.** The general multi-file gather finds each index's segment by a branchless
+binary search over the segment table. For the common sharded-write layout — N
+equal-sized files, the last possibly short — that search is avoidable.
+
+**Change.** When the segment table is a *uniform grid* (every segment the same row
+count R except possibly the global-last), find the segment by a magic-reciprocal
+division `s = idx / R` instead of the search, then the same `segment_base[s] +
+idx*itemsize` load. Detected once per dataset by an O(n_segments) vectorized pass over
+the start rows (memoized, reset on append); a no-op fallback to the searching kernel
+otherwise; sorted reads keep the cursor walk. New `gather_segment_uniform` /
+`_uniform_bins` kernels reuse the uniform-record magic divisor. Subsumes the
+equal-file-row-count and all-single-record-files layouts (both are uniform grids).
+
+**Measured (deployment hardware, 10M rows).** Single-column unsorted read 1.40x at 16
+files → 1.78x at 1024 files: the search baseline climbs with the file count (deeper
+search) while the division stays flat, so the win widens with the segment count;
+multi-column dict 1.10–1.20x (only the first column divides). No regression.
+
+## Stage 20 — Order-robust sorted gather and the per-read sortedness cache
+
+**Branch:** `perf/sorted-hint-cache`
+
+**Problem.** The reader chooses the cursor kernel (fast for sorted indices) over the
+searching kernel by testing whether the selector is sorted — a full O(K) serial pass
+for an already-sorted selector, recomputed once per column on a multi-column read.
+Separately, `gather_segment_sorted` assumed a non-decreasing selector: a backward step
+computed an address outside the segment and read out of bounds, so its correctness
+rested on caller discipline.
+
+**Change (safety).** The cursor self-corrects: on a backward step it re-locates the
+segment by binary search, so the address always satisfies `segment_starts_rows[s] <=
+idx < [s+1]` and stays in bounds. The kernel is now correct for any index order, so the
+sortedness hint is demoted to a pure performance advisory that can never cause a wrong
+or out-of-bounds read. The fast path for a sorted selector is unchanged (one extra,
+branch-predicted compare per element; the cursor stays 12–14x faster than the search
+kernel on sorted input).
+
+**Change (perf).** A multi-column read resolves the selector's order once and threads
+it to each column, replacing the per-column recompute.
+
+**Measured (deployment hardware, 10M rows, 6 columns, sorted).** 1.27x at K=200K →
+1.07x at K=5M — the redundant serial passes are a larger share at moderate K and
+shrink where materializing the output dominates the read.
+
+## Stage 21 — Recarray sortedness cache
+
+**Branch:** `perf/recarray-sortedness-cache`
+
+**Problem.** The record-array build reads each column through
+`_contiguous_native_source` → `_gather_one`, and each recomputed the sortedness test
+independently — the per-column redundancy Stage 20 removed for the dict path, still
+live for `recarray()` (measured 6x for a 6-column read).
+
+**Change.** Resolve the sortedness once in `_build_recarray` and thread it through the
+abstract `_gather_one` and the dataset's `_fancy_one`. Byte-identical; the per-column
+recompute collapses to one.
+
+**Measured (8-column sorted recarray).** 1.15x at K=5M multi-threaded, 1.05x
+single-threaded — the saving is a *larger* share at higher thread counts, because the
+serial passes shrink against the parallel gather, so it grows toward the deployment
+node's thread regime.
+
+## The bandwidth-bound frontier — a comprehensive read-path profile
+
+With the kernels unified, a parallel hunt for cache-miss / page-fault / branch hot
+spots — cross-checked with deterministic cache+branch simulation (cachegrind) and a
+full native flamegraph (Python + C++) — located where the read/write time goes and
+ruled out the tempting micro-optimizations on measured grounds:
+
+- **~75% is bandwidth/IO-bound** — the contiguous-range memcpy, the SoA→AoS
+  interleave, the parallel gather pool, and `writev` — plus the one-time reader-open
+  CRC. No kernel micro-opt moves it.
+- **~8% is serial numpy overhead** — the fancy-index bounds check (necessary, on
+  untrusted user indices, and not reachable from `where`/`filter`/mask selectors,
+  which lower to a mask that bypasses it), the sortedness test (Stages 20–21), and the
+  mask popcount. The only optimizable slice, and a small one.
+
+Two kernel candidates were implemented and **rejected on the real multi-threaded path**
+(see the rejected-alternatives list), both because the interleave/gather is
+bandwidth-bound: a microbench wins single-threaded but the saving vanishes once the
+cores saturate bandwidth. The systematic lesson recorded for the next round: vet a
+kernel change on the real multi-threaded path, never a single-thread microbench. The
+frontier conclusion is that the format is well-optimized and bandwidth-bound; the
+shipped wins this round are the serial-overhead caches (Stages 20–21), which survive
+multi-threading precisely because they trade against the parallel gather.
+
 # Net effect
 
 For the motivating workload — multi-column selection-driven reads over
@@ -898,7 +1018,12 @@ calibration remains a one-command operation with fingerprint-guarded
 caches. On the edit side, a dense-mask `ds[mask].edit()` takes the mask-native route rather
 than lowering to indices, and the streaming terminals are cache-resident by default (32 MiB),
 reuse one gather buffer per column under `copy=False`, and fold reductions in fixed 8 MiB
-chunks.
+chunks. The fancy/index gather is now one segment-table kernel family with layout
+specializations the reader picks in front of the general search — single-record, uniform-record
+division, uniform-grid multi-file division, strided range, and the sorted cursor — and that
+cursor is order-robust, so its sortedness hint is a pure performance advisory that cannot
+read out of bounds. A comprehensive native profile then placed the read/write floor at
+memory bandwidth and the reader-open CRC, leaving only small serial-overhead caches as wins.
 
 # Rejected alternatives (do not re-propose without new evidence)
 
@@ -1038,3 +1163,18 @@ chunks.
   which read the full int64 index). Gated on a profile showing such selectors
   reach the reader un-materialized rather than as a flatnonzero/arange int64
   array.
+* **Row-tiled recarray interleave** (Round 7 frontier) — tiling the SoA→AoS
+  interleave so one column is swept per tile wins ~2x in a single-thread microbench
+  (a hoisted itemsize makes the field-width switch loop-invariant, ~8x fewer branch
+  mispredictions; one sequential source stream instead of n_cols suits the
+  prefetcher), but the real `recarray()` interleave runs multi-threaded and
+  bandwidth-bound, so the win is 1.0x. cachegrind confirmed the cache-miss counts are
+  identical (same footprint) — the "less traffic" intuition was wrong; the only
+  deterministic delta was branch mispredictions, which do not survive bandwidth
+  saturation. Reopen only on a confirmed low-thread / warm-buffer interleave regime.
+* **Removing the mask kernel's all-ones run path** (Round 7 frontier) — routing every
+  non-zero mask word through the branchless compaction (deleting the all-ones-run
+  memcpy) wins 2.5–3.7x on a scattered-mask microbench, but the real multi-threaded
+  read is bandwidth-bound (1.01–1.11x, near noise) and a long-contiguous-run mask
+  regresses 0.81x — the memcpy run earns its keep on dense / blocked masks. Reopen
+  only for a confirmed single-thread / no-long-run mask workload.
