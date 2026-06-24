@@ -47,6 +47,9 @@ colstore = "colstore.cli:main"
 [project.entry-points."colstore.data_formats"]
 arrow = "colstore.interop.arrow:ArrowFormat"
 
+[project.entry-points."colstore.file_formats"]
+npz = "colstore.interop.npz:NpzFormat"
+
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
 progress = ["tqdm>=4.60"]
