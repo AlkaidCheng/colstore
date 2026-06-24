@@ -150,6 +150,43 @@ def test_single_element_selector_keeps_fused_route(sortedness_store, monkeypatch
         assert routes == ["gather_segment"]
 
 
+def test_sorted_hint_threaded_to_columns_never_lies(sortedness_store, monkeypatch):
+    # A multi-column read computes the selector's order once and threads it to
+    # each column as ``indices_sorted``. The hint is advisory -- the kernel is
+    # order-robust, so a wrong value only forgoes the speedup, never a wrong or
+    # out-of-bounds read -- but it must still be accurate for the read to take
+    # the route it should. Capture the hint reaching every column and assert it
+    # equals the true order.
+    path, full, total = sortedness_store
+    cols = ["f8", "i4"]
+    original = reader_mod.ColStoreReader._gather_one_multi_record
+
+    def checking(self, column_name, row_indexer, thread_cap, out=None, indices_sorted=None):
+        if (
+            indices_sorted is not None
+            and isinstance(row_indexer, np.ndarray)
+            and row_indexer.dtype != np.bool_
+        ):
+            idx64 = np.ascontiguousarray(row_indexer, dtype=np.int64)
+            actual = bool(np.all(idx64[1:] >= idx64[:-1]))
+            assert indices_sorted == actual, (column_name, indices_sorted, actual)
+        return original(
+            self, column_name, row_indexer, thread_cap, out=out, indices_sorted=indices_sorted
+        )
+
+    monkeypatch.setattr(reader_mod.ColStoreReader, "_gather_one_multi_record", checking)
+    rng = np.random.default_rng(4)
+    sorted_idx = np.sort(
+        rng.integers(0, total, 5_000).astype(np.int64)
+    )  # True hint reaches columns
+    unsorted_idx = rng.integers(0, total, 5_000).astype(np.int64)
+    with opened(path) as dataset:
+        for selector in (sorted_idx, unsorted_idx):
+            result = dataset[selector, cols].dict()
+            for name in cols:
+                assert np.array_equal(result[name], full[name][selector]), name
+
+
 # ---- Sorted-read routing ----------------------------------------------------
 # Sorted native fancy reads engage the walk kernel; unsorted reads do not;
 # results match the boundary-partition pipeline the kernel replaces (which
