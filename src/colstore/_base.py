@@ -263,9 +263,13 @@ class _ReaderBase(InteropMixin, abc.ABC):
         native source -- a zero-copy view where one exists, else a materialized
         gather -- feeds the parallel ``interleave_records`` kernel; without it, a
         parallel multi-column gather is assembled per field. The assembly itself
-        lives in :func:`colstore.kernels.interleave_record_array`. Assumes at
-        least one column.
+        lives in :func:`colstore.kernels.interleave_record_array`.
         """
+        if not column_names:
+            # A projection selecting no columns (drop-all, ds[rows, []]) is a valid
+            # but field-less record array; build it directly, since the interleave
+            # kernel derives the record count from the first column's length.
+            return np.empty(self._selection_length(row_indexer, self.n_rows), dtype=np.dtype([]))
         record_dtype = np.dtype([(name, self._native_dtype(name)) for name in column_names])
         if kernels.cpp_available():
             indices_sorted = self._row_indexer_sorted(row_indexer)
@@ -291,6 +295,20 @@ class _ReaderBase(InteropMixin, abc.ABC):
 
             return _indices_are_sorted(row_indexer)
         return None
+
+    @staticmethod
+    def _selection_length(row_indexer: Any, n_rows: int) -> int:
+        """Number of rows a resolved row selector yields -- for a field-less record array."""
+        if row_indexer is None:
+            return n_rows
+        if isinstance(row_indexer, (int, np.integer)):
+            return 1
+        if isinstance(row_indexer, slice):
+            return len(range(*row_indexer.indices(n_rows)))
+        array = np.asarray(row_indexer)
+        if array.dtype == np.bool_:
+            return int(array.sum())
+        return int(array.size)
 
     def _contiguous_native_source(
         self, column_name: str, row_indexer: Any, indices_sorted: bool | None = None
