@@ -587,14 +587,22 @@ inline void gather_segment_uniform_bins_typed(const std::int64_t* COLSTORE_RESTR
 }
 
 // Sorted multi-file gather: a monotonic segment cursor instead of a per-index
-// search. Requires ``indices`` non-decreasing (the caller proves it). Each
-// thread takes a contiguous chunk, binary-searches its first segment, then
-// walks the cursor forward -- O(K + n_segments) total comparisons versus
-// O(K log n_segments), with sequential within-segment access. ``segment_base``
-// is already each segment's folded absolute base, so the steady state is one
-// compare, one multiply-add, one load. The look-ahead prefetch is issued only
-// when the look-ahead index still lies in the current segment, mirroring the
-// single-file sorted kernel.
+// search, the fast path for a non-decreasing ``indices``. Each thread takes a
+// contiguous chunk, binary-searches its first segment, then walks the cursor
+// forward -- O(K + n_segments) total comparisons versus O(K log n_segments),
+// with sequential within-segment access. ``segment_base`` is already each
+// segment's folded absolute base, so the steady state is one compare, one
+// multiply-add, one load. The look-ahead prefetch is issued only when the
+// look-ahead index still lies in the current segment.
+//
+// The kernel is order-robust by construction, NOT contract: a step that moves
+// *backward* (which can happen only when the caller's sortedness claim is
+// wrong) re-locates the segment by binary search before the load, so the
+// address always satisfies ``segment_starts_rows[s] <= idx < [s+1]`` and stays
+// in bounds. Correct output for any index order, the cursor untouched for a
+// genuinely sorted one -- so an inaccurate sortedness hint can only cost speed
+// (the re-search), never memory safety. (In-range indices remain a separate
+// caller guarantee, enforced upstream by the view layer.)
 template <typename T>
 void gather_segment_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
@@ -621,6 +629,12 @@ void gather_segment_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
         do {
           ++s;
         } while (idx >= segment_starts_rows[s + 1]);
+        next_boundary = segment_starts_rows[s + 1];
+        seg_base = segment_base[s];
+      } else if (idx < segment_starts_rows[s]) {
+        // Backward step: indices were not non-decreasing. Re-locate the
+        // segment so the read stays in bounds (the memory-safety guard).
+        s = bin_record(segment_starts_rows, len, idx);
         next_boundary = segment_starts_rows[s + 1];
         seg_base = segment_base[s];
       }

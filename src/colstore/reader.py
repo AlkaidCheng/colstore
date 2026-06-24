@@ -492,6 +492,7 @@ class ColStoreReader(_ReaderBase):
         row_indexer: Any,
         thread_cap: int | None = None,
         out: NDArray[Any] | None = None,
+        indices_sorted: bool | None = None,
     ) -> NDArray[Any]:
         """Read one column with the given row selector; return owning ndarray.
 
@@ -505,6 +506,10 @@ class ColStoreReader(_ReaderBase):
         native-dtype buffer to fill in place (a reuse hint for streaming
         batches); it is honored on the multi-record and single-record fancy
         kernel paths, and the caller uses the return value either way.
+        ``indices_sorted`` is an optional precomputed sortedness of a fancy
+        ``row_indexer``; a multi-column read computes it once and passes it so
+        each column's multi-record gather skips the per-column recheck (``None``
+        recomputes it on demand).
         """
         if self._closed:
             raise ValueError("ColStoreReader is closed.")
@@ -518,7 +523,9 @@ class ColStoreReader(_ReaderBase):
             # fancy reads, and lowering here preserves it exactly.
             row_indexer = np.flatnonzero(row_indexer)
         if self._is_multi_record:
-            return self._gather_one_multi_record(column_name, row_indexer, thread_cap, out=out)
+            return self._gather_one_multi_record(
+                column_name, row_indexer, thread_cap, out=out, indices_sorted=indices_sorted
+            )
         # Single-record fast path: one per-column memmap; the read is a
         # simple slice / copy / kernel gather against that memmap.
         source = self._memmaps[column_name]
@@ -738,6 +745,7 @@ class ColStoreReader(_ReaderBase):
         row_indexer: Any,
         thread_cap: int | None,
         out: NDArray[Any] | None = None,
+        indices_sorted: bool | None = None,
     ) -> NDArray[Any]:
         """Read one column from a file with multiple records.
 
@@ -875,8 +883,19 @@ class ColStoreReader(_ReaderBase):
         # Sortedness gate: sampled rejection short-circuits the full O(K)
         # pass for random unsorted selectors; sorted selectors still get the
         # full proof (see _indices_are_sorted). The check stays serial, so
-        # its share of the read grows with the kernel's thread count.
-        if n > 1 and _indices_are_sorted(indices):
+        # its share of the read grows with the kernel's thread count -- a
+        # multi-column read supplies ``indices_sorted`` so it runs once, not
+        # once per column.
+        #
+        # The hint is a performance choice only, never a safety assertion:
+        # gather_segment_sorted is order-robust (it re-locates on a backward
+        # step), so a wrong hint can at worst forgo the cursor's speedup -- it
+        # cannot read out of bounds or return wrong values. None recomputes the
+        # proof here.
+        sorted_selector = (
+            indices_sorted if indices_sorted is not None else _indices_are_sorted(indices)
+        )
+        if n > 1 and sorted_selector:
             if _dtype_is_native(disk_dtype):
                 # Native byte order: linear-walk kernel (see gather.hpp).
                 start_rows, segment_base = self._column_segment_table(column_name)
@@ -1154,21 +1173,37 @@ class ColStoreReader(_ReaderBase):
         mask_route = self._gather_many_mask(column_names, row_indexer)
         if mask_route is not None:
             return mask_route
+        # Resolve the selector's sortedness once for the whole read; the fancy
+        # sub-routes take it as a hint rather than recomputing it per column
+        # (a full O(K) pass for an already-sorted selector).
+        indices_sorted: bool | None = None
         if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
             # Mask route declined (single-record store, sparse mask, or
             # too few native columns): lower once and use the fancy paths.
             row_indexer = np.flatnonzero(row_indexer)
-        bin_reuse = self._gather_many_bin_reuse(column_names, row_indexer)
+            indices_sorted = True  # np.flatnonzero is ascending by construction
+        elif isinstance(row_indexer, np.ndarray):
+            indices_sorted = _indices_are_sorted(row_indexer)
+        bin_reuse = self._gather_many_bin_reuse(column_names, row_indexer, indices_sorted)
         if bin_reuse is not None:
             return bin_reuse
         workers = self.max_workers
         if workers <= 1 or len(column_names) <= 1:
-            return {name: self._gather_one(name, row_indexer) for name in column_names}
+            return {
+                name: self._gather_one(name, row_indexer, indices_sorted=indices_sorted)
+                for name in column_names
+            }
         n_workers = min(workers, len(column_names))
         per_column_cap = max(1, config.get_gather_thread_cap() // n_workers)
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             futures = {
-                name: executor.submit(self._gather_one, name, row_indexer, per_column_cap)
+                name: executor.submit(
+                    self._gather_one,
+                    name,
+                    row_indexer,
+                    per_column_cap,
+                    indices_sorted=indices_sorted,
+                )
                 for name in column_names
             }
             return {name: futures[name].result() for name in column_names}
@@ -1225,11 +1260,11 @@ class ColStoreReader(_ReaderBase):
             indices = np.flatnonzero(mask)
             for name in column_names:
                 if name not in gathered:
-                    gathered[name] = self._gather_one(name, indices)
+                    gathered[name] = self._gather_one(name, indices, indices_sorted=True)
         return {name: gathered[name] for name in column_names}
 
     def _gather_many_bin_reuse(
-        self, column_names: list[str], row_indexer: Any
+        self, column_names: list[str], row_indexer: Any, indices_sorted: bool | None = None
     ) -> dict[str, NDArray[Any]] | None:
         """Bin-reuse route for multi-column unsorted fancy reads, or ``None``.
 
@@ -1263,7 +1298,10 @@ class ColStoreReader(_ReaderBase):
         n = indices.shape[0]
         if n <= 1:
             return None
-        if _indices_are_sorted(indices):
+        sorted_selector = (
+            indices_sorted if indices_sorted is not None else _indices_are_sorted(indices)
+        )
+        if sorted_selector:
             return None  # sorted: per-column path is already load-bound
         n_records = int(self._record_starts_bytes.shape[0])
         if n_records > np.iinfo(np.int32).max:
@@ -1352,7 +1390,11 @@ class ColStoreReader(_ReaderBase):
                 )
             gathered[name] = output
         return {
-            name: gathered[name] if name in gathered else self._gather_one(name, row_indexer)
+            name: (
+                gathered[name]
+                if name in gathered
+                else self._gather_one(name, row_indexer, indices_sorted=False)
+            )
             for name in column_names
         }
 

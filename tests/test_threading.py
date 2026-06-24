@@ -277,9 +277,9 @@ def test_gather_many_divides_thread_budget(tmp_path, monkeypatch):
 
     real_gather_one = store_mod.ColStoreReader._gather_one
 
-    def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
+    def spy(self, column_name, row_indexer, thread_cap=None, **kwargs):  # type: ignore[no-untyped-def]
         captured[column_name] = thread_cap
-        return real_gather_one(self, column_name, row_indexer, thread_cap)
+        return real_gather_one(self, column_name, row_indexer, thread_cap, **kwargs)
 
     monkeypatch.setattr(store_mod.ColStoreReader, "_gather_one", spy)
 
@@ -310,9 +310,9 @@ def test_gather_many_cap_never_below_one(tmp_path, monkeypatch):
 
     real = store_mod.ColStoreReader._gather_one
 
-    def spy(self, column_name, row_indexer, thread_cap=None):  # type: ignore[no-untyped-def]
+    def spy(self, column_name, row_indexer, thread_cap=None, **kwargs):  # type: ignore[no-untyped-def]
         captured[column_name] = thread_cap
-        return real(self, column_name, row_indexer, thread_cap)
+        return real(self, column_name, row_indexer, thread_cap, **kwargs)
 
     monkeypatch.setattr(store_mod.ColStoreReader, "_gather_one", spy)
     columns = {f"c{i}": np.arange(50, dtype=np.float32) for i in range(6)}
