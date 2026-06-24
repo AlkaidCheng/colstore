@@ -684,7 +684,11 @@ class ColStoreDataset(_ReaderBase):
             _cpp_module.gather_segment_withbins(indices, out[name], bins, segment_base, cap, -1)
 
     def _fancy_one(
-        self, column_name: str, indices: NDArray[np.int64], out: NDArray[Any] | None = None
+        self,
+        column_name: str,
+        indices: NDArray[np.int64],
+        out: NDArray[Any] | None = None,
+        indices_sorted: bool | None = None,
     ) -> NDArray[Any]:
         """Gather arbitrary global rows across files, preserving requested order.
 
@@ -692,7 +696,9 @@ class ColStoreDataset(_ReaderBase):
         binned to its file/record segment) when available. The portable fallback
         sorts the indices once to group them into one contiguous block per file,
         fills a sorted buffer concurrently (disjoint regions, no locking), then
-        un-sorts into the requested order with one scatter.
+        un-sorts into the requested order with one scatter. ``indices_sorted`` is
+        the selector's precomputed order (a multi-column read supplies it once);
+        ``None`` resolves it here.
         """
         dst = (
             out
@@ -703,7 +709,10 @@ class ColStoreDataset(_ReaderBase):
             return dst
         table = self._native_segment_table(column_name)
         if table is not None:
-            self._native_gather(dst, indices, table, _indices_are_sorted(indices))
+            sorted_selector = (
+                indices_sorted if indices_sorted is not None else _indices_are_sorted(indices)
+            )
+            self._native_gather(dst, indices, table, sorted_selector)
             return dst
         order, blocks = self._sorted_blocks(indices)
         buffer = np.empty(len(indices), dtype=self._native_dtype(column_name))
@@ -827,12 +836,15 @@ class ColStoreDataset(_ReaderBase):
         row_indexer: Any,
         thread_cap: int | None = None,
         out: NDArray[Any] | None = None,
+        indices_sorted: bool | None = None,
     ) -> NDArray[Any]:
         self._check_open()
         self._require_columns([column_name])
         children = self._children
         if len(children) == 1:
-            return children[0]._gather_one(column_name, row_indexer, thread_cap, out=out)
+            return children[0]._gather_one(
+                column_name, row_indexer, thread_cap, out=out, indices_sorted=indices_sorted
+            )
         if isinstance(row_indexer, np.ndarray) and row_indexer.dtype == np.bool_:
             native = self._mask_native([column_name], row_indexer)
             if native is not None:
@@ -847,7 +859,7 @@ class ColStoreDataset(_ReaderBase):
             child: ColStoreReader = children[file_index]
             return child._gather_one(column_name, local, thread_cap, out=out)
         if kind == "fancy":
-            return self._fancy_one(column_name, payload, out=out)
+            return self._fancy_one(column_name, payload, out=out, indices_sorted=indices_sorted)
         if kind == "whole":
             whole = (
                 out

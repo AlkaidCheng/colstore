@@ -68,6 +68,7 @@ class _ReaderBase(abc.ABC):
         row_indexer: Any,
         thread_cap: int | None = None,
         out: NDArray[Any] | None = None,
+        indices_sorted: bool | None = None,
     ) -> NDArray[Any]:
         """Copying read of one column for an already-normalized row selector.
 
@@ -75,7 +76,11 @@ class _ReaderBase(abc.ABC):
         in place instead of allocating -- a reuse hint for streaming batches. It is
         only a hint: callers use the RETURN value, which is ``out`` when the buffer
         was honored, or a freshly allocated array otherwise (a non-native dtype, or a
-        path that does not support filling)."""
+        path that does not support filling).
+
+        ``indices_sorted`` is an optional precomputed sortedness of a fancy
+        ``row_indexer``; a multi-column read computes it once and threads it so each
+        column's gather skips the per-column recheck (``None`` recomputes on demand)."""
 
     @abc.abstractmethod
     def _gather_many(self, column_names: list[str], row_indexer: Any) -> dict[str, NDArray[Any]]:
@@ -245,13 +250,33 @@ class _ReaderBase(abc.ABC):
         """
         record_dtype = np.dtype([(name, self._native_dtype(name)) for name in column_names])
         if kernels.cpp_available():
-            sources = [self._contiguous_native_source(name, row_indexer) for name in column_names]
+            indices_sorted = self._row_indexer_sorted(row_indexer)
+            sources = [
+                self._contiguous_native_source(name, row_indexer, indices_sorted)
+                for name in column_names
+            ]
         else:
             column_data = self._gather_many(column_names, row_indexer)
             sources = [column_data[name] for name in column_names]
         return kernels.interleave_record_array(column_names, sources, record_dtype)
 
-    def _contiguous_native_source(self, column_name: str, row_indexer: Any) -> NDArray[Any]:
+    @staticmethod
+    def _row_indexer_sorted(row_indexer: Any) -> bool | None:
+        """Sortedness of a fancy integer selector, computed once for a multi-column read.
+
+        ``None`` for non-fancy selectors (whole/slice/scalar/mask), where per-column
+        gathers never run the sortedness test; a fancy index resolves it here so the
+        record-array build does not recompute it once per column.
+        """
+        if isinstance(row_indexer, np.ndarray) and row_indexer.dtype != np.bool_:
+            from .reader import _indices_are_sorted
+
+            return _indices_are_sorted(row_indexer)
+        return None
+
+    def _contiguous_native_source(
+        self, column_name: str, row_indexer: Any, indices_sorted: bool | None = None
+    ) -> NDArray[Any]:
         """A contiguous, native-order array for one column over the row selection.
 
         A zero-copy memmap view when the store can give a contiguous one
@@ -264,10 +289,10 @@ class _ReaderBase(abc.ABC):
         try:
             view = self._view_one(column_name, row_indexer)
         except ValueError:
-            return self._gather_one(column_name, row_indexer)
+            return self._gather_one(column_name, row_indexer, indices_sorted=indices_sorted)
         if view.flags["C_CONTIGUOUS"]:
             return view
-        return self._gather_one(column_name, row_indexer)
+        return self._gather_one(column_name, row_indexer, indices_sorted=indices_sorted)
 
     # ---- Mapping protocol over column names ----------------------------
 
