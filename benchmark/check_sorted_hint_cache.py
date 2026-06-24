@@ -9,10 +9,11 @@ multi-column read with the cache against the per-column recompute baseline, and
 checks both equal the ground truth.
 
 The baseline is forced through the same internal seam the reader uses: stripping
-the ``indices_sorted`` hint so each column recomputes it. The win grows with the
-index count (the check is O(K)) and is purely on sorted selectors -- an unsorted
-selector rejects in the sampled pass, and single-column reads have nothing to
-amortize.
+the ``indices_sorted`` hint so each column recomputes it. The removed work is a
+full O(K) serial pass per column; it is the largest share at moderate index
+counts and shrinks at very large K, where materializing the output dominates the
+read. The cache helps only sorted selectors -- an unsorted selector rejects in
+the sampled pass, and single-column reads have nothing to amortize.
 
 Run on the deployment hardware:
 
