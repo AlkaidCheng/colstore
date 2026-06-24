@@ -773,13 +773,15 @@ def gather_segment_sorted(cnp.ndarray indices, cnp.ndarray output,
                             int thread_cap=0, Py_ssize_t prefetch_distance=-1):
     """Sorted multi-file fancy gather: a monotonic segment cursor, no search.
 
-    Identical output to :func:`gather_segment` but requires ``indices``
-    non-decreasing (the caller proves it). The cursor advances forward through
-    the segments as the indices climb, so the per-index cost drops to one
-    boundary compare and the within-segment access is sequential. A cursor walk
-    has nothing to amortize across columns, so a multi-column sorted read calls
-    this per column rather than the bins pair. All other parameters and errors
-    match :func:`gather_segment`.
+    Identical output to :func:`gather_segment`, the fast path for a
+    non-decreasing ``indices``: the cursor advances forward through the segments
+    as the indices climb, so the per-index cost drops to one boundary compare
+    and the within-segment access is sequential. A cursor walk has nothing to
+    amortize across columns, so a multi-column sorted read calls this per column
+    rather than the bins pair. The cursor is order-robust -- a backward step
+    re-locates by binary search -- so the output is correct and in-bounds for
+    any order; passing an unsorted ``indices`` only forgoes the speedup. All
+    other parameters and errors match :func:`gather_segment`.
     """
     _require_1d((indices, output, segment_starts_rows, segment_base), "indices, output, and segment arrays must be 1D.")
     _require_int64(indices, "indices")

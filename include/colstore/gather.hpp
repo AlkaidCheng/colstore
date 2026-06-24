@@ -182,12 +182,14 @@ int colstore_gather_segment_withbins(const std::int64_t* indices, std::uint8_t* 
                                        const std::int64_t* segment_base, int itemsize,
                                        int thread_cap, std::ptrdiff_t prefetch_distance);
 
-// Sorted multi-file gather: requires ``indices`` non-decreasing (the caller
-// proves it) and replaces the per-index segment search with a monotonic cursor,
-// O(K + n_segments) comparisons with sequential within-segment access. A cursor
-// walk has no search to amortize, so multi-column sorted reads call this per
-// column rather than the bins pair. Arguments and dtype contract otherwise
-// match colstore_gather_segment.
+// Sorted multi-file gather: the fast path for a non-decreasing ``indices``,
+// replacing the per-index segment search with a monotonic cursor -- O(K +
+// n_segments) comparisons with sequential within-segment access. A cursor walk
+// has no search to amortize, so multi-column sorted reads call this per column
+// rather than the bins pair. The cursor is order-robust: a backward step
+// re-locates by binary search, so the output is correct and in-bounds for any
+// order (an inaccurate sortedness hint costs only the re-search, never memory
+// safety). Arguments and dtype contract otherwise match colstore_gather_segment.
 int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* output,
                                      std::ptrdiff_t n, const std::int64_t* segment_starts_rows,
                                      const std::int64_t* segment_base, std::int64_t n_segments,

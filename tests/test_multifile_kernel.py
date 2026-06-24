@@ -252,6 +252,31 @@ def test_multifile_sorted_duplicates_and_single_segment():
     np.testing.assert_array_equal(out, oracle[idx])
 
 
+@pytest.mark.parametrize("cap", [0, 4])
+def test_segment_sorted_is_order_robust_and_in_bounds(cap):
+    # The cursor kernel is the fast path for sorted indices but stays correct and
+    # in-bounds for ANY order: a backward step re-locates by binary search rather
+    # than reading past the segment (a forward-only cursor would go out of bounds
+    # on a descending step). This is the memory-safety guard that lets the reader
+    # treat its sortedness hint as advisory, never a safety assertion.
+    layout = [[40, 30, 30], [50], [0], [20, 25], [60]]
+    starts, base, oracle, _keep = build_segments(layout, np.float64, seed=5)
+    total = int(starts[-1])
+    rng = np.random.default_rng(9)
+    patterns = {
+        "descending": np.arange(total - 1, -1, -1, dtype=np.int64),
+        "random_unsorted": rng.integers(0, total, size=4000).astype(np.int64),
+        "shuffled_all": rng.permutation(total).astype(np.int64),
+        "adversarial_jumps": np.array(
+            [0, total - 1, 1, total - 2, total // 2, 2, total - 1, 0], dtype=np.int64
+        ),
+    }
+    for name, idx in patterns.items():
+        out = np.empty(idx.size, dtype=np.float64)
+        _gather.gather_segment_sorted(idx, out, starts, base, cap, 8)
+        np.testing.assert_array_equal(out, oracle[idx], err_msg=f"{name}/cap={cap}")
+
+
 # ---- Uniform-grid division-binning -----------------------------------------
 # When every segment holds the same row count (the global-last may be partial),
 # the per-index binary search collapses to s = idx / rows_per_segment. The kernel
