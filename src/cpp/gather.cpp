@@ -499,6 +499,93 @@ inline void gather_segment_withbins_typed(const std::int64_t* COLSTORE_RESTRICT 
   }
 }
 
+// Uniform-grid multi-file gather: the searching gather_segment_typed specialized
+// for a segment table whose every segment holds the same row count (the global
+// last may be partial). The per-index segment is then ``s = idx / rows_per_segment``
+// in closed form -- one magic-reciprocal multiply, no binary search -- and the
+// load is the same ``segment_base[s] + idx * itemsize`` (the bases stay an array,
+// since multi-file segments live in different mmaps). The divide is exact for
+// every in-range index; the clamp guards only the degenerate idx == total.
+template <typename T>
+inline void gather_segment_uniform_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+                                          std::uint8_t* COLSTORE_RESTRICT output,
+                                          std::ptrdiff_t n_indices,
+                                          std::int64_t rows_per_segment,
+                                          const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                          std::int64_t n_segments, int thread_cap,
+                                          std::ptrdiff_t prefetch_distance) {
+  T* dst = reinterpret_cast<T*>(output);
+  const UniformDivisor div = make_uniform_divisor(static_cast<std::uint64_t>(rows_per_segment));
+  const std::int64_t last = n_segments - 1;
+  const auto segment_of = [&](std::int64_t idx) -> std::int64_t {
+    const std::int64_t s =
+        static_cast<std::int64_t>(uniform_divide(static_cast<std::uint64_t>(idx), div));
+    return s < last ? s : last;
+  };
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      const std::int64_t pidx = indices[i + prefetch_distance];
+      COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
+          segment_base[segment_of(pidx)] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+    }
+    const std::int64_t idx = indices[i];
+    const std::int64_t addr =
+        segment_base[segment_of(idx)] + idx * static_cast<std::int64_t>(sizeof(T));
+    dst[i] = load_unaligned<T>(
+        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+  }
+}
+
+// Bin-recording uniform-grid gather: gather_segment_uniform_typed plus bins[i] = s,
+// so the trailing columns of a multi-column read reuse the segment via
+// gather_segment_withbins (a sequential int32 read, no divide). The prefetch does
+// NOT write bins -- the look-ahead element may belong to another thread's chunk.
+template <typename T>
+inline void gather_segment_uniform_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+                                              std::uint8_t* COLSTORE_RESTRICT output,
+                                              std::int32_t* COLSTORE_RESTRICT bins,
+                                              std::ptrdiff_t n_indices,
+                                              std::int64_t rows_per_segment,
+                                              const std::int64_t* COLSTORE_RESTRICT segment_base,
+                                              std::int64_t n_segments, int thread_cap,
+                                              std::ptrdiff_t prefetch_distance) {
+  T* dst = reinterpret_cast<T*>(output);
+  const UniformDivisor div = make_uniform_divisor(static_cast<std::uint64_t>(rows_per_segment));
+  const std::int64_t last = n_segments - 1;
+  const auto segment_of = [&](std::int64_t idx) -> std::int64_t {
+    const std::int64_t s =
+        static_cast<std::int64_t>(uniform_divide(static_cast<std::uint64_t>(idx), div));
+    return s < last ? s : last;
+  };
+  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
+    if (n_threads > 1)
+#else
+  (void)n_threads;
+#endif
+  for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
+    if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
+      const std::int64_t pidx = indices[i + prefetch_distance];
+      COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
+          segment_base[segment_of(pidx)] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+    }
+    const std::int64_t idx = indices[i];
+    const std::int64_t s = segment_of(idx);
+    bins[i] = static_cast<std::int32_t>(s);
+    const std::int64_t addr = segment_base[s] + idx * static_cast<std::int64_t>(sizeof(T));
+    dst[i] = load_unaligned<T>(
+        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+  }
+}
+
 // Sorted multi-file gather: a monotonic segment cursor instead of a per-index
 // search. Requires ``indices`` non-decreasing (the caller proves it). Each
 // thread takes a contiguous chunk, binary-searches its first segment, then
@@ -1193,6 +1280,32 @@ int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* ou
     colstore::gather_segment_sorted_typed<T>(indices, output, n, segment_starts_rows,
                                                segment_base, n_segments, thread_cap,
                                                prefetch_distance);
+  });
+}
+
+int colstore_gather_segment_uniform(const std::int64_t* indices, std::uint8_t* output,
+                                      std::ptrdiff_t n, std::int64_t rows_per_segment,
+                                      const std::int64_t* segment_base, std::int64_t n_segments,
+                                      int itemsize, int thread_cap,
+                                      std::ptrdiff_t prefetch_distance) {
+  return colstore::run_sized(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    colstore::gather_segment_uniform_typed<T>(indices, output, n, rows_per_segment, segment_base,
+                                                n_segments, thread_cap, prefetch_distance);
+  });
+}
+
+int colstore_gather_segment_uniform_bins(const std::int64_t* indices, std::uint8_t* output,
+                                           std::int32_t* bins, std::ptrdiff_t n,
+                                           std::int64_t rows_per_segment,
+                                           const std::int64_t* segment_base,
+                                           std::int64_t n_segments, int itemsize, int thread_cap,
+                                           std::ptrdiff_t prefetch_distance) {
+  return colstore::run_sized(itemsize, [&](auto tag) {
+    using T = typename decltype(tag)::type;
+    colstore::gather_segment_uniform_bins_typed<T>(indices, output, bins, n, rows_per_segment,
+                                                     segment_base, n_segments, thread_cap,
+                                                     prefetch_distance);
   });
 }
 

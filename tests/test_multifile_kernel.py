@@ -252,6 +252,91 @@ def test_multifile_sorted_duplicates_and_single_segment():
     np.testing.assert_array_equal(out, oracle[idx])
 
 
+# ---- Uniform-grid division-binning -----------------------------------------
+# When every segment holds the same row count (the global-last may be partial),
+# the per-index binary search collapses to s = idx / rows_per_segment. The kernel
+# must equal the searching kernel and the oracle across files/records, partial
+# tails, single-byte dtypes, and thread caps; the bins variant must record the
+# true segment for cross-column reuse.
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.float32, np.int64, np.int32, np.int16, np.int8])
+@pytest.mark.parametrize("thread_cap", [1, 4])
+@pytest.mark.parametrize("prefetch", [0, 8, 128])
+def test_segment_uniform_matches_searching_and_oracle(dtype, thread_cap, prefetch):
+    # Uniform grid spanning several files and several records per file.
+    rows = 200
+    starts, base, oracle, _keep = build_segments([[rows, rows, rows], [rows, rows], [rows]], dtype)
+    rng = np.random.default_rng(0)
+    idx = rng.integers(0, oracle.size, size=5000).astype(np.int64)
+    out_u = np.empty(idx.size, dtype=dtype)
+    _gather.gather_segment_uniform(idx, out_u, rows, base, thread_cap, prefetch)
+    out_g = np.empty(idx.size, dtype=dtype)
+    _gather.gather_segment(idx, out_g, starts, base, thread_cap, prefetch)
+    np.testing.assert_array_equal(out_u, out_g)
+    np.testing.assert_array_equal(out_u, oracle[idx])
+
+
+def test_segment_uniform_partial_global_tail():
+    # The final segment is smaller than rows_per_segment -- still a uniform grid.
+    rows, tail = 256, 73
+    _starts, base, oracle, _keep = build_segments(
+        [[rows, rows], [rows], [tail]], np.float64, seed=4
+    )
+    total = int(oracle.size)
+    patterns = {
+        "boundaries": np.array([0, rows - 1, rows, total - 1, total - 1], dtype=np.int64),
+        "all_in_tail": np.random.default_rng(5).integers(3 * rows, total, 300).astype(np.int64),
+        "every_row": np.arange(total, dtype=np.int64),
+        "single": np.array([total // 2], dtype=np.int64),
+    }
+    for name, idx in patterns.items():
+        out = np.empty(idx.size, dtype=np.float64)
+        _gather.gather_segment_uniform(idx, out, rows, base, 2, 8)
+        np.testing.assert_array_equal(out, oracle[idx], err_msg=name)
+
+
+def test_segment_uniform_bins_reuse_matches_oracle():
+    # Two columns share one uniform grid: the bins kernel divides once and records
+    # the segment; the withbins kernel reuses it for the second column.
+    layout = [[64, 64], [64], [64, 64]]  # 5 segments, all 64 rows
+    rows = 64
+    starts_a, base_a, oracle_a, _ka = build_segments(layout, np.float64, seed=7)
+    _starts_b, base_b, oracle_b, _kb = build_segments(layout, np.float64, seed=11)
+    rng = np.random.default_rng(3)
+    idx = rng.integers(0, int(starts_a[-1]), size=2000, dtype=np.int64)
+    idx[::9] = idx[0]  # duplicates
+
+    out_a = np.empty(len(idx), dtype=np.float64)
+    bins = np.empty(len(idx), dtype=np.int32)
+    _gather.gather_segment_uniform_bins(idx, out_a, bins, rows, base_a, 0, -1)
+    np.testing.assert_array_equal(out_a, oracle_a[idx])
+    np.testing.assert_array_equal(bins, (idx // rows).astype(np.int32))
+
+    out_b = np.empty(len(idx), dtype=np.float64)
+    _gather.gather_segment_withbins(idx, out_b, bins, base_b, 0, -1)
+    np.testing.assert_array_equal(out_b, oracle_b[idx])
+
+
+def test_segment_uniform_validates_inputs():
+    _starts, base, _oracle, _keep = build_segments([[8], [8]], np.float64)
+    idx = np.zeros(4, dtype=np.int64)
+    out = np.empty(4, dtype=np.float64)
+    bins = np.empty(4, dtype=np.int32)
+    with pytest.raises(ValueError, match="rows_per_segment"):
+        _gather.gather_segment_uniform(idx, out, 0, base)
+    with pytest.raises(TypeError, match="int64"):
+        _gather.gather_segment_uniform(idx.astype(np.int32), out, 8, base)
+    with pytest.raises(ValueError, match="length"):
+        _gather.gather_segment_uniform(idx, np.empty(2), 8, base)
+    with pytest.raises(ValueError, match="C-contiguous"):
+        _gather.gather_segment_uniform(idx, out, 8, np.repeat(base, 2)[::2])
+    with pytest.raises(TypeError, match="int32"):
+        _gather.gather_segment_uniform_bins(idx, out, bins.astype(np.int64), 8, base)
+    with pytest.raises(ValueError, match="lengths"):
+        _gather.gather_segment_uniform_bins(idx, out, np.empty(2, dtype=np.int32), 8, base)
+
+
 # ---- parallel_copy_runs ------------------------------------------------
 
 

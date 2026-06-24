@@ -63,6 +63,30 @@ _INT32_MAX = (1 << 31) - 1
 # each segment's absolute byte base (see _native_segment_table).
 SegmentTable: TypeAlias = tuple[NDArray[np.int64], NDArray[np.int64]]
 
+
+def _uniform_segment_rows(starts: NDArray[np.int64]) -> int | None:
+    """``rows_per_segment`` if ``starts`` describes a uniform grid, else ``None``.
+
+    A uniform grid has every segment of equal row count except possibly the
+    global-last (which is no larger) -- the layout under which the per-index
+    binary search over the segment table collapses to ``s = idx / rows_per_segment``.
+    Cheap O(n_segments) vectorized pass; returns ``None`` for fewer than two
+    segments, where there is no search to amortize.
+    """
+    n_segments = starts.shape[0] - 1
+    if n_segments < 2:
+        return None
+    seg_rows = np.diff(starts)
+    rows = int(seg_rows[0])
+    if rows <= 0:
+        return None
+    if not bool(np.all(seg_rows[:-1] == rows)):
+        return None
+    if int(seg_rows[-1]) > rows:
+        return None
+    return rows
+
+
 # One file's contribution to a contiguous read: the half-open output row range
 # ``[out_lo, out_hi)`` it fills, its child reader, and the per-file selector
 # (``None``, a slice, or a boolean sub-mask) -- see _fill_contiguous_columns.
@@ -113,6 +137,12 @@ class ColStoreDataset(_ReaderBase):
     ``O(n_files)`` while the kernel touches only the sampled rows -- so the memo is
     what keeps that workload fast. The cache is cleared whenever the children
     change (:meth:`_rebuild_offsets`), so it never serves a stale table.
+
+    Whether that table is a *uniform grid* -- every segment the same row count
+    except possibly the global-last -- is likewise a property of the children, not
+    the read, so it too is memoized (``_uniform_grid_rows``, reset on the same
+    child change). On a uniform grid the unsorted gather divides instead of
+    searching (:meth:`_uniform_segment_grid`).
     """
 
     def __init__(
@@ -126,6 +156,8 @@ class ColStoreDataset(_ReaderBase):
         self._offsets: NDArray[np.int64] = np.zeros(1, dtype=np.int64)
         self._n_rows = 0
         self._segment_table_cache: dict[str, SegmentTable | None] = {}
+        self._uniform_grid_rows: int | None = None
+        self._uniform_grid_known = False
         self._closed = False
         if sources is not None:
             self.append(sources, **reader_kwargs)
@@ -198,6 +230,7 @@ class ColStoreDataset(_ReaderBase):
 
     def _rebuild_offsets(self) -> None:
         self._segment_table_cache.clear()
+        self._uniform_grid_known = False
         self._offsets = np.zeros(len(self._children) + 1, dtype=np.int64)
         if self._children:
             self._offsets[1:] = np.cumsum([child.n_rows for child in self._children])
@@ -566,6 +599,19 @@ class ColStoreDataset(_ReaderBase):
                 runs.extend(child._column_disk_runs(column_name))
         return runs
 
+    def _uniform_segment_grid(self, starts: NDArray[np.int64]) -> int | None:
+        """The common segment row count if the segment table is a uniform grid,
+        else ``None``.
+
+        ``starts`` is the global row partition, identical for every column, so the
+        grid test is column-independent and memoized once across the dataset's
+        lifetime (reset when files are added). See :func:`_uniform_segment_rows`.
+        """
+        if not self._uniform_grid_known:
+            self._uniform_grid_rows = _uniform_segment_rows(starts)
+            self._uniform_grid_known = True
+        return self._uniform_grid_rows
+
     def _native_gather(
         self,
         out: NDArray[Any],
@@ -574,13 +620,20 @@ class ColStoreDataset(_ReaderBase):
         indices_sorted: bool,
     ) -> None:
         """Fill ``out`` with one native pass: a cursor walk if the indices are
-        non-decreasing, otherwise the searching kernel."""
+        non-decreasing, the division-binning kernel on a uniform grid, otherwise
+        the searching kernel."""
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
         starts, segment_base = table
         cap = config.get_gather_thread_cap()
         if indices_sorted:
             _cpp_module.gather_segment_sorted(indices, out, starts, segment_base, cap, -1)
+            return
+        rows_per_segment = self._uniform_segment_grid(starts)
+        if rows_per_segment is not None:
+            _cpp_module.gather_segment_uniform(
+                indices, out, rows_per_segment, segment_base, cap, -1
+            )
         else:
             _cpp_module.gather_segment(indices, out, starts, segment_base, cap, -1)
 
@@ -595,11 +648,13 @@ class ColStoreDataset(_ReaderBase):
 
         Sorted indices take the per-column cursor walk -- a walk has no search to
         amortize, and its within-segment access is sequential. Unsorted reads of
-        two or more columns search the (column-independent) segment once with
-        ``gather_segment_bins`` and replay it per column with
-        ``gather_segment_withbins``, the same amortization the single-file
-        multi-column path gives across records. A single column, or a segment
-        count past the int32 bin range, takes an independent pass per column.
+        two or more columns compute the (column-independent) segment once for the
+        first column and replay it per column with ``gather_segment_withbins``, the
+        same amortization the single-file multi-column path gives across records.
+        That first column divides (``gather_segment_uniform_bins``) on a uniform
+        grid and otherwise searches (``gather_segment_bins``). A single column, or a
+        segment count past the int32 bin range, takes an independent pass per
+        column.
         """
         from . import _gather as _cpp_module  # type: ignore[attr-defined]
 
@@ -614,9 +669,15 @@ class ColStoreDataset(_ReaderBase):
             return
         cap = config.get_gather_thread_cap()
         bins = np.empty(len(indices), dtype=np.int32)
-        _cpp_module.gather_segment_bins(
-            indices, out[column_names[0]], bins, first_starts, first_base, cap, -1
-        )
+        rows_per_segment = self._uniform_segment_grid(first_starts)
+        if rows_per_segment is not None:
+            _cpp_module.gather_segment_uniform_bins(
+                indices, out[column_names[0]], bins, rows_per_segment, first_base, cap, -1
+            )
+        else:
+            _cpp_module.gather_segment_bins(
+                indices, out[column_names[0]], bins, first_starts, first_base, cap, -1
+            )
         for name, table in zip(column_names[1:], tables[1:], strict=True):
             assert table is not None
             _, segment_base = table
