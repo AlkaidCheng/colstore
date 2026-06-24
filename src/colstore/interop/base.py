@@ -397,6 +397,26 @@ class InteropMixin:
             raise ValueError("cannot write a file from a selection with no columns.")
         return file_format_for_path(dest, format).to_file(selection, dest, **kwargs)
 
+    def to_npz(self, dest: Any, **kwargs: Any) -> Any:
+        """Write this selection to a NumPy ``.npz`` file (``saveas(dest, format="npz")``)."""
+        return self.saveas(dest, format="npz", **kwargs)
+
+    def to_parquet(self, dest: Any, **kwargs: Any) -> Any:
+        """Write this selection to a Parquet file (``saveas(dest, format="parquet")``)."""
+        return self.saveas(dest, format="parquet", **kwargs)
+
+    def to_feather(self, dest: Any, **kwargs: Any) -> Any:
+        """Write this selection to a Feather file (``saveas(dest, format="feather")``)."""
+        return self.saveas(dest, format="feather", **kwargs)
+
+    def to_json(self, dest: Any, **kwargs: Any) -> Any:
+        """Write this selection to a JSON file (``saveas(dest, format="json")``)."""
+        return self.saveas(dest, format="json", **kwargs)
+
+    def to_hdf(self, dest: Any, **kwargs: Any) -> Any:
+        """Write this selection to an HDF5 file (``saveas(dest, format="hdf5")``)."""
+        return self.saveas(dest, format="hdf5", **kwargs)
+
     def arrow(self) -> Any:
         """Export this selection to Apache Arrow -- shorthand for ``to("arrow")``.
 

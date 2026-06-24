@@ -1,9 +1,9 @@
-"""The uproot kernel for the ROOT file format (pure-Python backend).
+"""The uproot backend for the ROOT file format (pure-Python backend).
 
 Reads stream through ``tree.iterate`` and writes stream through ``mktree`` +
 ``extend``, both honoring a ``batch_size`` memory budget. uproot is imported
-lazily, only when this kernel runs, so it is never pulled in by ``import
-colstore`` or by selecting the ROOT kernel.
+lazily, only when this backend runs, so it is never pulled in by ``import
+colstore`` or by selecting the ROOT backend.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from ..progress import progress_bar
 from ._streaming import ColumnBatch
 from .root import (
     _SCALAR_KINDS,
-    RootKernel,
+    RootBackend,
     _batch_dict,
     _relabel,
     _resolve_chunk_rows,
@@ -37,7 +37,7 @@ def _import_uproot() -> Any:
         import uproot
     except ImportError as exc:  # pragma: no cover - exercised only without uproot
         raise ImportError(
-            "The uproot kernel requires uproot, which is not installed "
+            "The uproot backend requires uproot, which is not installed "
             "(install it with 'pip install uproot')."
         ) from exc
     return uproot
@@ -64,8 +64,8 @@ def _resolve_source(source: Any, treename: str | None) -> tuple[Any, str | None]
     if isinstance(source, os.PathLike):
         return os.fspath(source), treename
     raise TypeError(
-        f"the uproot kernel reads a path or a {{tree: files}} mapping, not "
-        f"{type(source).__name__}; use kernel='ROOT' for an RDataFrame."
+        f"the uproot backend reads a path or a {{tree: files}} mapping, not "
+        f"{type(source).__name__}; use backend='ROOT' for an RDataFrame."
     )
 
 
@@ -108,7 +108,7 @@ def _total_entries(uproot: Any, files: Any, tree: str) -> int:
     return total
 
 
-class UprootKernel(RootKernel):
+class UprootBackend(RootBackend):
     """The pure-Python uproot backend."""
 
     name: ClassVar[str] = "uproot"

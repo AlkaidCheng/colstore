@@ -50,6 +50,10 @@ arrow = "colstore.interop.arrow:ArrowFormat"
 [project.entry-points."colstore.file_formats"]
 npz = "colstore.interop.npz:NpzFormat"
 root = "colstore.interop.root:RootFormat"
+parquet = "colstore.interop.parquet:ParquetFormat"
+feather = "colstore.interop.feather:FeatherFormat"
+json = "colstore.interop.json:JsonFormat"
+hdf5 = "colstore.interop.hdf5:Hdf5Format"
 
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
@@ -57,12 +61,15 @@ progress = ["tqdm>=4.60"]
 numba = ["numba>=0.59"]
 arrow = ["pyarrow>=14"]
 uproot = ["uproot>=5"]
-all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59", "pyarrow>=14", "uproot>=5"]
+hdf5 = ["h5py>=3"]
+all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59", "pyarrow>=14", "uproot>=5", "h5py>=3"]
 dev = [
     "pandas>=1.5",
     "tqdm>=4.60",
     "numba>=0.59",
     "pyarrow>=14",
+    "h5py>=3",
+    "uproot>=5",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.4",

@@ -1,9 +1,9 @@
-"""The ROOT file format for colstore, with two interchangeable kernels.
+"""The ROOT file format for colstore, with two interchangeable backends.
 
 A ROOT file is read and written through one of two backends, selected by
-``kernel``: ROOT's own RDataFrame (PyROOT) or the pure-Python uproot library.
+``backend``: ROOT's own RDataFrame (PyROOT) or the pure-Python uproot library.
 ``"auto"`` (the default) uses PyROOT when it is importable and otherwise falls
-back to uproot. Each backend is imported lazily, inside the kernel that uses it,
+back to uproot. Each backend is imported lazily, inside the backend that uses it,
 so importing this module -- and therefore ``import colstore`` -- pulls in
 neither ROOT nor uproot. Annotations that name ROOT types stay strings at
 runtime (``from __future__ import annotations``); ROOT ships no type stubs and
@@ -41,13 +41,13 @@ from .base import FileFormat, Selection
 if TYPE_CHECKING:
     import ROOT
 
-#: The kernel selector accepted by :func:`from_root` / :func:`to_root`.
-RootKernelName: TypeAlias = str
+#: The backend selector accepted by :func:`from_root` / :func:`to_root`.
+RootBackendName: TypeAlias = str
 
 #: A ROOT source accepted by :func:`from_root`.
 RootSource: TypeAlias = "ROOT.RDataFrame | str | os.PathLike[str] | dict[str, str | list[str]]"
 
-# NumPy dtype kinds that map to a fixed-size colstore column. Both kernels judge
+# NumPy dtype kinds that map to a fixed-size colstore column. Both backends judge
 # storability from the MATERIALIZED dtype (a one-row sample), not a C++ type-name
 # table, so they agree exactly: a jagged / array branch samples to an object or
 # multi-dimensional array and is rejected; a scalar branch samples to a 1-D
@@ -92,8 +92,8 @@ def _import_root() -> ModuleType:
         import ROOT
     except ImportError as exc:  # pragma: no cover - exercised only without ROOT
         raise ImportError(
-            "The ROOT kernel requires PyROOT, which is not installed. Install ROOT "
-            "(e.g. 'conda install -c conda-forge root'), or use kernel='uproot'."
+            "The ROOT backend requires PyROOT, which is not installed. Install ROOT "
+            "(e.g. 'conda install -c conda-forge root'), or use backend='uproot'."
         ) from exc
     return cast(ModuleType, ROOT)
 
@@ -121,7 +121,7 @@ def filter_storable(
     colstore column. ``keep_valid_only`` governs every column uniformly --
     auto-discovered or explicitly requested: ``True`` keeps the storable ones and
     skips the rest with a warning naming them; ``False`` raises if any column is
-    not storable. Shared by both kernels so the policy is identical.
+    not storable. Shared by both backends so the policy is identical.
     """
     if not names:
         raise ValueError("No columns to read from the source.")
@@ -153,7 +153,7 @@ def _select_storable_columns(
     Storability is read from the materialized one-row sample (1-D, numeric/bool),
     not the declared C++ type name -- so RDataFrame's ``std::int32_t`` spelling for
     a uproot-written or RNTuple integer branch is recognized like any other
-    integer, matching the uproot kernel exactly.
+    integer, matching the uproot backend exactly.
     """
     available = [str(name) for name in rdf.GetColumnNames()]
     names = available if requested is None else [str(name) for name in requested]
@@ -305,13 +305,13 @@ def _ingest_batches(
         yield rdf.Range(start, end).AsNumpy(columns=columns)
 
 
-class RootKernel(ABC):
+class RootBackend(ABC):
     """A backend that reads and writes ROOT files for the ROOT file format.
 
-    Two kernels implement this: :class:`RootCppKernel` (PyROOT / RDataFrame) and
-    :class:`~colstore.interop._uproot.UprootKernel` (the pure-Python uproot
+    Two backends implement this: :class:`RootCppBackend` (PyROOT / RDataFrame) and
+    :class:`~colstore.interop._uproot.UprootBackend` (the pure-Python uproot
     library). Both stream in bounded memory -- one batch per record in each
-    direction. :func:`resolve_kernel` picks one from the ``kernel`` selector.
+    direction. :func:`resolve_backend` picks one from the ``backend`` selector.
     """
 
     name: ClassVar[str]
@@ -319,7 +319,7 @@ class RootKernel(ABC):
     @staticmethod
     @abstractmethod
     def available() -> bool:
-        """Whether this kernel's backend is importable."""
+        """Whether this backend's backend is importable."""
 
     @abstractmethod
     def read_batches(
@@ -348,7 +348,7 @@ class RootKernel(ABC):
         """Stream ``reader``'s ``columns`` to a ROOT file at ``dest``."""
 
 
-class RootCppKernel(RootKernel):
+class RootCppBackend(RootBackend):
     """ROOT's own RDataFrame, via PyROOT: reads with ``AsNumpy``, writes with ``Snapshot``."""
 
     name: ClassVar[str] = "ROOT"
@@ -394,12 +394,12 @@ class RootCppKernel(RootKernel):
         dtypes = reader.dtypes
         # ROOT's Snapshot cannot build a leaflist for an 8-bit fundamental integer
         # (Char_t): it silently drops the column under MT and segfaults otherwise.
-        # Reject up front rather than crash; the uproot kernel writes int8 fine.
+        # Reject up front rather than crash; the uproot backend writes int8 fine.
         tiny_ints = [n for n in columns if dtypes[n].kind in "iu" and dtypes[n].itemsize == 1]
         if tiny_ints:
             raise TypeError(
-                f"the ROOT kernel cannot write 8-bit integer column(s) {tiny_ints} "
-                f"(ROOT's Snapshot mishandles them); use kernel='uproot', or cast to int16."
+                f"the ROOT backend cannot write 8-bit integer column(s) {tiny_ints} "
+                f"(ROOT's Snapshot mishandles them); use backend='uproot', or cast to int16."
             )
         out_path = os.fspath(dest)
         total_rows = reader.n_rows
@@ -444,48 +444,48 @@ class RootCppKernel(RootKernel):
                 )
 
 
-def resolve_kernel(kernel: RootKernelName, source: Any = None) -> RootKernel:
-    """Pick a :class:`RootKernel` from the ``kernel`` selector.
+def resolve_backend(backend: RootBackendName, source: Any = None) -> RootBackend:
+    """Pick a :class:`RootBackend` from the ``backend`` selector.
 
     ``"auto"`` (default) uses PyROOT when it is importable, otherwise uproot,
     raising if neither is installed. ``"ROOT"`` and ``"uproot"`` request a
     specific backend and raise if it is missing. The match is case-insensitive.
     """
-    name = kernel.lower()
+    name = backend.lower()
     if name == "auto":
         if _is_rdataframe_source(source):
-            # Only the ROOT kernel can read an in-memory RDataFrame.
-            if RootCppKernel.available():
-                return RootCppKernel()
+            # Only the ROOT backend can read an in-memory RDataFrame.
+            if RootCppBackend.available():
+                return RootCppBackend()
             raise ImportError(
                 "reading an RDataFrame source needs PyROOT; pass a path or {tree: files} "
-                "to read with the uproot kernel instead."
+                "to read with the uproot backend instead."
             )
-        if RootCppKernel.available():
-            return RootCppKernel()
+        if RootCppBackend.available():
+            return RootCppBackend()
         if _uproot_available():
-            return _uproot_kernel()
+            return _uproot_backend()
         raise ImportError(
             "Reading or writing ROOT files needs PyROOT or uproot; neither is installed "
             "(install one, e.g. 'pip install uproot' or 'conda install -c conda-forge root')."
         )
     if name == "root":
-        if not RootCppKernel.available():
-            raise ImportError("kernel='ROOT' needs PyROOT; install ROOT or use kernel='uproot'.")
-        return RootCppKernel()
+        if not RootCppBackend.available():
+            raise ImportError("backend='ROOT' needs PyROOT; install ROOT or use backend='uproot'.")
+        return RootCppBackend()
     if name == "uproot":
         if not _uproot_available():
-            raise ImportError("kernel='uproot' needs uproot; install it or use kernel='ROOT'.")
-        return _uproot_kernel()
-    raise ValueError(f"unknown kernel {kernel!r}; expected 'auto', 'ROOT', or 'uproot'.")
+            raise ImportError("backend='uproot' needs uproot; install it or use backend='ROOT'.")
+        return _uproot_backend()
+    raise ValueError(f"unknown backend {backend!r}; expected 'auto', 'ROOT', or 'uproot'.")
 
 
 def _is_rdataframe_source(source: Any) -> bool:
-    """Whether ``source`` is an in-memory RDataFrame (ROOT-kernel-only) rather than a path.
+    """Whether ``source`` is an in-memory RDataFrame (ROOT-backend-only) rather than a path.
 
     A path / mapping / list, a colstore reader or dataset (the export side), or
     ``None`` are all readable without an RDataFrame; anything else is taken to be an
-    RDataFrame/RNode, which only the PyROOT kernel can read.
+    RDataFrame/RNode, which only the PyROOT backend can read.
     """
     return source is not None and not isinstance(
         source, (str, os.PathLike, dict, list, tuple, _ReaderBase)
@@ -496,17 +496,17 @@ def _uproot_available() -> bool:
     return importlib.util.find_spec("uproot") is not None
 
 
-def _uproot_kernel() -> RootKernel:
-    from ._uproot import UprootKernel  # lazy: do not import uproot until it is selected
+def _uproot_backend() -> RootBackend:
+    from ._uproot import UprootBackend  # lazy: do not import uproot until it is selected
 
-    return UprootKernel()
+    return UprootBackend()
 
 
 def from_root(
     source: RootSource,
     path: StrPath,
     *,
-    kernel: RootKernelName = "auto",
+    backend: RootBackendName = "auto",
     treename: str | None = None,
     columns: list[str] | None = None,
     keep_valid_only: bool = True,
@@ -520,7 +520,7 @@ def from_root(
     Parameters
     ----------
     source : ROOT.RDataFrame, str, os.PathLike, or dict
-        An existing ``RDataFrame`` (read only by the ``"ROOT"`` kernel); a path
+        An existing ``RDataFrame`` (read only by the ``"ROOT"`` backend); a path
         to a ``.root`` file (its single tree is used, or ``treename`` selects
         one); or a ``{treename: files}`` mapping with exactly one entry (``files``
         may be a path or a list). A ``str`` path may embed the tree as
@@ -530,7 +530,7 @@ def from_root(
         the mapping form.
     path : str or os.PathLike
         Destination ``.cstore`` file.
-    kernel : str, optional
+    backend : str, optional
         Backend to read with: ``"auto"`` (default) uses PyROOT if importable,
         else uproot; ``"ROOT"`` forces PyROOT/RDataFrame; ``"uproot"`` forces
         uproot. Raises if the requested backend is missing.
@@ -567,7 +567,7 @@ def from_root(
     return RootFormat().from_file(
         source,
         path,
-        kernel=kernel,
+        backend=backend,
         treename=treename,
         columns=columns,
         keep_valid_only=keep_valid_only,
@@ -654,7 +654,7 @@ def to_root(
     source: _ReaderBase | StrPath,
     path: StrPath,
     *,
-    kernel: RootKernelName = "auto",
+    backend: RootBackendName = "auto",
     treename: str = _DEFAULT_TREE_NAME,
     columns: list[str] | None = None,
     batch_size: int | str | None = _DEFAULT_BATCH_SIZE,
@@ -678,7 +678,7 @@ def to_root(
         An opened reader or dataset, or a path to a ``.cstore`` file.
     path : str or os.PathLike
         Destination ``.root`` file; recreated if it already exists.
-    kernel : str, optional
+    backend : str, optional
         Backend to write with: ``"auto"`` (default) uses PyROOT if importable,
         else uproot; ``"ROOT"`` forces PyROOT/RDataFrame; ``"uproot"`` forces
         uproot. Raises if the requested backend is missing.
@@ -691,7 +691,7 @@ def to_root(
         Per-batch memory budget: an ``int`` is rows per batch; a ``str`` (default
         ``"512 MiB"``) is a byte budget; ``None`` writes in a single pass.
     compression_level, compression_algorithm, output_format, multithreading
-        ROOT-kernel options (ignored by the uproot kernel). ``compression_level``
+        ROOT-backend options (ignored by the uproot backend). ``compression_level``
         defaults to ``0`` (uncompressed; ROOT's own default is 5). The string
         ``compression_algorithm`` (``"zlib"``/``"lzma"``/``"lz4"``/``"zstd"``) and
         ``output_format`` (``"default"``/``"ttree"``/``"rntuple"``) name ROOT
@@ -712,7 +712,7 @@ def to_root(
     return RootFormat().to_file(
         target._interop_selection(),
         path,
-        kernel=kernel,
+        backend=backend,
         treename=treename,
         batch_size=batch_size,
         show_progress=show_progress,
@@ -889,7 +889,7 @@ class RootFormat(FileFormat):
         selection: Selection,
         dest: Any,
         *,
-        kernel: RootKernelName = "auto",
+        backend: RootBackendName = "auto",
         treename: str = _DEFAULT_TREE_NAME,
         batch_size: int | str | None = _DEFAULT_BATCH_SIZE,
         show_progress: bool = True,
@@ -899,13 +899,19 @@ class RootFormat(FileFormat):
 
         A whole-store selection streams straight from the store; a row subset is
         gathered into a scratch ``.cstore`` first and streamed from there.
-        ``**options`` carries the ROOT-kernel write options (``compression_level``,
+        ``**options`` carries the ROOT-backend write options (``compression_level``,
         ``compression_algorithm``, ``output_format``, ``multithreading``).
         """
-        backend = resolve_kernel(kernel, selection.store)
+        impl = resolve_backend(backend, selection.store)
         columns = list(selection.columns)
+        string_columns = [name for name in columns if selection.native_dtype(name).kind in "US"]
+        if string_columns:
+            raise TypeError(
+                f"the ROOT backend cannot write string column(s) {string_columns}; drop or cast "
+                f"them (ROOT branches have no fixed-width string type)."
+            )
         if selection.is_whole_column():
-            backend.write(
+            impl.write(
                 selection.store,
                 columns=columns,
                 dest=dest,
@@ -919,15 +925,20 @@ class RootFormat(FileFormat):
             with tempfile.TemporaryDirectory() as scratch:
                 scratch_store = os.path.join(scratch, "selection.cstore")
                 reader = api.store(data, scratch_store, show_progress=False)
-                backend.write(
-                    reader,
-                    columns=columns,
-                    dest=dest,
-                    treename=treename,
-                    batch_size=batch_size,
-                    show_progress=show_progress,
-                    **options,
-                )
+                # Close the scratch reader before the directory is removed: on
+                # Windows a still-mapped file cannot be deleted (WinError 32).
+                try:
+                    impl.write(
+                        reader,
+                        columns=columns,
+                        dest=dest,
+                        treename=treename,
+                        batch_size=batch_size,
+                        show_progress=show_progress,
+                        **options,
+                    )
+                finally:
+                    reader.close()
         return Path(os.fspath(dest))
 
     def from_file(
@@ -935,7 +946,7 @@ class RootFormat(FileFormat):
         source: Any,
         dest: Any,
         *,
-        kernel: RootKernelName = "auto",
+        backend: RootBackendName = "auto",
         treename: str | None = None,
         columns: list[str] | None = None,
         keep_valid_only: bool = True,
@@ -945,8 +956,8 @@ class RootFormat(FileFormat):
         show_progress: bool = True,
     ) -> ColStoreReader:
         """Read a ROOT ``source`` into a ``.cstore`` and open it. See :func:`from_root`."""
-        backend = resolve_kernel(kernel, source)
-        batches, total_rows = backend.read_batches(
+        impl = resolve_backend(backend, source)
+        batches, total_rows = impl.read_batches(
             source,
             treename=treename,
             columns=columns,
@@ -960,5 +971,5 @@ class RootFormat(FileFormat):
             total_rows=total_rows,
             compact=compact,
             show_progress=show_progress,
-            desc=f"{os.fspath(dest)} <- ROOT ({backend.name})",
+            desc=f"{os.fspath(dest)} <- ROOT ({impl.name})",
         )
