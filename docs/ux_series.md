@@ -157,6 +157,23 @@ total = d["energy"].sum()
 ds[100:200, ["price", "qty"]].frame(copy=False)
 ```
 
+### NumPy and pandas
+
+`np.asarray` / `np.array` materialize any reader, dataset, or view: a single
+column becomes a 1-D array; several columns, or a whole store, become a
+structured record array (one field per column, `result[name]` is the column).
+
+```python
+np.asarray(ds["price"])              # 1-D ndarray
+np.asarray(ds)                       # structured record array, one field per column
+np.asarray(ds[:, ["price", "qty"]])  # likewise, for the selection
+```
+
+For a pandas DataFrame, call `ds.frame()` — it builds the columns directly and
+takes `copy=False`. `pd.DataFrame(ds.dict())` is equivalent; passing a reader
+itself to `pd.DataFrame(ds)` does not expand it into columns, so prefer
+`ds.frame()`.
+
 ### Interop with external formats
 
 colstore exchanges data with external formats through `Format` objects in
