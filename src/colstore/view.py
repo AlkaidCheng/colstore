@@ -394,6 +394,18 @@ class ColumnView(_BaseView):
         """This single column and its resolved rows -- the export seam (see InteropMixin)."""
         return self._store, [self._column_name], self._resolve_row_indexer(), True
 
+    def __arrow_c_array__(self, requested_schema: Any = None) -> Any:
+        """Arrow C array interface: lets any Arrow consumer ingest the column.
+
+        For example ``pyarrow.array(view)`` or ``polars.from_arrow(view)``. A
+        column split across segments is concatenated into one array here (a copy);
+        :meth:`~colstore.interop.base.InteropMixin.__arrow_c_stream__` keeps it
+        zero-copy.
+        """
+        from .interop.arrow import to_c_array
+
+        return to_c_array(self.arrow(), requested_schema)
+
     def head(self, n: int | None = None) -> Preview:
         """First ``n`` values of the column as a previewable peek (default config rows)."""
         return self._preview(self._head_rows(self._preview_n(n)))
