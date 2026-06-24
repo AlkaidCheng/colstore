@@ -14,7 +14,8 @@ Importing any external source is a materialization -- colstore mmaps only its ow
 format, so a ``.cstore`` is written and then opened. Formats are discovered by
 name through the registry here (:func:`get`, :func:`data_formats`,
 :func:`file_formats`, :func:`register`). The reader, dataset, and view classes
-mix in :class:`InteropMixin` for the data-format export surface (``to(name)``).
+mix in :class:`InteropMixin` for the data-format export surface (``to(name)`` and
+the ``arrow()`` shorthand).
 
 A backend (e.g. ``pyarrow``) is imported only when a conversion runs -- ``import
 colstore`` loads neither the format modules nor their optional dependencies.
@@ -283,9 +284,9 @@ def from_object(name: str, obj: Any, dest: Any, *args: Any, **kwargs: Any) -> Co
 class InteropMixin:
     """The data-format export surface shared by readers, datasets, and views.
 
-    Mixed into the reader and view base classes so ``to()`` is defined once. Each
-    concrete class supplies only :meth:`_interop_target`, the small seam describing
-    its column/row selection.
+    Mixed into the reader and view base classes so ``to()``, ``arrow()``, and the
+    Arrow C stream interface are defined once. Each concrete class supplies only
+    :meth:`_interop_target`, the small seam describing its column/row selection.
     """
 
     def _interop_target(self) -> tuple[_ReaderBase, list[str], Any, bool]:
@@ -306,3 +307,22 @@ class InteropMixin:
         if not isinstance(fmt, DataFormat):
             raise TypeError(f"{name!r} is a {fmt.kind} format; write a file with .saveas(path).")
         return fmt.to_object(self._interop_selection())
+
+    def arrow(self) -> Any:
+        """Export this selection to Apache Arrow -- shorthand for ``to("arrow")``.
+
+        A single column yields a ``pyarrow.Array`` (or a ``ChunkedArray`` over many
+        records/files); several columns yield a ``pyarrow.Table``. The whole column
+        on a native store is zero-copy. Requires ``pyarrow``.
+        """
+        return self.to("arrow")
+
+    def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
+        """Arrow C stream interface: any Arrow consumer can ingest this selection.
+
+        For example ``pyarrow.table(ds)`` or ``polars.from_arrow(ds)``; zero-copy
+        where :meth:`arrow` is.
+        """
+        from .arrow import to_c_stream
+
+        return to_c_stream(self.arrow(), requested_schema)

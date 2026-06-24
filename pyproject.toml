@@ -40,15 +40,24 @@ dependencies = [
 [project.scripts]
 colstore = "colstore.cli:main"
 
+# Built-in interop formats, discovered through entry points (one group per kind)
+# so the registry is not a hard-coded table and third parties can add a format by
+# declaring an entry point in their own package. The group encodes the kind, so
+# the registry lists formats by kind without importing the format module.
+[project.entry-points."colstore.data_formats"]
+arrow = "colstore.interop.arrow:ArrowFormat"
+
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
 progress = ["tqdm>=4.60"]
 numba = ["numba>=0.59"]
-all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59"]
+arrow = ["pyarrow>=14"]
+all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59", "pyarrow>=14"]
 dev = [
     "pandas>=1.5",
     "tqdm>=4.60",
     "numba>=0.59",
+    "pyarrow>=14",
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "ruff>=0.4",
