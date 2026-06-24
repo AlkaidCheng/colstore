@@ -49,13 +49,15 @@ arrow = "colstore.interop.arrow:ArrowFormat"
 
 [project.entry-points."colstore.file_formats"]
 npz = "colstore.interop.npz:NpzFormat"
+root = "colstore.interop.root:RootFormat"
 
 [project.optional-dependencies]
 pandas = ["pandas>=1.5"]
 progress = ["tqdm>=4.60"]
 numba = ["numba>=0.59"]
 arrow = ["pyarrow>=14"]
-all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59", "pyarrow>=14"]
+uproot = ["uproot>=5"]
+all = ["pandas>=1.5", "tqdm>=4.60", "numba>=0.59", "pyarrow>=14", "uproot>=5"]
 dev = [
     "pandas>=1.5",
     "tqdm>=4.60",

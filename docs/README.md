@@ -17,8 +17,9 @@ deeper.
 - **[Optimization series](optimization_series.md)** — the cumulative engineering
   record: every optimization stage across three rounds, each with the
   measurement that justified it and the alternatives that were rejected.
-- **[ROOT parser](root_parser.md)** — convert ROOT files to and from colstore
-  through `RDataFrame`, via the extensible `colstore.parsers` package.
+- **[Interop with external formats](interop.md)** — the `colstore.interop`
+  registry: exchange colstore data with Apache Arrow, NumPy `.npz`, and ROOT
+  (PyROOT or uproot kernel) through `to` / `arrow` / `saveas` / `ingest`.
 - **[Valgrind leak checking](valgrind_leak_checking.md)** — the developer
   Memcheck harness under `scripts/` that leak-checks the native gather extension
   and reports only leaks attributable to colstore's own code.

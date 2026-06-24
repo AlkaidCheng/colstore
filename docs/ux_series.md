@@ -176,40 +176,10 @@ itself to `pd.DataFrame(ds)` does not expand it into columns, so prefer
 
 ### Interop with external formats
 
-colstore exchanges data with external formats through `Format` objects in
-`colstore.interop`, discovered by name. A `DataFormat` (in-memory object, e.g.
-Apache Arrow) is selected by name; a `FileFormat` (on-disk file) is selected by
-extension. Formats are registered through packaging entry points, so a third
-party adds one by declaring an entry point in its own package -- no colstore
-change. `colstore.interop.data_formats()` / `file_formats()` list what is
-available; `register()` adds one at runtime.
-
-A column, selection, or whole store exports to a data format with `to(name)`:
-
-```python
-colstore.interop.data_formats()  # frozenset({'arrow'})
-ds.to("arrow")              # pyarrow.Table, one field per column
-ds.arrow()                  # shorthand for to("arrow")
-ds["price"].to("arrow")     # pyarrow.Array (a ChunkedArray over many records/files)
-ds[:, ["price", "qty"]].to("arrow")
-```
-
-A native column is handed over without copying — the Arrow values buffer *is* the
-memory-mapped file, and the mapping is kept alive for the lifetime of the Arrow
-data. Reader, dataset, and view objects also implement the Arrow C Data Interface
-(`__arrow_c_array__` / `__arrow_c_stream__`), so an Arrow consumer reads colstore
-data directly:
-
-```python
-import pyarrow as pa
-pa.table(ds)                # zero-copy
-pl.from_arrow(ds["price"])  # polars, DuckDB, etc.
-```
-
-The whole column on a native store is zero-copy; a row subset, a boolean or
-Unicode column, or a non-native (big-endian) file materializes first.
-`datetime64` / `timedelta64` columns must be in a second-to-nanosecond unit.
-Requires `pyarrow` (`pip install colstore[arrow]`).
+`colstore.interop` exchanges colstore data with Apache Arrow (zero-copy), NumPy
+`.npz`, and ROOT through `ds.to("arrow")` / `ds.arrow()`, `ds.saveas(path)`, and
+`colstore.ingest(path, dest)`. See **[Interop](interop.md)** for the full registry,
+the export/import verbs, and the ROOT kernels.
 
 ---
 

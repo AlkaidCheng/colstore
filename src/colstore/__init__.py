@@ -56,7 +56,7 @@ except PackageNotFoundError:  # source checkout without an installed dist
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from . import interop, parsers, profiling, testing
+from . import interop, profiling, testing
 from ._query import QueryError, col
 from .api import (
     ColStoreInfo,
@@ -90,8 +90,8 @@ from .config import (
 from .dataset import ColStoreDataset
 from .format import FILE_EXTENSION, FormatError
 from .frame import ColStoreFrame
+from .interop.root import from_root, to_root
 from .kernels import cpp_available, max_threads, numba_available
-from .parsers import from_root, to_root
 from .reader import ColStoreReader
 from .view import ColumnView, TableView
 from .writer import ColStoreWriter
@@ -128,7 +128,6 @@ __all__ = [
     "max_threads",
     "numba_available",
     "open",
-    "parsers",
     "profiling",
     "recreate",
     "saveas",
