@@ -193,6 +193,47 @@ def _dataframe_to_columns(frame: Any) -> dict[str, np.ndarray[Any, np.dtype[Any]
     return columns
 
 
+# ---- Foreign file formats: ingest / saveas -----------------------------
+
+
+def ingest(
+    source: str | os.PathLike[str],
+    dest: str | os.PathLike[str],
+    *,
+    format: str | None = None,
+    **kwargs: Any,
+) -> ColStoreReader:
+    """Import a foreign file into a new ``.cstore`` at ``dest`` and open it.
+
+    The format is chosen from ``source``'s extension (e.g. ``.npz``); pass
+    ``format=`` to override it (``format="npz"``). ``dest`` is required -- colstore
+    mmaps only its own format, so the foreign file is materialized into a ``.cstore``
+    first -- and the opened :class:`~colstore.reader.ColStoreReader` is returned.
+    ``dest`` must not already exist (pass ``mode="recreate"`` to overwrite it). List
+    the available file formats with :func:`colstore.interop.file_formats`; importing
+    an in-memory object instead uses :func:`colstore.interop.from_object`.
+    """
+    from . import interop
+
+    return interop.file_format_for_path(source, format).from_file(source, dest, **kwargs)
+
+
+def saveas(
+    source: Any,
+    dest: str | os.PathLike[str],
+    *,
+    format: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Write a reader, dataset, or view to a file -- the function form of ``source.saveas``.
+
+    ``colstore.saveas(ds, "out.npz")`` is ``ds.saveas("out.npz")``: the format is
+    chosen from ``dest``'s extension, overridable with ``format=``. The whole store
+    is written, or just a selection (``colstore.saveas(ds[rows, cols], dest)``).
+    """
+    return source.saveas(dest, format=format, **kwargs)
+
+
 # ---- Compaction --------------------------------------------------------
 
 

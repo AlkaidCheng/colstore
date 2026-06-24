@@ -23,6 +23,7 @@ colstore`` loads neither the format modules nor their optional dependencies.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from importlib.metadata import entry_points
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -219,8 +220,34 @@ def register(fmt: Format, *, override: bool = False) -> None:
                     f"format name {nm!r} is claimed by the {claimed!r} entry point; "
                     f"choose another name/alias or pass override=True."
                 )
+        collision = _extension_collision(fmt)
+        if collision is not None:
+            ext, owner = collision
+            raise ValueError(
+                f"file extension {ext!r} is already claimed by the {owner!r} format; "
+                f"choose another extension or pass override=True."
+            )
     for nm in names:
         _REGISTRY[nm] = fmt
+
+
+def _extension_collision(fmt: Format) -> tuple[str, str] | None:
+    """An (extension, owner-name) a *different* file format already claims, or ``None``.
+
+    File extensions match case-insensitively, so the check compares lowercased.
+    """
+    if not isinstance(fmt, FileFormat):
+        return None
+    claimed = {
+        ext.lower(): other.name
+        for other in _REGISTRY.values()
+        if isinstance(other, FileFormat) and type(other).__qualname__ != type(fmt).__qualname__
+        for ext in other.extensions
+    }
+    for ext in fmt.extensions:
+        if ext.lower() in claimed:
+            return ext, claimed[ext.lower()]
+    return None
 
 
 def _entry_point_names(kind: str) -> frozenset[str]:
@@ -262,9 +289,6 @@ def get(name: str) -> Format:
                     return _REGISTRY[name]
     available = sorted(data_formats() | file_formats())
     raise KeyError(f"unknown format {name!r}; available formats: {available}.")
-    raise KeyError(
-        f"unknown format {name!r}; available formats: {sorted(data_formats() | file_formats())}."
-    )
 
 
 def from_object(name: str, obj: Any, dest: Any, *args: Any, **kwargs: Any) -> ColStoreReader:
@@ -279,6 +303,56 @@ def from_object(name: str, obj: Any, dest: Any, *args: Any, **kwargs: Any) -> Co
     if not isinstance(fmt, DataFormat):
         raise TypeError(f"{name!r} is a {fmt.kind} format; import a file with colstore.ingest().")
     return fmt.from_object(obj, dest, *args, **kwargs)
+
+
+def _load_file_formats() -> None:
+    """Import every declared file format so its extensions become known.
+
+    Loading a format's class (via its entry point) registers it through
+    ``__init_subclass__`` but does not import its backend -- the backend loads
+    only when a conversion runs -- so this is cheap enough to call per dispatch.
+    """
+    for ep in entry_points(group=_GROUPS["file"]):
+        if ep.name not in _REGISTRY:
+            ep.load()
+
+
+def file_format_for_extension(extension: str) -> FileFormat:
+    """The registered file format claiming ``extension`` (e.g. ``".npz"``).
+
+    The lookup is case-insensitive on the extension (including its leading dot).
+    Raises ``KeyError`` -- listing the known extensions -- if none claims it.
+    """
+    ext = extension.lower()
+    _load_file_formats()
+    for fmt in _REGISTRY.values():
+        if isinstance(fmt, FileFormat) and ext in {e.lower() for e in fmt.extensions}:
+            return fmt
+    known = sorted(
+        e.lower() for f in _REGISTRY.values() if isinstance(f, FileFormat) for e in f.extensions
+    )
+    raise KeyError(f"no file format handles extension {extension!r}; known extensions: {known}.")
+
+
+def file_format_for_path(path: Any, format: str | None = None) -> FileFormat:
+    """Resolve the file format for a path: ``format`` by name, else by extension."""
+    fmt = get(format) if format is not None else file_format_for_extension(_extension(path))
+    if not isinstance(fmt, FileFormat):
+        raise TypeError(
+            f"{fmt.name!r} is a {fmt.kind} format, not a file format; "
+            f"exchange an in-memory object with .to({fmt.name!r}) / "
+            f"colstore.interop.from_object({fmt.name!r}, ...)."
+        )
+    return fmt
+
+
+def _extension(path: str | os.PathLike[str]) -> str:
+    """The file extension of ``path`` (with its dot), or ``""``.
+
+    ``os.fsdecode`` normalizes a ``bytes`` path to ``str`` so it dispatches like
+    any other path rather than failing a ``bytes``-vs-``str`` extension compare.
+    """
+    return os.path.splitext(os.fsdecode(path))[1]
 
 
 class InteropMixin:
@@ -307,6 +381,21 @@ class InteropMixin:
         if not isinstance(fmt, DataFormat):
             raise TypeError(f"{name!r} is a {fmt.kind} format; write a file with .saveas(path).")
         return fmt.to_object(self._interop_selection())
+
+    def saveas(self, dest: Any, *, format: str | None = None, **kwargs: Any) -> Any:
+        """Write this selection to a file, choosing the format by ``dest``'s extension.
+
+        ``ds.saveas("out.npz")`` writes the whole store; ``ds[rows, cols].saveas(...)``
+        writes just the selection. Pass ``format=`` to override the extension (e.g.
+        ``format="npz"``). An existing file at ``dest`` is overwritten. List the
+        available file formats with :func:`colstore.interop.file_formats`. Raises
+        ``TypeError`` for an in-memory data format (exported with :meth:`to` instead)
+        and ``ValueError`` for a selection with no columns.
+        """
+        selection = self._interop_selection()
+        if not selection.columns:
+            raise ValueError("cannot write a file from a selection with no columns.")
+        return file_format_for_path(dest, format).to_file(selection, dest, **kwargs)
 
     def arrow(self) -> Any:
         """Export this selection to Apache Arrow -- shorthand for ``to("arrow")``.
