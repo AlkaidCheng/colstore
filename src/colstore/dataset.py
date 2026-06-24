@@ -580,9 +580,9 @@ class ColStoreDataset(_ReaderBase):
         starts, segment_base = table
         cap = config.get_gather_thread_cap()
         if indices_sorted:
-            _cpp_module.gather_multifile_sorted(indices, out, starts, segment_base, cap, -1)
+            _cpp_module.gather_segment_sorted(indices, out, starts, segment_base, cap, -1)
         else:
-            _cpp_module.gather_multifile(indices, out, starts, segment_base, cap, -1)
+            _cpp_module.gather_segment(indices, out, starts, segment_base, cap, -1)
 
     def _native_gather_many(
         self,
@@ -596,8 +596,8 @@ class ColStoreDataset(_ReaderBase):
         Sorted indices take the per-column cursor walk -- a walk has no search to
         amortize, and its within-segment access is sequential. Unsorted reads of
         two or more columns search the (column-independent) segment once with
-        ``gather_multifile_bins`` and replay it per column with
-        ``gather_multifile_withbins``, the same amortization the single-file
+        ``gather_segment_bins`` and replay it per column with
+        ``gather_segment_withbins``, the same amortization the single-file
         multi-column path gives across records. A single column, or a segment
         count past the int32 bin range, takes an independent pass per column.
         """
@@ -614,13 +614,13 @@ class ColStoreDataset(_ReaderBase):
             return
         cap = config.get_gather_thread_cap()
         bins = np.empty(len(indices), dtype=np.int32)
-        _cpp_module.gather_multifile_bins(
+        _cpp_module.gather_segment_bins(
             indices, out[column_names[0]], bins, first_starts, first_base, cap, -1
         )
         for name, table in zip(column_names[1:], tables[1:], strict=True):
             assert table is not None
             _, segment_base = table
-            _cpp_module.gather_multifile_withbins(indices, out[name], bins, segment_base, cap, -1)
+            _cpp_module.gather_segment_withbins(indices, out[name], bins, segment_base, cap, -1)
 
     def _fancy_one(
         self, column_name: str, indices: NDArray[np.int64], out: NDArray[Any] | None = None

@@ -66,7 +66,7 @@ def build_segments(file_record_rows, dtype, seed=7):
 
 def gather(indices, starts, seg_base, dtype, thread_cap=0, prefetch=-1):
     out = np.empty(len(indices), dtype=dtype)
-    _gather.gather_multifile(
+    _gather.gather_segment(
         np.asarray(indices, dtype=np.int64), out, starts, seg_base, thread_cap, prefetch
     )
     return out
@@ -123,7 +123,7 @@ def test_empty_indices_is_noop():
     dtype = np.float64
     starts, seg_base, _oracle, _keep = build_segments([[10], [10]], dtype)
     out = np.empty(0, dtype=dtype)
-    _gather.gather_multifile(np.empty(0, dtype=np.int64), out, starts, seg_base)
+    _gather.gather_segment(np.empty(0, dtype=np.int64), out, starts, seg_base)
     assert out.shape == (0,)
 
 
@@ -132,7 +132,7 @@ def test_unsupported_itemsize_raises():
     idx = np.zeros(4, dtype=np.int64)
     out = np.empty(4, dtype=np.dtype("V3"))  # 3-byte element: unsupported
     with pytest.raises(TypeError, match="element size"):
-        _gather.gather_multifile(idx, out, starts, seg_base)
+        _gather.gather_segment(idx, out, starts, seg_base)
 
 
 def test_segment_starts_length_mismatch_raises():
@@ -140,14 +140,14 @@ def test_segment_starts_length_mismatch_raises():
     idx = np.zeros(4, dtype=np.int64)
     out = np.empty(4, dtype=np.float64)
     with pytest.raises(ValueError, match="n_segments"):
-        _gather.gather_multifile(idx, out, starts[:-1], seg_base)
+        _gather.gather_segment(idx, out, starts[:-1], seg_base)
 
 
 def test_non_int64_indices_raises():
     starts, seg_base, _oracle, _keep = build_segments([[8], [8]], np.float64)
     out = np.empty(4, dtype=np.float64)
     with pytest.raises(TypeError):
-        _gather.gather_multifile(np.zeros(4, dtype=np.int32), out, starts, seg_base)
+        _gather.gather_segment(np.zeros(4, dtype=np.int32), out, starts, seg_base)
 
 
 # ---- Segment-bin reuse across columns --------------------------------------
@@ -171,14 +171,14 @@ def test_multifile_bins_reuse_matches_plain_and_oracle():
 
     out_a = np.empty(len(idx), dtype=np.float64)
     bins = np.empty(len(idx), dtype=np.int32)
-    _gather.gather_multifile_bins(idx, out_a, bins, starts_a, base_a, 0, -1)
+    _gather.gather_segment_bins(idx, out_a, bins, starts_a, base_a, 0, -1)
     np.testing.assert_array_equal(out_a, oracle_a[idx])
     np.testing.assert_array_equal(out_a, gather(idx, starts_a, base_a, np.float64))
     expected = np.searchsorted(starts_a, idx, side="right").astype(np.int32) - 1
     np.testing.assert_array_equal(bins, expected)
 
     out_b = np.empty(len(idx), dtype=np.float64)
-    _gather.gather_multifile_withbins(idx, out_b, bins, base_b, 0, -1)
+    _gather.gather_segment_withbins(idx, out_b, bins, base_b, 0, -1)
     np.testing.assert_array_equal(out_b, oracle_b[idx])
 
 
@@ -190,9 +190,9 @@ def test_multifile_bins_reuse_small_dtype_and_cap():
     idx = np.arange(int(starts[-1]) - 1, -1, -1, dtype=np.int64)  # reversed, exhaustive
     out_a = np.empty(len(idx), dtype=np.int16)
     bins = np.empty(len(idx), dtype=np.int32)
-    _gather.gather_multifile_bins(idx, out_a, bins, starts, base_a, 2, 4)
+    _gather.gather_segment_bins(idx, out_a, bins, starts, base_a, 2, 4)
     out_b = np.empty(len(idx), dtype=np.int16)
-    _gather.gather_multifile_withbins(idx, out_b, bins, base_b, 2, 4)
+    _gather.gather_segment_withbins(idx, out_b, bins, base_b, 2, 4)
     np.testing.assert_array_equal(out_a, oracle_a[idx])
     np.testing.assert_array_equal(out_b, oracle_b[idx])
 
@@ -203,7 +203,7 @@ def test_multifile_bins_length_mismatch_raises():
     out = np.empty(4, dtype=np.float64)
     bins = np.empty(3, dtype=np.int32)  # wrong length
     with pytest.raises(ValueError, match="bins"):
-        _gather.gather_multifile_bins(idx, out, bins, starts, seg_base)
+        _gather.gather_segment_bins(idx, out, bins, starts, seg_base)
 
 
 def test_multifile_bins_wrong_dtype_raises():
@@ -212,7 +212,7 @@ def test_multifile_bins_wrong_dtype_raises():
     out = np.empty(4, dtype=np.float64)
     bins = np.empty(4, dtype=np.int64)  # must be int32
     with pytest.raises(TypeError, match="bins"):
-        _gather.gather_multifile_bins(idx, out, bins, starts, seg_base)
+        _gather.gather_segment_bins(idx, out, bins, starts, seg_base)
 
 
 # ---- Sorted cursor walk ----------------------------------------------------
@@ -228,7 +228,7 @@ def test_multifile_sorted_matches_plain_and_oracle(cap):
     total = int(starts[-1])
     idx = np.sort(np.random.default_rng(2).integers(0, total, size=3000)).astype(np.int64)
     out = np.empty(len(idx), dtype=np.float64)
-    _gather.gather_multifile_sorted(idx, out, starts, base, cap, -1)
+    _gather.gather_segment_sorted(idx, out, starts, base, cap, -1)
     np.testing.assert_array_equal(out, oracle[idx])
     np.testing.assert_array_equal(out, gather(idx, starts, base, np.float64, thread_cap=cap))
 
@@ -239,7 +239,7 @@ def test_multifile_sorted_exhaustive_ascending():
     starts, base, oracle, _keep = build_segments(layout, np.int32, seed=6)
     idx = np.arange(int(starts[-1]), dtype=np.int64)
     out = np.empty(len(idx), dtype=np.int32)
-    _gather.gather_multifile_sorted(idx, out, starts, base, 2, 4)
+    _gather.gather_segment_sorted(idx, out, starts, base, 2, 4)
     np.testing.assert_array_equal(out, oracle[idx])
 
 
@@ -248,7 +248,7 @@ def test_multifile_sorted_duplicates_and_single_segment():
     starts, base, oracle, _keep = build_segments([[100]], np.float64, seed=8)
     idx = np.sort(np.array([0, 0, 0, 5, 5, 99, 99, 50], dtype=np.int64))
     out = np.empty(len(idx), dtype=np.float64)
-    _gather.gather_multifile_sorted(idx, out, starts, base, 0, -1)
+    _gather.gather_segment_sorted(idx, out, starts, base, 0, -1)
     np.testing.assert_array_equal(out, oracle[idx])
 
 

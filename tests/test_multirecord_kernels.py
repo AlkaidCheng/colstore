@@ -1,10 +1,14 @@
-"""Kernel contracts of the multi-record gather family (direct ``_gather`` calls).
+"""Kernel contracts of the fancy gather family (direct ``_gather`` calls).
 
-One section per kernel; each must equal its reference (NumPy indexing, or
-the generic fused kernel) for every supported dtype, irregular record
-shapes, nonzero column prefixes, duplicates, record-boundary indices,
-thread caps, and prefetch settings, and must validate its inputs. Reader
-routing for these kernels is pinned in ``test_multirecord_routing.py``.
+The general fancy gather is the segment-table kernel (``gather_segment`` and
+its sorted/bins/withbins companions), which serves single- and multi-file
+reads alike; the uniform-record and strided kernels are layout
+specializations the reader picks in front of it. One section per kernel;
+each must equal its reference (NumPy indexing, or the general segment
+kernel) for every supported dtype, irregular record shapes, nonzero column
+prefixes, duplicates, record-boundary indices, thread caps, and prefetch
+settings, and must validate its inputs. Reader routing for these kernels is
+pinned in ``test_multirecord_routing.py``.
 """
 
 from __future__ import annotations
@@ -30,14 +34,11 @@ def test_sorted_kernel_matches_unsorted_kernel(dtype, thread_cap):
     rng = np.random.default_rng(1)
     indices = np.sort(rng.integers(0, lay.total, size=5_000).astype(np.int64))
 
+    start_rows, segment_base = _segment_table(lay, np.dtype(dtype).itemsize)
     out_sorted = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord_sorted(
-        lay.buf, indices, out_sorted, lay.rsr, lay.rsb, lay.nrr, 0, thread_cap, 0
-    )
+    _gather.gather_segment_sorted(indices, out_sorted, start_rows, segment_base, thread_cap, 0)
     out_reference = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord(
-        lay.buf, indices, out_reference, lay.rsr, lay.rsb, lay.nrr, 0, thread_cap, 0
-    )
+    _gather.gather_segment(indices, out_reference, start_rows, segment_base, thread_cap, 0)
     assert np.array_equal(out_sorted, out_reference)
     assert np.array_equal(out_sorted, lay.column[indices])
 
@@ -61,25 +62,23 @@ def test_sorted_kernel_edge_index_patterns(prefetch):
         ),
         "single_element": np.array([total // 2], dtype=np.int64),
     }
+    start_rows, segment_base = _segment_table(lay, 8)
     for name, indices in patterns.items():
         output = np.empty(indices.size, dtype=np.float64)
-        _gather.gather_multirecord_sorted(
-            lay.buf, indices, output, lay.rsr, lay.rsb, lay.nrr, 0, 2, prefetch
-        )
+        _gather.gather_segment_sorted(indices, output, start_rows, segment_base, 2, prefetch)
         assert np.array_equal(output, lay.column[indices]), (name, prefetch)
 
 
 def test_sorted_kernel_validates_inputs():
     lay = build_layout([10] * 4, np.float64)
     indices = np.array([0, 5, 39], dtype=np.int64)
+    start_rows, segment_base = _segment_table(lay, 8)
     with pytest.raises(TypeError, match="int64"):
-        _gather.gather_multirecord_sorted(
-            lay.buf, indices.astype(np.int32), np.empty(3), lay.rsr, lay.rsb, lay.nrr, 0
+        _gather.gather_segment_sorted(
+            indices.astype(np.int32), np.empty(3), start_rows, segment_base
         )
     with pytest.raises(ValueError, match="length"):
-        _gather.gather_multirecord_sorted(
-            lay.buf, indices, np.empty(2), lay.rsr, lay.rsb, lay.nrr, 0
-        )
+        _gather.gather_segment_sorted(indices, np.empty(2), start_rows, segment_base)
 
 
 # ---- Strided range-walk kernel ---------------------------------------------
@@ -238,8 +237,8 @@ def test_uniform_kernel_matches_generic_kernel(dtype, last_rows, thread_cap):
         0,
     )
     out_generic = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord(
-        lay.buf, indices, out_generic, lay.rsr, lay.rsb, lay.nrr, lay.prefix, thread_cap, 0
+    _gather.gather_segment(
+        indices, out_generic, *_segment_table(lay, np.dtype(dtype).itemsize), thread_cap, 0
     )
     assert np.array_equal(out_uniform, out_generic)
     assert np.array_equal(out_uniform, lay.column[indices])
@@ -340,9 +339,7 @@ def test_uniform_bins_pair_matches_generic_pair(last_rows, thread_cap):
     )
     out_g = np.empty(indices.size, dtype=np.float64)
     bins_g = np.empty(indices.size, dtype=np.int32)
-    _gather.gather_multirecord_bins(
-        lay.buf, indices, out_g, bins_g, lay.rsr, lay.rsb, lay.nrr, lay.prefix, thread_cap, 0
-    )
+    _gather.gather_segment_bins(indices, out_g, bins_g, *_segment_table(lay, 8), thread_cap, 0)
     assert np.array_equal(out_u, out_g)
     assert np.array_equal(bins_u, bins_g)
     assert np.array_equal(out_u, lay.column[indices])
@@ -397,22 +394,19 @@ def test_bins_kernel_matches_searchsorted_and_plain_kernel(dtype):
     lay = build_layout([100] * 64, dtype, seed=1)
     indices = np.random.default_rng(1).integers(0, lay.total, size=5_000).astype(np.int64)
 
+    start_rows, segment_base = _segment_table(lay, np.dtype(dtype).itemsize)
     out_plain = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord(lay.buf, indices, out_plain, lay.rsr, lay.rsb, lay.nrr, 0, 2, 0)
+    _gather.gather_segment(indices, out_plain, start_rows, segment_base, 2, 0)
 
     out_bins = np.empty(indices.size, dtype=dtype)
     bins = np.empty(indices.size, dtype=np.int32)
-    _gather.gather_multirecord_bins(
-        lay.buf, indices, out_bins, bins, lay.rsr, lay.rsb, lay.nrr, 0, 2, 0
-    )
+    _gather.gather_segment_bins(indices, out_bins, bins, start_rows, segment_base, 2, 0)
     assert np.array_equal(out_bins, out_plain)
-    expected_bins = (np.searchsorted(lay.rsr, indices, side="right") - 1).astype(np.int32)
+    expected_bins = (np.searchsorted(start_rows, indices, side="right") - 1).astype(np.int32)
     assert np.array_equal(bins, expected_bins)
 
     out_with = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord_withbins(
-        lay.buf, indices, out_with, bins, lay.rsr, lay.rsb, lay.nrr, 0, 2, 0
-    )
+    _gather.gather_segment_withbins(indices, out_with, bins, segment_base, 2, 0)
     assert np.array_equal(out_with, out_plain)
 
 
@@ -420,17 +414,16 @@ def test_bins_kernels_validate_bins_dtype_and_length():
     lay = build_layout([10] * 4, np.float64)
     indices = np.array([0, 5, 39], dtype=np.int64)
     out = np.empty(3)
+    start_rows, segment_base = _segment_table(lay, 8)
     with pytest.raises(TypeError, match="bins must be int32"):
-        _gather.gather_multirecord_bins(
-            lay.buf, indices, out, np.empty(3, dtype=np.int64), lay.rsr, lay.rsb, lay.nrr, 0
+        _gather.gather_segment_bins(
+            indices, out, np.empty(3, dtype=np.int64), start_rows, segment_base
         )
     with pytest.raises(ValueError, match="lengths"):
-        _gather.gather_multirecord_withbins(
-            lay.buf, indices, out, np.empty(2, dtype=np.int32), lay.rsr, lay.rsb, lay.nrr, 0
-        )
+        _gather.gather_segment_withbins(indices, out, np.empty(2, dtype=np.int32), segment_base)
 
 
-# ---- Record-base (rbase) variant --------------------------------------------
+# ---- Segment withbins over irregular layouts (+ record-base fold) -----------
 
 
 def _record_base(rsr, rsb, nrr, col_prefix, itemsize):
@@ -440,49 +433,25 @@ def _record_base(rsr, rsb, nrr, col_prefix, itemsize):
 @pytest.mark.parametrize("dtype", [np.float64, np.float32, np.int64, np.int16, np.int8])
 @pytest.mark.parametrize("thread_cap", [1, 4])
 @pytest.mark.parametrize("prefetch", [0, 8])
-def test_rbase_kernel_matches_withbins(dtype, thread_cap, prefetch):
+def test_segment_withbins_matches_generic_irregular(dtype, thread_cap, prefetch):
     lay = build_layout([3, 70, 1, 640, 10, 4, 250, 33], dtype, col_prefix_rows=2)
     indices = np.random.default_rng(1).integers(0, lay.total, 4_000).astype(np.int64)
+    start_rows, segment_base = _segment_table(lay, np.dtype(dtype).itemsize)
     out_first = np.empty(indices.size, dtype=dtype)
     bins = np.empty(indices.size, dtype=np.int32)
-    _gather.gather_multirecord_bins(
-        lay.buf,
-        indices,
-        out_first,
-        bins,
-        lay.rsr,
-        lay.rsb,
-        lay.nrr,
-        lay.prefix,
-        thread_cap,
-        prefetch,
-    )
-    rbase = _record_base(lay.rsr, lay.rsb, lay.nrr, lay.prefix, np.dtype(dtype).itemsize)
-    out_rbase = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord_withbins_rbase(
-        lay.buf, indices, out_rbase, bins, rbase, thread_cap, prefetch
+    _gather.gather_segment_bins(
+        indices, out_first, bins, start_rows, segment_base, thread_cap, prefetch
     )
     out_withbins = np.empty(indices.size, dtype=dtype)
-    _gather.gather_multirecord_withbins(
-        lay.buf,
-        indices,
-        out_withbins,
-        bins,
-        lay.rsr,
-        lay.rsb,
-        lay.nrr,
-        lay.prefix,
-        thread_cap,
-        prefetch,
-    )
-    assert np.array_equal(out_rbase, out_withbins)
-    assert np.array_equal(out_rbase, lay.column[indices])
+    _gather.gather_segment_withbins(indices, out_withbins, bins, segment_base, thread_cap, prefetch)
+    assert np.array_equal(out_withbins, out_first)
+    assert np.array_equal(out_withbins, lay.column[indices])
 
 
-def test_rbase_kernel_edge_patterns():
+def test_segment_withbins_edge_patterns():
     lay = build_layout([5, 1, 100, 7], np.float64, col_prefix_rows=3, seed=2)
     total = lay.total
-    rbase = _record_base(lay.rsr, lay.rsb, lay.nrr, lay.prefix, 8)
+    start_rows, segment_base = _segment_table(lay, 8)
     patterns = {
         "boundaries_duplicates": np.array([0, 0, 4, 5, 5, 6, total - 1, total - 1], dtype=np.int64),
         "single": np.array([total // 2], dtype=np.int64),
@@ -491,36 +460,26 @@ def test_rbase_kernel_edge_patterns():
     for name, indices in patterns.items():
         bins = np.empty(indices.size, dtype=np.int32)
         first = np.empty(indices.size, dtype=np.float64)
-        _gather.gather_multirecord_bins(
-            lay.buf, indices, first, bins, lay.rsr, lay.rsb, lay.nrr, lay.prefix, 2, 0
-        )
+        _gather.gather_segment_bins(indices, first, bins, start_rows, segment_base, 2, 0)
         output = np.empty(indices.size, dtype=np.float64)
-        _gather.gather_multirecord_withbins_rbase(lay.buf, indices, output, bins, rbase, 2, 8)
+        _gather.gather_segment_withbins(indices, output, bins, segment_base, 2, 8)
         assert np.array_equal(output, lay.column[indices]), name
 
 
-def test_rbase_kernel_validates_inputs():
+def test_segment_withbins_validates_inputs():
     lay = build_layout([10, 20, 5], np.float64)
     indices = np.array([0, 5, 30], dtype=np.int64)
     output = np.empty(3, dtype=np.float64)
     bins = np.zeros(3, dtype=np.int32)
-    rbase = _record_base(lay.rsr, lay.rsb, lay.nrr, lay.prefix, 8)
+    _start_rows, segment_base = _segment_table(lay, 8)
     with pytest.raises(TypeError, match="int32"):
-        _gather.gather_multirecord_withbins_rbase(
-            lay.buf, indices, output, bins.astype(np.int64), rbase
-        )
-    with pytest.raises(TypeError, match="record_base"):
-        _gather.gather_multirecord_withbins_rbase(
-            lay.buf, indices, output, bins, rbase.astype(np.float64)
-        )
+        _gather.gather_segment_withbins(indices, output, bins.astype(np.int64), segment_base)
+    with pytest.raises(TypeError, match="segment_base"):
+        _gather.gather_segment_withbins(indices, output, bins, segment_base.astype(np.float64))
     with pytest.raises(ValueError, match="lengths"):
-        _gather.gather_multirecord_withbins_rbase(
-            lay.buf, indices, np.empty(5, dtype=np.float64), bins, rbase
-        )
+        _gather.gather_segment_withbins(indices, np.empty(5, dtype=np.float64), bins, segment_base)
     with pytest.raises(ValueError, match="C-contiguous"):
-        _gather.gather_multirecord_withbins_rbase(
-            lay.buf, indices, output, bins, np.repeat(rbase, 2)[::2]
-        )
+        _gather.gather_segment_withbins(indices, output, bins, np.repeat(segment_base, 2)[::2])
 
 
 def _segment_table(lay, itemsize):
@@ -670,40 +629,44 @@ def _entry_contiguity_cases():
             ["source", "byte_offsets", "output"],
         ),
         (
-            "gather_multirecord",
-            _gather.gather_multirecord,
-            dict(source=lay.buf, indices=indices, output=output, col_prefix_bytes=0, **rec),
-            ["source", "indices", "output", *rec],
-        ),
-        (
-            "gather_multirecord_sorted",
-            _gather.gather_multirecord_sorted,
-            dict(source=lay.buf, indices=indices, output=output, col_prefix_bytes=0, **rec),
-            ["source", "indices", "output", *rec],
-        ),
-        (
-            "gather_multirecord_bins",
-            _gather.gather_multirecord_bins,
+            "gather_segment",
+            _gather.gather_segment,
             dict(
-                source=lay.buf, indices=indices, output=output, bins=bins, col_prefix_bytes=0, **rec
+                indices=indices,
+                output=output,
+                segment_starts_rows=lay.rsr,
+                segment_base=record_base,
             ),
-            ["source", "indices", "output", "bins", *rec],
+            ["indices", "output", "segment_starts_rows", "segment_base"],
         ),
         (
-            "gather_multirecord_withbins",
-            _gather.gather_multirecord_withbins,
+            "gather_segment_sorted",
+            _gather.gather_segment_sorted,
             dict(
-                source=lay.buf, indices=indices, output=output, bins=bins, col_prefix_bytes=0, **rec
+                indices=indices,
+                output=output,
+                segment_starts_rows=lay.rsr,
+                segment_base=record_base,
             ),
-            ["source", "indices", "output", "bins", *rec],
+            ["indices", "output", "segment_starts_rows", "segment_base"],
         ),
         (
-            "gather_multirecord_withbins_rbase",
-            _gather.gather_multirecord_withbins_rbase,
+            "gather_segment_bins",
+            _gather.gather_segment_bins,
             dict(
-                source=lay.buf, indices=indices, output=output, bins=bins, record_base=record_base
+                indices=indices,
+                output=output,
+                bins=bins,
+                segment_starts_rows=lay.rsr,
+                segment_base=record_base,
             ),
-            ["source", "indices", "output", "bins", "record_base"],
+            ["indices", "output", "bins", "segment_starts_rows", "segment_base"],
+        ),
+        (
+            "gather_segment_withbins",
+            _gather.gather_segment_withbins,
+            dict(indices=indices, output=output, bins=bins, segment_base=record_base),
+            ["indices", "output", "bins", "segment_base"],
         ),
         (
             "gather_multirecord_strided",
@@ -771,5 +734,5 @@ def test_contiguity_guard_does_not_false_positive():
     indices = np.arange(8, dtype=np.int64)
     out = np.empty(8, dtype=np.float64)
     bins = np.empty(8, dtype=np.int32)
-    _gather.gather_multirecord_bins(lay.buf, indices, out, bins, lay.rsr, lay.rsb, lay.nrr, 0)
+    _gather.gather_segment_bins(indices, out, bins, *_segment_table(lay, 8))
     assert np.array_equal(out, lay.column[indices])

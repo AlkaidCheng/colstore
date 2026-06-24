@@ -133,28 +133,6 @@ void colstore_copy_multirecord_range(const std::uint8_t* base,
                                      std::int64_t col_prefix_bytes,
                                      std::int64_t itemsize);
 
-// Fused multi-record fancy gather. ``output[i] = column_value(indices[i])``
-// for an arbitrary (unsorted) integer index array. For each index the record
-// is located by a branchless binary search over ``record_starts_rows`` (the
-// R+1 cumulative row boundaries, tiny and cache-resident), the byte address is
-// computed in registers, and the element is loaded -- all in one pass,
-// OpenMP-parallel across indices.
-//
-// Dispatched on ``itemsize`` (1/2/4/8 bytes; any other value returns -1). Caller guarantees native byte order and that every index is in
-// ``[0, record_starts_rows[n_records])``. ``col_prefix_bytes`` is the summed
-// itemsize of the columns preceding this one in a record body.
-// Fused multi-record fancy gather, one per element size (1/2/4/8 bytes).
-// See colstore_gather_multirecord for the addressing contract.
-int colstore_gather_multirecord(const std::uint8_t* base,
-                                   const std::int64_t* indices,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   const std::int64_t* record_starts_rows,
-                                   const std::int64_t* record_starts_bytes,
-                                   const std::int64_t* n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-                               std::ptrdiff_t prefetch_distance);
-
 // Fused multi-FILE fancy gather: the fused multi-record gather one level up.
 // A dataset of several files is one global row space; each file contributes
 // one or more *segments* (a segment is one record of one file), whose global
@@ -172,34 +150,34 @@ int colstore_gather_multirecord(const std::uint8_t* base,
 // ``segment_base`` has ``n_segments``. Caller guarantees native byte order and
 // every index in ``[0, segment_starts_rows[n_segments])``. Dispatched on
 // itemsize (1/2/4/8 bytes; any other returns -1).
-int colstore_gather_multifile(const std::int64_t* indices,
+int colstore_gather_segment(const std::int64_t* indices,
                               std::uint8_t* output, std::ptrdiff_t n,
                               const std::int64_t* segment_starts_rows,
                               const std::int64_t* segment_base,
                               std::int64_t n_segments, int itemsize, int thread_cap,
                               std::ptrdiff_t prefetch_distance);
 
-// Bin-recording multi-file gather: like colstore_gather_multifile, and also
+// Bin-recording multi-file gather: like colstore_gather_segment, and also
 // writes ``bins[i]`` = the segment index found for ``indices[i]``. The segment
 // is column-independent, so a multi-column read computes it once here and the
-// other columns reuse it via colstore_gather_multifile_withbins, skipping the
+// other columns reuse it via colstore_gather_segment_withbins, skipping the
 // search -- the same amortization the single-file bins pair gives across
 // records. ``segment_base`` is THIS (first) column's per-segment absolute
 // bases; ``bins`` has length ``n`` and requires ``n_segments <= INT32_MAX``
 // (the caller guards). Other arguments and the dtype contract match
-// colstore_gather_multifile.
-int colstore_gather_multifile_bins(const std::int64_t* indices, std::uint8_t* output,
+// colstore_gather_segment.
+int colstore_gather_segment_bins(const std::int64_t* indices, std::uint8_t* output,
                                    std::int32_t* bins, std::ptrdiff_t n,
                                    const std::int64_t* segment_starts_rows,
                                    const std::int64_t* segment_base, std::int64_t n_segments,
                                    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Companion: gather one column reusing segment ids from
-// colstore_gather_multifile_bins for the same indices. The segment is a
+// colstore_gather_segment_bins for the same indices. The segment is a
 // sequential int32 read instead of a search (the prefetch look-ahead reads its
 // bin too), and the address is ``segment_base[bins[i]] + indices[i] * itemsize``
 // with THIS column's bases. No segment boundary array is needed.
-int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_withbins(const std::int64_t* indices, std::uint8_t* output,
                                        const std::int32_t* bins, std::ptrdiff_t n,
                                        const std::int64_t* segment_base, int itemsize,
                                        int thread_cap, std::ptrdiff_t prefetch_distance);
@@ -209,8 +187,8 @@ int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t
 // O(K + n_segments) comparisons with sequential within-segment access. A cursor
 // walk has no search to amortize, so multi-column sorted reads call this per
 // column rather than the bins pair. Arguments and dtype contract otherwise
-// match colstore_gather_multifile.
-int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* output,
+// match colstore_gather_segment.
+int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* output,
                                      std::ptrdiff_t n, const std::int64_t* segment_starts_rows,
                                      const std::int64_t* segment_base, std::int64_t n_segments,
                                      int itemsize, int thread_cap,
@@ -245,20 +223,6 @@ void colstore_interleave_records(std::uint8_t* output, std::int64_t record_items
                                  const std::int64_t* src_itemsizes,
                                  const std::int64_t* field_offsets,
                                  std::int64_t n_cols, int thread_cap);
-
-// Sorted multi-record fancy gather: a linear record walk instead of a
-// per-element binary search. Requires ``indices`` to be non-decreasing
-// (the caller checks; behavior is undefined otherwise). Each OpenMP thread
-// binary-searches the record of the first index in its chunk, then advances
-// the record cursor monotonically -- O(K + R) total work, no byte_offsets
-// array, no per-record host-language loop.
-// Sorted walk; see colstore_gather_multirecord_sorted.
-int colstore_gather_multirecord_sorted(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
 
 // Strided multi-record range gather: ``output[i] = column_value(start + i*step)``
 // for ``i`` in ``[0, n_out)``. The row stream is arithmetic, so no index array
@@ -321,47 +285,6 @@ int colstore_gather_multirecord_uniform_withbins(
     std::int64_t record_stride_bytes, std::int64_t first_body_offset,
     std::int64_t n_records, std::int64_t last_record_rows,
     std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
-
-// Variant of colstore_gather_multirecord that additionally records each index's
-// record bin (int32) so subsequent columns sharing the same index set can
-// skip the binary search entirely. The binning dominates the fused kernel's
-// cost and is identical across columns of one read -- computing it once and
-// reusing it is the multi-column win. ``bins`` must have length
-// ``n_indices``; requires ``n_records <= INT32_MAX`` (the caller guards).
-// Bin-reuse pair; see colstore_gather_multirecord_bins.
-int colstore_gather_multirecord_bins(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-    std::ptrdiff_t prefetch_distance);
-// Companion: gather one column using record bins computed by
-// colstore_gather_multirecord_bins for the same ``indices``. No search per
-// element -- the bin is a sequential int32 read -- and the prefetch
-// look-ahead also reads its bin instead of re-searching.
-int colstore_gather_multirecord_withbins(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
-
-// Record-base variant of colstore_gather_multirecord_withbins for irregular
-// files: the caller precomputes, per column,
-//   record_base[r] = record_starts_bytes[r]
-//                  + col_prefix_bytes * n_rows_per_record[r]
-//                  - record_starts_rows[r] * itemsize
-// (an O(R) vectorized pass), and the per-element address collapses to
-//   off = record_base[bins[i]] + indices[i] * itemsize
-// -- one metadata load instead of three, one multiply-add instead of two
-// multiplies and three adds. ``bins`` comes from
-// colstore_gather_multirecord_bins on the same indices; ``record_base`` has
-// one entry per record and must be built with this column's prefix and
-// itemsize.
-// Record-base withbins variant; see colstore_gather_multirecord_withbins_rbase.
-int colstore_gather_multirecord_withbins_rbase(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance);
 
 // Returns OpenMP's maximum thread count, or 1 if OpenMP is not compiled in.
 // Exposed for diagnostics.

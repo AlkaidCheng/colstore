@@ -258,9 +258,9 @@ cost.
 
 When several columns share the same unsorted index, mapping each row to its
 record is *identical* for every column. The multi-column route computes that
-mapping **once** on the first native column (`gather_multirecord_bins`, which
-writes an `int32` "bin" — the record id — per row alongside its gathered values),
-and every subsequent column consumes those bins (`gather_multirecord_withbins`),
+mapping **once** on the first native column (`gather_segment_bins`, which
+writes an `int32` "bin" — the segment id — per row alongside its gathered values),
+and every subsequent column consumes those bins (`gather_segment_withbins`),
 skipping the search entirely. For a C-column read this turns the dominant
 per-row search into a one-time cost.
 
@@ -359,18 +359,23 @@ the GCC/Clang deploy toolchain); platforms without it (e.g. MSVC) get a plain
 `n / divisor` fallback that is provably correct and pays only a `div` the gather
 can hide.
 
-### 6.2 Per-record base precompute (irregular multi-column trailing columns)
+### 6.2 Folded segment base (the general multi-column addressing)
 
-On irregular files, a trailing column's address still depends only on its
-*record*, via `record_base[r]` from §3 — three metadata loads and two multiplies
-per row. The route folds that into a single per-column `record_base[]` array,
-built in one O(R) vectorized pass, so the inner loop becomes `record_base[bins[i]]
-+ indices[i]*itemsize` — one load, one multiply-add. It is **gated on `n >=
-n_records`** (`_RBASE_MIN_INDICES_PER_RECORD = 1.0`) so the O(R) build only runs
-when there are enough rows to amortize it; below the gate the generic withbins
-kernel runs unchanged. (A per-reader cache of these arrays was rejected: the
-build is sub-millisecond against tens-to-hundreds-of-ms kernels, and the cache
-would cost `R×8` resident bytes per column for no measurable return.)
+Every fancy read addresses through a **segment table**: a column's rows are a
+sequence of *segments* (one record of one file), and `segment_base[s]` is the
+absolute byte address at which global row `i` of segment `s` lives, so that row
+reads at `segment_base[s] + i*itemsize`. The segment's global start row is folded
+*into* that base, so a global index plugs straight in with no separate shift.
+Building the table is one O(segments) vectorized pass per column, memoized by the
+reader (`_column_segment_table`).
+
+This makes the trailing columns of a multi-column read cheap: the first column
+records each row's segment id in `bins[]` (§5.5), and every subsequent column's
+inner loop is just `segment_base[bins[i]] + indices[i]*itemsize` — one metadata
+load, one multiply-add, no per-row search. The same folded base serves a
+single-file multi-record store (each record is one segment) and a multi-file
+dataset (every file's records stitched into one table), so one kernel family —
+`gather_segment*` — covers both instead of separate single- and multi-file paths.
 
 ### 6.3 Sampled-rejection sortedness check
 

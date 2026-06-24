@@ -327,100 +327,6 @@ inline std::int64_t bin_record(const std::int64_t* rsr, std::int64_t len,
   return basep - rsr;
 }
 
-// Fused multi-record fancy gather. See header for the addressing contract.
-//
-// One pass over ``indices``: per element, bin to a record with the branchless
-// search above, compute the byte address in registers, and load. The binning
-// is fused into the load and the loop is OpenMP-parallel across indices.
-//
-// The software prefetch recomputes the record bin for the look-ahead index;
-// the search is cheap relative to the DRAM latency it hides for the scattered
-// data load.
-template <typename T>
-struct MultiRecordPolicy {
-  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
-                                      const std::int64_t* COLSTORE_RESTRICT indices,
-                                      const std::int64_t* COLSTORE_RESTRICT rsr,
-                                      const std::int64_t* COLSTORE_RESTRICT rsb,
-                                      const std::int64_t* COLSTORE_RESTRICT nrr,
-                                      std::int64_t len, std::int64_t col_prefix_bytes) {
-    const std::int64_t idx = indices[i];
-    const std::int64_t r = bin_record(rsr, len, idx);
-    return rsb[r] + col_prefix_bytes * nrr[r] +
-           (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
-  }
-};
-
-// Bin-recording variant: identical addressing to MultiRecordPolicy,
-// plus ``bins[i] = r`` so subsequent columns of the same read reuse the
-// binning (the dominant cost of this kernel) instead of recomputing it per
-// column. prefetch_offset repeats the search WITHOUT the write -- the
-// look-ahead element can belong to another thread's chunk.
-template <typename T>
-struct MultiRecordBinsPolicy {
-  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
-                                      const std::int64_t* COLSTORE_RESTRICT indices,
-                                      std::int32_t* COLSTORE_RESTRICT bins,
-                                      const std::int64_t* COLSTORE_RESTRICT rsr,
-                                      const std::int64_t* COLSTORE_RESTRICT rsb,
-                                      const std::int64_t* COLSTORE_RESTRICT nrr,
-                                      std::int64_t len, std::int64_t col_prefix_bytes) {
-    const std::int64_t idx = indices[i];
-    const std::int64_t r = bin_record(rsr, len, idx);
-    bins[i] = static_cast<std::int32_t>(r);
-    return rsb[r] + col_prefix_bytes * nrr[r] +
-           (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
-  }
-  static inline std::ptrdiff_t prefetch_offset(std::ptrdiff_t i,
-                                               const std::int64_t* COLSTORE_RESTRICT indices,
-                                               std::int32_t* COLSTORE_RESTRICT bins,
-                                               const std::int64_t* COLSTORE_RESTRICT rsr,
-                                               const std::int64_t* COLSTORE_RESTRICT rsb,
-                                               const std::int64_t* COLSTORE_RESTRICT nrr,
-                                               std::int64_t len, std::int64_t col_prefix_bytes) {
-    (void)bins;
-    const std::int64_t idx = indices[i];
-    const std::int64_t r = bin_record(rsr, len, idx);
-    return rsb[r] + col_prefix_bytes * nrr[r] +
-           (idx - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
-  }
-};
-
-// Bins-provided companion: the per-element record bin is a sequential int32
-// read instead of a branchless search, and the prefetch look-ahead likewise
-// reads ``bins[i + d]`` -- no second search anywhere.
-template <typename T>
-struct WithBinsPolicy {
-  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
-                                      const std::int64_t* COLSTORE_RESTRICT indices,
-                                      const std::int32_t* COLSTORE_RESTRICT bins,
-                                      const std::int64_t* COLSTORE_RESTRICT rsr,
-                                      const std::int64_t* COLSTORE_RESTRICT rsb,
-                                      const std::int64_t* COLSTORE_RESTRICT nrr,
-                                      std::int64_t col_prefix_bytes) {
-    const std::int64_t r = bins[i];
-    return rsb[r] + col_prefix_bytes * nrr[r] +
-           (indices[i] - rsr[r]) * static_cast<std::int64_t>(sizeof(T));
-  }
-};
-
-// Record-base withbins variant: the per-element steady state is the
-// sequential int32 bin read, one record_base load, one multiply-add, and
-// the data load -- against the generic withbins kernel's three metadata
-// loads and two multiplies. The record_base array is built by the caller
-// per column (O(R), vectorized) and folds the column prefix and the
-// row-to-byte conversion into a single per-record scalar.
-template <typename T>
-struct RBasePolicy {
-  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
-                                      const std::int64_t* COLSTORE_RESTRICT indices,
-                                      const std::int32_t* COLSTORE_RESTRICT bins,
-                                      const std::int64_t* COLSTORE_RESTRICT record_base) {
-    return record_base[bins[i]] +
-           indices[i] * static_cast<std::int64_t>(sizeof(T));
-  }
-};
-
 // Compile-time itemsize -> element-type dispatch. The generic lambda is
 // instantiated once per supported size, so the typed kernels are implicitly
 // instantiated here (no explicit instantiation lists needed) and the only
@@ -492,7 +398,7 @@ inline int run_sized(int itemsize, F&& f) {
 // fused multi-record kernel; the search is cheap against the DRAM latency it
 // hides.
 template <typename T>
-inline void gather_multifile_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+inline void gather_segment_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::ptrdiff_t n_indices,
                                    const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
@@ -523,12 +429,12 @@ inline void gather_multifile_typed(const std::int64_t* COLSTORE_RESTRICT indices
   }
 }
 
-// Bin-recording multi-file gather: gather_multifile_typed plus bins[i] = s.
+// Bin-recording multi-file gather: gather_segment_typed plus bins[i] = s.
 // The prefetch search does NOT write bins (the look-ahead element may belong to
 // another thread's chunk -- a write there would race), matching the single-file
 // bins policy.
 template <typename T>
-inline void gather_multifile_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+inline void gather_segment_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                         std::uint8_t* COLSTORE_RESTRICT output,
                                         std::int32_t* COLSTORE_RESTRICT bins,
                                         std::ptrdiff_t n_indices,
@@ -565,7 +471,7 @@ inline void gather_multifile_bins_typed(const std::int64_t* COLSTORE_RESTRICT in
 // search; the prefetch look-ahead reads its bin too. ``segment_base`` is this
 // column's bases.
 template <typename T>
-inline void gather_multifile_withbins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+inline void gather_segment_withbins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                             std::uint8_t* COLSTORE_RESTRICT output,
                                             const std::int32_t* COLSTORE_RESTRICT bins,
                                             std::ptrdiff_t n_indices,
@@ -603,7 +509,7 @@ inline void gather_multifile_withbins_typed(const std::int64_t* COLSTORE_RESTRIC
 // when the look-ahead index still lies in the current segment, mirroring the
 // single-file sorted kernel.
 template <typename T>
-void gather_multifile_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
+void gather_segment_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::ptrdiff_t n_indices,
                                    const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
@@ -738,72 +644,6 @@ void copy_multirecord_range(const std::uint8_t* COLSTORE_RESTRICT base,
 // the *current* record (the common case for dense sorted reads, where rows
 // per record >> prefetch distance). It is a hint; skipping cross-record
 // look-aheads costs nothing but a few unprefetched boundary elements.
-template <typename T>
-void gather_multirecord_sorted_typed(const std::uint8_t* COLSTORE_RESTRICT base,
-                                     const std::int64_t* COLSTORE_RESTRICT indices,
-                                     std::uint8_t* COLSTORE_RESTRICT output,
-                                     std::ptrdiff_t n_indices,
-                                     const std::int64_t* COLSTORE_RESTRICT record_starts_rows,
-                                     const std::int64_t* COLSTORE_RESTRICT record_starts_bytes,
-                                     const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
-                                     std::int64_t n_records,
-                                     std::int64_t col_prefix_bytes,
-                                     int thread_cap,
-                                     std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  const std::int64_t len = n_records + 1;  // entries in record_starts_rows
-  T* dst = reinterpret_cast<T*>(output);
-  const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
-
-  const auto walk_range = [&](std::ptrdiff_t lo, std::ptrdiff_t hi) {
-    if (lo >= hi) {
-      return;
-    }
-    std::int64_t r = bin_record(record_starts_rows, len, indices[lo]);
-    // Per-record state, recomputed only at record boundaries: the inner
-    // loop's steady state is one compare, one multiply-add, one load.
-    std::int64_t next_boundary = record_starts_rows[r + 1];
-    std::int64_t record_base = record_starts_bytes[r] +
-                               col_prefix_bytes * n_rows_per_record[r] -
-                               record_starts_rows[r] * itemsize;
-    for (std::ptrdiff_t i = lo; i < hi; ++i) {
-      const std::int64_t idx = indices[i];
-      if (idx >= next_boundary) {
-        do {
-          ++r;
-        } while (idx >= record_starts_rows[r + 1]);
-        next_boundary = record_starts_rows[r + 1];
-        record_base = record_starts_bytes[r] +
-                      col_prefix_bytes * n_rows_per_record[r] -
-                      record_starts_rows[r] * itemsize;
-      }
-      if (prefetch_distance > 0 && i + prefetch_distance < hi) {
-        const std::int64_t j = indices[i + prefetch_distance];
-        if (j < next_boundary) {
-          COLSTORE_PREFETCH(base + record_base + j * itemsize);
-        }
-      }
-      dst[i] = load_unaligned<T>(base + record_base + idx * itemsize);
-    }
-  };
-
-#ifdef _OPENMP
-  if (n_threads > 1) {
-#pragma omp parallel num_threads(static_cast<int>(n_threads))
-    {
-      const std::ptrdiff_t worker_count = omp_get_num_threads();
-      const std::ptrdiff_t worker_id = omp_get_thread_num();
-      const std::ptrdiff_t chunk = (n_indices + worker_count - 1) / worker_count;
-      const std::ptrdiff_t lo = worker_id * chunk;
-      const std::ptrdiff_t hi = std::min(n_indices, lo + chunk);
-      walk_range(lo, hi);
-    }
-    return;
-  }
-#endif
-  walk_range(0, n_indices);
-}
-
 // Strided range gather: a linear record walk over the arithmetic row stream
 // ``start + i*step``. Structurally the sorted kernel with the index-array
 // loads deleted -- the row is synthesized in a register, so the per-element
@@ -1258,54 +1098,6 @@ void colstore_copy_multirecord_range(const std::uint8_t* base,
                                    col_prefix_bytes, itemsize);
 }
 
-int colstore_gather_multirecord(const std::uint8_t* base,
-                                   const std::int64_t* indices,
-                                   std::uint8_t* output, std::ptrdiff_t n,
-                                   const std::int64_t* record_starts_rows,
-                                   const std::int64_t* record_starts_bytes,
-                                   const std::int64_t* n_rows_per_record,
-                                   std::int64_t n_records,
-                                   std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-                               std::ptrdiff_t prefetch_distance) {
-  return colstore::gather_entry<colstore::MultiRecordPolicy>(
-      itemsize, base, output, n, thread_cap, prefetch_distance, indices, record_starts_rows,
-      record_starts_bytes, n_rows_per_record, n_records + 1, col_prefix_bytes);
-}
-
-int colstore_gather_multirecord_bins(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-    std::ptrdiff_t prefetch_distance) {
-  return colstore::gather_entry<colstore::MultiRecordBinsPolicy>(
-      itemsize, base, output, n, thread_cap, prefetch_distance, indices, bins,
-      record_starts_rows, record_starts_bytes, n_rows_per_record, n_records + 1,
-      col_prefix_bytes);
-}
-
-int colstore_gather_multirecord_withbins(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::gather_entry<colstore::WithBinsPolicy>(
-      itemsize, base, output, n, thread_cap, prefetch_distance, indices, bins,
-      record_starts_rows, record_starts_bytes, n_rows_per_record, col_prefix_bytes);
-}
-
-int colstore_gather_multirecord_sorted(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    std::ptrdiff_t n, const std::int64_t* record_starts_rows,
-    const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
-    std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
-    std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_sorted_typed<T>(base, indices, output, n, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
-  });
-}
-
 int colstore_gather_multirecord_strided(
     const std::uint8_t* base, std::uint8_t* output,
     std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
@@ -1354,15 +1146,7 @@ int colstore_gather_multirecord_uniform_withbins(
   });
 }
 
-int colstore_gather_multirecord_withbins_rbase(
-    const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
-    const std::int32_t* bins, std::ptrdiff_t n, const std::int64_t* record_base,
-    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::gather_entry<colstore::RBasePolicy>(
-      itemsize, base, output, n, thread_cap, prefetch_distance, indices, bins, record_base);
-}
-
-int colstore_gather_multifile(const std::int64_t* indices,
+int colstore_gather_segment(const std::int64_t* indices,
                               std::uint8_t* output, std::ptrdiff_t n,
                               const std::int64_t* segment_starts_rows,
                               const std::int64_t* segment_base,
@@ -1370,43 +1154,43 @@ int colstore_gather_multifile(const std::int64_t* indices,
                               std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_typed<T>(indices, output, n, segment_starts_rows, segment_base,
+    colstore::gather_segment_typed<T>(indices, output, n, segment_starts_rows, segment_base,
                                         n_segments, thread_cap, prefetch_distance);
   });
 }
 
-int colstore_gather_multifile_bins(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_bins(const std::int64_t* indices, std::uint8_t* output,
                                    std::int32_t* bins, std::ptrdiff_t n,
                                    const std::int64_t* segment_starts_rows,
                                    const std::int64_t* segment_base, std::int64_t n_segments,
                                    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_bins_typed<T>(indices, output, bins, n, segment_starts_rows,
+    colstore::gather_segment_bins_typed<T>(indices, output, bins, n, segment_starts_rows,
                                              segment_base, n_segments, thread_cap,
                                              prefetch_distance);
   });
 }
 
-int colstore_gather_multifile_withbins(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_withbins(const std::int64_t* indices, std::uint8_t* output,
                                        const std::int32_t* bins, std::ptrdiff_t n,
                                        const std::int64_t* segment_base, int itemsize,
                                        int thread_cap, std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_withbins_typed<T>(indices, output, bins, n, segment_base,
+    colstore::gather_segment_withbins_typed<T>(indices, output, bins, n, segment_base,
                                                  thread_cap, prefetch_distance);
   });
 }
 
-int colstore_gather_multifile_sorted(const std::int64_t* indices, std::uint8_t* output,
+int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* output,
                                      std::ptrdiff_t n, const std::int64_t* segment_starts_rows,
                                      const std::int64_t* segment_base, std::int64_t n_segments,
                                      int itemsize, int thread_cap,
                                      std::ptrdiff_t prefetch_distance) {
   return colstore::run_sized(itemsize, [&](auto tag) {
     using T = typename decltype(tag)::type;
-    colstore::gather_multifile_sorted_typed<T>(indices, output, n, segment_starts_rows,
+    colstore::gather_segment_sorted_typed<T>(indices, output, n, segment_starts_rows,
                                                segment_base, n_segments, thread_cap,
                                                prefetch_distance);
   });

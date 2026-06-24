@@ -3,8 +3,8 @@
 For a multi-column **unsorted fancy** read of a multi-record store, the
 per-index record binning (a branchless binary search, measured 87-93% of the
 fused gather kernel's cost on the target hardware) is identical for every
-column, so the reader computes it once (``gather_multirecord_bins``) and
-reuses it for the remaining columns (``gather_multirecord_withbins``). This
+column, so the reader computes it once (``gather_segment_bins``) and
+reuses it for the remaining columns (``gather_segment_withbins``). This
 script checks the route end-to-end through the public reader API and times
 it against the per-column path it replaces.
 

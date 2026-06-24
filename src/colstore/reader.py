@@ -66,14 +66,6 @@ def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
 _SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
 _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 
-# Record-base precompute gate for the irregular multi-column route: build a
-# per-column record_base array (an O(R) vectorized pass plus an R-element
-# allocation) only when the read is large enough to amortize it -- the
-# kernel-side saving is per element, so the ratio of indices to records is
-# the deciding quantity. Below the gate the generic withbins kernel runs
-# unchanged. The constant doubles as the benchmark's baseline seam.
-_RBASE_MIN_INDICES_PER_RECORD = 1.0
-
 
 def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     """Non-decreasing test with a cheap sampled rejection pass first.
@@ -765,7 +757,7 @@ class ColStoreReader(_ReaderBase):
           fall back to ``np.arange`` + the fancy path below.
 
         * **Sorted fancy index**: native linear-walk kernel
-          (``gather_multirecord_sorted``); the NumPy boundary-partition
+          (``gather_segment_sorted``); the NumPy boundary-partition
           pipeline survives only as the non-native (big-endian host)
           fallback.
 
@@ -887,14 +879,12 @@ class ColStoreReader(_ReaderBase):
         if n > 1 and _indices_are_sorted(indices):
             if _dtype_is_native(disk_dtype):
                 # Native byte order: linear-walk kernel (see gather.hpp).
-                _cpp_module.gather_multirecord_sorted(
-                    self._file_mmap,
+                start_rows, segment_base = self._column_segment_table(column_name)
+                _cpp_module.gather_segment_sorted(
                     indices,
                     output,
-                    record_starts_rows,
-                    record_starts_bytes,
-                    n_rows_per_record,
-                    int(col_prefix),
+                    start_rows,
+                    segment_base,
                     effective_cap,
                     config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=True),
                 )
@@ -954,14 +944,12 @@ class ColStoreReader(_ReaderBase):
                     config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
                 )
             else:
-                _cpp_module.gather_multirecord(
-                    self._file_mmap,
+                start_rows, segment_base = self._column_segment_table(column_name)
+                _cpp_module.gather_segment(
                     indices,
                     output,
-                    record_starts_rows,
-                    record_starts_bytes,
-                    n_rows_per_record,
-                    int(col_prefix),
+                    start_rows,
+                    segment_base,
                     effective_cap,
                     config.resolve_prefetch_distance(self._file_mmap.nbytes, indices_sorted=False),
                 )
@@ -1248,7 +1236,7 @@ class ColStoreReader(_ReaderBase):
         Taken when the store is multi-record, the selector is a fancy index
         array that is unsorted, and at least two requested columns are
         native-byte-order (the bins kernels do raw typed loads). The first
-        native column runs ``gather_multirecord_bins``; the rest reuse the
+        native column runs ``gather_segment_bins``; the rest reuse the
         bins via the withbins kernels. Columns run sequentially, each at the
         full thread cap, OpenMP-parallel over indices -- the shape that won
         on the deployment hardware over both the column-pool shape and a
@@ -1348,55 +1336,19 @@ class ColStoreReader(_ReaderBase):
                 for name in column_names
             }
         bins = np.empty(n, dtype=np.int32)
-        # Record-base precompute (irregular files): when the read is large
-        # enough to amortize the O(R) per-column record_base build (see the
-        # gate constant), columns after the first use the rbase kernel;
-        # below the gate the generic withbins kernel runs unchanged.
-        use_record_base = n >= n_records * _RBASE_MIN_INDICES_PER_RECORD
-        rsr_records = self._record_starts_rows[:-1]
+        # First column records the segment found for each index; the rest replay
+        # those bins. The per-column segment base is memoized and already folds in
+        # the record byte base, so there is no per-read record_base build.
         for position, name in enumerate(native_names):
             output = np.empty(n, dtype=self._column_dtypes[name].newbyteorder("="))
+            start_rows, segment_base = self._column_segment_table(name)
             if position == 0:
-                _cpp_module.gather_multirecord_bins(
-                    self._file_mmap,
-                    indices,
-                    output,
-                    bins,
-                    self._record_starts_rows,
-                    self._record_starts_bytes,
-                    self._n_rows_per_record,
-                    int(self._column_prefix_bytes[name]),
-                    effective_cap,
-                    prefetch,
-                )
-            elif use_record_base:
-                itemsize = output.dtype.itemsize
-                record_base = (
-                    self._record_starts_bytes
-                    + int(self._column_prefix_bytes[name]) * self._n_rows_per_record
-                    - rsr_records * itemsize
-                )
-                _cpp_module.gather_multirecord_withbins_rbase(
-                    self._file_mmap,
-                    indices,
-                    output,
-                    bins,
-                    record_base,
-                    effective_cap,
-                    prefetch,
+                _cpp_module.gather_segment_bins(
+                    indices, output, bins, start_rows, segment_base, effective_cap, prefetch
                 )
             else:
-                _cpp_module.gather_multirecord_withbins(
-                    self._file_mmap,
-                    indices,
-                    output,
-                    bins,
-                    self._record_starts_rows,
-                    self._record_starts_bytes,
-                    self._n_rows_per_record,
-                    int(self._column_prefix_bytes[name]),
-                    effective_cap,
-                    prefetch,
+                _cpp_module.gather_segment_withbins(
+                    indices, output, bins, segment_base, effective_cap, prefetch
                 )
             gathered[name] = output
         return {
