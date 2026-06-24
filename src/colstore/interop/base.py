@@ -317,6 +317,43 @@ class InteropMixin:
         """
         return self.to("arrow")
 
+    def __array__(
+        self, dtype: np.dtype[Any] | None = None, copy: bool | None = None
+    ) -> NDArray[Any]:
+        """NumPy array interface: ``np.asarray(ds)`` / ``np.array(ds["x"])`` materialize here.
+
+        A single-column selection yields a 1-D array of that column; several
+        columns -- or a whole reader or dataset -- yield a structured record array
+        with one field per column (``result[name]`` is the column). ``dtype`` casts
+        the result. The default returns an owning array; ``copy=False`` returns a
+        read-only zero-copy view of a single native column and raises rather than
+        copy when no view is possible (a record array, a column needing a gather, or
+        a dtype cast).
+        """
+        store, columns, row_indexer, single = self._interop_target()
+        if single:
+            result = (
+                store._view_one(columns[0], row_indexer)
+                if copy is False
+                else store._gather_one(columns[0], row_indexer)
+            )
+        elif copy is False:
+            raise ValueError(
+                "a colstore record array repacks its columns and cannot be created "
+                "without copying; use np.asarray(...) or copy=True."
+            )
+        else:
+            result = store._build_recarray(row_indexer, columns)
+        if dtype is None or result.dtype == dtype:
+            return result
+        # A dtype change forces a copy, which copy=False forbids (numpy's no-copy
+        # contract raises here rather than silently allocating).
+        if copy is False:
+            raise ValueError(
+                "casting to a different dtype requires a copy; use np.asarray(...) or copy=True."
+            )
+        return result.astype(dtype)
+
     def __arrow_c_stream__(self, requested_schema: Any = None) -> Any:
         """Arrow C stream interface: any Arrow consumer can ingest this selection.
 
