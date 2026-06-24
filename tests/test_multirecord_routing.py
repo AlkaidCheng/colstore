@@ -3,7 +3,7 @@
 Each section pins one routing contract end to end: which kernel a selector
 class reaches (spied call sequences are pinned contracts), that the route
 and the fallback it replaces produce identical results across each seam
-(forced detection-off, forced non-native, rbase gate, mask-density gate),
+(forced detection-off, forced non-native, mask-density gate),
 and that the contract survives the edge cases that historically broke it
 (non-contiguous selectors, misaligned columns, single-record stores).
 Direct kernel contracts live in ``test_multirecord_kernels.py``.
@@ -113,13 +113,13 @@ def test_routing_unchanged_for_sorted_and_unsorted(sortedness_store, monkeypatch
     unsorted_idx = rng.integers(0, total, size).astype(np.int64)
     sorted_idx = np.sort(unsorted_idx)
 
-    routes = kernel_spy(monkeypatch, ["gather_multirecord_sorted", "gather_multirecord"])
+    routes = kernel_spy(monkeypatch, ["gather_segment_sorted", "gather_segment"])
     with opened(path) as dataset:
         assert np.array_equal(dataset[sorted_idx, "f8"].array(), full["f8"][sorted_idx])
-        assert routes == ["gather_multirecord_sorted"]
+        assert routes == ["gather_segment_sorted"]
         routes.clear()
         assert np.array_equal(dataset[unsorted_idx, "f8"].array(), full["f8"][unsorted_idx])
-        assert routes == ["gather_multirecord"]
+        assert routes == ["gather_segment"]
 
 
 @pytest.mark.parametrize("size", [1_000, THRESHOLD * 2])
@@ -129,7 +129,7 @@ def test_bin_reuse_gate_unchanged(sortedness_store, monkeypatch, size):
     unsorted_idx = rng.integers(0, total, size).astype(np.int64)
     sorted_idx = np.sort(unsorted_idx)
 
-    bins_calls = kernel_spy(monkeypatch, ["gather_multirecord_bins"])
+    bins_calls = kernel_spy(monkeypatch, ["gather_segment_bins"])
     with opened(path) as dataset:
         result = dataset[unsorted_idx, ["f8", "i4"]].dict()
         assert len(bins_calls) == 1  # unsorted multi-column: bin-reuse route
@@ -144,10 +144,10 @@ def test_single_element_selector_keeps_fused_route(sortedness_store, monkeypatch
     # n == 1 historically routes to the fused (unsorted) kernel via the
     # ``n > 1 and`` guard; the sortedness helper must not move it.
     path, full, _ = sortedness_store
-    routes = kernel_spy(monkeypatch, ["gather_multirecord_sorted", "gather_multirecord"])
+    routes = kernel_spy(monkeypatch, ["gather_segment_sorted", "gather_segment"])
     with opened(path) as dataset:
         assert dataset[np.array([42], dtype=np.int64), "f8"].array()[0] == full["f8"][42]
-        assert routes == ["gather_multirecord"]
+        assert routes == ["gather_segment"]
 
 
 # ---- Sorted-read routing ----------------------------------------------------
@@ -172,7 +172,7 @@ def sorted_mixed_store(tmp_path):
 
 def test_sorted_reads_route_through_walk_kernel(sorted_mixed_store, monkeypatch):
     path, full, total = sorted_mixed_store
-    calls = kernel_spy(monkeypatch, ["gather_multirecord_sorted"])
+    calls = kernel_spy(monkeypatch, ["gather_segment_sorted"])
     dataset = colstore.open(path)
     indices = np.sort(np.random.default_rng(9).integers(0, total, size=20_000).astype(np.int64))
     for name in full:
@@ -183,7 +183,7 @@ def test_sorted_reads_route_through_walk_kernel(sorted_mixed_store, monkeypatch)
 
 def test_unsorted_reads_do_not_route(sorted_mixed_store, monkeypatch):
     path, full, total = sorted_mixed_store
-    calls = kernel_spy(monkeypatch, ["gather_multirecord_sorted"])
+    calls = kernel_spy(monkeypatch, ["gather_segment_sorted"])
     dataset = colstore.open(path)
     indices = np.random.default_rng(10).integers(0, total, size=5_000).astype(np.int64)
     assert np.array_equal(dataset[indices, "f8"].array(), full["f8"][indices])
@@ -316,7 +316,7 @@ def test_detection_rejects_irregular_layouts(tmp_path, shape):
 
 def test_uniform_store_routes_single_column_to_uniform_kernel(tmp_path, monkeypatch):
     path, full, total = write_standard_store(tmp_path, [500] * 8, seed=11)
-    calls = kernel_spy(monkeypatch, ["gather_multirecord_uniform", "gather_multirecord"])
+    calls = kernel_spy(monkeypatch, ["gather_multirecord_uniform", "gather_segment"])
     indices = np.random.default_rng(12).integers(0, total, 700).astype(np.int64)
     with opened(path) as dataset:
         for name, values in full.items():
@@ -331,8 +331,8 @@ def test_uniform_store_multi_column_uses_uniform_bins_pair(tmp_path, monkeypatch
         [
             "gather_multirecord_uniform_bins",
             "gather_multirecord_uniform_withbins",
-            "gather_multirecord_bins",
-            "gather_multirecord_withbins",
+            "gather_segment_bins",
+            "gather_segment_withbins",
         ],
     )
     indices = np.random.default_rng(13).integers(0, total, 900).astype(np.int64)
@@ -349,11 +349,11 @@ def test_uniform_store_multi_column_uses_uniform_bins_pair(tmp_path, monkeypatch
 
 def test_uniform_store_sorted_path_unaffected(tmp_path, monkeypatch):
     path, full, total = write_standard_store(tmp_path, [500] * 8, seed=11)
-    calls = kernel_spy(monkeypatch, ["gather_multirecord_uniform", "gather_multirecord_sorted"])
+    calls = kernel_spy(monkeypatch, ["gather_multirecord_uniform", "gather_segment_sorted"])
     indices = np.sort(np.random.default_rng(15).integers(0, total, 700).astype(np.int64))
     with opened(path) as dataset:
         assert np.array_equal(dataset[indices, "f8"].array(), full["f8"][indices])
-        assert calls == ["gather_multirecord_sorted"]
+        assert calls == ["gather_segment_sorted"]
 
 
 def test_forced_generic_route_matches_uniform_route(tmp_path, monkeypatch):
@@ -373,15 +373,14 @@ def test_forced_generic_route_matches_uniform_route(tmp_path, monkeypatch):
         assert np.array_equal(via_uniform[name], via_generic[name]), name
 
 
-# ---- Irregular multi-column routing: bin reuse and record-base --------------
+# ---- Irregular multi-column routing: bin reuse ------------------------------
 # Unsorted multi-column fancy reads on irregular stores engage the bins
-# route (first column binned, the rest served from the bins); above the
-# rbase size gate the trailing columns take the record-base variant.
+# route: the first column is binned and the rest are served from the bins
+# (trailing columns reuse the segment ids, no per-element search).
 
 BINS_KERNELS = [
-    "gather_multirecord_bins",
-    "gather_multirecord_withbins",
-    "gather_multirecord_withbins_rbase",
+    "gather_segment_bins",
+    "gather_segment_withbins",
     "gather_multirecord_uniform_bins",
 ]
 
@@ -458,13 +457,13 @@ def test_parallel_regime_route_taken_without_concurrent_alternative(
     path, full, total = parallel_regime_store
     n = _KERNEL_PARALLEL_THRESHOLD * 2
     indices = np.random.default_rng(5).integers(0, total, size=n).astype(np.int64)
-    bins_calls = kernel_spy(monkeypatch, ["gather_multirecord_bins"])
+    bins_calls = kernel_spy(monkeypatch, ["gather_segment_bins"])
     original = config_mod.get_max_workers()
     try:
         config_mod.set_max_workers(1)
         with opened(path) as dataset:
             result = dataset[indices, ["f8", "i4"]].dict()
-        assert bins_calls == ["gather_multirecord_bins"]  # route taken
+        assert bins_calls == ["gather_segment_bins"]  # route taken
         assert np.array_equal(result["f8"], full["f8"][indices])
         assert np.array_equal(result["i4"], full["i4"][indices])
     finally:
@@ -490,7 +489,7 @@ def test_parallel_regime_route_declines_when_pool_fields_more_threads(
         if not (sequential > 1 and concurrent > sequential):
             pytest.skip("OpenMP width too low to realize a bin-reuse decline")
         indices = np.random.default_rng(6).integers(0, total, size=n).astype(np.int64)
-        bins_calls = kernel_spy(monkeypatch, ["gather_multirecord_bins"])
+        bins_calls = kernel_spy(monkeypatch, ["gather_segment_bins"])
         with opened(path) as dataset:
             result = dataset[indices, ["f8", "i4"]].dict()
         assert bins_calls == []  # route declined: fell through to column pool
@@ -503,9 +502,7 @@ def test_parallel_regime_route_declines_when_pool_fields_more_threads(
 
 def test_multicolumn_read_routes_and_matches_per_column(bin_reuse_store, monkeypatch):
     path, full = bin_reuse_store
-    calls = kernel_spy(
-        monkeypatch, ["gather_multirecord_withbins", "gather_multirecord_withbins_rbase"]
-    )
+    calls = kernel_spy(monkeypatch, ["gather_segment_withbins"])
     dataset = colstore.open(path)
     indices = np.random.default_rng(9).integers(0, 40_000, size=15_000).astype(np.int64)
 
@@ -532,9 +529,7 @@ def test_duplicates_and_reversed_indices(bin_reuse_store):
 
 def test_route_not_taken_for_sorted_single_column_or_slice(bin_reuse_store, monkeypatch):
     path, full = bin_reuse_store
-    calls = kernel_spy(
-        monkeypatch, ["gather_multirecord_withbins", "gather_multirecord_withbins_rbase"]
-    )
+    calls = kernel_spy(monkeypatch, ["gather_segment_withbins"])
     dataset = colstore.open(path)
     indices = np.random.default_rng(2).integers(0, 40_000, size=5_000).astype(np.int64)
 
@@ -548,30 +543,30 @@ def test_route_not_taken_for_sorted_single_column_or_slice(bin_reuse_store, monk
     dataset.close()
 
 
-def test_large_read_routes_trailing_columns_to_rbase(rbase_irregular_store, monkeypatch):
+def test_large_read_routes_trailing_columns_to_withbins(rbase_irregular_store, monkeypatch):
     path, full, total = rbase_irregular_store
     calls = kernel_spy(monkeypatch, BINS_KERNELS)
-    # n >= n_records * gate: 10 records, 5000 indices -> rbase engaged.
+    # 10 records, 5000 indices: first column binned, trailing columns reuse it.
     indices = np.random.default_rng(32).integers(0, total, 5_000).astype(np.int64)
     with opened(path) as dataset:
         result = dataset[indices, ["f8", "f4", "i2"]].dict()
         assert calls == [
-            "gather_multirecord_bins",
-            "gather_multirecord_withbins_rbase",
-            "gather_multirecord_withbins_rbase",
+            "gather_segment_bins",
+            "gather_segment_withbins",
+            "gather_segment_withbins",
         ]
         for name in ("f8", "f4", "i2"):
             assert np.array_equal(result[name], full[name][indices]), name
 
 
-def test_small_read_keeps_generic_withbins(tmp_path, monkeypatch):
-    # 2000 records, 30 indices: below the gate, generic withbins retained.
+def test_small_read_routes_trailing_columns_to_withbins(tmp_path, monkeypatch):
+    # 2000 records, 30 indices: the bins/withbins route is size-independent.
     path, full, total = write_standard_store(tmp_path, [17, 23] * 1000, seed=33, name="rbase")
     calls = kernel_spy(monkeypatch, BINS_KERNELS)
     indices = np.random.default_rng(34).integers(0, total, 30).astype(np.int64)
     with opened(path) as dataset:
         result = dataset[indices, ["f8", "i2"]].dict()
-        assert calls == ["gather_multirecord_bins", "gather_multirecord_withbins"]
+        assert calls == ["gather_segment_bins", "gather_segment_withbins"]
         assert np.array_equal(result["f8"], full["f8"][indices])
 
 
@@ -585,19 +580,6 @@ def test_uniform_store_keeps_uniform_pair(tmp_path, monkeypatch):
         assert np.array_equal(result["f8"], full["f8"][indices])
 
 
-def test_rbase_route_matches_forced_generic_route(rbase_irregular_store, monkeypatch):
-    path, full, total = rbase_irregular_store
-    indices = np.random.default_rng(37).integers(0, total, 8_000).astype(np.int64)
-    with opened(path) as dataset:
-        via_rbase = dataset[indices, ["f8", "f4", "i2"]].dict()
-    monkeypatch.setattr(reader_mod, "_RBASE_MIN_INDICES_PER_RECORD", float("inf"))
-    with opened(path) as dataset:
-        via_generic = dataset[indices, ["f8", "f4", "i2"]].dict()
-    for name in ("f8", "f4", "i2"):
-        assert np.array_equal(via_rbase[name], via_generic[name]), name
-        assert np.array_equal(via_rbase[name], full[name][indices]), name
-
-
 # ---- Boolean-mask routing ---------------------------------------------------
 # Multi-record reads with native dtypes and mask density at or above the
 # gate take the mask kernel; sparse masks, single-record stores, and
@@ -608,7 +590,7 @@ def test_rbase_route_matches_forced_generic_route(rbase_irregular_store, monkeyp
 # or any calibration cache on the dev machine.
 GATE = 0.15
 
-MASK_SPIED = ["gather_segment_mask", "gather_multirecord_sorted", "gather_multirecord_bins"]
+MASK_SPIED = ["gather_segment_mask", "gather_segment_sorted", "gather_segment_bins"]
 
 
 @pytest.fixture()
@@ -641,7 +623,7 @@ def test_sparse_mask_lowers_to_indices(mask_irregular_store, monkeypatch):
     assert mask.mean() < GATE
     with opened(path) as dataset:
         assert np.array_equal(dataset[mask, "f8"].array(), full["f8"][mask])
-        assert calls == ["gather_multirecord_sorted"]  # flatnonzero is sorted
+        assert calls == ["gather_segment_sorted"]  # flatnonzero is sorted
 
 
 def test_gate_seam_parity(mask_irregular_store, monkeypatch):
@@ -918,10 +900,10 @@ def test_single_record_store_never_routes_to_multirecord_kernels(tmp_path, monke
     calls = kernel_spy(
         monkeypatch,
         [
-            "gather_multirecord_sorted",
-            "gather_multirecord_bins",
-            "gather_multirecord_withbins",
-            "gather_multirecord_withbins_rbase",
+            "gather_segment_sorted",
+            "gather_segment_bins",
+            "gather_segment_withbins",
+            "gather_segment_withbins",
             "gather_multirecord_uniform",
             "gather_multirecord_uniform_bins",
             "gather_multirecord_uniform_withbins",

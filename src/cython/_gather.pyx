@@ -53,9 +53,6 @@ cdef extern from "colstore/gather.hpp" nogil:
                                          const int64_t*, const int64_t*,
                                          const int64_t*, int64_t,
                                          int64_t, int64_t)
-    int colstore_gather_multirecord(const uint8_t*, const int64_t*, uint8_t*,
-                                       ptrdiff_t, const int64_t*, const int64_t*,
-                                       const int64_t*, int64_t, int64_t, int, int, ptrdiff_t)
     int colstore_gather_segment(const int64_t*, uint8_t*, ptrdiff_t,
                                   const int64_t*, const int64_t*, int64_t,
                                   int, int, ptrdiff_t)
@@ -74,17 +71,6 @@ cdef extern from "colstore/gather.hpp" nogil:
                                      const int64_t*, int64_t, int)
     void colstore_interleave_records(uint8_t*, int64_t, int64_t, const int64_t*,
                                      const int64_t*, const int64_t*, int64_t, int)
-    int colstore_gather_multirecord_bins(
-        const uint8_t*, const int64_t*, uint8_t*, int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, int, ptrdiff_t)
-    int colstore_gather_multirecord_withbins(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int, int, ptrdiff_t)
-    int colstore_gather_multirecord_sorted(
-        const uint8_t*, const int64_t*, uint8_t*, ptrdiff_t,
-        const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
-        int, int, ptrdiff_t)
     int colstore_gather_multirecord_strided(
         const uint8_t*, uint8_t*, int64_t, int64_t, ptrdiff_t,
         const int64_t*, const int64_t*, const int64_t*, int64_t, int64_t,
@@ -101,9 +87,6 @@ cdef extern from "colstore/gather.hpp" nogil:
         const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
         int, int, ptrdiff_t)
-    int colstore_gather_multirecord_withbins_rbase(
-        const uint8_t*, const int64_t*, uint8_t*, const int32_t*, ptrdiff_t,
-        const int64_t*, int, int, ptrdiff_t)
     int colstore_max_threads()
     int colstore_bind_threads_to_cpus(const int*, int)
 
@@ -346,167 +329,6 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
 
 
 
-def gather_multirecord_bins(cnp.ndarray source, cnp.ndarray indices,
-                            cnp.ndarray output, cnp.ndarray bins,
-                            cnp.ndarray record_starts_rows,
-                            cnp.ndarray record_starts_bytes,
-                            cnp.ndarray n_rows_per_record,
-                            long long col_prefix_bytes, int thread_cap=0,
-                            Py_ssize_t prefetch_distance=-1):
-    """Fused multi-record gather that also records each index's record bin.
-
-    Identical addressing and output to :func:`gather_multirecord`, plus
-    ``bins[i]`` is filled with the record index (``int32``) that
-    ``indices[i]`` binned to. The binning dominates the fused kernel's cost
-    and is identical for every column of a multi-column read, so a caller
-    reading C columns computes it once here and reuses it C-1 times via
-    :func:`gather_multirecord_withbins`.
-
-    ``bins`` must be 1D ``int32`` of the same length as ``indices``; the
-    caller guarantees ``n_records <= 2**31 - 1``. All other parameters and
-    errors match :func:`gather_multirecord`.
-    """
-    _require_1d((indices, output, bins, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, bins, and index arrays must be 1D.")
-    _require_int64(indices, "indices")
-    _require_int32(bins, "bins")
-    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
-
-    cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n or bins.shape[0] != n:
-        raise ValueError(
-            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
-            f"match indices length {n}."
-        )
-    cdef long long n_records = record_starts_bytes.shape[0]
-    if n_rows_per_record.shape[0] != n_records:
-        raise ValueError("n_rows_per_record length must match record count.")
-    if record_starts_rows.shape[0] != n_records + 1:
-        raise ValueError("record_starts_rows length must be n_records + 1.")
-    if n == 0:
-        return
-
-    cdef int itemsize = output.dtype.itemsize
-    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
-    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
-    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
-    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
-    cdef int32_t* bins_ptr = <int32_t*>cnp.PyArray_DATA(bins)
-    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
-    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
-    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
-
-    cdef ptrdiff_t pd = (
-        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
-    )
-    cdef int status
-    with nogil:
-        status = colstore_gather_multirecord_bins(base, indices_ptr, output_ptr, bins_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
-    if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
-
-
-def gather_multirecord_withbins(cnp.ndarray source, cnp.ndarray indices,
-                                cnp.ndarray output, cnp.ndarray bins,
-                                cnp.ndarray record_starts_rows,
-                                cnp.ndarray record_starts_bytes,
-                                cnp.ndarray n_rows_per_record,
-                                long long col_prefix_bytes, int thread_cap=0,
-                                Py_ssize_t prefetch_distance=-1):
-    """Multi-record gather using record bins from :func:`gather_multirecord_bins`.
-
-    ``bins`` must be the array filled by :func:`gather_multirecord_bins` for
-    the *same* ``indices`` against the same record layout. Output is
-    identical to :func:`gather_multirecord` for the column selected by
-    ``col_prefix_bytes``. Other parameters and errors match
-    :func:`gather_multirecord`.
-    """
-    _require_1d((indices, output, bins, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, bins, and index arrays must be 1D.")
-    _require_int64(indices, "indices")
-    _require_int32(bins, "bins")
-    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
-
-    cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n or bins.shape[0] != n:
-        raise ValueError(
-            f"output/bins lengths ({output.shape[0]}/{bins.shape[0]}) must "
-            f"match indices length {n}."
-        )
-    cdef long long n_records = record_starts_bytes.shape[0]
-    if n_rows_per_record.shape[0] != n_records:
-        raise ValueError("n_rows_per_record length must match record count.")
-    if record_starts_rows.shape[0] != n_records + 1:
-        raise ValueError("record_starts_rows length must be n_records + 1.")
-    if n == 0:
-        return
-
-    cdef int itemsize = output.dtype.itemsize
-    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
-    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
-    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
-    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
-    cdef const int32_t* bins_ptr = <const int32_t*>cnp.PyArray_DATA(bins)
-    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
-    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
-    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
-
-    cdef ptrdiff_t pd = (
-        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
-    )
-    cdef int status
-    with nogil:
-        status = colstore_gather_multirecord_withbins(base, indices_ptr, output_ptr, bins_ptr, n, rsr, rsb, nrr, col_prefix_bytes, itemsize, thread_cap, pd)
-    if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
-
-
-
-def gather_multirecord_sorted(cnp.ndarray source, cnp.ndarray indices,
-                              cnp.ndarray output,
-                              cnp.ndarray record_starts_rows,
-                              cnp.ndarray record_starts_bytes,
-                              cnp.ndarray n_rows_per_record,
-                              long long col_prefix_bytes, int thread_cap=0,
-                              Py_ssize_t prefetch_distance=-1):
-    """Sorted multi-record fancy gather via a linear record walk.
-
-    ``indices`` MUST be non-decreasing; the caller is responsible for the
-    check (the reader's sortedness test gates the route) and behavior is
-    undefined otherwise. Parameters and errors match
-    :func:`gather_multirecord`; see ``gather.hpp`` for the walk design.
-    """
-    _require_1d((indices, output, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, and index arrays must be 1D.")
-    _require_int64(indices, "indices")
-    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
-
-    cdef ptrdiff_t n = indices.shape[0]
-    _require_output_len(output, n, "indices")
-    cdef long long n_records = record_starts_bytes.shape[0]
-    if n_rows_per_record.shape[0] != n_records:
-        raise ValueError("n_rows_per_record length must match record count.")
-    if record_starts_rows.shape[0] != n_records + 1:
-        raise ValueError("record_starts_rows length must be n_records + 1.")
-    if n == 0:
-        return
-
-    cdef int itemsize = output.dtype.itemsize
-    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
-    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
-    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
-    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
-    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
-    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
-    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
-
-    cdef ptrdiff_t pd = (
-        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
-    )
-    cdef int status
-    with nogil:
-        status = colstore_gather_multirecord_sorted(base, indices_ptr, output_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
-    if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
-
-
 def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
                                long long start, long long stop, long long step,
                                cnp.ndarray record_starts_rows,
@@ -522,7 +344,9 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
     elements. The caller guarantees every visited row is in range (the
     reader derives the triple from ``slice.indices``, which clamps) and
     that the dtype is in native byte order (raw typed loads cannot
-    byteswap). Other parameters and errors match :func:`gather_multirecord`.
+    byteswap). ``record_starts_rows`` has ``n_records + 1`` entries and the
+    other two index arrays have ``n_records``; an unsupported ``itemsize``
+    raises :class:`TypeError`.
     """
     _require_1d((output, record_starts_rows, record_starts_bytes, n_rows_per_record), "output and index arrays must be 1D.")
     if step == 0:
@@ -568,10 +392,10 @@ def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
                                Py_ssize_t prefetch_distance=-1):
     """Unsorted fancy gather over a uniform-record file: arithmetic binning.
 
-    Specialization of :func:`gather_multirecord` for files whose records all
-    have ``rows_per_record`` rows (the final record may be partial, with
-    ``last_record_rows`` rows) and whose record bodies sit at a constant
-    byte stride. The caller detects the layout and guarantees its
+    Specialization of the general fancy gather (:func:`gather_segment`) for
+    files whose records all have ``rows_per_record`` rows (the final record
+    may be partial, with ``last_record_rows`` rows) and whose record bodies
+    sit at a constant byte stride. The caller detects the layout and guarantees its
     invariants (see ``gather.hpp``) plus native byte order; this entry
     validates only the scalar sanity conditions and the array contracts
     shared by every kernel.
@@ -705,52 +529,6 @@ def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
         raise TypeError(f"unsupported itemsize {itemsize}.")
 
 
-def gather_multirecord_withbins_rbase(cnp.ndarray source, cnp.ndarray indices,
-                                      cnp.ndarray output, cnp.ndarray bins,
-                                      cnp.ndarray record_base, int thread_cap=0,
-                                      Py_ssize_t prefetch_distance=-1):
-    """Bins-fed gather with per-record byte bases precomputed by the caller.
-
-    ``record_base[r] = record_starts_bytes[r] + col_prefix * n_rows_per_record[r]
-    - record_starts_rows[r] * itemsize`` for THIS column's prefix and
-    itemsize, one entry per record; the per-element address is then
-    ``record_base[bins[i]] + indices[i] * itemsize``. ``bins`` must come
-    from :func:`gather_multirecord_bins` (or the uniform bins kernel) on
-    the same ``indices``; record membership and base correctness are the
-    caller's contract and are not re-validated. Other parameters and
-    errors match :func:`gather_multirecord_withbins`.
-    """
-    _require_1d((indices, output, bins, record_base), "indices, output, bins, and record_base must be 1D.")
-    _require_int64(indices, "indices")
-    _require_int32(bins, "bins")
-    _require_int64(record_base, "record_base")
-
-    cdef ptrdiff_t n = indices.shape[0]
-    if output.shape[0] != n or bins.shape[0] != n:
-        raise ValueError("output and bins lengths must match indices length.")
-    if record_base.shape[0] <= 0:
-        raise ValueError("record_base must be non-empty.")
-    if n == 0:
-        return
-
-    cdef int itemsize = output.dtype.itemsize
-    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("bins", bins), ("record_base", record_base)))
-    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
-    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
-    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
-    cdef const int32_t* bins_ptr = <const int32_t*>cnp.PyArray_DATA(bins)
-    cdef const int64_t* rbase = <const int64_t*>cnp.PyArray_DATA(record_base)
-
-    cdef ptrdiff_t pd = (
-        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
-    )
-    cdef int status
-    with nogil:
-        status = colstore_gather_multirecord_withbins_rbase(base, indices_ptr, output_ptr, bins_ptr, n, rbase, itemsize, thread_cap, pd)
-    if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
-
-
 def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
                            long long start, long long stop,
                            cnp.ndarray record_starts_rows,
@@ -815,86 +593,6 @@ def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
                                         rsr, rsb, nrr, n_records,
                                         col_prefix_bytes, itemsize)
 
-
-def gather_multirecord(cnp.ndarray source, cnp.ndarray indices,
-                       cnp.ndarray output,
-                       cnp.ndarray record_starts_rows,
-                       cnp.ndarray record_starts_bytes,
-                       cnp.ndarray n_rows_per_record,
-                       long long col_prefix_bytes, int thread_cap=0,
-                       Py_ssize_t prefetch_distance=-1):
-    """Fused multi-record fancy gather: ``output[i] = column_value(indices[i])``.
-
-    Unsorted-selector kernel: each index is binned to its record inside the
-    kernel (see ``gather.hpp`` for the design). The metadata parameters
-    below define the record layout contract shared by every irregular
-    multi-record kernel in this module.
-
-    Parameters
-    ----------
-    source : numpy.ndarray
-        Whole-file ``uint8`` mmap; the raw byte base pointer.
-    indices : numpy.ndarray
-        1D ``int64`` element indices into the logical (global) row space. Each
-        must lie in ``[0, total_rows)``; the caller (view layer) guarantees
-        this. Need not be sorted.
-    output : numpy.ndarray
-        1D destination of length ``len(indices)`` and the column's dtype, in
-        *native* byte order (the kernel does a raw typed load and cannot
-        byteswap). Filled in-place.
-    record_starts_rows : numpy.ndarray
-        1D ``int64`` cumulative row counts, length ``n_records + 1``.
-    record_starts_bytes : numpy.ndarray
-        1D ``int64`` per-record body byte offsets, length ``n_records``.
-    n_rows_per_record : numpy.ndarray
-        1D ``int64`` per-record row counts, length ``n_records``.
-    col_prefix_bytes : int
-        Summed itemsize of the columns preceding this one in a record body.
-    thread_cap, prefetch_distance : int, optional
-        Shared kernel parameters; see the module docstring.
-
-    Raises
-    ------
-    TypeError
-        If ``indices`` or any index array is not ``int64``, or the element
-        size is unsupported.
-    ValueError
-        If shapes are 1D-inconsistent or lengths disagree.
-    """
-    _require_1d((indices, output, record_starts_rows, record_starts_bytes, n_rows_per_record), "indices, output, and index arrays must be 1D.")
-    _require_int64(indices, "indices")
-    _require_record_arrays(record_starts_rows, record_starts_bytes, n_rows_per_record)
-
-    cdef ptrdiff_t n = indices.shape[0]
-    _require_output_len(output, n, "indices")
-    cdef long long n_records = record_starts_bytes.shape[0]
-    if n_rows_per_record.shape[0] != n_records:
-        raise ValueError("n_rows_per_record length must match record count.")
-    if record_starts_rows.shape[0] != n_records + 1:
-        raise ValueError("record_starts_rows length must be n_records + 1.")
-    if n == 0:
-        return
-
-    cdef int itemsize = output.dtype.itemsize
-    _require_c_contiguous((("source", source), ("indices", indices), ("output", output), ("record_starts_rows", record_starts_rows), ("record_starts_bytes", record_starts_bytes), ("n_rows_per_record", n_rows_per_record)))
-    cdef const uint8_t* base = <const uint8_t*>cnp.PyArray_DATA(source)
-    cdef const int64_t* indices_ptr = <const int64_t*>cnp.PyArray_DATA(indices)
-    cdef uint8_t* output_ptr = <uint8_t*>cnp.PyArray_DATA(output)
-    cdef const int64_t* rsr = <const int64_t*>cnp.PyArray_DATA(record_starts_rows)
-    cdef const int64_t* rsb = <const int64_t*>cnp.PyArray_DATA(record_starts_bytes)
-    cdef const int64_t* nrr = <const int64_t*>cnp.PyArray_DATA(n_rows_per_record)
-
-    cdef ptrdiff_t pd = (
-        DEFAULT_PREFETCH_DISTANCE if prefetch_distance < 0 else prefetch_distance
-    )
-    cdef int status
-    with nogil:
-        status = colstore_gather_multirecord(base, indices_ptr, output_ptr, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
-    if status != 0:
-        raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
-        )
 
 def gather_segment(cnp.ndarray indices, cnp.ndarray output,
                      cnp.ndarray segment_starts_rows,

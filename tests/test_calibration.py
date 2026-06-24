@@ -87,7 +87,7 @@ def test_gather_output_identical_across_distances(distance):
 @pytest.mark.parametrize("distance", [0, 8, 64])
 def test_multirecord_reads_identical_across_config_distances(tmp_path, distance):
     # End-to-end: the reader passes config.get_prefetch_distance() into both
-    # gather_bytes (sorted branch) and gather_multirecord (unsorted branch).
+    # gather_segment_sorted (sorted branch) and gather_segment (unsorted branch).
     rng = np.random.default_rng(5)
     full = rng.standard_normal(40_000)
     path = tmp_path / "p.cstore"

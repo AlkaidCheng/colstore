@@ -88,14 +88,12 @@ def sweep_multirecord(
                 w.write({"a": full[off : off + n]})
                 off += n
         ds = ColStoreReader(path)
-        rsr, rsb, nrr = ds._record_starts_rows, ds._record_starts_bytes, ds._n_rows_per_record
+        start_rows, segment_base = ds._column_segment_table("a")
         idx = rng.integers(0, total_rows, size=k).astype(np.int64)
         out = np.empty(k, dtype=np.float64)
         times = [
             _time(
-                lambda dd=dd: g.gather_multirecord(
-                    ds._file_mmap, idx, out, rsr, rsb, nrr, 0, threads, dd
-                ),
+                lambda dd=dd: g.gather_segment(idx, out, start_rows, segment_base, threads, dd),
                 repeat=repeat,
             )
             * 1e3

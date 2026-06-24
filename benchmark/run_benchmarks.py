@@ -5,8 +5,8 @@ emits a flat list of measurement records (see ``_common.Result``) plus a
 machine fingerprint. Each scenario runs a correctness gate before timing and,
 where it replaced a slower path, times that baseline too so the JSON carries
 an honest speedup. Baselines are forced through the documented seams (numpy
-backend, uniform-detection off, rbase gate to infinity, mask-density gate
-high) -- the same seams the focused ``check_*.py`` scripts use.
+backend, uniform-detection off, mask-density gate high) -- the same seams the
+focused ``check_*.py`` scripts use.
 
 This is the *showcase / plotting* benchmark; ``perf_suite.py`` remains the
 regression-comparison tool (``--compare`` against a saved baseline). The two
@@ -17,7 +17,7 @@ share the fingerprint shape, and both build on ``_common``.
         --json summary.json --repeat 20
 
 Plot ideas the JSON supports (no plotting code here yet): speedup vs record
-count (fancy/sorted/rbase), throughput vs operation (write/read), mask-native
+count (fancy/sorted), throughput vs operation (write/read), mask-native
 vs lowered across density, zero-copy vs copy.
 """
 
@@ -278,55 +278,6 @@ def scenario_multicolumn_bin_reuse(
             C.set_speedup(reuse, per_col)
         finally:
             ds.close()
-
-
-def scenario_record_base(
-    results: list[Result], rng, total: int, k: int, n_records: int, *, repeat, gate, bench
-):
-    cols = testing.make_columns(
-        total, 4, dtype=("f8", "f4", "i4", "i2"), names=("f8", "f4", "i4", "i2"), rng=rng
-    )
-    names = list(cols)
-    indices = rng.integers(0, total, size=k).astype(np.int64)
-    with tempfile.TemporaryDirectory() as d:
-        path = Path(d) / "rb.cstore"
-        rows = testing.uniform_record_rows(total, n_records)
-        rows[0] += 1
-        rows[-1] -= 1
-        testing.write_columns(path, cols, records=rows).close()
-        ds = colstore.open(path)
-        try:
-            if gate:
-                table = ds[indices, names].dict()
-                for name in names:
-                    check_equal(table[name], cols[name][indices], f"rbase/{name}")
-            if not bench:
-                return
-            params = {"rows": total, "k": k, "n_records": n_records, "columns": len(names)}
-            with _temp_attr(reader_mod, "_RBASE_MIN_INDICES_PER_RECORD", float("inf")):
-                generic = _measure(
-                    results,
-                    "record_base",
-                    "generic_withbins",
-                    params,
-                    lambda: ds[indices, names].dict(),
-                    repeat=repeat,
-                    rows=k,
-                )
-            rbase = _measure(
-                results,
-                "record_base",
-                "rbase",
-                params,
-                lambda: ds[indices, names].dict(),
-                repeat=repeat,
-                rows=k,
-            )
-            C.set_speedup(rbase, generic)
-        finally:
-            ds.close()
-
-
 def scenario_strided(
     results: list[Result], rng, total: int, n_records: int, step: int, *, repeat, gate, bench
 ):
@@ -575,9 +526,6 @@ def main() -> None:
     )
     scenario_multicolumn_bin_reuse(
         results, rng, n(2_000_000), n(500_000), 1000, repeat=repeat, gate=gate, bench=bench
-    )
-    scenario_record_base(
-        results, rng, n(2_000_000), n(1_000_000), 1000, repeat=repeat, gate=gate, bench=bench
     )
     scenario_strided(results, rng, n(2_000_000), 1000, 8, repeat=repeat, gate=gate, bench=bench)
     scenario_mask_native(

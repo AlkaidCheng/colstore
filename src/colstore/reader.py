@@ -66,6 +66,7 @@ def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
 _SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
 _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 
+
 def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     """Non-decreasing test with a cheap sampled rejection pass first.
 
@@ -756,7 +757,7 @@ class ColStoreReader(_ReaderBase):
           fall back to ``np.arange`` + the fancy path below.
 
         * **Sorted fancy index**: native linear-walk kernel
-          (``gather_multirecord_sorted``); the NumPy boundary-partition
+          (``gather_segment_sorted``); the NumPy boundary-partition
           pipeline survives only as the non-native (big-endian host)
           fallback.
 
@@ -1235,7 +1236,7 @@ class ColStoreReader(_ReaderBase):
         Taken when the store is multi-record, the selector is a fancy index
         array that is unsorted, and at least two requested columns are
         native-byte-order (the bins kernels do raw typed loads). The first
-        native column runs ``gather_multirecord_bins``; the rest reuse the
+        native column runs ``gather_segment_bins``; the rest reuse the
         bins via the withbins kernels. Columns run sequentially, each at the
         full thread cap, OpenMP-parallel over indices -- the shape that won
         on the deployment hardware over both the column-pool shape and a
