@@ -27,6 +27,8 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from itertools import pairwise
 from pathlib import Path
 
 import _common as _c
@@ -66,6 +68,30 @@ def _stream(src: Path, out: Path) -> None:
 def _copy(src: Path, out: Path) -> None:
     """Whole-file byte copy (the single-file append fast path)."""
     shutil.copyfile(src, out)
+
+
+def _copy_mt(src: Path, out: Path, workers: int) -> None:
+    """Parallel whole-file copy: split the file into ``workers`` byte ranges and
+    copy each concurrently with ``os.copy_file_range`` (Linux). A verbatim copy
+    has no column boundaries to respect, so any byte partition is valid -- the gain
+    is parallel I/O to a striped parallel filesystem."""
+    size = src.stat().st_size
+    with open(out, "wb") as handle:
+        handle.truncate(size)
+    bounds = [size * i // workers for i in range(workers + 1)]
+
+    def _copy_range(lo: int, hi: int) -> None:
+        with open(src, "rb") as source, open(out, "r+b") as dest:
+            offset, remaining = lo, hi - lo
+            while remaining:
+                sent = os.copy_file_range(source.fileno(), dest.fileno(), remaining, offset, offset)
+                if sent == 0:
+                    break
+                offset += sent
+                remaining -= sent
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(lambda b: _copy_range(*b), pairwise(bounds)))
 
 
 _STRATEGY = {"materialize": _materialize, "stream": _stream, "copy": _copy}
@@ -206,6 +232,20 @@ def main() -> int:
     rss = {v: _measure_rss(v, src, outs[v]) for v in _VARIANTS}
     for variant in _VARIANTS:
         print(f"  {variant:>12}  +{rss[variant] / 1e6:8.1f} MB resident")
+
+    if hasattr(os, "copy_file_range"):
+        print("\n=== copy throughput vs threads (parallel copy_file_range) ===")
+        mt_out = work / "append_out_copy_mt.cstore"
+        _copy_mt(src, mt_out, 4)
+        if mt_out.read_bytes() != src.read_bytes():
+            raise SystemExit("parallel copy produced a non-identical file")
+        for workers in (1, 2, 4, 8, 16, 32):
+            stats = _c.time_stats(
+                lambda w=workers: _copy_mt(src, mt_out, w), repeat=args.repeat, warmup=args.warmup
+            )
+            print(f"  {workers:>3} threads  {src_mb / (stats.median_ms / 1e3):8.0f} MB/s")
+    else:
+        print("\n# os.copy_file_range unavailable (non-Linux); skipping the parallel-copy sweep")
 
     if args.json is not None:
         summary = [
