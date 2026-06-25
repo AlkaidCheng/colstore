@@ -246,7 +246,7 @@ with colstore.update("data.cstore") as f:
     f.write({"x": more_x, "y": more_y})
 ```
 
-The writer commits records atomically on `close()` by rewriting a 32-byte
+The writer commits records atomically on `close()` by rewriting a 64-byte
 counters block. A reader opening the file mid-write sees only what the
 last successful close committed.
 
@@ -545,7 +545,7 @@ memory budget. Output is byte-identical across every method.
 
 ```
 [magic 8B = b"CSTORE\x00\x01"]
-[counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
+[counters 64B: n_records(8) + committed_rows(8) + stats_offset(8) + crc32(4) + reserved(36)]
 [manifest_len 8B (u64 little-endian)]
 [manifest_json: format_version + columns + manifest_crc32]
 [zero-padding to 64-byte alignment]
@@ -555,7 +555,7 @@ memory budget. Output is byte-identical across every method.
 ```
 
 The JSON manifest is immutable and carries only the schema; the mutable
-record/row counters live in their own fixed-position 32-byte block (with
+record/row counters live in their own fixed-position 64-byte block (with
 its own CRC) right after the magic. Each record body holds the columns
 back-to-back as raw bytes. A one-shot write produces a single-record file
 that reads via a per-column memmap fast path; a streamed write produces a

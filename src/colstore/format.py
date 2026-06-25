@@ -3,7 +3,7 @@
 File layout::
 
     [magic 8B: b"CSTORE\\x00\\x01" -- constant for the life of the format]
-    [counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
+    [counters 64B: n_records(8) + committed_rows(8) + stats_offset(8) + crc32(4) + reserved(36)]
     [manifest_len 8B (u64 little-endian)]
     [manifest_json: format_version + columns + manifest_crc32]
     [zero-padding to 64-byte alignment]
@@ -11,10 +11,10 @@ File layout::
     [record_1 header 32B][record_1 body, padded to 8B]
     ...
 
-The mutable counters (``n_records``, ``committed_rows``, own CRC32) sit at
-fixed offset 8, separate from the immutable JSON manifest
+The mutable counters (``n_records``, ``committed_rows``, ``stats_offset``,
+own CRC32) sit at fixed offset 8, separate from the immutable JSON manifest
 (``format_version`` and per-column ``{name, dtype, encoding, nullable}``).
-This split lets the writer commit a session atomically: the 32-byte
+This split lets the writer commit a session atomically: the 64-byte
 counters block is rewritten in place without shifting any record byte
 offsets. Format evolution is tracked via ``format_version`` in the
 manifest, not by changing the magic. The canonical file extension is
@@ -303,8 +303,8 @@ def write_header(
     The on-disk header has four parts:
 
       * 8-byte magic (constant).
-      * 32-byte counters block at fixed offset 8 -- ``(n_records,
-        committed_rows, crc32)``. The writer rewrites this in place on
+      * 64-byte counters block at fixed offset 8 -- ``(n_records,
+        committed_rows, stats_offset, crc32)``. The writer rewrites this in place on
         :meth:`ColStoreWriter.close` without touching the manifest.
       * 8-byte manifest length prefix + JSON manifest (immutable schema).
       * Zero padding so the first record header lands at a 64-byte
@@ -332,12 +332,12 @@ def write_header(
 def write_counters(
     file: IO[bytes], n_records: int, committed_rows: int, stats_offset: int = 0
 ) -> None:
-    """Rewrite the 32-byte counters block at its fixed offset.
+    """Rewrite the 64-byte counters block at its fixed offset.
 
     Seeks to the counters block first, so callers don't need to know
     where it lives on disk. Used by :meth:`ColStoreWriter.close` to
     commit the new record count, row total, and statistics-footer offset
-    atomically. The 32-byte block is small enough that a single ``write()``
+    atomically. The 64-byte block is small enough that a single ``write()``
     is generally atomic on common filesystems; even if it isn't, the
     embedded CRC catches a torn write on the next open.
     """
@@ -380,8 +380,8 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
 
     The header_dict merges the immutable manifest fields
     (``format_version``, ``columns``, ``manifest_crc32``) with the mutable
-    counters (``n_records``, ``committed_rows``); callers need not know
-    they live in separate on-disk regions. Only the file header is
+    counters (``n_records``, ``committed_rows``, ``stats_offset``); callers
+    need not know they live in separate on-disk regions. Only the file header is
     validated (magic, counters CRC, format version, manifest CRC);
     per-record headers and truncation past the file header are validated
     by :func:`read_record_index`, which the caller runs next. Callers that
