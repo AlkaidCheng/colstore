@@ -24,7 +24,9 @@ import shutil
 import tempfile
 import warnings
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
+from itertools import pairwise
 from pathlib import Path
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -50,6 +52,17 @@ _INDEX_FIELD = re.compile(r"\{index(?::[^}]*)?\}")
 
 PathLike = str | os.PathLike[str]
 Columns = dict[str, np.ndarray[Any, np.dtype[Any]]]
+
+#: A single-file shard copy at least this size is split across multiple I/O streams.
+_PARALLEL_COPY_MIN_CHUNK = 128 * 1024 * 1024
+#: Upper bound on concurrent copy streams. The useful count is what the storage can
+#: serve in parallel (a handful saturates a parallel filesystem; more only contends),
+#: not the core count -- so this is a small fixed ceiling, not hardware-derived.
+_PARALLEL_COPY_MAX_STREAMS = 4
+#: Per-read size for the ``os.pread`` / ``os.pwrite`` copy fallback.
+_COPY_BUFSIZE = 8 * 1024 * 1024
+#: ``os.copy_file_range`` when the runtime exposes it (Linux), else ``None``.
+_COPY_FILE_RANGE = getattr(os, "copy_file_range", None)
 
 
 @lru_cache
@@ -290,14 +303,65 @@ def _write_shard_atomic(
     return final
 
 
+def _copy_bytes(src_fd: int, dst_fd: int, offset: int, count: int) -> None:
+    """Copy ``count`` bytes at ``offset`` from ``src_fd`` to ``dst_fd``.
+
+    Uses ``os.copy_file_range`` (kernel-to-kernel) where the runtime exposes it,
+    else ``os.pread`` / ``os.pwrite``; both release the GIL, so concurrent calls on
+    disjoint ranges parallelize the I/O.
+    """
+    pos, remaining = offset, count
+    while remaining:
+        if _COPY_FILE_RANGE is not None:
+            sent = _COPY_FILE_RANGE(src_fd, dst_fd, remaining, pos, pos)
+        else:
+            chunk = os.pread(src_fd, min(remaining, _COPY_BUFSIZE), pos)
+            sent = os.pwrite(dst_fd, chunk, pos) if chunk else 0
+        if sent == 0:
+            break
+        pos += sent
+        remaining -= sent
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    """Copy ``src`` to ``dst``, parallelizing a large file across a few I/O streams.
+
+    A file at least :data:`_PARALLEL_COPY_MIN_CHUNK` is split into up to
+    :data:`_PARALLEL_COPY_MAX_STREAMS` disjoint byte ranges copied concurrently; a
+    smaller file copies in one stream. The stream count is bounded by what the
+    storage serves in parallel, not the core count, so the speedup comes from I/O
+    width on a parallel filesystem without depending on the host's hardware.
+    """
+    size = src.stat().st_size
+    streams = min(max(1, size // _PARALLEL_COPY_MIN_CHUNK), _PARALLEL_COPY_MAX_STREAMS)
+    if streams == 1:
+        shutil.copyfile(src, dst)
+        return
+    os.truncate(dst, size)
+    bounds = [size * i // streams for i in range(streams + 1)]
+
+    def _copy_range(span: tuple[int, int]) -> None:
+        lo, hi = span
+        src_fd = os.open(src, os.O_RDONLY)
+        dst_fd = os.open(dst, os.O_WRONLY)
+        try:
+            _copy_bytes(src_fd, dst_fd, lo, hi - lo)
+        finally:
+            os.close(dst_fd)
+            os.close(src_fd)
+
+    with ThreadPoolExecutor(max_workers=streams) as pool:
+        list(pool.map(_copy_range, pairwise(bounds)))
+
+
 def _copy_shard_atomic(src_file: Path, final: Path) -> None:
     """Copy ``src_file`` to the shard ``final`` byte-for-byte, atomically.
 
-    ``shutil.copyfile`` uses ``copy_file_range`` / ``os.sendfile`` /
-    ``fclonefileat`` where available, so the bytes never pass through Python.
+    A large source is split across a few concurrent I/O streams (see
+    :func:`_copy_file`); the bytes never pass through Python.
     """
     with _atomic_shard(final) as tmp:
-        shutil.copyfile(src_file, tmp)
+        _copy_file(src_file, Path(tmp))
 
 
 def append(
