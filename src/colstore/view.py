@@ -20,7 +20,7 @@ import numpy as np
 
 from . import config
 from ._pandas import _make_dataframe_no_consolidate
-from ._query import _Expr, evaluate_mask
+from ._query import _Expr
 from ._render import Preview, render_lazy_card
 from .frame import ColStoreFrame
 from .interop import InteropMixin
@@ -169,7 +169,7 @@ class _BaseView(InteropMixin):
         """
         row = self._row_part
         if isinstance(row, _Expr):
-            row = evaluate_mask(row, self._store._read_query_column, self._store.n_rows)
+            row = self._store._evaluate_query_mask(row)
         if row is None:
             return None
         if isinstance(row, (int, np.integer)):

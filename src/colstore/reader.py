@@ -27,6 +27,7 @@ from numpy.typing import NDArray
 
 from . import _footer, _numa, config, format, kernels
 from ._base import _ReaderBase
+from ._query import _Compare, _Expr
 
 if TYPE_CHECKING:
     from .dataset import ColStoreDataset
@@ -393,6 +394,68 @@ class ColStoreReader(_ReaderBase):
         except OSError:
             return None
         return _footer.parse_stats(raw)
+
+    # ---- predicate evaluation with statistics skipping -----------------
+
+    def _evaluate_query_mask(self, expr: _Expr) -> NDArray[np.bool_]:
+        """Evaluate a predicate to a row mask, skipping records that cannot match.
+
+        A ``col(name) <op> scalar`` filter on a multi-record file with statistics
+        consults each record's ``[min, max]`` and reads only the records that can
+        contain a matching row; the rest are masked out without touching their
+        bytes. Any other predicate, or a file without statistics, reads in full.
+        The result is identical to the full evaluation either way.
+        """
+        mask = self._try_skip_query_mask(expr)
+        return mask if mask is not None else super()._evaluate_query_mask(expr)
+
+    def _try_skip_query_mask(self, expr: _Expr) -> NDArray[np.bool_] | None:
+        """Build the row mask by skipping disjoint records, or None to read in full."""
+        if not self._is_multi_record or not isinstance(expr, _Compare):
+            return None
+        stats = self._record_stats
+        if stats is None:
+            return None
+        bounds = expr.predicate_bounds()
+        if bounds is None:
+            return None
+        name, ufunc, scalar = bounds
+        column_stats = stats.get(name)
+        if column_stats is None:
+            return None
+        try:
+            if ufunc in (np.greater, np.greater_equal):
+                keeps = np.asarray(ufunc(column_stats["max"], scalar), dtype=bool)
+            elif ufunc in (np.less, np.less_equal):
+                keeps = np.asarray(ufunc(column_stats["min"], scalar), dtype=bool)
+            else:  # np.equal: the value must lie within [min, max]
+                keeps = np.asarray(
+                    (column_stats["min"] <= scalar) & (column_stats["max"] >= scalar), dtype=bool
+                )
+        except (TypeError, ValueError):
+            return None  # incomparable scalar (e.g. wrong kind): read in full
+        # A non-prunable record (string column, empty, or a NaN/NaT chunk) is
+        # always read; it cannot be ruled out by [min, max].
+        survives = keeps | ~column_stats["prunable"]
+        if survives.all():
+            return None  # nothing prunes: the in-full path is no slower
+        mask = np.zeros(self._n_rows, dtype=bool)
+        starts = self._record_starts_rows
+        for record_index in np.nonzero(survives)[0]:
+            column = self._read_record_column(name, int(record_index))
+            row_mask = np.asarray(ufunc(column, scalar), dtype=bool)
+            mask[int(starts[record_index]) : int(starts[record_index + 1])] = row_mask
+        return mask
+
+    def _read_record_column(self, name: str, record_index: int) -> NDArray[Any]:
+        """View one record's column from the file mapping (no copy)."""
+        dtype = self._column_dtypes[name]
+        n_rows = int(self._n_rows_per_record[record_index])
+        offset = (
+            int(self._record_starts_bytes[record_index])
+            + int(self._column_prefix_bytes[name]) * n_rows
+        )
+        return self._file_mmap[offset : offset + n_rows * dtype.itemsize].view(dtype)
 
     def __repr__(self) -> str:
         column_preview = self.columns[:5]

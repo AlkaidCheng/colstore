@@ -20,7 +20,7 @@ from numpy.typing import NDArray
 
 from . import kernels
 from ._pandas import _make_dataframe_no_consolidate
-from ._query import _Expr, parse_query, validate_predicate
+from ._query import _Expr, evaluate_mask, parse_query, validate_predicate
 from ._render import Preview
 from .interop import InteropMixin
 from .view import (
@@ -483,6 +483,15 @@ class _ReaderBase(InteropMixin, abc.ABC):
     def _read_query_column(self, name: str) -> NDArray[Any]:
         """Read one whole column as an array, for predicate evaluation."""
         return self[name].array()
+
+    def _evaluate_query_mask(self, expr: _Expr) -> NDArray[np.bool_]:
+        """Evaluate a predicate expression to a boolean row mask.
+
+        The base implementation reads every referenced column in full. A reader
+        with per-record statistics overrides this to skip records that cannot
+        match a ``col() <op> scalar`` filter.
+        """
+        return evaluate_mask(expr, self._read_query_column, self.n_rows)
 
     def _query_probe(self, name: str) -> NDArray[Any]:
         """An empty typed array for one column, for the data-free query dtype probe."""
