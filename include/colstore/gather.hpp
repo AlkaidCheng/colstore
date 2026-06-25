@@ -76,10 +76,10 @@ std::ptrdiff_t resolve_thread_count(std::ptrdiff_t n_indices, int cap);
 
 }  // namespace colstore
 
-// C-callable wrappers used by the Cython binding. Two families:
-//   colstore_gather_indexed_<N>: element-indexed (hot path).
-//   colstore_gather_bytes_<N>:   byte-offset (multi-record path).
-// where <N> is element size in bytes: 1, 2, 4, or 8.
+// C-callable wrappers used by the Cython binding. Two functions:
+//   colstore_gather_indexed: element-indexed (hot path).
+//   colstore_gather_bytes:   byte-offset (multi-record path).
+// Each dispatches on the itemsize argument (1, 2, 4, or 8 bytes).
 extern "C" {
 
 // Space-separated names of the optimization toggles compiled in (see
@@ -120,7 +120,6 @@ int colstore_gather_bytes(const std::uint8_t* base,
 // This is a raw byte copy: the caller guarantees the on-disk dtype is in the
 // host's native byte order (a byte copy cannot byteswap). ``record_starts_rows``
 // has ``n_records + 1`` entries; the other two index arrays have ``n_records``.
-// Contiguous multi-record range copy (size-agnostic; one memcpy per record).
 // See colstore::copy_multirecord_range for the addressing contract.
 void colstore_copy_multirecord_range(const std::uint8_t* base,
                                      std::uint8_t* output,
@@ -264,7 +263,6 @@ void colstore_interleave_records(std::uint8_t* output, std::int64_t record_items
 // guarantees every visited row ``start + i*step`` is in
 // ``[0, record_starts_rows[n_records])`` (the reader derives ``start``/``stop``
 // from ``slice.indices``, which clamps). Caller guarantees native byte order.
-// Strided range walk; see colstore_gather_multirecord_strided.
 int colstore_gather_multirecord_strided(
     const std::uint8_t* base, std::uint8_t* output,
     std::int64_t start, std::int64_t step, std::ptrdiff_t n_out,
@@ -286,7 +284,6 @@ int colstore_gather_multirecord_strided(
 // arithmetic sequence with stride ``record_stride_bytes`` starting at
 // ``first_body_offset``, ``0 < last_record_rows <= rows_per_record``,
 // every index is in range, and the dtype is native byte order.
-// Uniform-record arithmetic-bin gather; see colstore_gather_multirecord_uniform.
 int colstore_gather_multirecord_uniform(
     const std::uint8_t* base, const std::int64_t* indices, std::uint8_t* output,
     std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
