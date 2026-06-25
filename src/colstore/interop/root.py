@@ -295,11 +295,13 @@ def _ingest_batches(
 ) -> Iterator[ColumnBatch]:
     """Yield AsNumpy batches, one per output record.
 
-    A zero-row source still yields one typed (empty) batch so the schema is
-    captured. ``RDataFrame.Range`` is incompatible with implicit MT; disable
-    ``ROOT.EnableImplicitMT()`` before a chunked ingest.
+    A tree that fits the memory budget is read in a single ``AsNumpy`` (no ``Range``);
+    only a budget smaller than the tree falls back to ``Range`` chunks. A zero-row
+    source still yields one typed (empty) batch so the schema is captured. The
+    implicit-MT whole-tree fast path lives in :meth:`RootCppBackend.read_batches`
+    (``Range`` is incompatible with implicit MT, so chunked reads stay single-threaded).
     """
-    if total_rows == 0 or rows_per_batch is None:
+    if total_rows == 0 or rows_per_batch is None or total_rows <= rows_per_batch:
         yield rdf.AsNumpy(columns=columns)
         return
     for start in range(0, total_rows, rows_per_batch):
@@ -368,6 +370,7 @@ class RootCppBackend(RootBackend):
         keep_valid_only: bool,
         batch_size: int | str | None,
     ) -> tuple[Iterator[ColumnBatch], int]:
+        root = _import_root()
         rdf = _as_rdataframe(source, treename)
         selected = _select_storable_columns(rdf, columns, keep_valid_only)
         total = int(rdf.Count().GetValue())
@@ -379,6 +382,16 @@ class RootCppBackend(RootBackend):
             )
         else:
             rows_per_batch = resolve_batch_rows(batch_size)
+        # When the whole tree fits the budget and we own the RDataFrame, read it in
+        # one AsNumpy with implicit MT. The RDF fixes its thread-slot count at
+        # construction, so a fresh one is built INSIDE the MT context; Range (used
+        # only when the budget is smaller than the tree) is incompatible with it.
+        whole_tree = rows_per_batch is None or total <= rows_per_batch
+        if total > 0 and whole_tree and isinstance(source, (str, os.PathLike, dict)):
+            with _implicit_mt(root, _DEFAULT_MULTITHREADING):
+                mt_rdf = _as_rdataframe(source, treename)
+                batch = mt_rdf.AsNumpy(columns=selected)
+            return iter([batch]), total
         return _ingest_batches(rdf, selected, rows_per_batch, total), total
 
     def write(

@@ -79,6 +79,33 @@ def test_streaming_batches_roundtrip(tmp_path, store, columns, backend):
     back.close()
 
 
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_read_whole_vs_chunked_agree(tmp_path, backend):
+    # The whole-file read (a single AsNumpy, implicit-MT for the ROOT backend) and
+    # the chunked Range read must reconstruct identical, row-intact data. Sorting by
+    # a key column and checking a correlated column catches any cross-column mixup
+    # (which per-column sorting in the other tests would miss).
+    n = 5000
+    data = {"key": np.arange(n, dtype=np.int64), "val": (np.arange(n) * 2).astype(np.float64)}
+    src = colstore.store(data, tmp_path / "rw.cstore", show_progress=False)
+    rp = tmp_path / "rw.root"
+    colstore.to_root(src, rp, treename="events", backend=backend, show_progress=False)
+
+    whole = colstore.from_root(rp, tmp_path / "whole.cstore", backend=backend, show_progress=False)
+    chunked = colstore.from_root(
+        rp, tmp_path / "chunk.cstore", backend=backend, batch_size=1500, show_progress=False
+    )
+    for back in (whole, chunked):
+        assert back.n_rows == n
+        order = np.argsort(np.asarray(back.array("key")))
+        np.testing.assert_array_equal(np.asarray(back.array("key"))[order], np.arange(n))
+        np.testing.assert_array_equal(
+            np.asarray(back.array("val"))[order], (np.arange(n) * 2).astype(np.float64)
+        )
+    whole.close()
+    chunked.close()
+
+
 @pytest.mark.skipif(not (_HAS_ROOT and _HAS_UPROOT), reason="needs both backends")
 def test_cross_backend_interchange(tmp_path, store, columns):
     # write with each backend, read back with the other
