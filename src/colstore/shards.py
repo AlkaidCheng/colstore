@@ -35,7 +35,7 @@ from ._paths import _natural_sort_key
 from ._sizes import resolve_batch_rows
 
 #: Default shard filename template; ``{index}`` is the next free shard number.
-DEFAULT_SHARD_NAME = "shard_{index:05d}.cstore"
+DEFAULT_SHARD_NAME = f"shard_{{index:05d}}{fmt.FILE_EXTENSION}"
 _LOCK_NAME = ".colstore.lock"
 _INDEX_FIELD = re.compile(r"\{index(?::[^}]*)?\}")
 
@@ -64,6 +64,19 @@ def _shard_name(template: str, index: int) -> str:
     return template if _shard_pattern(template) is None else template.format(index=index)
 
 
+def _validate_shard_name(name: str) -> None:
+    """Require a shard name or template to carry the ``.cstore`` extension.
+
+    The dataset is read by globbing ``*.cstore`` (:func:`_list_shards`), so a shard
+    written under any other extension would not be seen by the reader.
+    """
+    if not name.endswith(fmt.FILE_EXTENSION):
+        raise ValueError(
+            f"shard name {name!r} must end in {fmt.FILE_EXTENSION!r}; the dataset is "
+            f"read by listing {fmt.FILE_EXTENSION} files."
+        )
+
+
 def _next_index(directory: Path, template: str) -> int:
     """The next free ``{index}`` for ``template`` in ``directory`` (gap-tolerant).
 
@@ -87,7 +100,7 @@ def _list_shards(directory: PathLike) -> list[str]:
     The ``.colstore.lock`` sentinel and any ``.<name>.tmp`` orphan from a crashed
     append are excluded -- they do not end in ``.cstore`` / are dotfiles.
     """
-    matches = glob.glob(os.path.join(os.fspath(directory), "*.cstore"))
+    matches = glob.glob(os.path.join(os.fspath(directory), f"*{fmt.FILE_EXTENSION}"))
     return sorted(matches, key=lambda path: _natural_sort_key(os.path.basename(path)))
 
 
@@ -181,13 +194,16 @@ def append(
     :func:`colstore.store` accepts -- a ``{name: array}`` dict, a structured array,
     or a DataFrame -- or an open reader / dataset. It must match the existing
     shards' schema. The shard is named from ``name`` (a template whose ``{index}``
-    is the next free shard number, or a literal filename) and committed atomically.
-    Returns the new shard's path. ``statistics=True`` records per-record statistics
-    in the shard (see :func:`colstore.store`).
+    is the next free shard number, or a literal filename; it must end in
+    ``.cstore``) and committed atomically. Returns the new shard's path.
+    ``statistics=True`` records per-record statistics in the shard (see
+    :func:`colstore.store`).
 
     Raises :class:`OSError` if another writer holds the directory lock, and
-    :class:`ValueError` if ``data`` does not match the existing schema.
+    :class:`ValueError` if ``name`` lacks the ``.cstore`` extension or ``data``
+    does not match the existing schema.
     """
+    _validate_shard_name(name)
     directory = Path(directory)
     columns = _coerce_append_data(data)
     fd = _acquire_directory_lock(directory)
@@ -228,6 +244,7 @@ class Appender:
         # Stays True until construction fully succeeds, so __del__ is a no-op if
         # __init__ raises (e.g. lock contention) on a partially-built object.
         self._closed = True
+        _validate_shard_name(name)
         self._directory = Path(directory)
         self._name = name
         self._is_literal = _shard_pattern(name) is None

@@ -121,6 +121,17 @@ def test_index_allocation_tolerates_gaps(tmp_path):
     assert path.name == "shard_00005.cstore"  # max + 1, not the count
 
 
+def test_non_cstore_name_is_rejected(tmp_path):
+    # A name without the .cstore extension would be written but never listed by
+    # the reader's *.cstore glob, so it is refused at the entry point.
+    for bad in ("shard_{index:03d}.bin", "snapshot.dat", "shard_{index}"):
+        with pytest.raises(ValueError, match="cstore"):
+            colstore.append(tmp_path, {"x": np.arange(3, dtype=np.int64)}, name=bad)
+    with pytest.raises(ValueError, match="cstore"):
+        colstore.appender(tmp_path, name="run_{index}.parquet")
+    assert _shards(tmp_path) == []  # nothing written by a rejected name
+
+
 # ---- atomicity / orphans ----------------------------------------------------
 
 
