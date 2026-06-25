@@ -213,7 +213,7 @@ class ColStoreWriter:
     def _commit_counters(self, stats_offset: int = 0) -> None:
         """Seek to the counters block, rewrite it, and fsync.
 
-        The 32-byte counters block is small enough that a single write is
+        The 64-byte counters block is small enough that a single write is
         typically atomic at the syscall level; the embedded CRC catches a
         torn write on next open if it isn't. ``stats_offset`` is the location
         of the statistics footer written just before this commit.
