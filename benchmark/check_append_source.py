@@ -70,11 +70,18 @@ def _copy(src: Path, out: Path) -> None:
     shutil.copyfile(src, out)
 
 
+_HAS_COPY_FILE_RANGE = hasattr(os, "copy_file_range")
+
+
 def _copy_mt(src: Path, out: Path, workers: int) -> None:
     """Parallel whole-file copy: split the file into ``workers`` byte ranges and
-    copy each concurrently with ``os.copy_file_range`` (Linux). A verbatim copy
-    has no column boundaries to respect, so any byte partition is valid -- the gain
-    is parallel I/O to a striped parallel filesystem."""
+    copy each concurrently. A verbatim copy has no column boundaries to respect, so
+    any byte partition is valid -- the gain is parallel I/O to a striped filesystem.
+
+    Uses ``os.copy_file_range`` (kernel-to-kernel) where available, else
+    ``os.pread`` / ``os.pwrite``; both release the GIL, so the threads parallelize
+    the I/O regardless. The pread/pwrite path is portable to a Python whose ``os``
+    lacks ``copy_file_range`` (e.g. one built against an older glibc)."""
     size = src.stat().st_size
     with open(out, "wb") as handle:
         handle.truncate(size)
@@ -82,9 +89,14 @@ def _copy_mt(src: Path, out: Path, workers: int) -> None:
 
     def _copy_range(lo: int, hi: int) -> None:
         with open(src, "rb") as source, open(out, "r+b") as dest:
+            src_fd, dst_fd = source.fileno(), dest.fileno()
             offset, remaining = lo, hi - lo
             while remaining:
-                sent = os.copy_file_range(source.fileno(), dest.fileno(), remaining, offset, offset)
+                if _HAS_COPY_FILE_RANGE:
+                    sent = os.copy_file_range(src_fd, dst_fd, remaining, offset, offset)
+                else:
+                    chunk = os.pread(src_fd, min(remaining, 8 << 20), offset)
+                    sent = os.pwrite(dst_fd, chunk, offset) if chunk else 0
                 if sent == 0:
                     break
                 offset += sent
@@ -233,19 +245,17 @@ def main() -> int:
     for variant in _VARIANTS:
         print(f"  {variant:>12}  +{rss[variant] / 1e6:8.1f} MB resident")
 
-    if hasattr(os, "copy_file_range"):
-        print("\n=== copy throughput vs threads (parallel copy_file_range) ===")
-        mt_out = work / "append_out_copy_mt.cstore"
-        _copy_mt(src, mt_out, 4)
-        if mt_out.read_bytes() != src.read_bytes():
-            raise SystemExit("parallel copy produced a non-identical file")
-        for workers in (1, 2, 4, 8, 16, 32):
-            stats = _c.time_stats(
-                lambda w=workers: _copy_mt(src, mt_out, w), repeat=args.repeat, warmup=args.warmup
-            )
-            print(f"  {workers:>3} threads  {src_mb / (stats.median_ms / 1e3):8.0f} MB/s")
-    else:
-        print("\n# os.copy_file_range unavailable (non-Linux); skipping the parallel-copy sweep")
+    primitive = "copy_file_range" if _HAS_COPY_FILE_RANGE else "pread/pwrite"
+    print(f"\n=== copy throughput vs threads (parallel {primitive}) ===")
+    mt_out = work / "append_out_copy_mt.cstore"
+    _copy_mt(src, mt_out, 4)
+    if mt_out.read_bytes() != src.read_bytes():
+        raise SystemExit("parallel copy produced a non-identical file")
+    for workers in (1, 2, 4, 8, 16, 32):
+        stats = _c.time_stats(
+            lambda w=workers: _copy_mt(src, mt_out, w), repeat=args.repeat, warmup=args.warmup
+        )
+        print(f"  {workers:>3} threads  {src_mb / (stats.median_ms / 1e3):8.0f} MB/s")
 
     if args.json is not None:
         summary = [
