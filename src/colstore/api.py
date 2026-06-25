@@ -234,6 +234,41 @@ def saveas(
     return source.saveas(dest, format=format, **kwargs)
 
 
+def from_npz(
+    source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
+) -> ColStoreReader:
+    """Import a NumPy ``.npz`` file into a ``.cstore`` (``ingest(..., format="npz")``)."""
+    return ingest(source, dest, format="npz", **kwargs)
+
+
+def from_parquet(
+    source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
+) -> ColStoreReader:
+    """Import a Parquet file into a ``.cstore`` (``ingest(..., format="parquet")``)."""
+    return ingest(source, dest, format="parquet", **kwargs)
+
+
+def from_feather(
+    source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
+) -> ColStoreReader:
+    """Import a Feather file into a ``.cstore`` (``ingest(..., format="feather")``)."""
+    return ingest(source, dest, format="feather", **kwargs)
+
+
+def from_json(
+    source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
+) -> ColStoreReader:
+    """Import a JSON file into a ``.cstore`` (``ingest(..., format="json")``)."""
+    return ingest(source, dest, format="json", **kwargs)
+
+
+def from_hdf(
+    source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
+) -> ColStoreReader:
+    """Import an HDF5 file into a ``.cstore`` (``ingest(..., format="hdf5")``)."""
+    return ingest(source, dest, format="hdf5", **kwargs)
+
+
 # ---- Compaction --------------------------------------------------------
 
 

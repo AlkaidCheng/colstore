@@ -1,0 +1,268 @@
+"""Tests for the Parquet, Feather, JSON, and HDF5 file formats, the per-format
+sugar (``ds.to_parquet`` / ``colstore.from_parquet`` ...), the string-coercion /
+nested-rejection policy, and HDF5's cross-writer reading.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+
+import numpy as np
+import pytest
+
+import colstore
+from colstore import interop
+
+# "tables" is PyTables, which pandas needs for its HDF5 backend (DataFrame.to_hdf
+# / read_hdf); it is a separate, heavyweight optional dependency from pandas.
+_HAS = {m: importlib.util.find_spec(m) is not None for m in ("pyarrow", "pandas", "h5py", "tables")}
+
+# (format, extension, required backends, preserves_dtype)
+# JSON is text and carries no dtype, so it round-trips values but not the exact
+# width (float32 -> float64); the binary formats preserve dtypes.
+_FORMATS = [
+    ("parquet", "parquet", ("pyarrow",), True),
+    ("feather", "feather", ("pyarrow",), True),
+    ("json", "json", ("pandas",), False),
+    ("hdf5", "h5", ("h5py",), True),
+]
+
+
+@pytest.fixture
+def columns():
+    return {
+        "i": np.arange(8, dtype=np.int64),
+        "f": (np.arange(8) * 1.5).astype(np.float32),
+        "u": np.arange(8, dtype=np.uint16),
+        "ok": (np.arange(8) % 2 == 0),
+        "s": np.array(["aa", "bb", "ccc", "d", "e", "ff", "g", "hh"]),  # <U3
+    }
+
+
+@pytest.fixture
+def store(tmp_path, columns):
+    return colstore.store(columns, tmp_path / "s.cstore", show_progress=False)
+
+
+def _need(*backends):
+    missing = [b for b in backends if not _HAS[b]]
+    if missing:
+        pytest.skip(f"needs {', '.join(missing)}")
+
+
+# ---- round-trip parity, all four formats -----------------------------------
+
+
+@pytest.mark.parametrize("fmt, ext, backends, preserves_dtype", _FORMATS)
+def test_roundtrip(tmp_path, store, columns, fmt, ext, backends, preserves_dtype):
+    _need(*backends)
+    path = tmp_path / f"x.{ext}"
+    store.saveas(path)
+    back = colstore.ingest(path, tmp_path / f"b.{ext}.cstore")
+    assert set(back.columns) == set(columns)
+    for name, values in columns.items():
+        if name == "s":
+            assert list(back.array("s")) == list(values)
+            assert back.dtypes["s"].kind == "U"  # widened to fixed-width unicode
+        else:
+            np.testing.assert_array_equal(back.array(name), values)
+            if preserves_dtype:
+                assert back.dtypes[name] == values.dtype
+    back.close()
+
+
+@pytest.mark.parametrize("fmt, ext, backends, preserves_dtype", _FORMATS)
+def test_column_projection(tmp_path, store, columns, fmt, ext, backends, preserves_dtype):
+    _need(*backends)
+    path = tmp_path / f"p.{ext}"
+    store.saveas(path)
+    back = colstore.ingest(path, tmp_path / f"p.{ext}.cstore", columns=["i", "f"])
+    assert set(back.columns) == {"i", "f"}
+    np.testing.assert_array_equal(back.array("i"), columns["i"])
+    back.close()
+
+
+def test_all_formats_registered():
+    assert {"parquet", "feather", "json", "hdf5"} <= interop.file_formats()
+
+
+# ---- per-format sugar ------------------------------------------------------
+
+
+def test_sugar_methods_and_functions(tmp_path, store, columns):
+    pairs = [
+        ("to_npz", colstore.from_npz, "npz", ()),
+        ("to_parquet", colstore.from_parquet, "parquet", ("pyarrow",)),
+        ("to_feather", colstore.from_feather, "feather", ("pyarrow",)),
+        ("to_json", colstore.from_json, "json", ("pandas",)),
+        ("to_hdf", colstore.from_hdf, "h5", ("h5py",)),
+    ]
+    for to_method, from_func, ext, backends in pairs:
+        if any(not _HAS[b] for b in backends):
+            continue
+        path = tmp_path / f"sugar.{ext}"
+        getattr(store, to_method)(path)
+        back = from_func(path, tmp_path / f"sugar.{ext}.cstore")
+        np.testing.assert_array_equal(back.array("i"), columns["i"])
+        back.close()
+
+
+# ---- string coercion and nested rejection ----------------------------------
+
+
+def test_nested_column_rejected(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    table = pa.table({"a": [1, 2, 3], "lst": [[1, 2], [3], [4, 5]]})
+    path = tmp_path / "nested.parquet"
+    pq.write_table(table, str(path))
+    with pytest.raises(TypeError, match="nested"):
+        colstore.ingest(path, tmp_path / "nested.cstore")
+
+
+# ---- HDF5: cross-writer reading + backends + key ---------------------------
+
+
+def test_hdf5_pandas_written_read_auto(tmp_path, columns):
+    _need("h5py", "pandas", "tables")
+    import pandas as pd
+
+    path = tmp_path / "pd.h5"
+    pd.DataFrame(columns).to_hdf(path, key="frame", mode="w")
+    back = colstore.ingest(path, tmp_path / "pd.cstore")  # auto-detects pandas store
+    assert set(back.columns) == set(columns)
+    assert list(back.array("s")) == list(columns["s"])
+    back.close()
+
+
+def test_hdf5_h5py_root_datasets_read(tmp_path):
+    _need("h5py")
+    import h5py
+
+    path = tmp_path / "root.h5"
+    with h5py.File(path, "w") as f:  # datasets at the root, no group
+        f.create_dataset("a", data=np.arange(5, dtype=np.int64))
+        f.create_dataset("b", data=(np.arange(5) * 2.0))
+    back = colstore.ingest(path, tmp_path / "root.cstore")
+    assert set(back.columns) == {"a", "b"}
+    np.testing.assert_array_equal(back.array("a"), np.arange(5))
+    back.close()
+
+
+def test_hdf5_backend_and_key(tmp_path, store, columns):
+    _need("h5py", "pandas", "tables")
+    # write with the pandas backend under a custom key, read it back
+    p1 = tmp_path / "pdkey.h5"
+    store.saveas(p1, backend="pandas", key="mytable")
+    back = colstore.ingest(p1, tmp_path / "pdkey.cstore", key="mytable")
+    np.testing.assert_array_equal(back.array("i"), columns["i"])
+    back.close()
+    # write with the h5py backend under a custom key
+    p2 = tmp_path / "h5key.h5"
+    store.saveas(p2, backend="h5py", key="grp")
+    back2 = colstore.ingest(p2, tmp_path / "h5key.cstore", key="grp")
+    np.testing.assert_array_equal(back2.array("i"), columns["i"])
+    back2.close()
+
+
+def test_hdf5_unknown_backend_rejected(tmp_path, store):
+    _need("h5py")
+    with pytest.raises(ValueError, match="unknown hdf5 backend"):
+        store.saveas(tmp_path / "x.h5", backend="bogus")
+
+
+# ---- coercion policy: reject nulls / non-strings ---------------------------
+
+
+def test_parquet_null_columns_rejected(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    for col in (pa.array(["a", None, "c"]), pa.array([1, None, 3], type=pa.int64())):
+        path = tmp_path / "null.parquet"
+        pq.write_table(pa.table({"x": col}), str(path))
+        with pytest.raises(TypeError, match="null"):
+            colstore.from_parquet(path, tmp_path / "null.cstore")
+
+
+def test_json_null_rejected(tmp_path):
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    path = tmp_path / "n.json"
+    pd.DataFrame({"s": ["a", None, "c"]}).to_json(path, orient="records")
+    with pytest.raises(TypeError, match="null"):
+        colstore.from_json(path, tmp_path / "n.cstore")
+
+
+def test_nested_or_non_string_object_rejected():
+    from colstore.interop._convert import storable_column
+
+    # a nested value past the 64-sample window must still be rejected
+    with pytest.raises(TypeError, match="not a fixed-width string"):
+        storable_column("c", np.array(["x"] * 64 + [{"k": 1}], dtype=object))
+    # a numeric object column is not a string column
+    with pytest.raises(TypeError, match="not a fixed-width string"):
+        storable_column("c", np.array([1, 2, 3], dtype=object))
+
+
+def test_json_numeric_string_preserved(tmp_path):
+    pytest.importorskip("pandas")
+    store = colstore.store(
+        {"sid": np.array(["1", "2", "30"]), "n": np.arange(3, dtype=np.int64)},
+        tmp_path / "s.cstore",
+        show_progress=False,
+    )
+    store.to_json(tmp_path / "j.json")
+    back = colstore.from_json(tmp_path / "j.json", tmp_path / "jb.cstore")
+    assert back.dtypes["sid"].kind == "U"  # numeric-looking strings stay strings
+    assert back.dtypes["n"].kind == "i"
+    back.close()
+
+
+# ---- HDF5 dtype fidelity ---------------------------------------------------
+
+
+def test_hdf5_datetime_roundtrip(tmp_path):
+    _need("h5py")
+    times = np.arange("2020-01-01", "2020-01-06", dtype="datetime64[D]")
+    store = colstore.store({"t": times}, tmp_path / "dt.cstore", show_progress=False)
+    store.to_hdf(tmp_path / "dt.h5")
+    back = colstore.from_hdf(tmp_path / "dt.h5", tmp_path / "dtb.cstore")
+    assert back.dtypes["t"] == np.dtype("datetime64[D]")  # unit preserved
+    np.testing.assert_array_equal(back.array("t"), times)
+    back.close()
+
+
+def test_hdf5_bytes_preserved(tmp_path):
+    _need("h5py")
+    store = colstore.store(
+        {"b": np.array([b"x", b"yy", b"z"])}, tmp_path / "b.cstore", show_progress=False
+    )
+    store.to_hdf(tmp_path / "b.h5")
+    back = colstore.from_hdf(tmp_path / "b.h5", tmp_path / "bb.cstore")
+    assert back.dtypes["b"].kind == "S"  # fixed bytes stay bytes (not widened to U)
+    back.close()
+
+
+def test_hdf5_unknown_read_backend_rejected(tmp_path, store):
+    _need("h5py")
+    store.saveas(tmp_path / "x.h5")
+    with pytest.raises(ValueError, match="unknown hdf5 backend"):
+        colstore.from_hdf(tmp_path / "x.h5", tmp_path / "x.cstore", backend="bogus")
+
+
+# ---- lazy import -----------------------------------------------------------
+
+
+def test_import_colstore_loads_no_backend():
+    import subprocess
+    import sys
+
+    code = (
+        "import colstore, sys; "
+        "bad=[m for m in ('pyarrow','h5py','pandas') if m in sys.modules]; "
+        "assert not bad, bad"
+    )
+    assert subprocess.run([sys.executable, "-c", code]).returncode == 0

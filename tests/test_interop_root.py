@@ -1,10 +1,10 @@
-"""Tests for the ROOT file format (``colstore.interop.root``) and its two kernels.
+"""Tests for the ROOT file format (``colstore.interop.root``) and its two backends.
 
-Both kernels are exercised against real backends where installed (PyROOT for
-``kernel="ROOT"``, uproot for ``kernel="uproot"``); each test is parametrized over
-the available kernels and skipped when neither is present. Covers round-trip
-parity, streaming in batches, cross-kernel interchange, the ``keep_valid_only``
-policy, column selection, kernel selection and errors, dataset export, and the
+Both backends are exercised against real backends where installed (PyROOT for
+``backend="ROOT"``, uproot for ``backend="uproot"``); each test is parametrized over
+the available backends and skipped when neither is present. Covers round-trip
+parity, streaming in batches, cross-backend interchange, the ``keep_valid_only``
+policy, column selection, backend selection and errors, dataset export, and the
 ``RootFormat`` (saveas / ingest) wiring.
 """
 
@@ -22,9 +22,9 @@ from colstore.interop import root as root_mod
 
 _HAS_ROOT = importlib.util.find_spec("ROOT") is not None
 _HAS_UPROOT = importlib.util.find_spec("uproot") is not None
-_KERNELS = (["ROOT"] if _HAS_ROOT else []) + (["uproot"] if _HAS_UPROOT else [])
+_BACKENDS = (["ROOT"] if _HAS_ROOT else []) + (["uproot"] if _HAS_UPROOT else [])
 
-pytestmark = pytest.mark.skipif(not _KERNELS, reason="neither PyROOT nor uproot is installed")
+pytestmark = pytest.mark.skipif(not _BACKENDS, reason="neither PyROOT nor uproot is installed")
 
 
 @pytest.fixture
@@ -48,45 +48,45 @@ def _assert_same_columns(reader, expected):
         np.testing.assert_array_equal(np.sort(reader.array(name)), np.sort(values))
 
 
-# ---- round-trip parity, both kernels ---------------------------------------
+# ---- round-trip parity, both backends ---------------------------------------
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_roundtrip(tmp_path, store, columns, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_roundtrip(tmp_path, store, columns, backend):
     root_path = tmp_path / "out.root"
     result = colstore.to_root(
-        store, root_path, kernel=kernel, treename="events", show_progress=False
+        store, root_path, backend=backend, treename="events", show_progress=False
     )
     assert isinstance(result, Path) and result == root_path and root_path.exists()
     back = colstore.from_root(
-        root_path, tmp_path / "back.cstore", kernel=kernel, show_progress=False
+        root_path, tmp_path / "back.cstore", backend=backend, show_progress=False
     )
     _assert_same_columns(back, columns)
     back.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_streaming_batches_roundtrip(tmp_path, store, columns, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_streaming_batches_roundtrip(tmp_path, store, columns, backend):
     # a small batch_size forces multiple write/read batches
     root_path = tmp_path / "b.root"
     colstore.to_root(
-        store, root_path, kernel=kernel, treename="t", batch_size=7, show_progress=False
+        store, root_path, backend=backend, treename="t", batch_size=7, show_progress=False
     )
     back = colstore.from_root(
-        root_path, tmp_path / "b.cstore", kernel=kernel, batch_size=7, show_progress=False
+        root_path, tmp_path / "b.cstore", backend=backend, batch_size=7, show_progress=False
     )
     _assert_same_columns(back, columns)
     back.close()
 
 
-@pytest.mark.skipif(not (_HAS_ROOT and _HAS_UPROOT), reason="needs both kernels")
-def test_cross_kernel_interchange(tmp_path, store, columns):
-    # write with each kernel, read back with the other
+@pytest.mark.skipif(not (_HAS_ROOT and _HAS_UPROOT), reason="needs both backends")
+def test_cross_backend_interchange(tmp_path, store, columns):
+    # write with each backend, read back with the other
     for writer, reader in (("ROOT", "uproot"), ("uproot", "ROOT")):
         root_path = tmp_path / f"{writer}.root"
-        colstore.to_root(store, root_path, kernel=writer, treename="events", show_progress=False)
+        colstore.to_root(store, root_path, backend=writer, treename="events", show_progress=False)
         back = colstore.from_root(
-            root_path, tmp_path / f"{writer}_{reader}.cstore", kernel=reader, show_progress=False
+            root_path, tmp_path / f"{writer}_{reader}.cstore", backend=reader, show_progress=False
         )
         _assert_same_columns(back, columns)
         back.close()
@@ -95,22 +95,22 @@ def test_cross_kernel_interchange(tmp_path, store, columns):
 # ---- column selection -------------------------------------------------------
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_column_selection(tmp_path, store, columns, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_column_selection(tmp_path, store, columns, backend):
     root_path = tmp_path / "sel.root"
-    colstore.to_root(store, root_path, kernel=kernel, columns=["pt", "n"], show_progress=False)
+    colstore.to_root(store, root_path, backend=backend, columns=["pt", "n"], show_progress=False)
     back = colstore.from_root(
-        root_path, tmp_path / "sel.cstore", kernel=kernel, columns=["pt"], show_progress=False
+        root_path, tmp_path / "sel.cstore", backend=backend, columns=["pt"], show_progress=False
     )
     assert back.columns == ["pt"]
     np.testing.assert_array_equal(np.sort(back.array("pt")), columns["pt"])
     back.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_missing_export_column_raises(tmp_path, store, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_missing_export_column_raises(tmp_path, store, backend):
     with pytest.raises(ValueError, match="not found"):
-        colstore.to_root(store, tmp_path / "x.root", kernel=kernel, columns=["nope"])
+        colstore.to_root(store, tmp_path / "x.root", backend=backend, columns=["nope"])
 
 
 # ---- keep_valid_only on a file with a jagged branch ------------------------
@@ -137,72 +137,86 @@ def _jagged_file(path):
         )
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_keep_valid_only_skips_jagged(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_keep_valid_only_skips_jagged(tmp_path, backend):
     src = tmp_path / "jag.root"
     _jagged_file(src)
     with pytest.warns(RuntimeWarning, match="non-fixed-size"):
-        back = colstore.from_root(src, tmp_path / "k.cstore", kernel=kernel, show_progress=False)
+        back = colstore.from_root(src, tmp_path / "k.cstore", backend=backend, show_progress=False)
     assert "jag" not in back.columns  # the jagged branch is skipped
     assert "pt" in back.columns  # the scalar branch is kept
     np.testing.assert_array_equal(np.sort(back.array("pt")), np.arange(6, dtype=np.float64))
     back.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_keep_valid_only_false_raises(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_keep_valid_only_false_raises(tmp_path, backend):
     src = tmp_path / "jag.root"
     _jagged_file(src)
     with pytest.raises(ValueError, match="cannot be stored"):
-        colstore.from_root(src, tmp_path / "k.cstore", kernel=kernel, keep_valid_only=False)
+        colstore.from_root(src, tmp_path / "k.cstore", backend=backend, keep_valid_only=False)
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_keep_valid_only_skips_requested_invalid(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_keep_valid_only_skips_requested_invalid(tmp_path, backend):
     # the unified policy skips an explicitly requested invalid column too (with a warning)
     src = tmp_path / "jag.root"
     _jagged_file(src)
     with pytest.warns(RuntimeWarning, match="non-fixed-size"):
         back = colstore.from_root(
-            src, tmp_path / "k.cstore", kernel=kernel, columns=["pt", "jag"], show_progress=False
+            src, tmp_path / "k.cstore", backend=backend, columns=["pt", "jag"], show_progress=False
         )
     assert back.columns == ["pt"]
     back.close()
 
 
-# ---- dtype fidelity and storability (review regressions) -------------------
+# ---- dtype fidelity and storability ----------------------------------------
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_missing_read_column_raises(tmp_path, store, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_missing_read_column_raises(tmp_path, store, backend):
     # a typo'd column must raise, not be silently skipped under keep_valid_only=True
     root_path = tmp_path / "m.root"
-    colstore.to_root(store, root_path, kernel=kernel, treename="events", show_progress=False)
+    colstore.to_root(store, root_path, backend=backend, treename="events", show_progress=False)
     with pytest.raises(ValueError, match="not found in the ROOT tree"):
-        colstore.from_root(root_path, tmp_path / "m.cstore", kernel=kernel, columns=["pt", "nope"])
+        colstore.from_root(
+            root_path, tmp_path / "m.cstore", backend=backend, columns=["pt", "nope"]
+        )
 
 
-def test_root_kernel_rejects_int8(tmp_path):
-    # ROOT's Snapshot cannot emit an 8-bit integer; the ROOT kernel must reject it
-    # (not segfault/silently drop), while the uproot kernel writes it fine.
+def test_root_backend_rejects_int8(tmp_path):
+    # ROOT's Snapshot cannot emit an 8-bit integer; the ROOT backend must reject it
+    # (not segfault/silently drop), while the uproot backend writes it fine.
     store = colstore.store(
         {"q": np.arange(-3, 3, dtype=np.int8)}, tmp_path / "i.cstore", show_progress=False
     )
     if _HAS_ROOT:
         with pytest.raises(TypeError, match="8-bit integer"):
-            colstore.to_root(store, tmp_path / "i.root", kernel="ROOT", show_progress=False)
+            colstore.to_root(store, tmp_path / "i.root", backend="ROOT", show_progress=False)
     if _HAS_UPROOT:
-        colstore.to_root(store, tmp_path / "iu.root", kernel="uproot", show_progress=False)
+        colstore.to_root(store, tmp_path / "iu.root", backend="uproot", show_progress=False)
         back = colstore.ingest(
-            tmp_path / "iu.root", tmp_path / "iu.cstore", kernel="uproot", show_progress=False
+            tmp_path / "iu.root", tmp_path / "iu.cstore", backend="uproot", show_progress=False
         )
         assert back.dtypes["q"] == np.int8
         np.testing.assert_array_equal(back.array("q"), np.arange(-3, 3, dtype=np.int8))
         back.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_reads_cstdint_integer_branches(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_root_rejects_string_column(tmp_path, backend):
+    # ROOT branches have no fixed-width string type; reject cleanly, not crash.
+    store = colstore.store(
+        {"s": np.array(["a", "bb", "c"]), "n": np.arange(3, dtype=np.int64)},
+        tmp_path / "str.cstore",
+        show_progress=False,
+    )
+    with pytest.raises(TypeError, match="string column"):
+        colstore.to_root(store, tmp_path / "str.root", backend=backend, show_progress=False)
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_reads_cstdint_integer_branches(tmp_path, backend):
     # uproot's f[name]={dict} form writes branches RDataFrame reports as
     # std::int32_t etc.; storability is judged by dtype, so integers are kept.
     uproot = pytest.importorskip("uproot")
@@ -215,58 +229,58 @@ def test_reads_cstdint_integer_branches(tmp_path, kernel):
             "u16": np.arange(6, dtype=np.uint16),
         }
     back = colstore.from_root(
-        src, tmp_path / "ints.cstore", kernel=kernel, treename="events", show_progress=False
+        src, tmp_path / "ints.cstore", backend=backend, treename="events", show_progress=False
     )
     assert set(back.columns) == {"f64", "i64", "u16"}
     assert back.dtypes["i64"] == np.int64 and back.dtypes["u16"] == np.uint16
     back.close()
 
 
-# ---- kernel selection and errors -------------------------------------------
+# ---- backend selection and errors -------------------------------------------
 
 
-def test_unknown_kernel_raises(tmp_path, store):
-    with pytest.raises(ValueError, match="unknown kernel"):
-        colstore.to_root(store, tmp_path / "x.root", kernel="bogus")
+def test_unknown_backend_raises(tmp_path, store):
+    with pytest.raises(ValueError, match="unknown backend"):
+        colstore.to_root(store, tmp_path / "x.root", backend="bogus")
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_auto_kernel_roundtrip(tmp_path, store, columns, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_auto_backend_roundtrip(tmp_path, store, columns, backend):
     # 'auto' resolves to an available backend; exercise the default path
     root_path = tmp_path / "auto.root"
-    colstore.to_root(store, root_path, show_progress=False)  # kernel='auto'
+    colstore.to_root(store, root_path, show_progress=False)  # backend='auto'
     back = colstore.from_root(root_path, tmp_path / "auto.cstore", show_progress=False)
     _assert_same_columns(back, columns)
     back.close()
 
 
-def test_resolve_kernel_names():
+def test_resolve_backend_names():
     if _HAS_ROOT:
-        assert root_mod.resolve_kernel("ROOT").name == "ROOT"
-        assert root_mod.resolve_kernel("root").name == "ROOT"  # case-insensitive
+        assert root_mod.resolve_backend("ROOT").name == "ROOT"
+        assert root_mod.resolve_backend("root").name == "ROOT"  # case-insensitive
     if _HAS_UPROOT:
-        assert root_mod.resolve_kernel("uproot").name == "uproot"
-    assert root_mod.resolve_kernel("auto").name in {"ROOT", "uproot"}
+        assert root_mod.resolve_backend("uproot").name == "uproot"
+    assert root_mod.resolve_backend("auto").name in {"ROOT", "uproot"}
 
 
 # ---- RootFormat: saveas / ingest -------------------------------------------
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_saveas_and_ingest(tmp_path, store, columns, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_saveas_and_ingest(tmp_path, store, columns, backend):
     root_path = tmp_path / "f.root"
-    store.saveas(root_path, kernel=kernel, treename="events", show_progress=False)
+    store.saveas(root_path, backend=backend, treename="events", show_progress=False)
     assert root_path.exists()
-    back = colstore.ingest(root_path, tmp_path / "f.cstore", kernel=kernel, show_progress=False)
+    back = colstore.ingest(root_path, tmp_path / "f.cstore", backend=backend, show_progress=False)
     _assert_same_columns(back, columns)
     back.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_saveas_row_subset(tmp_path, store, columns, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_saveas_row_subset(tmp_path, store, columns, backend):
     root_path = tmp_path / "sub.root"
-    store[5:10, ["pt", "n"]].saveas(root_path, kernel=kernel, show_progress=False)
-    back = colstore.ingest(root_path, tmp_path / "sub.cstore", kernel=kernel, show_progress=False)
+    store[5:10, ["pt", "n"]].saveas(root_path, backend=backend, show_progress=False)
+    back = colstore.ingest(root_path, tmp_path / "sub.cstore", backend=backend, show_progress=False)
     assert set(back.columns) == {"pt", "n"}
     assert back.n_rows == 5
     np.testing.assert_array_equal(np.sort(back.array("pt")), columns["pt"][5:10])
@@ -291,8 +305,8 @@ def test_import_colstore_does_not_load_backends():
 # ---- dataset export and name sanitization ----------------------------------
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_dataset_export(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_dataset_export(tmp_path, backend):
     paths = []
     for i in range(2):
         p = tmp_path / f"part{i}.cstore"
@@ -303,9 +317,9 @@ def test_dataset_export(tmp_path, kernel):
     ds = colstore.open(paths)
     try:
         root_path = tmp_path / "ds.root"
-        colstore.to_root(ds, root_path, kernel=kernel, treename="t", show_progress=False)
+        colstore.to_root(ds, root_path, backend=backend, treename="t", show_progress=False)
         back = colstore.from_root(
-            root_path, tmp_path / "ds.cstore", kernel=kernel, show_progress=False
+            root_path, tmp_path / "ds.cstore", backend=backend, show_progress=False
         )
         np.testing.assert_array_equal(np.sort(back.array("x")), np.arange(10))
         back.close()
@@ -313,8 +327,8 @@ def test_dataset_export(tmp_path, kernel):
         ds.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_branch_name_sanitization(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_branch_name_sanitization(tmp_path, backend):
     store = colstore.store(
         {"good": np.arange(4, dtype=np.int64), "bad name": np.arange(4, dtype=np.float64)},
         tmp_path / "names.cstore",
@@ -322,25 +336,25 @@ def test_branch_name_sanitization(tmp_path, kernel):
     )
     root_path = tmp_path / "names.root"
     with pytest.warns(RuntimeWarning, match="Sanitized"):
-        colstore.to_root(store, root_path, kernel=kernel, show_progress=False)
+        colstore.to_root(store, root_path, backend=backend, show_progress=False)
     back = colstore.from_root(
-        root_path, tmp_path / "names_back.cstore", kernel=kernel, show_progress=False
+        root_path, tmp_path / "names_back.cstore", backend=backend, show_progress=False
     )
     assert "bad_name" in back.columns  # sanitized to a valid branch name
     back.close()
 
 
-@pytest.mark.parametrize("kernel", _KERNELS)
-def test_empty_store_roundtrip(tmp_path, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_empty_store_roundtrip(tmp_path, backend):
     store = colstore.store(
         {"a": np.empty(0, np.int64), "b": np.empty(0, np.float64)},
         tmp_path / "empty.cstore",
         show_progress=False,
     )
     root_path = tmp_path / "empty.root"
-    colstore.to_root(store, root_path, kernel=kernel, treename="t", show_progress=False)
+    colstore.to_root(store, root_path, backend=backend, treename="t", show_progress=False)
     back = colstore.from_root(
-        root_path, tmp_path / "empty_back.cstore", kernel=kernel, show_progress=False
+        root_path, tmp_path / "empty_back.cstore", backend=backend, show_progress=False
     )
     assert back.n_rows == 0
     assert set(back.columns) == {"a", "b"}
