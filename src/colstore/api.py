@@ -58,32 +58,38 @@ def open(
     return ColStoreDataset(path, **kwargs)
 
 
-def create(path: str | os.PathLike[str]) -> ColStoreWriter:
+def create(path: str | os.PathLike[str], *, statistics: bool = False) -> ColStoreWriter:
     """Open a new file for streaming writes; fail if it already exists.
 
     Use this when you want to be sure you are not overwriting anything.
+    ``statistics=True`` records per-column statistics so later filters can skip
+    data that cannot match; off by default, most useful for selective queries on
+    sorted or clustered data.
     """
-    return ColStoreWriter(path, mode="create")
+    return ColStoreWriter(path, mode="create", statistics=statistics)
 
 
-def recreate(path: str | os.PathLike[str]) -> ColStoreWriter:
+def recreate(path: str | os.PathLike[str], *, statistics: bool = False) -> ColStoreWriter:
     """Open a file for streaming writes, truncating any existing content.
 
     Use this when you intentionally want to overwrite. To fail on
-    overwrite instead, use :func:`create`.
+    overwrite instead, use :func:`create`. ``statistics=True`` records per-column
+    statistics so later filters can skip data that cannot match (off by default).
     """
-    return ColStoreWriter(path, mode="recreate")
+    return ColStoreWriter(path, mode="recreate", statistics=statistics)
 
 
-def update(path: str | os.PathLike[str]) -> ColStoreWriter:
+def update(path: str | os.PathLike[str], *, statistics: bool = False) -> ColStoreWriter:
     """Open an existing file for append.
 
     The schema is loaded from the existing manifest; every :meth:`write`
     must match it exactly. Orphan bytes from a crashed prior writer (if
     any) are truncated on open. Raises :class:`FileNotFoundError` if the
-    file does not exist.
+    file does not exist. ``statistics=True`` keeps the per-column statistics
+    current as records are appended; pass it on each update to keep them (off by
+    default).
     """
-    return ColStoreWriter(path, mode="update")
+    return ColStoreWriter(path, mode="update", statistics=statistics)
 
 
 def store(
@@ -93,6 +99,7 @@ def store(
     mode: str = "create",
     batch_size: int | str | None = "auto",
     show_progress: bool = True,
+    statistics: bool = False,
     **open_kwargs: Any,
 ) -> ColStoreReader:
     """One-shot: write a single-record file and return an opened reader.
@@ -125,6 +132,9 @@ def store(
     show_progress : bool, default ``True``
         Whether to display a tqdm progress bar. The bar's postfix shows
         cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
+    statistics : bool, default ``False``
+        Record per-column statistics so later filters can skip data that cannot
+        match. Most useful for selective queries on sorted or clustered data.
 
     Returns the opened :class:`ColStoreReader` for immediate use.
     """
@@ -139,7 +149,9 @@ def store(
     # right the first time) and surfaces a progress bar.
     if mode == "create" and os.path.exists(path):
         raise FileExistsError(f"{path} already exists; use mode='recreate' to overwrite.")
-    fmt.write_dataset(columns, path, batch_size=batch_size, show_progress=show_progress)
+    fmt.write_dataset(
+        columns, path, batch_size=batch_size, show_progress=show_progress, statistics=statistics
+    )
     return ColStoreReader(path, **open_kwargs)
 
 

@@ -43,7 +43,7 @@ from typing import Any
 
 import numpy as np
 
-from . import _lock, _numa
+from . import _footer, _lock, _numa
 from . import format as fmt
 
 # ---- vectored record emission ---------------------------------------------
@@ -98,12 +98,16 @@ class ColStoreWriter:
     """Append-only writer for a colstore file. See module docstring.
 
     Use :func:`colstore.create`, :func:`colstore.recreate`, or
-    :func:`colstore.update` rather than constructing directly.
+    :func:`colstore.update` rather than constructing directly. ``statistics=True``
+    records per-column statistics so later filters can skip data that cannot
+    match; off by default.
     """
 
     _VALID_MODES = frozenset({"create", "recreate", "update"})
 
-    def __init__(self, path: str | os.PathLike[str], mode: str) -> None:
+    def __init__(
+        self, path: str | os.PathLike[str], mode: str, *, statistics: bool = False
+    ) -> None:
         if mode not in self._VALID_MODES:
             raise ValueError(f"Invalid mode {mode!r}; expected one of {sorted(self._VALID_MODES)}.")
         self._path = Path(path)
@@ -113,6 +117,11 @@ class ColStoreWriter:
         self._n_records = 0
         self._committed_rows = 0
         self._data_offset = 0  # set when header is written / read
+        # Whether to write the statistics footer on close (off by default).
+        self._statistics = statistics
+        # Per-record statistics, one dict {name: (min, max, prunable)} per record,
+        # in record order, populated only when ``statistics`` is on.
+        self._record_stats_acc: list[dict[str, _footer.ColumnStat]] = []
 
         # Determine open mode and existence checks.
         if mode == "create":
@@ -188,6 +197,12 @@ class ColStoreWriter:
         else:
             end_of_committed = data_offset
 
+        # Recover the existing records' statistics (the old footer sits past
+        # end_of_committed and is truncated away next), so the footer rewritten on
+        # close keeps them.
+        if self._statistics:
+            self._record_stats_acc = self._load_existing_stats(int(manifest["stats_offset"]))
+
         # Truncate any orphan bytes past the last committed record (left by a
         # crashed writer). After this, the file ends exactly at end_of_committed
         # and future writes append at that offset.
@@ -207,16 +222,71 @@ class ColStoreWriter:
         )
         self._has_header = True
 
-    def _commit_counters(self) -> None:
+    def _commit_counters(self, stats_offset: int = 0) -> None:
         """Seek to the counters block, rewrite it, and fsync.
 
         The 32-byte counters block is small enough that a single write is
         typically atomic at the syscall level; the embedded CRC catches a
-        torn write on next open if it isn't.
+        torn write on next open if it isn't. ``stats_offset`` is the location
+        of the statistics footer written just before this commit.
         """
-        fmt.write_counters(self._file, self._n_records, self._committed_rows)
+        fmt.write_counters(self._file, self._n_records, self._committed_rows, stats_offset)
         self._file.flush()
         os.fsync(self._file.fileno())
+
+    def _write_stats_footer(self) -> int:
+        """Append the statistics footer at end-of-file; return its offset (0 if none).
+
+        Written after the last record and before the counters commit, so a crash in
+        between leaves ``stats_offset`` unchanged and the orphan footer is truncated
+        on the next update-mode open. The statistics are advisory: a crash during an
+        append that has overwritten the prior footer leaves the pre-existing records
+        non-prunable on recovery (their data is intact; they are read in full until
+        a later rewrite regenerates the footer).
+        """
+        if self._n_records == 0 or not self._record_stats_acc:
+            return 0
+        self._file.seek(0, os.SEEK_END)
+        offset = self._file.tell()
+        self._file.write(_footer.serialize_stats(self._schema or [], self._record_stats_acc))
+        return offset
+
+    def _load_existing_stats(self, stats_offset: int) -> list[dict[str, _footer.ColumnStat]]:
+        """Recover the existing records' per-record stats for an update-mode append.
+
+        Reads the prior footer (past the committed end, before it is truncated
+        away) so a rewritten footer keeps the old records' min/max. A file with no
+        usable footer yields non-prunable placeholders -- those records are never
+        skipped at read time.
+        """
+        schema = self._schema or []
+        parsed = None
+        if stats_offset:
+            self._file.seek(stats_offset)
+            parsed = _footer.parse_stats(self._file.read())
+        usable = parsed is not None and all(
+            name in parsed and len(parsed[name]["prunable"]) >= self._n_records
+            for name in (col["name"] for col in schema)
+        )
+        if usable and parsed is not None:
+            return [
+                {
+                    col["name"]: (
+                        parsed[col["name"]]["min"][index],
+                        parsed[col["name"]]["max"][index],
+                        bool(parsed[col["name"]]["prunable"][index]),
+                    )
+                    for col in schema
+                }
+                for index in range(self._n_records)
+            ]
+        placeholder = {
+            col["name"]: _footer.column_stat(
+                np.dtype(col["dtype"]), np.zeros(0, dtype=np.dtype(col["dtype"]))
+            )
+            for col in schema
+        }
+        return [dict(placeholder) for _ in range(self._n_records)]
 
     # ---- public API ---------------------------------------------------
 
@@ -310,6 +380,16 @@ class ColStoreWriter:
         self._n_records += 1
         self._committed_rows += n_rows
         self._wrote_anything = True
+        # Capture this record's per-column min/max for the statistics footer.
+        if self._statistics:
+            self._record_stats_acc.append(
+                {
+                    meta["name"]: _footer.column_stat(
+                        np.dtype(meta["dtype"]), le_columns[meta["name"]]
+                    )
+                    for meta in columns_meta
+                }
+            )
 
     def _emit_record(
         self,
@@ -373,7 +453,8 @@ class ColStoreWriter:
             return
         try:
             if self._has_header:
-                self._commit_counters()
+                stats_offset = self._write_stats_footer()
+                self._commit_counters(stats_offset)
             else:
                 # create/recreate, never wrote: drop the empty file.
                 pass

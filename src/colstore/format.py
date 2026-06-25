@@ -55,7 +55,7 @@ from typing import IO, Any
 
 import numpy as np
 
-from . import _numa, config
+from . import _footer, _numa, config
 from ._sizes import parse_byte_size
 from .frame import Expr, evaluate, fusible_passthroughs, validate_length
 from .progress import progress_bar
@@ -66,23 +66,30 @@ _MANIFEST_LEN_FMT = "<Q"
 _MANIFEST_LEN_SIZE = struct.calcsize(_MANIFEST_LEN_FMT)
 _ALIGNMENT = 64
 _FORMAT_VERSION = 1
+# The optional statistics footer is gated by stats_offset in the counters block
+# (0 = no footer), independent of the format version.
 _SUPPORTED_VERSIONS = frozenset({1})
 
 # Counters block. Lives at a fixed offset (right after the magic bytes) so the
 # writer can rewrite it in place on close() without shifting any record byte
-# offsets. The block is 32 bytes:
+# offsets. The block is 64 bytes (one alignment unit), with reserved space for
+# future mutable section pointers:
 #
-#     8B  n_records       (i64 LE)
-#     8B  committed_rows  (i64 LE)
-#     4B  counters_crc32  (over the first 16 bytes)
-#     12B reserved        (zero)
+#     8B   n_records       (i64 LE)
+#     8B   committed_rows  (i64 LE)
+#     8B   stats_offset    (i64 LE; 0 = no statistics footer)
+#     4B   counters_crc32  (over the preceding 24 bytes)
+#     36B  reserved        (zero)
 #
 # Separating mutable counters from the immutable JSON manifest is what enables
-# crash-safe streaming writes: each successful close() atomically commits the
-# new counter values; the immutable manifest never moves.
+# crash-safe streaming writes: each close() atomically commits the new counter
+# values, and the manifest never moves. ``stats_offset`` is mutable (it changes
+# with the records), so it lives here, not in the manifest. The statistics footer
+# carries its own CRC over its contents.
 _COUNTERS_OFFSET = len(_MAGIC)  # 8
-_COUNTERS_FMT = "<qqI12s"
-_COUNTERS_SIZE = struct.calcsize(_COUNTERS_FMT)  # 32
+_COUNTERS_FMT = "<qqqI36s"
+_COUNTERS_SIZE = struct.calcsize(_COUNTERS_FMT)  # 64
+_COUNTERS_CRC_FMT = "<qqq"  # the 24 bytes the counters CRC covers
 
 # Record header layout. A record is "[32B header][record body]" where the
 # body is column-major (columns concatenated in schema order) and padded to a
@@ -130,27 +137,32 @@ def _manifest_checksum(columns_meta: list[dict[str, Any]]) -> int:
     return zlib.crc32(payload) & 0xFFFFFFFF
 
 
-def _pack_counters(n_records: int, committed_rows: int) -> bytes:
-    """Pack the 32-byte counters block including its CRC32."""
-    body = struct.pack("<qq", n_records, committed_rows)
+def _pack_counters(n_records: int, committed_rows: int, stats_offset: int = 0) -> bytes:
+    """Pack the 64-byte counters block including its CRC32."""
+    body = struct.pack(_COUNTERS_CRC_FMT, n_records, committed_rows, stats_offset)
     crc = zlib.crc32(body) & 0xFFFFFFFF
-    return struct.pack(_COUNTERS_FMT, n_records, committed_rows, crc, b"\x00" * 12)
+    return struct.pack(_COUNTERS_FMT, n_records, committed_rows, stats_offset, crc, b"\x00" * 36)
 
 
-def _unpack_counters(raw: bytes) -> tuple[int, int]:
-    """Parse and validate the 32-byte counters block; return (n_records, committed_rows)."""
+def _unpack_counters(raw: bytes) -> tuple[int, int, int]:
+    """Parse the 64-byte counters block; return (n_records, committed_rows, stats_offset)."""
     if len(raw) != _COUNTERS_SIZE:
         raise FormatError(
             f"Counters block truncated: expected {_COUNTERS_SIZE} bytes, got {len(raw)}."
         )
-    n_records, committed_rows, stored_crc, _reserved = struct.unpack(_COUNTERS_FMT, raw)
-    actual_crc = zlib.crc32(struct.pack("<qq", n_records, committed_rows)) & 0xFFFFFFFF
+    n_records, committed_rows, stats_offset, stored_crc, _reserved = struct.unpack(
+        _COUNTERS_FMT, raw
+    )
+    actual_crc = (
+        zlib.crc32(struct.pack(_COUNTERS_CRC_FMT, n_records, committed_rows, stats_offset))
+        & 0xFFFFFFFF
+    )
     if actual_crc != stored_crc:
         raise FormatError(
             f"Counters block CRC mismatch (stored {stored_crc}, computed {actual_crc}); "
             f"the file header is corrupt."
         )
-    return n_records, committed_rows
+    return n_records, committed_rows, stats_offset
 
 
 def record_body_size(n_rows: int, itemsizes: list[int]) -> int:
@@ -284,6 +296,7 @@ def write_header(
     columns_meta: list[dict[str, Any]],
     n_records: int,
     committed_rows: int,
+    stats_offset: int = 0,
 ) -> int:
     """Write magic + counters + manifest + padding; return the data start offset.
 
@@ -309,25 +322,27 @@ def write_header(
     data_offset = align_up(header_size)
 
     file.write(_MAGIC)
-    file.write(_pack_counters(n_records, committed_rows))
+    file.write(_pack_counters(n_records, committed_rows, stats_offset))
     file.write(struct.pack(_MANIFEST_LEN_FMT, len(manifest_bytes)))
     file.write(manifest_bytes)
     file.write(b"\x00" * (data_offset - header_size))
     return data_offset
 
 
-def write_counters(file: IO[bytes], n_records: int, committed_rows: int) -> None:
+def write_counters(
+    file: IO[bytes], n_records: int, committed_rows: int, stats_offset: int = 0
+) -> None:
     """Rewrite the 32-byte counters block at its fixed offset.
 
     Seeks to the counters block first, so callers don't need to know
     where it lives on disk. Used by :meth:`ColStoreWriter.close` to
-    commit the new record count and row total atomically. The 32-byte
-    block is small enough that a single ``write()`` is generally atomic
-    on common filesystems; even if it isn't, the embedded CRC catches a
-    torn write on the next open.
+    commit the new record count, row total, and statistics-footer offset
+    atomically. The 32-byte block is small enough that a single ``write()``
+    is generally atomic on common filesystems; even if it isn't, the
+    embedded CRC catches a torn write on the next open.
     """
     file.seek(_COUNTERS_OFFSET)
-    file.write(_pack_counters(n_records, committed_rows))
+    file.write(_pack_counters(n_records, committed_rows, stats_offset))
 
 
 def record_header_bytes(record_index: int, n_rows: int) -> bytes:
@@ -396,7 +411,7 @@ def read_header_from_file(input_file: IO[bytes]) -> tuple[dict[str, Any], int]:
     magic = input_file.read(len(_MAGIC))
     if magic != _MAGIC:
         raise FormatError(f"Not a colstore file: expected magic {_MAGIC!r}, got {magic!r}")
-    n_records, committed_rows = _unpack_counters(input_file.read(_COUNTERS_SIZE))
+    n_records, committed_rows, stats_offset = _unpack_counters(input_file.read(_COUNTERS_SIZE))
     manifest_size = struct.unpack(_MANIFEST_LEN_FMT, input_file.read(_MANIFEST_LEN_SIZE))[0]
     manifest_bytes = input_file.read(manifest_size)
     try:
@@ -423,6 +438,7 @@ def read_header_from_file(input_file: IO[bytes]) -> tuple[dict[str, Any], int]:
     # Merge counters into the returned dict so callers see one unified view.
     manifest["n_records"] = n_records
     manifest["committed_rows"] = committed_rows
+    manifest["stats_offset"] = stats_offset
 
     header_size = len(_MAGIC) + _COUNTERS_SIZE + _MANIFEST_LEN_SIZE + manifest_size
     data_offset = align_up(header_size)
@@ -679,6 +695,7 @@ def write_dataset(
     *,
     batch_size: int | str | None,
     show_progress: bool,
+    statistics: bool = False,
 ) -> None:
     """Serialize a dict of 1D NumPy columns to disk in colstore format.
 
@@ -699,6 +716,9 @@ def write_dataset(
     show_progress : bool
         Whether to display a tqdm progress bar. The bar's postfix shows
         cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
+    statistics : bool, default ``False``
+        Record per-column statistics so later filters can skip data that cannot
+        match. Most useful for selective queries on sorted or clustered data.
     """
     column_names, n_rows, little_endian_columns, columns_meta = normalize_columns(columns)
     column_itemsizes = [little_endian_columns[name].dtype.itemsize for name in column_names]
@@ -841,6 +861,22 @@ def write_dataset(
         pad = align_up(body_bytes, _RECORD_BODY_ALIGNMENT) - body_bytes
         if pad:
             output_file.write(b"\x00" * pad)
+
+        # Statistics footer: record 0's per-column min/max and prunable flag,
+        # computed from the in-memory arrays, written after the body, and located
+        # by stats_offset in the counters block (rewritten in place here).
+        if statistics:
+            record_stats = {
+                meta["name"]: _footer.column_stat(
+                    np.dtype(meta["dtype"]), little_endian_columns[meta["name"]]
+                )
+                for meta in columns_meta
+            }
+            stats_offset = output_file.tell()
+            output_file.write(_footer.serialize_stats(columns_meta, [record_stats]))
+            write_counters(
+                output_file, n_records=1, committed_rows=n_rows, stats_offset=stats_offset
+            )
 
 
 def _resolve_streaming_layout(
