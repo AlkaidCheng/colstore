@@ -327,6 +327,46 @@ The written file reads back on the single-record fast path. See the [dataset
 read decomposition](docs/dataset_read_decomposition.svg) diagram for how a read
 is split across files and reassembled.
 
+### Growing a dataset by appending
+
+A dataset can also *be* a directory, grown one piece at a time. Each new piece is
+written as its own immutable `.cstore` *shard*, and the directory's contents are
+the dataset — `open(dir)` reads every shard in order, the same as `open([...])`
+over a list:
+
+```python
+colstore.append("trades/", jan)            # writes trades/shard_00000.cstore
+colstore.append("trades/", feb)            # writes trades/shard_00001.cstore
+
+ds = colstore.open("trades/")              # the whole directory as one table
+ds.n_rows                                  # sum across every shard
+```
+
+`append` writes only the new rows, so extending a large dataset stays cheap no
+matter how big it already is — unlike re-running `concat` to a single file, which
+rewrites everything each time. There is nothing to keep in sync by hand: add a
+shard and it is in the dataset; remove one and it is gone. New shards take the
+next free `shard_{index:05d}.cstore` name; pass `name=` to choose another
+template (any `{index}` field) or a fixed filename.
+
+To stream many batches without holding them all in memory, use `appender`, which
+rolls a new shard each time the buffer reaches a size budget (a row count, a byte
+string like `"256 MiB"`, or `None` to roll only on an explicit `flush()`):
+
+```python
+with colstore.appender("trades/", shard_size="256 MiB") as out:
+    for batch in source:
+        out.write(batch)                   # buffered; rolls a shard at the budget
+# the remainder is flushed and the shard committed on exit
+```
+
+Every shard must share the schema of the ones already there, and is committed
+atomically — a reader only ever sees a complete shard, and an interrupted write
+leaves nothing behind. One writer holds the directory at a time. Pass
+`statistics=True` (to either `append` or `appender`) to record per-record
+min/max bounds in each shard, so a later filtered read can skip shards that
+cannot match.
+
 ## Introspection
 
 ```python
