@@ -22,6 +22,7 @@ import os
 import re
 import tempfile
 import warnings
+from functools import lru_cache
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -42,10 +43,13 @@ PathLike = str | os.PathLike[str]
 Columns = dict[str, np.ndarray[Any, np.dtype[Any]]]
 
 
+@lru_cache
 def _shard_pattern(template: str) -> re.Pattern[str] | None:
     """A regex matching ``template`` with its ``{index}`` field as a digit capture.
 
     Returns ``None`` when the template has no ``{index}`` field (a literal name).
+    Memoized: a template is compiled once and reused across every shard roll and
+    every appender rather than recompiled per call.
     """
     field = _INDEX_FIELD.search(template)
     if field is None:
