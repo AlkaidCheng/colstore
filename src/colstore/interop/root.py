@@ -295,38 +295,107 @@ def _resolve_file_list(
     return bare, treename or embedded
 
 
-def _as_rdataframe(source: RootSource, treename: str | None) -> ROOT.RDF.RNode:
-    """Build (or pass through) an RDataFrame from a path, a list, a mapping, or an RDF."""
+def _source_files_and_tree(
+    root: ModuleType, source: RootSource, treename: str | None
+) -> tuple[list[str] | None, str | None]:
+    """Resolve a file-based ``source`` to its bare paths and the one tree they share.
+
+    A path, a ``"file.root:tree"`` spec, a list of those, and a ``{treename: files}``
+    mapping all funnel through here, so the metadata RDataFrame, the implicit-MT
+    whole-tree read, and the per-file chunker agree on the same files and tree.
+    Returns ``(None, None)`` for a pre-built RDataFrame (read as-is).
+    """
     if not isinstance(source, (str, os.PathLike, list, tuple, dict)):
-        return source  # already an RDataFrame/RNode; use duck-typed, no ROOT import
-    root = _import_root()
+        return None, None  # already an RDataFrame/RNode
     if isinstance(source, (list, tuple)):
         paths, tree = _resolve_file_list(source, treename)
-        resolved = tree if tree is not None else _resolve_tree_name(root, paths[0], None)
-        return root.RDataFrame(resolved, paths)
+        return paths, (tree if tree is not None else _resolve_tree_name(root, paths[0], None))
     if isinstance(source, dict):
         if len(source) != 1:
             raise ValueError(
                 f"A {{treename: files}} mapping must name exactly one tree; got {len(source)}."
             )
         ((tree, files),) = source.items()
-        return root.RDataFrame(tree, files)
-
+        paths = (
+            [os.fspath(f) for f in files]
+            if isinstance(files, (list, tuple))
+            else [os.fspath(files)]
+        )
+        return paths, tree
     # A str may carry an embedded ":tree"; an os.PathLike is strictly a path.
     if isinstance(source, str):
-        file_path, embedded_tree = _split_path_and_tree(source)
+        file_path, embedded = _split_path_and_tree(source)
     else:
-        file_path, embedded_tree = os.fspath(source), None
+        file_path, embedded = os.fspath(source), None
+    if embedded is not None and treename is not None and treename != embedded:
+        raise ValueError(
+            f"Conflicting tree names: treename={treename!r} but the path names "
+            f"{embedded!r}; pass only one."
+        )
+    tree = treename or embedded
+    return [file_path], (tree if tree is not None else _resolve_tree_name(root, file_path, None))
 
-    if embedded_tree is not None:
-        if treename is not None and treename != embedded_tree:
-            raise ValueError(
-                f"Conflicting tree names: treename={treename!r} but the path names "
-                f"{embedded_tree!r}; pass only one."
-            )
-        return root.RDataFrame(embedded_tree, file_path)
-    resolved_tree = _resolve_tree_name(root, file_path, treename)
-    return root.RDataFrame(resolved_tree, file_path)
+
+def _file_entry_counts(root: ModuleType, paths: list[str], tree: str) -> list[int]:
+    """Per-file entry counts from each TTree's metadata (no event loop)."""
+    counts: list[int] = []
+    for path in paths:
+        opened = root.TFile.Open(os.fspath(path))
+        if not opened or opened.IsZombie():
+            if opened:
+                opened.Close()
+            raise ValueError(f"Could not open {path!r} as a ROOT file.")
+        try:
+            obj = opened.Get(tree)
+            if not obj:
+                raise ValueError(f"Tree {tree!r} not found in {path!r}.")
+            counts.append(int(obj.GetEntries()))
+        finally:
+            opened.Close()
+    return counts
+
+
+def _group_files_by_budget(counts: list[int], budget: int) -> list[list[int]]:
+    """Pack consecutive files greedily into groups whose summed rows stay within
+    ``budget`` (a file larger than the budget forms its own group). Returns the
+    file indices per group.
+    """
+    groups: list[list[int]] = []
+    current: list[int] = []
+    current_rows = 0
+    for index, count in enumerate(counts):
+        if current and current_rows + count > budget:
+            groups.append(current)
+            current, current_rows = [], 0
+        current.append(index)
+        current_rows += count
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _file_group_batches(
+    root: ModuleType, files: list[str], tree: str, columns: list[str], rows_per_batch: int
+) -> Iterator[ColumnBatch]:
+    """Yield AsNumpy batches over file groups, each group read in one implicit-MT
+    ``AsNumpy``. Files are packed greedily up to ``rows_per_batch`` rows; a single
+    file larger than the budget is ``Range``-chunked instead (``Range`` disables
+    implicit MT, so those chunks read single-threaded).
+    """
+    counts = _file_entry_counts(root, files, tree)
+    for group in _group_files_by_budget(counts, rows_per_batch):
+        group_files = [files[i] for i in group]
+        group_rows = sum(counts[i] for i in group)
+        if len(group_files) == 1 and group_rows > rows_per_batch:
+            with _implicit_mt(root, False):
+                rdf = root.RDataFrame(tree, group_files)
+                for start in range(0, group_rows, rows_per_batch):
+                    end = min(start + rows_per_batch, group_rows)
+                    yield rdf.Range(start, end).AsNumpy(columns=columns)
+        else:
+            with _implicit_mt(root, _DEFAULT_MULTITHREADING):
+                batch = root.RDataFrame(tree, group_files).AsNumpy(columns=columns)
+            yield batch
 
 
 def _ingest_batches(
@@ -413,7 +482,8 @@ class RootCppBackend(RootBackend):
         batch_size: int | str | None,
     ) -> tuple[Iterator[ColumnBatch], int]:
         root = _import_root()
-        rdf = _as_rdataframe(source, treename)
+        files, tree = _source_files_and_tree(root, source, treename)
+        rdf = root.RDataFrame(tree, files) if files is not None else source
         selected = _select_storable_columns(rdf, columns, keep_valid_only)
         total = int(rdf.Count().GetValue())
         if total == 0:
@@ -424,16 +494,21 @@ class RootCppBackend(RootBackend):
             )
         else:
             rows_per_batch = resolve_batch_rows(batch_size)
-        # When the whole tree fits the budget and we own the RDataFrame, read it in
-        # one AsNumpy with implicit MT. The RDF fixes its thread-slot count at
-        # construction, so a fresh one is built INSIDE the MT context; Range (used
-        # only when the budget is smaller than the tree) is incompatible with it.
         whole_tree = rows_per_batch is None or total <= rows_per_batch
-        if total > 0 and whole_tree and not _is_rdataframe_source(source):
+        # When the whole tree fits the budget and we own the files, read it in one
+        # AsNumpy with implicit MT. The RDF fixes its thread-slot count at
+        # construction, so a fresh one is built INSIDE the MT context.
+        if total > 0 and whole_tree and files is not None:
+            assert tree is not None  # a file-based source always resolves a tree
             with _implicit_mt(root, _DEFAULT_MULTITHREADING):
-                mt_rdf = _as_rdataframe(source, treename)
-                batch = mt_rdf.AsNumpy(columns=selected)
+                batch = root.RDataFrame(tree, files).AsNumpy(columns=selected)
             return iter([batch]), total
+        # A multi-file dataset over the budget chunks by file group, so each group
+        # reads in one implicit-MT AsNumpy instead of a single-threaded Range over
+        # the concatenation. (A lone over-budget file still needs Range, MT off.)
+        if total > 0 and files is not None and rows_per_batch is not None and len(files) > 1:
+            assert tree is not None
+            return _file_group_batches(root, files, tree, selected, rows_per_batch), total
         return _ingest_batches(rdf, selected, rows_per_batch, total), total
 
     def write(
