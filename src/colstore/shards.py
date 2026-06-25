@@ -131,6 +131,11 @@ def _open_source(data: Any) -> tuple[ShardSource, bool] | None:
     return None
 
 
+def _materialize_source(source: ShardSource) -> Columns:
+    """Read every column of ``source`` into memory as a column dict."""
+    return {name: source[name].array() for name in source.columns}
+
+
 def _coerce_append_data(data: Any) -> Columns:
     """Materialize append data to a column dict: a :func:`colstore.store` input,
     an open reader/dataset, or a path to read."""
@@ -140,7 +145,7 @@ def _coerce_append_data(data: Any) -> Columns:
     if opened is not None:
         source, owned = opened
         try:
-            return {name: source[name].array() for name in source.columns}
+            return _materialize_source(source)
         finally:
             if owned:
                 source.close()
@@ -170,6 +175,21 @@ def _source_files(source: ShardSource) -> list[Path]:
     """The physical ``.cstore`` files backing ``source`` (one for a single reader)."""
     path = source.path
     return list(path) if isinstance(path, tuple) else [path]
+
+
+def _reject_self_append(source: ShardSource, directory: Path) -> None:
+    """Refuse to append a dataset to itself; every existing row would be duplicated.
+
+    A source whose files are shards of the locked directory aliases the dataset's
+    own membership (mirrors :func:`concat`'s out-aliases-source guard).
+    """
+    target = directory.resolve()
+    for path in _source_files(source):
+        if Path(path).resolve().parent == target:
+            raise ValueError(
+                f"cannot append the dataset at {directory} to itself; the source "
+                f"includes its own shard {os.path.basename(path)}."
+            )
 
 
 def _write_shard_from_source(
@@ -307,8 +327,9 @@ def append(
     materializing path (the streaming writer records no footer).
 
     Raises :class:`OSError` if another writer holds the directory lock, and
-    :class:`ValueError` if ``name`` lacks the ``.cstore`` extension or ``data``
-    does not match the existing schema.
+    :class:`ValueError` if ``name`` lacks the ``.cstore`` extension, ``data`` does
+    not match the existing schema, or ``data`` is the dataset's own directory (a
+    self-append would duplicate every existing row).
     """
     _validate_shard_name(name)
     directory = Path(directory)
@@ -316,28 +337,42 @@ def append(
     try:
         expected = _existing_schema(directory)
         shard_name = _shard_name(name, _next_index(directory, name))
-        opened = None if statistics else _open_source(data)
-        if opened is not None:
-            source, owned = opened
-            try:
-                final = directory / shard_name
-                _assert_shard_absent(final)
-                _validate_source_schema(source, expected)
-                _write_shard_from_source(source, final, memory_budget=None)
-            finally:
-                if owned:
-                    source.close()
+        opened = _open_source(data)
+        if opened is None:
+            # In-memory data (dict / structured array / DataFrame): materialize.
+            columns = _coerce_append_data(data)
+            fmt.normalize_columns(columns, expected_schema=expected)
+            return _write_shard_atomic(
+                directory,
+                columns,
+                shard_name,
+                statistics=statistics,
+                batch_size=batch_size,
+                show_progress=show_progress,
+            )
+        source, owned = opened
+        try:
+            _reject_self_append(source, directory)
+            if statistics:
+                # The streaming/copy paths record no footer, so materialize here.
+                columns = _materialize_source(source)
+                fmt.normalize_columns(columns, expected_schema=expected)
+                return _write_shard_atomic(
+                    directory,
+                    columns,
+                    shard_name,
+                    statistics=True,
+                    batch_size=batch_size,
+                    show_progress=show_progress,
+                )
+            final = directory / shard_name
+            _assert_shard_absent(final)
+            _validate_source_schema(source, expected)
+            _write_shard_from_source(source, final, memory_budget=None)
             return final
-        columns = _coerce_append_data(data)
-        fmt.normalize_columns(columns, expected_schema=expected)
-        return _write_shard_atomic(
-            directory,
-            columns,
-            shard_name,
-            statistics=statistics,
-            batch_size=batch_size,
-            show_progress=show_progress,
-        )
+        finally:
+            if owned:
+                source.close()
     finally:
         _release_directory_lock(fd)
 

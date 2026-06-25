@@ -85,6 +85,23 @@ def test_append_streams_a_multifile_dataset_source(tmp_path):
     ds.close()
 
 
+def test_append_rejects_self_append(tmp_path):
+    # Appending the dataset's own directory (or a dataset over its shards) would
+    # silently duplicate every existing row; reject it before writing.
+    colstore.append(tmp_path, {"x": np.arange(5, dtype=np.int64)})
+    colstore.append(tmp_path, {"x": np.arange(5, 10, dtype=np.int64)})
+    before = _shards(tmp_path)
+    with pytest.raises(ValueError, match="itself"):
+        colstore.append(tmp_path, tmp_path)  # the directory itself
+    own = colstore.open(tmp_path)
+    with pytest.raises(ValueError, match="itself"):
+        colstore.append(tmp_path, own)  # a dataset over its own shards
+    own.close()
+    with pytest.raises(ValueError, match="itself"):
+        colstore.append(tmp_path, tmp_path, statistics=True)  # statistics path too
+    assert _shards(tmp_path) == before  # nothing duplicated
+
+
 def test_append_source_validates_schema_before_writing(tmp_path):
     shard_dir = tmp_path / "ds"
     colstore.append(shard_dir, {"x": np.arange(3, dtype=np.int64)})
