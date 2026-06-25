@@ -60,6 +60,24 @@ _UNARY_OPS: dict[type[ast.unaryop], np.ufunc] = {
 # than ``_Op``, consistent with the comparison operators.
 _COMPARE_UFUNCS = frozenset(_COMPARE_OPS.values())
 
+# Comparison ufuncs whose truth over a block of values is decided by the block's
+# min and max, and how each one reads when the column moves to the right of the
+# operator (``scalar < col`` is ``col > scalar``). ``!=`` is absent: a block can
+# almost always contain a non-equal value, so it does not prune.
+_BOUND_FLIP: dict[np.ufunc, np.ufunc] = {
+    np.less: np.greater,
+    np.less_equal: np.greater_equal,
+    np.greater: np.less,
+    np.greater_equal: np.less_equal,
+    np.equal: np.equal,
+}
+
+
+def _is_scalar_operand(value: Any) -> bool:
+    """Whether ``value`` is a single scalar (not a column expression or array)."""
+    return not isinstance(value, _Expr) and np.ndim(value) == 0
+
+
 ReadColumn = Callable[[str], NDArray[Any]]
 
 
@@ -344,6 +362,22 @@ class _Compare(_Expr):
         right = _operand(self._right, read_column)
         left, right = _align_strings(left, right)
         return self._ufunc(left, right)
+
+    def predicate_bounds(self) -> tuple[str, np.ufunc, Any] | None:
+        """Lower a ``col(name) <op> scalar`` comparison to ``(name, ufunc, scalar)``.
+
+        Returns ``None`` unless exactly one operand is a bare column reference and
+        the other is a scalar, with ``<op>`` one of ``< <= > >= ==`` (the forms a
+        block's min/max can decide). A scalar-on-the-left comparison is flipped so
+        the column is on the left. Used to skip blocks that cannot match a filter.
+        """
+        if self._ufunc not in _BOUND_FLIP:
+            return None
+        if isinstance(self._left, _Col) and _is_scalar_operand(self._right):
+            return self._left._name, self._ufunc, self._right
+        if isinstance(self._right, _Col) and _is_scalar_operand(self._left):
+            return self._right._name, _BOUND_FLIP[self._ufunc], self._left
+        return None
 
     def _columns(self) -> Iterator[str]:
         yield from _operand_columns(self._left)
