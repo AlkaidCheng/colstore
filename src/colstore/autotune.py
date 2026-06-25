@@ -525,8 +525,8 @@ def calibrate_prefetch(
 # The boolean-mask-native route's density gate (see
 # config.set_mask_density_gate) sits at a hardware-dependent crossover:
 # below it, per-column int64 index traffic (8 bytes per SELECTED element)
-# undercuts re-reading the 1-byte-per-ROW mask. The compiled default (0.15)
-# is conservative; this calibration measures the crossover where jobs run.
+# undercuts re-reading the 1-byte-per-ROW mask. The compiled default (0.0)
+# routes at every density; this calibration measures the crossover where jobs run.
 _MASK_DENSITY_GRID = (0.02, 0.05, 0.08, 0.12, 0.15, 0.2, 0.3)
 _MASK_DENSITY_WIN_RATIO = 1.05
 _MASK_CALIB_N_RECORDS = 2_000

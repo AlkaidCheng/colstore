@@ -463,7 +463,7 @@ only large ones spend the whole budget.
 
 The cap itself defaults to half the physical cores, bounded by a per-socket
 allowance so multi-socket hosts (with more memory channels) get a higher
-default; `colstore.autotune` refines it per host by measuring the saturation
+default; `colstore.calibrate()` refines it per host by measuring the saturation
 knee directly.
 
 ## NUMA placement
