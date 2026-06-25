@@ -148,11 +148,11 @@ def _write_shard_atomic(
         fmt.write_dataset(
             columns, tmp, batch_size=batch_size, show_progress=show_progress, statistics=statistics
         )
-        sync_fd = os.open(tmp, os.O_RDONLY)
-        try:
-            os.fsync(sync_fd)
-        finally:
-            os.close(sync_fd)
+        # Reopen read/write for the durability fsync: on Windows os.fsync maps to
+        # _commit(), which fails with EBADF on a read-only descriptor. The handle
+        # is closed before os.replace, which Windows also requires.
+        with open(tmp, "r+b") as written:
+            os.fsync(written.fileno())
         os.replace(tmp, final)
     except BaseException:
         with contextlib.suppress(OSError):
