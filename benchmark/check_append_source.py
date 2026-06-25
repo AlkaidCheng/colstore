@@ -20,10 +20,13 @@ RAM, the other two do not).
 from __future__ import annotations
 
 import argparse
+import os
 import resource
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import _common as _c
@@ -68,13 +71,77 @@ def _copy(src: Path, out: Path) -> None:
 _STRATEGY = {"materialize": _materialize, "stream": _stream, "copy": _copy}
 
 
-def _peak_rss_bytes() -> int:
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return rss * 1024 if sys.platform == "linux" else rss  # Linux KiB, macOS bytes
+def _private_rss_bytes() -> int | None:
+    """Current *private* (anonymous) resident bytes on Linux, else ``None``.
+
+    ``resident - shared`` from ``/proc/self/statm`` excludes the file-backed,
+    reclaimable source mmap and counts only private memory -- the materialized
+    arrays -- which is the real demand on the memory budget.
+    """
+    try:
+        with open("/proc/self/statm") as handle:
+            fields = handle.read().split()
+        private_pages = int(fields[1]) - int(fields[2])
+    except (OSError, ValueError, IndexError):
+        return None
+    return private_pages * os.sysconf("SC_PAGE_SIZE")
+
+
+class _PeakRSS:
+    """Sample *current private* RSS in a background thread; report the peak rise.
+
+    Uses current private RSS rather than lifetime ``ru_maxrss``, which on a
+    many-core node is swamped by the one-time import/threading-init peak (identical
+    for every strategy) and would also count the shared source mmap. The figure is
+    the private memory the operation adds. Where ``/proc`` is unavailable (e.g.
+    macOS) it falls back to the lifetime peak, less precise.
+    """
+
+    def __init__(self, interval: float = 0.001) -> None:
+        self._interval = interval
+        self._stop = threading.Event()
+        self._baseline = _private_rss_bytes()
+        self._peak = self._baseline or 0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self) -> _PeakRSS:
+        self._thread.start()
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            rss = _private_rss_bytes()
+            if rss is not None and rss > self._peak:
+                self._peak = rss
+            time.sleep(self._interval)
+
+    def __exit__(self, *exc: object) -> None:
+        self._stop.set()
+        self._thread.join()
+        rss = _private_rss_bytes()
+        if rss is not None and rss > self._peak:
+            self._peak = rss
+
+    @property
+    def peak_rise_bytes(self) -> int:
+        if self._baseline is None:  # no /proc: lifetime peak (units per platform)
+            lifetime = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return lifetime * 1024 if sys.platform == "linux" else lifetime
+        return self._peak - self._baseline
+
+
+def _rss_warmup(src: Path) -> None:
+    """Spin up the gather thread pool and steady state before the RSS baseline,
+    so the measured rise is the operation's data, not one-time init."""
+    reader = _c.colstore.open(src)
+    try:
+        reader[:1024, reader.columns[0]].array()
+    finally:
+        reader.close()
 
 
 def _measure_rss(variant: str, src: Path, out: Path) -> int:
-    """Peak RSS of writing ``out`` via ``variant``, isolated in a fresh process."""
+    """Peak RSS rise of writing ``out`` via ``variant``, isolated in a fresh process."""
     out.unlink(missing_ok=True)
     proc = subprocess.run(
         [sys.executable, __file__, "--rss-variant", variant, "--src", str(src), "--out", str(out)],
@@ -83,7 +150,7 @@ def _measure_rss(variant: str, src: Path, out: Path) -> int:
         check=True,
     )
     for line in proc.stdout.splitlines():
-        if line.startswith("PEAK_RSS_BYTES="):
+        if line.startswith("PEAK_RSS_RISE_BYTES="):
             return int(line.split("=", 1)[1])
     raise RuntimeError(f"no RSS from the {variant} subprocess:\n{proc.stdout}\n{proc.stderr}")
 
@@ -96,10 +163,12 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    # Subprocess RSS mode: run one strategy, report this process's peak RSS.
+    # Subprocess RSS mode: warm up, then report the RSS the one strategy adds.
     if args.rss_variant is not None:
-        _STRATEGY[args.rss_variant](args.src, args.out)
-        print(f"PEAK_RSS_BYTES={_peak_rss_bytes()}")
+        _rss_warmup(args.src)
+        with _PeakRSS() as peak:
+            _STRATEGY[args.rss_variant](args.src, args.out)
+        print(f"PEAK_RSS_RISE_BYTES={peak.peak_rise_bytes}")
         return 0
 
     work = Path(args.tmpdir) if args.tmpdir is not None else Path(".")
@@ -133,19 +202,17 @@ def main() -> int:
     for variant, res in zip(_VARIANTS, results, strict=True):
         print(f"  {variant:>12}  {src_mb / (res.wall_ms / 1e3):8.0f} MB/s")
 
-    print("\n=== peak RSS: subprocess-isolated, one strategy per process ===")
+    print("\n=== peak RSS added by the operation (subprocess-isolated, baselined) ===")
     rss = {v: _measure_rss(v, src, outs[v]) for v in _VARIANTS}
-    base = rss["copy"]  # copy holds no column data; the rest is interpreter baseline
     for variant in _VARIANTS:
-        delta = (rss[variant] - base) / 1e6
-        print(f"  {variant:>12}  peak={rss[variant] / 1e6:8.0f} MB   (+{delta:7.0f} MB vs copy)")
+        print(f"  {variant:>12}  +{rss[variant] / 1e6:8.1f} MB resident")
 
     if args.json is not None:
         summary = [
             _c.Result(
                 scenario="append_source",
                 variant=variant,
-                params={"peak_rss_mb": round(rss[variant] / 1e6, 1)},
+                params={"peak_rss_rise_mb": round(rss[variant] / 1e6, 1)},
                 median_ms=res.wall_ms,
                 min_ms=res.wall_ms,
                 p95_ms=res.wall_ms,
