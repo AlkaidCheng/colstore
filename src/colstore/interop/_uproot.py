@@ -24,6 +24,7 @@ from .root import (
     _batch_dict,
     _relabel,
     _resolve_chunk_rows,
+    _resolve_file_list,
     _sanitized_name_map,
     _split_path_and_tree,
     _warn_branch_renames,
@@ -63,9 +64,11 @@ def _resolve_source(source: Any, treename: str | None) -> tuple[Any, str | None]
         return path, embedded or treename
     if isinstance(source, os.PathLike):
         return os.fspath(source), treename
+    if isinstance(source, (list, tuple)):
+        return _resolve_file_list(source, treename)
     raise TypeError(
-        f"the uproot backend reads a path or a {{tree: files}} mapping, not "
-        f"{type(source).__name__}; use backend='ROOT' for an RDataFrame."
+        f"the uproot backend reads a path, a list of paths, or a {{tree: files}} "
+        f"mapping, not {type(source).__name__}; use backend='ROOT' for an RDataFrame."
     )
 
 

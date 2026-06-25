@@ -106,6 +106,116 @@ def test_read_whole_vs_chunked_agree(tmp_path, backend):
     chunked.close()
 
 
+# ---- multiple files ---------------------------------------------------------
+
+
+def _two_files(tmp_path, backend, splits=((0, 600), (600, 1500))):
+    """Write two ROOT files sharing one tree over disjoint key ranges; return paths."""
+    files = []
+    for i, (lo, hi) in enumerate(splits):
+        s = colstore.store(
+            {
+                "key": np.arange(lo, hi, dtype=np.int64),
+                "val": (np.arange(lo, hi) * 2).astype(np.float64),
+            },
+            tmp_path / f"s{i}.cstore",
+            show_progress=False,
+        )
+        p = tmp_path / f"f{i}.root"
+        colstore.to_root(s, p, treename="events", backend=backend, show_progress=False)
+        files.append(p)
+    return files
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("form", ["list", "dict", "list_embedded"])
+def test_read_multiple_files(tmp_path, backend, form):
+    # Two files with the same tree, read as one combined, row-intact table.
+    files = _two_files(tmp_path, backend)
+    if form == "list":
+        source, treename = [str(f) for f in files], "events"
+    elif form == "dict":
+        source, treename = {"events": [str(f) for f in files]}, None
+    else:  # paths carry their own ":events"
+        source, treename = [f"{f}:events" for f in files], None
+    back = colstore.from_root(
+        source, tmp_path / "out.cstore", backend=backend, treename=treename, show_progress=False
+    )
+    assert back.n_rows == 1500
+    order = np.argsort(np.asarray(back.array("key")))
+    np.testing.assert_array_equal(np.asarray(back.array("key"))[order], np.arange(1500))
+    np.testing.assert_array_equal(
+        np.asarray(back.array("val"))[order], (np.arange(1500) * 2).astype(np.float64)
+    )
+    back.close()
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_read_file_list_conflicting_trees_raises(tmp_path, store, backend):
+    rp = tmp_path / "x.root"
+    colstore.to_root(store, rp, treename="events", backend=backend, show_progress=False)
+    with pytest.raises(ValueError, match="multiple trees"):
+        colstore.from_root(
+            [f"{rp}:events", f"{rp}:other"],
+            tmp_path / "o.cstore",
+            backend=backend,
+            show_progress=False,
+        )
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_read_empty_file_list_raises(tmp_path, backend):
+    with pytest.raises(ValueError, match="empty file list"):
+        colstore.from_root([], tmp_path / "o.cstore", backend=backend, show_progress=False)
+
+
+def test_group_files_by_budget():
+    assert root_mod._group_files_by_budget([1000, 1000, 1000, 1000], 2500) == [[0, 1], [2, 3]]
+    assert root_mod._group_files_by_budget([1000, 1000, 1000, 1000], 1500) == [[0], [1], [2], [3]]
+    assert root_mod._group_files_by_budget([3000, 500, 500], 1000) == [
+        [0],
+        [1, 2],
+    ]  # big file alone
+    assert root_mod._group_files_by_budget([], 1000) == []
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+@pytest.mark.parametrize("batch_size", [500, 100])
+def test_read_multifile_over_budget(tmp_path, backend, batch_size):
+    # Four files x 200 rows; a budget below the total exercises file-group chunking
+    # (batch_size=500: groups of two files; batch_size=100: each 200-row file exceeds
+    # the budget, so the ROOT backend falls back to Range within it). Stays row-intact.
+    files = []
+    for i in range(4):
+        lo, hi = i * 200, i * 200 + 200
+        s = colstore.store(
+            {
+                "key": np.arange(lo, hi, dtype=np.int64),
+                "val": (np.arange(lo, hi) * 3).astype(np.float64),
+            },
+            tmp_path / f"s{i}.cstore",
+            show_progress=False,
+        )
+        p = tmp_path / f"f{i}.root"
+        colstore.to_root(s, p, treename="events", backend=backend, show_progress=False)
+        files.append(str(p))
+    back = colstore.from_root(
+        files,
+        tmp_path / "o.cstore",
+        backend=backend,
+        treename="events",
+        batch_size=batch_size,
+        show_progress=False,
+    )
+    assert back.n_rows == 800
+    order = np.argsort(np.asarray(back.array("key")))
+    np.testing.assert_array_equal(np.asarray(back.array("key"))[order], np.arange(800))
+    np.testing.assert_array_equal(
+        np.asarray(back.array("val"))[order], (np.arange(800) * 3).astype(np.float64)
+    )
+    back.close()
+
+
 @pytest.mark.skipif(not (_HAS_ROOT and _HAS_UPROOT), reason="needs both backends")
 def test_cross_backend_interchange(tmp_path, store, columns):
     # write with each backend, read back with the other
