@@ -207,6 +207,11 @@ def _acquire_directory_lock(directory: Path) -> int:
     except BlockingIOError as exc:
         os.close(fd)
         raise OSError(f"Another writer holds the lock on {directory}; close it first.") from exc
+    except BaseException:
+        # An unexpected lock error (or interrupt) must not leak the open fd; it
+        # has no finalizer, so close it before the exception propagates.
+        os.close(fd)
+        raise
     return fd
 
 

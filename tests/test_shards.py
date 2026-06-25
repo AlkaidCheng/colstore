@@ -203,6 +203,36 @@ def test_directory_lock_rejects_a_second_appender(tmp_path):
     colstore.appender(tmp_path).close()
 
 
+def test_acquire_lock_closes_fd_on_unexpected_lock_error(tmp_path, monkeypatch):
+    # An OSError from the lock syscall that is not contention (e.g. EIO) must not
+    # leak the open lock-file descriptor.
+    import colstore.shards as shards_mod
+
+    def _raise_eio(fd):
+        raise OSError(5, "EIO")
+
+    monkeypatch.setattr(shards_mod._lock, "lock_exclusive_nonblocking", _raise_eio)
+    lock_fds = []
+    closed = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(path, *args, **kwargs):
+        fd = real_open(path, *args, **kwargs)
+        if str(path).endswith(shards_mod._LOCK_NAME):
+            lock_fds.append(fd)
+        return fd
+
+    def spy_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(os, "open", spy_open)
+    monkeypatch.setattr(os, "close", spy_close)
+    with pytest.raises(OSError):
+        shards_mod._acquire_directory_lock(tmp_path)
+    assert lock_fds and lock_fds[0] in closed  # the lock fd was closed, not leaked
+
+
 def test_appender_releases_lock_if_schema_read_fails(tmp_path, monkeypatch):
     # A damaged first shard makes the construction-time schema read raise; the
     # directory lock must be released, not leaked, so a later writer can take it.
