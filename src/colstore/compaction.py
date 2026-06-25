@@ -263,7 +263,7 @@ def _copy_range(src_fp: IO[bytes], dst_fp: IO[bytes], offset: int, count: int) -
             if sent == 0:  # pragma: no cover -- EOF before count satisfied
                 raise OSError(
                     f"sendfile returned 0 with {remaining} bytes left; "
-                    f"source file is shorter than expected."
+                    "source file is shorter than expected."
                 )
             cur_offset += sent
             remaining -= sent

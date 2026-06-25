@@ -116,7 +116,6 @@ class ColStoreWriter:
         self._schema: list[dict[str, Any]] | None = None
         self._n_records = 0
         self._committed_rows = 0
-        self._data_offset = 0  # set when header is written / read
         # Whether to write the statistics footer on close (off by default).
         self._statistics = statistics
         # Per-record statistics, one dict {name: (min, max, prunable)} per record,
@@ -132,12 +131,10 @@ class ColStoreWriter:
                 )
             self._file = open(self._path, "w+b")  # noqa: SIM115
             self._has_header = False
-            self._wrote_anything = False
         elif mode == "recreate":
             # Truncate if exists; otherwise create.
             self._file = open(self._path, "w+b")  # noqa: SIM115
             self._has_header = False
-            self._wrote_anything = False
         else:  # update
             if not self._path.exists():
                 raise FileNotFoundError(
@@ -146,7 +143,6 @@ class ColStoreWriter:
                 )
             self._file = open(self._path, "r+b")  # noqa: SIM115
             self._has_header = True
-            self._wrote_anything = True  # something is already there
 
         # Take the advisory lock BEFORE any destructive operations. In update
         # mode the load step below truncates orphan bytes past the last
@@ -176,7 +172,6 @@ class ColStoreWriter:
         self._schema = manifest["columns"]
         self._n_records = int(manifest["n_records"])
         self._committed_rows = int(manifest["committed_rows"])
-        self._data_offset = data_offset
 
         # Walk records to find where the last one ends; that's where we append.
         # Even though read_record_index also validates each record, we need
@@ -212,9 +207,7 @@ class ColStoreWriter:
         """
         self._schema = columns_meta
         self._file.seek(0)
-        self._data_offset = fmt.write_header(
-            self._file, columns_meta, n_records=0, committed_rows=0
-        )
+        fmt.write_header(self._file, columns_meta, n_records=0, committed_rows=0)
         self._has_header = True
 
     def _commit_counters(self, stats_offset: int = 0) -> None:
@@ -374,7 +367,6 @@ class ColStoreWriter:
 
         self._n_records += 1
         self._committed_rows += n_rows
-        self._wrote_anything = True
         # Capture this record's per-column min/max for the statistics footer.
         if self._statistics:
             self._record_stats_acc.append(

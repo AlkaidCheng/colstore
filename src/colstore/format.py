@@ -628,7 +628,6 @@ def _resolve_rows_per_step(
     *,
     n_rows: int,
     n_columns: int,
-    total_bytes: int,
     column_itemsizes: list[int],
 ) -> list[int]:
     """Resolve a fixed-size ``batch_size`` to per-column rows-per-progress-step.
@@ -739,7 +738,6 @@ def write_dataset(
             resolved_batch_size,
             n_rows=n_rows,
             n_columns=n_columns,
-            total_bytes=total_bytes,
             column_itemsizes=column_itemsizes,
         )
 
