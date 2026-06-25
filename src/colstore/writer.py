@@ -168,15 +168,10 @@ class ColStoreWriter:
     # ---- internals ----------------------------------------------------
 
     def _load_existing_state_for_update(self) -> None:
-        """Read schema + counters from disk; seek to end of last committed record.
-
-        Reads the header through ``self._file`` rather than re-opening
-        the path. This is a small efficiency win on every platform (one
-        fewer ``open`` syscall) and matches the writer's lifecycle --
-        the file is already open and at offset 0 from the ``r+b`` open
-        above, so reading the header from it costs nothing extra.
-        """
+        """Read schema + counters from disk; seek to end of last committed record."""
         self._file.seek(0)
+        # Read the header through the already-open r+b handle (at offset 0) instead
+        # of re-opening the path: one fewer open syscall, the same bytes.
         manifest, data_offset = fmt.read_header_from_file(self._file)
         self._schema = manifest["columns"]
         self._n_records = int(manifest["n_records"])

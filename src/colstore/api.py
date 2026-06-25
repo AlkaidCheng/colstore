@@ -185,7 +185,8 @@ def _coerce_to_columns(
 
 
 def _is_pandas_dataframe(data: Any) -> bool:
-    """Duck-typed pandas check so we don't import pandas at module load."""
+    """Return whether ``data`` looks like a pandas DataFrame (duck-typed)."""
+    # Duck-typed (not isinstance) to avoid importing pandas at module load.
     return (
         hasattr(data, "columns")
         and hasattr(data, "to_numpy")

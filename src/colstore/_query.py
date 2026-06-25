@@ -235,7 +235,7 @@ class _Expr:
     def __ne__(self, other: Any) -> _Expr:  # type: ignore[override]
         return _Compare(np.not_equal, self, other)
 
-    # -- boolean combinators (use & | ~, like pandas) --
+    # -- boolean combinators (use & | ~) --
     def __and__(self, other: Any) -> _Expr:
         return _Op(np.bitwise_and, self, other)
 

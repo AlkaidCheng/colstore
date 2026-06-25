@@ -54,7 +54,7 @@ def storable_column(name: str, array: Any) -> np.ndarray[Any, Any]:
 
 
 def arrow_to_columns(table: Any) -> dict[str, np.ndarray[Any, Any]]:
-    """Convert a pyarrow Table to colstore columns (coerce strings, reject nested)."""
+    """Convert a pyarrow Table to colstore columns (coerce strings, reject nulls/nested)."""
     import pyarrow as pa
 
     columns: dict[str, np.ndarray[Any, Any]] = {}

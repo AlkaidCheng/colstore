@@ -313,7 +313,7 @@ class Expr:
         return Cast(self, np.dtype(dtype))
 
     def where(self, cond: Any, other: Any = np.nan) -> Expr:
-        """Keep this column where ``cond`` is true, else ``other`` (pandas ``Series.where``).
+        """Keep this column where ``cond`` is true, else ``other``.
 
         ``cond`` is a boolean column expression and ``other`` a column or scalar;
         equivalent to ``numpy.where(cond, self, other)``.
