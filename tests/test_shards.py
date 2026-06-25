@@ -71,6 +71,38 @@ def test_append_single_file_source_is_a_verbatim_copy(tmp_path):
     ds.close()
 
 
+def test_parallel_copy_is_byte_identical(tmp_path, monkeypatch):
+    # Force the multi-stream copy path on a small file and check the shard is exact.
+    import colstore.shards as shards_mod
+
+    monkeypatch.setattr(shards_mod, "_PARALLEL_COPY_MIN_CHUNK", 256)
+    data = {
+        "x": np.arange(5000, dtype=np.int64),
+        "y": (np.arange(5000) * 0.5).astype(np.float64),
+    }
+    src_path = tmp_path / "src.cstore"
+    colstore.store(data, src_path).close()
+    assert src_path.stat().st_size // 256 >= shards_mod._PARALLEL_COPY_MAX_STREAMS  # >1 stream
+    shard = colstore.append(tmp_path / "ds", src_path)
+    assert shard.read_bytes() == src_path.read_bytes()  # parallel copy is exact
+    ds = colstore.open(tmp_path / "ds")
+    np.testing.assert_array_equal(ds.array("x"), data["x"])
+    np.testing.assert_array_equal(ds.array("y"), data["y"])
+    ds.close()
+
+
+def test_copy_file_below_threshold_is_single_stream(tmp_path):
+    # A file under the threshold copies in one stream; still byte-identical.
+    import colstore.shards as shards_mod
+
+    src_path = tmp_path / "small.cstore"
+    colstore.store({"x": np.arange(50, dtype=np.int64)}, src_path).close()
+    assert src_path.stat().st_size < shards_mod._PARALLEL_COPY_MIN_CHUNK
+    dst_path = tmp_path / "out.bin"
+    shards_mod._copy_file(src_path, dst_path)
+    assert dst_path.read_bytes() == src_path.read_bytes()
+
+
 def test_append_streams_a_multifile_dataset_source(tmp_path):
     # A multi-file dataset source is streamed (not materialized) into one shard.
     a = colstore.store({"x": np.arange(10, dtype=np.int64)}, tmp_path / "a.cstore")
