@@ -253,7 +253,7 @@ last successful close committed.
 The streaming writers (`create` / `recreate` / `update`) and `compact` take an
 advisory `flock` for the duration of the write, so a second writer on the same
 file fails fast with a clear error instead of corrupting it. On filesystems that
-don't implement `flock` (some Lustre, GPFS, and NFS mounts), the lock is skipped
+don't implement `flock` (some networked or parallel filesystem mounts), the lock is skipped
 with a one-time warning and the write proceeds — there is no lock to contend for
 on such a mount, so concurrent-writer detection is simply unavailable there.
 

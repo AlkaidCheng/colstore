@@ -24,8 +24,8 @@ Three design commitments shape everything below:
   `ds[mask, "energy"].array()`; underneath, the access pattern you expressed is
   matched to a kernel written for exactly that shape.
 - **Speed first, measured, with no-regression floors.** Every fast path was
-  validated on the deployment target (dual-socket many-core AMD EPYC, multiple
-  NUMA nodes) with paired A/B timing, and every routing decision falls back to
+  validated on the deployment target (a multi-socket, multi-NUMA-node server)
+  with paired A/B timing, and every routing decision falls back to
   the simple path when the fast one would not actually win for your data.
 
 ### The file format

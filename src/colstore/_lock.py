@@ -68,7 +68,7 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-    # Some network / parallel filesystems (Lustre, GPFS, certain NFS mounts) do
+    # Some network / parallel filesystems (for example certain NFS mounts) do
     # not implement flock and report it as one of these errnos. ENOTSUPP (524)
     # is a kernel-internal code with no errno-module name that leaks to
     # userspace from exactly these mounts; EOPNOTSUPP and ENOLCK are the
