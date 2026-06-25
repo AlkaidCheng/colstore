@@ -181,6 +181,15 @@ path = colstore.to_root(ds, "out.root", treename="events")
 ds.saveas("out.root", backend="uproot")                                # file-verb form
 ```
 
+A **list of files** (or a `{treename: [files]}` mapping) is read as one combined
+dataset over a shared tree — taken from `treename=`, an embedded
+`"file.root:tree"`, or the first file's sole tree:
+
+```python
+reader = colstore.from_root(["a.root", "b.root"], "all.cstore", treename="events")
+reader = colstore.from_root({"events": ["a.root", "b.root"]}, "all.cstore")
+```
+
 Only **fixed-size scalar branches** are storable: a branch's storability is read
 from its materialized NumPy dtype (1-D, numeric/bool), so both backends agree
 exactly and a jagged (`RVec`, `vector<…>`) or array branch is not stored.

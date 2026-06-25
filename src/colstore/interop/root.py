@@ -25,7 +25,7 @@ import shutil
 import tempfile
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, cast
@@ -47,7 +47,10 @@ if TYPE_CHECKING:
 RootBackendName: TypeAlias = str
 
 #: A ROOT source accepted by :func:`from_root`.
-RootSource: TypeAlias = "ROOT.RDataFrame | str | os.PathLike[str] | dict[str, str | list[str]]"
+RootSource: TypeAlias = (
+    "ROOT.RDataFrame | str | os.PathLike[str] "
+    "| list[str | os.PathLike[str]] | dict[str, str | list[str]]"
+)
 
 # NumPy dtype kinds that map to a fixed-size colstore column. Both backends judge
 # storability from the MATERIALIZED dtype (a one-row sample), not a C++ type-name
@@ -257,11 +260,50 @@ def _split_path_and_tree(spec: str) -> tuple[str, str | None]:
     return prefix + rest, None
 
 
+def _resolve_file_list(
+    files: Sequence[StrPath], treename: str | None
+) -> tuple[list[str], str | None]:
+    """Split a non-empty list of paths (each maybe ``"file:tree"``) into bare paths
+    and the one tree they share.
+
+    The tree is ``treename`` if given, else the single tree embedded across the
+    entries, else ``None`` (the caller resolves the first file's sole tree). Raises
+    if the entries name conflicting trees, or disagree with ``treename``.
+    """
+    if not files:
+        raise ValueError("an empty file list has no tree to read; pass at least one path.")
+    bare: list[str] = []
+    embedded_trees: set[str] = set()
+    for entry in files:
+        if isinstance(entry, str):
+            path, embedded = _split_path_and_tree(entry)
+        else:
+            path, embedded = os.fspath(entry), None
+        bare.append(path)
+        if embedded is not None:
+            embedded_trees.add(embedded)
+    if len(embedded_trees) > 1:
+        raise ValueError(
+            f"the file list names multiple trees ({', '.join(sorted(embedded_trees))}); "
+            "pass a single treename."
+        )
+    embedded = next(iter(embedded_trees)) if embedded_trees else None
+    if treename is not None and embedded is not None and treename != embedded:
+        raise ValueError(
+            f"Conflicting tree names: treename={treename!r} but the list names {embedded!r}."
+        )
+    return bare, treename or embedded
+
+
 def _as_rdataframe(source: RootSource, treename: str | None) -> ROOT.RDF.RNode:
-    """Build (or pass through) an RDataFrame from a path, a mapping, or an RDF."""
-    if not isinstance(source, (str, os.PathLike, dict)):
+    """Build (or pass through) an RDataFrame from a path, a list, a mapping, or an RDF."""
+    if not isinstance(source, (str, os.PathLike, list, tuple, dict)):
         return source  # already an RDataFrame/RNode; use duck-typed, no ROOT import
     root = _import_root()
+    if isinstance(source, (list, tuple)):
+        paths, tree = _resolve_file_list(source, treename)
+        resolved = tree if tree is not None else _resolve_tree_name(root, paths[0], None)
+        return root.RDataFrame(resolved, paths)
     if isinstance(source, dict):
         if len(source) != 1:
             raise ValueError(
@@ -387,7 +429,7 @@ class RootCppBackend(RootBackend):
         # construction, so a fresh one is built INSIDE the MT context; Range (used
         # only when the budget is smaller than the tree) is incompatible with it.
         whole_tree = rows_per_batch is None or total <= rows_per_batch
-        if total > 0 and whole_tree and isinstance(source, (str, os.PathLike, dict)):
+        if total > 0 and whole_tree and not _is_rdataframe_source(source):
             with _implicit_mt(root, _DEFAULT_MULTITHREADING):
                 mt_rdf = _as_rdataframe(source, treename)
                 batch = mt_rdf.AsNumpy(columns=selected)
@@ -534,12 +576,14 @@ def from_root(
 
     Parameters
     ----------
-    source : ROOT.RDataFrame, str, os.PathLike, or dict
+    source : ROOT.RDataFrame, str, os.PathLike, list, or dict
         An existing ``RDataFrame`` (read only by the ``"ROOT"`` backend); a path
         to a ``.root`` file (its single tree is used, or ``treename`` selects
-        one); or a ``{treename: files}`` mapping with exactly one entry (``files``
-        may be a path or a list). A ``str`` path may embed the tree as
-        ``"file.root:treename"`` (the uproot convention; URL-scheme and
+        one); a **list of paths** read as one combined dataset over a shared tree
+        (from ``treename``, an embedded ``"file.root:treename"``, or the first
+        file's sole tree); or a ``{treename: files}`` mapping with exactly one
+        entry (``files`` may be a path or a list). A ``str`` path may embed the
+        tree as ``"file.root:treename"`` (the uproot convention; URL-scheme and
         Windows-drive colons are not separators). To read a file whose name
         contains a colon, pass it as a :class:`pathlib.Path` (never split) or use
         the mapping form.
