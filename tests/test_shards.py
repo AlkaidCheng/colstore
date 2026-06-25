@@ -51,6 +51,40 @@ def test_append_accepts_a_reader_as_data(tmp_path):
     ds.close()
 
 
+def test_append_accepts_a_file_path_as_data(tmp_path):
+    colstore.store({"x": np.arange(8, dtype=np.int64)}, tmp_path / "src.cstore").close()
+    path = colstore.append(tmp_path / "ds", tmp_path / "src.cstore")  # a path, not in-memory
+    assert path.name == "shard_00000.cstore"
+    ds = colstore.open(tmp_path / "ds")
+    np.testing.assert_array_equal(ds.array("x"), np.arange(8))
+    ds.close()
+
+
+def test_append_streams_a_multifile_dataset_source(tmp_path):
+    # A multi-file dataset source is streamed (not materialized) into one shard.
+    a = colstore.store({"x": np.arange(10, dtype=np.int64)}, tmp_path / "a.cstore")
+    b = colstore.store({"x": np.arange(10, 20, dtype=np.int64)}, tmp_path / "b.cstore")
+    src = a | b  # a two-file ColStoreDataset
+    colstore.append(tmp_path / "ds", src)
+    a.close()
+    b.close()
+    ds = colstore.open(tmp_path / "ds")
+    assert ds.n_rows == 20
+    np.testing.assert_array_equal(ds.array("x"), np.arange(20))
+    ds.close()
+
+
+def test_append_source_validates_schema_before_writing(tmp_path):
+    shard_dir = tmp_path / "ds"
+    colstore.append(shard_dir, {"x": np.arange(3, dtype=np.int64)})
+    before = _shards(shard_dir)
+    bad = colstore.store({"x": np.arange(3, dtype=np.float64)}, tmp_path / "bad.cstore")
+    with pytest.raises(ValueError, match="schema"):
+        colstore.append(shard_dir, bad)  # dtype mismatch, from headers, no shard written
+    bad.close()
+    assert _shards(shard_dir) == before
+
+
 # ---- ColStoreDataset over a directory ---------------------------------------
 
 

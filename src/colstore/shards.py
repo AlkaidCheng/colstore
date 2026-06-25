@@ -25,7 +25,7 @@ import warnings
 from functools import lru_cache
 from pathlib import Path
 from types import TracebackType
-from typing import Any
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import numpy as np
 
@@ -33,6 +33,13 @@ from . import _lock
 from . import format as fmt
 from ._paths import _natural_sort_key
 from ._sizes import resolve_batch_rows
+
+if TYPE_CHECKING:
+    from .dataset import ColStoreDataset
+    from .reader import ColStoreReader
+
+#: An already-open colstore source to append from (borrowed) or to open from a path.
+ShardSource: TypeAlias = "ColStoreReader | ColStoreDataset"
 
 #: Default shard filename template; ``{index}`` is the next free shard number.
 DEFAULT_SHARD_NAME = f"shard_{{index:05d}}{fmt.FILE_EXTENSION}"
@@ -104,14 +111,69 @@ def _list_shards(directory: PathLike) -> list[str]:
     return sorted(matches, key=lambda path: _natural_sort_key(os.path.basename(path)))
 
 
-def _coerce_append_data(data: Any) -> Columns:
-    """Columns from append data: anything :func:`colstore.store` takes, or a reader."""
-    from . import api
-    from ._base import _ReaderBase
+def _open_source(data: Any) -> tuple[ShardSource, bool] | None:
+    """The colstore source for ``data`` and whether this call owns it (must close).
 
-    if isinstance(data, _ReaderBase):
-        return {name: data[name].array() for name in data.columns}
+    An open reader or dataset is borrowed (``False``); a path is opened and owned
+    (``True``). Returns ``None`` when ``data`` is in-memory (a dict, structured
+    array, or DataFrame) and must be materialized instead.
+    """
+    from . import api
+    from .dataset import ColStoreDataset
+    from .reader import ColStoreReader
+
+    if isinstance(data, (ColStoreReader, ColStoreDataset)):
+        return data, False
+    if isinstance(data, (str, os.PathLike)):
+        return api.open(data), True
+    return None
+
+
+def _coerce_append_data(data: Any) -> Columns:
+    """Materialize append data to a column dict: a :func:`colstore.store` input,
+    an open reader/dataset, or a path to read."""
+    from . import api
+
+    opened = _open_source(data)
+    if opened is not None:
+        source, owned = opened
+        try:
+            return {name: source[name].array() for name in source.columns}
+        finally:
+            if owned:
+                source.close()
     return api._coerce_to_columns(data)
+
+
+def _validate_source_schema(
+    source: ShardSource, expected_schema: list[dict[str, Any]] | None
+) -> None:
+    """Require ``source`` to match the dataset's existing shard schema, or raise.
+
+    Compared from headers only -- no column is read -- so a mismatch is rejected
+    before the streaming/copy write begins. A first shard (``None``) defines it.
+    """
+    if expected_schema is None:
+        return
+    expected = [(col["name"], col["dtype"]) for col in expected_schema]
+    actual = [(name, dtype.str) for name, dtype in source._column_dtypes.items()]
+    if actual != expected:
+        raise ValueError(
+            f"shard schema mismatch: the source has columns {actual}, but the dataset "
+            f"schema is {expected} (same names, order, and dtypes required)."
+        )
+
+
+def _write_shard_from_source(
+    source: ShardSource, final: Path, *, memory_budget: int | None
+) -> None:
+    """Write ``source`` to the shard ``final`` without materializing it into memory.
+
+    The source's columns are streamed into the shard one row range at a time
+    (bounded by ``memory_budget``; a no-transform source takes the merge-copy fast
+    path), committed atomically by the streaming writer's own temp-and-rename.
+    """
+    source.edit().write(final, memory_budget=memory_budget).close()
 
 
 def _existing_schema(directory: Path) -> list[dict[str, Any]] | None:
@@ -142,6 +204,12 @@ def _release_directory_lock(fd: int) -> None:
         os.close(fd)
 
 
+def _assert_shard_absent(final: Path) -> None:
+    """Refuse to overwrite an existing shard; shards are immutable once written."""
+    if final.exists():
+        raise FileExistsError(f"shard {final} already exists; shards are immutable.")
+
+
 def _write_shard_atomic(
     directory: Path,
     columns: Columns,
@@ -157,8 +225,7 @@ def _write_shard_atomic(
     so a reader never sees a partial shard and a crash leaves an ignored temp file.
     """
     final = directory / name
-    if final.exists():
-        raise FileExistsError(f"shard {final} already exists; shards are immutable.")
+    _assert_shard_absent(final)
     fd, tmp = tempfile.mkstemp(dir=os.fspath(directory), prefix=f".{name}.", suffix=".tmp")
     os.close(fd)
     try:
@@ -192,12 +259,17 @@ def append(
     The directory is created if needed and its ``.cstore`` shards form the dataset
     (read with ``colstore.open(directory)``). ``data`` is anything
     :func:`colstore.store` accepts -- a ``{name: array}`` dict, a structured array,
-    or a DataFrame -- or an open reader / dataset. It must match the existing
-    shards' schema. The shard is named from ``name`` (a template whose ``{index}``
-    is the next free shard number, or a literal filename; it must end in
-    ``.cstore``) and committed atomically. Returns the new shard's path.
-    ``statistics=True`` records per-record statistics in the shard (see
-    :func:`colstore.store`).
+    or a DataFrame -- or an open reader / dataset, or a path to a ``.cstore`` file
+    (or directory of them). It must match the existing shards' schema. The shard is
+    named from ``name`` (a template whose ``{index}`` is the next free shard number,
+    or a literal filename; it must end in ``.cstore``) and committed atomically.
+    Returns the new shard's path. ``statistics=True`` records per-record statistics
+    in the shard (see :func:`colstore.store`).
+
+    A colstore source (path, reader, or dataset) is written without materializing
+    it into memory: its columns are streamed into the shard in bounded memory, so a
+    file far larger than RAM can be appended. ``statistics=True`` uses the
+    materializing path (the streaming writer records no footer).
 
     Raises :class:`OSError` if another writer holds the directory lock, and
     :class:`ValueError` if ``name`` lacks the ``.cstore`` extension or ``data``
@@ -205,15 +277,28 @@ def append(
     """
     _validate_shard_name(name)
     directory = Path(directory)
-    columns = _coerce_append_data(data)
     fd = _acquire_directory_lock(directory)
     try:
-        fmt.normalize_columns(columns, expected_schema=_existing_schema(directory))
-        index = _next_index(directory, name)
+        expected = _existing_schema(directory)
+        shard_name = _shard_name(name, _next_index(directory, name))
+        opened = None if statistics else _open_source(data)
+        if opened is not None:
+            source, owned = opened
+            try:
+                final = directory / shard_name
+                _assert_shard_absent(final)
+                _validate_source_schema(source, expected)
+                _write_shard_from_source(source, final, memory_budget=None)
+            finally:
+                if owned:
+                    source.close()
+            return final
+        columns = _coerce_append_data(data)
+        fmt.normalize_columns(columns, expected_schema=expected)
         return _write_shard_atomic(
             directory,
             columns,
-            _shard_name(name, index),
+            shard_name,
             statistics=statistics,
             batch_size=batch_size,
             show_progress=show_progress,
