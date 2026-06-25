@@ -20,8 +20,10 @@ import contextlib
 import glob
 import os
 import re
+import shutil
 import tempfile
 import warnings
+from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
 from types import TracebackType
@@ -164,16 +166,27 @@ def _validate_source_schema(
         )
 
 
+def _source_files(source: ShardSource) -> list[Path]:
+    """The physical ``.cstore`` files backing ``source`` (one for a single reader)."""
+    path = source.path
+    return list(path) if isinstance(path, tuple) else [path]
+
+
 def _write_shard_from_source(
     source: ShardSource, final: Path, *, memory_budget: int | None
 ) -> None:
     """Write ``source`` to the shard ``final`` without materializing it into memory.
 
-    The source's columns are streamed into the shard one row range at a time
-    (bounded by ``memory_budget``; a no-transform source takes the merge-copy fast
-    path), committed atomically by the streaming writer's own temp-and-rename.
+    A source backed by a single file is copied byte-for-byte -- the shard already
+    has the optimal layout, so no column is read or rewritten. A multi-file source
+    is streamed into one shard one row range at a time (bounded by ``memory_budget``;
+    a no-transform source takes the merge-copy fast path). Both commit atomically.
     """
-    source.edit().write(final, memory_budget=memory_budget).close()
+    files = _source_files(source)
+    if len(files) == 1:
+        _copy_shard_atomic(files[0], final)
+    else:
+        source.edit().write(final, memory_budget=memory_budget).close()
 
 
 def _existing_schema(directory: Path) -> list[dict[str, Any]] | None:
@@ -210,6 +223,29 @@ def _assert_shard_absent(final: Path) -> None:
         raise FileExistsError(f"shard {final} already exists; shards are immutable.")
 
 
+@contextlib.contextmanager
+def _atomic_shard(final: Path) -> Iterator[str]:
+    """Yield a temp path to fill, then fsync it and rename it onto ``final``.
+
+    A reader never sees a partial shard: the content is built under a temporary
+    dotfile and published with one atomic rename, and a failure unlinks the temp
+    and re-raises (a crash leaves only an ignored temp). The fsync uses a writable
+    handle -- on Windows os.fsync maps to _commit(), which fails with EBADF on a
+    read-only descriptor -- and closes it before os.replace, which Windows requires.
+    """
+    fd, tmp = tempfile.mkstemp(dir=os.fspath(final.parent), prefix=f".{final.name}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        yield tmp
+        with open(tmp, "r+b") as written:
+            os.fsync(written.fileno())
+        os.replace(tmp, final)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def _write_shard_atomic(
     directory: Path,
     columns: Columns,
@@ -219,30 +255,24 @@ def _write_shard_atomic(
     batch_size: int | str | None,
     show_progress: bool,
 ) -> Path:
-    """Write ``columns`` to ``directory/name`` atomically; return the shard path.
-
-    The shard is written to a temporary dotfile, fsynced, then renamed into place,
-    so a reader never sees a partial shard and a crash leaves an ignored temp file.
-    """
+    """Write ``columns`` to ``directory/name`` atomically; return the shard path."""
     final = directory / name
     _assert_shard_absent(final)
-    fd, tmp = tempfile.mkstemp(dir=os.fspath(directory), prefix=f".{name}.", suffix=".tmp")
-    os.close(fd)
-    try:
+    with _atomic_shard(final) as tmp:
         fmt.write_dataset(
             columns, tmp, batch_size=batch_size, show_progress=show_progress, statistics=statistics
         )
-        # Reopen read/write for the durability fsync: on Windows os.fsync maps to
-        # _commit(), which fails with EBADF on a read-only descriptor. The handle
-        # is closed before os.replace, which Windows also requires.
-        with open(tmp, "r+b") as written:
-            os.fsync(written.fileno())
-        os.replace(tmp, final)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
     return final
+
+
+def _copy_shard_atomic(src_file: Path, final: Path) -> None:
+    """Copy ``src_file`` to the shard ``final`` byte-for-byte, atomically.
+
+    ``shutil.copyfile`` uses ``copy_file_range`` / ``os.sendfile`` /
+    ``fclonefileat`` where available, so the bytes never pass through Python.
+    """
+    with _atomic_shard(final) as tmp:
+        shutil.copyfile(src_file, tmp)
 
 
 def append(

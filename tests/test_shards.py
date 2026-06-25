@@ -60,6 +60,17 @@ def test_append_accepts_a_file_path_as_data(tmp_path):
     ds.close()
 
 
+def test_append_single_file_source_is_a_verbatim_copy(tmp_path):
+    # A single-file source is copied byte-for-byte, not read and rewritten.
+    src_path = tmp_path / "src.cstore"
+    colstore.store({"x": np.arange(200, dtype=np.int64)}, src_path).close()
+    shard = colstore.append(tmp_path / "ds", src_path)
+    assert shard.read_bytes() == src_path.read_bytes()
+    ds = colstore.open(tmp_path / "ds")
+    np.testing.assert_array_equal(ds.array("x"), np.arange(200))
+    ds.close()
+
+
 def test_append_streams_a_multifile_dataset_source(tmp_path):
     # A multi-file dataset source is streamed (not materialized) into one shard.
     a = colstore.store({"x": np.arange(10, dtype=np.int64)}, tmp_path / "a.cstore")
