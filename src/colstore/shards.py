@@ -63,6 +63,9 @@ _PARALLEL_COPY_MAX_STREAMS = 4
 _COPY_BUFSIZE = 8 * 1024 * 1024
 #: ``os.copy_file_range`` when the runtime exposes it (Linux), else ``None``.
 _COPY_FILE_RANGE = getattr(os, "copy_file_range", None)
+#: Whether a positional copy primitive exists. ``os.pread`` / ``os.pwrite`` are
+#: Unix-only, so Windows (with no ``copy_file_range`` either) copies single-stream.
+_CAN_PARALLEL_COPY = _COPY_FILE_RANGE is not None or hasattr(os, "pwrite")
 
 
 @lru_cache
@@ -330,11 +333,12 @@ def _copy_file(src: Path, dst: Path) -> None:
     :data:`_PARALLEL_COPY_MAX_STREAMS` disjoint byte ranges copied concurrently; a
     smaller file copies in one stream. The stream count is bounded by what the
     storage serves in parallel, not the core count, so the speedup comes from I/O
-    width on a parallel filesystem without depending on the host's hardware.
+    width on a parallel filesystem without depending on the host's hardware. A
+    platform with no positional copy primitive (Windows) copies in one stream.
     """
     size = src.stat().st_size
     streams = min(max(1, size // _PARALLEL_COPY_MIN_CHUNK), _PARALLEL_COPY_MAX_STREAMS)
-    if streams == 1:
+    if streams == 1 or not _CAN_PARALLEL_COPY:
         shutil.copyfile(src, dst)
         return
     os.truncate(dst, size)
