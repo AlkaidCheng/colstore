@@ -766,8 +766,7 @@ def write_dataset(
         # gate lives in _numa.writer_policy_scope so this path and the
         # streaming path agree. The one-shot colstore.store() (which is
         # what most callers use) routes through here, so this is the
-        # call site that actually fixes the warm-cache NUMA placement
-        # the original benchmark identified.
+        # call site that fixes warm-cache NUMA placement for one-shot writes.
         _numa.writer_policy_scope(),
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
@@ -1019,7 +1018,7 @@ def _fill_streaming_mmap(
 
 # Whether the streaming pwrite fill overlaps each batch's write with the next
 # batch's read+transform via a single background writer (a benchmark hook; False
-# writes each batch inline, the prior serial behavior). The compute is
+# writes each batch inline, no read/write overlap). The compute is
 # memory-bandwidth-bound and the pwrite is filesystem-bound, so the next batch is
 # prepared while the current one is written.
 _STREAMING_OVERLAP_WRITE: bool = True

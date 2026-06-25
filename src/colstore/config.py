@@ -529,8 +529,8 @@ def set_write_method(method: WriteMethod) -> None:
     * ``"pwrite"`` -- large sequential ``os.pwrite`` calls. Far faster on a
       parallel filesystem, where mmap's page-granular dirtying is slow; also
       faster node-local.
-    * ``"mmap"`` -- store each batch/run through a memory-mapped output. The
-      pre-pwrite behavior; kept for parity and as the non-Unix fallback.
+    * ``"mmap"`` -- store each batch/run through a memory-mapped output; kept
+      for parity and as the non-Unix fallback.
 
     The default suits every filesystem measured so far; override only to force a
     method (e.g. to reproduce the mmap path, or on a platform where it wins).

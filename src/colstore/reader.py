@@ -626,8 +626,8 @@ class ColStoreReader(_ReaderBase):
         native_dtype = disk_dtype.newbyteorder("=")
         effective_cap = thread_cap if thread_cap is not None else config.get_gather_thread_cap()
         # ``np.array(..., copy=True)`` is typed to return ``NDArray[Any]``;
-        # the older ``np.asarray(x).copy()`` chain returns ``Any`` under
-        # current numpy stubs, hence the explicit constructor calls.
+        # an ``np.asarray(x).copy()`` chain returns ``Any`` under current
+        # numpy stubs, hence the explicit constructor calls.
         if row_indexer is None:
             return _parallel_copy(source, native_dtype, thread_cap=effective_cap)
         if isinstance(row_indexer, int):
@@ -642,7 +642,7 @@ class ColStoreReader(_ReaderBase):
             # threshold-gated row-range split parallelizes it the same way the
             # contiguous case is split once the read clears
             # _PARALLEL_COPY_BYTES_PER_THREAD; below that it falls back to a
-            # single np.array copy, exactly as before.
+            # single np.array copy.
             return _parallel_copy(source[row_indexer], native_dtype, thread_cap=effective_cap)
         # Integer ndarray (fancy index): dispatch to chosen backend.
         return kernels.gather(
