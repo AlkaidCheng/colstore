@@ -50,7 +50,17 @@ def open(
     order is the dataset's row order, and a pattern matching no files raises
     :class:`FileNotFoundError`. Globbing applies to path arguments only -- column
     selection is always explicit -- and a list element may itself be a glob.
+
+    A **directory** path returns a :class:`ColStoreDataset` over its ``.cstore``
+    shards in numeric order -- the managed dataset that :func:`append` /
+    :func:`appender` write to (an empty directory is an empty dataset).
     """
+    if isinstance(path, (str, os.PathLike)) and os.path.isdir(path):
+        # A directory is a managed shard dataset: its ``.cstore`` files are the
+        # shards, read in numeric order (an empty directory is an empty dataset).
+        from .shards import _list_shards
+
+        return ColStoreDataset(_list_shards(path), **kwargs)
     if isinstance(path, str) and has_glob_magic(path):
         return ColStoreDataset(path, **kwargs)
     if isinstance(path, (str, os.PathLike)):

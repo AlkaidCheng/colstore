@@ -98,6 +98,7 @@ from .frame import ColStoreFrame
 from .interop.root import from_root, to_root
 from .kernels import cpp_available, max_threads, numba_available
 from .reader import ColStoreReader
+from .shards import Appender, append, appender
 from .view import ColumnView, TableView
 from .writer import ColStoreWriter
 
@@ -105,6 +106,7 @@ apply_cached_cap_if_present()
 
 __all__ = [
     "FILE_EXTENSION",
+    "Appender",
     "ColStoreDataset",
     "ColStoreFrame",
     "ColStoreInfo",
@@ -115,6 +117,8 @@ __all__ = [
     "QueryError",
     "TableView",
     "__version__",
+    "append",
+    "appender",
     "calibrate",
     "col",
     "compact",
