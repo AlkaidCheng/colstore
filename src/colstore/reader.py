@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
-from . import _numa, config, format, kernels
+from . import _footer, _numa, config, format, kernels
 from ._base import _ReaderBase
 
 if TYPE_CHECKING:
@@ -249,6 +249,12 @@ class ColStoreReader(_ReaderBase):
         self._manifest, data_offset = format.read_header(self._path)
         self._closed = False
 
+        # Byte offset of the optional per-record statistics footer (0 = none),
+        # parsed lazily on first access (see the _record_stats property).
+        self._stats_offset = int(self._manifest.get("stats_offset", 0) or 0)
+        self._record_stats_loaded = False
+        self._record_stats_value: _footer.RecordStats | None = None
+
         # Per-column segment table for the mask kernel, row-independent so it is
         # memoized (see _column_segment_table); also reused by the dataset stitch.
         self._segment_table_cache: dict[str, tuple[NDArray[np.int64], NDArray[np.int64]]] = {}
@@ -363,6 +369,30 @@ class ColStoreReader(_ReaderBase):
         if self._max_workers_override is not None:
             return self._max_workers_override
         return config.get_max_workers()
+
+    @property
+    def _record_stats(self) -> _footer.RecordStats | None:
+        """Per-record column statistics, or None if the file has none or they fail
+        to parse (advisory: the reader then reads in full).
+
+        Parsed lazily and cached. Each present entry maps a column name to
+        ``{"min", "max", "prunable"}`` arrays of length ``n_records``.
+        """
+        if not self._record_stats_loaded:
+            self._record_stats_value = self._load_record_stats()
+            self._record_stats_loaded = True
+        return self._record_stats_value
+
+    def _load_record_stats(self) -> _footer.RecordStats | None:
+        if not self._stats_offset:
+            return None
+        try:
+            with open(self._path, "rb") as stats_file:
+                stats_file.seek(self._stats_offset)
+                raw = stats_file.read()
+        except OSError:
+            return None
+        return _footer.parse_stats(raw)
 
     def __repr__(self) -> str:
         column_preview = self.columns[:5]
