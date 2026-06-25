@@ -287,6 +287,22 @@ def test_saveas_row_subset(tmp_path, store, columns, backend):
     back.close()
 
 
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_saveas_row_subset_chunked(tmp_path, store, columns, backend):
+    # A row subset is gathered into memory and streamed straight to ROOT; a small
+    # batch_size forces several chunks, exercising the in-memory source's slicing.
+    root_path = tmp_path / "subchunk.root"
+    store[5:15, ["pt", "n"]].saveas(root_path, backend=backend, batch_size=4, show_progress=False)
+    back = colstore.ingest(
+        root_path, tmp_path / "subchunk.cstore", backend=backend, show_progress=False
+    )
+    assert set(back.columns) == {"pt", "n"}
+    assert back.n_rows == 10
+    np.testing.assert_array_equal(np.sort(back.array("pt")), columns["pt"][5:15])
+    np.testing.assert_array_equal(np.sort(back.array("n")), columns["n"][5:15])
+    back.close()
+
+
 def test_root_format_registered():
     assert "root" in interop.file_formats()
     assert interop.file_format_for_extension(".root").name == "root"
