@@ -50,6 +50,7 @@ from . import config
 from ._base import _ReaderBase
 from ._paths import expand_glob
 from .reader import ColStoreReader, _indices_are_sorted
+from .shards import _list_shards
 
 # A single source: a path to open (owned), or an already-open reader/dataset
 # (borrowed). The constructor and append() accept one of these or a sequence.
@@ -121,13 +122,17 @@ class ColStoreDataset(_ReaderBase):
         ColStoreDataset(reader)           # borrow one open reader
         ColStoreDataset([p, reader, ds])  # paths owned, readers/datasets borrowed
         ColStoreDataset("run_*.cstore")   # glob: own every match, numeric order
+        ColStoreDataset("trades/")        # a directory: its .cstore shards, in order
 
     Paths are opened and *owned* (closed on :meth:`close`); readers and datasets
     are *borrowed* (left open). Datasets are flattened to their children. A path
     *string* may be a glob (``*``, ``?``, ``[``; ``**`` recursive), expanded to
     its matches in numeric order; a pattern matching no files raises
-    :class:`FileNotFoundError`. The public read surface matches
-    :class:`~colstore.reader.ColStoreReader`.
+    :class:`FileNotFoundError`. A path naming a *directory* expands to its
+    ``.cstore`` shards in numeric order -- the managed dataset :func:`append` /
+    :func:`appender` write to -- so a directory and a list of files compose the
+    same way (an empty directory is an empty dataset). The public read surface
+    matches :class:`~colstore.reader.ColStoreReader`.
 
     The native multi-file gather's per-column segment table (:meth:`_native_segment_table`)
     depends only on the children and the column, not on the rows a read requests,
@@ -189,7 +194,10 @@ class ColStoreDataset(_ReaderBase):
         try:
             for item in self._as_source_list(sources):
                 if isinstance(item, (str, os.PathLike)):
-                    for path in expand_glob(item):
+                    # A directory is a managed shard dataset (its ``.cstore`` files,
+                    # in order); anything else is a literal path or a glob pattern.
+                    paths = _list_shards(item) if os.path.isdir(item) else expand_glob(item)
+                    for path in paths:
                         reader = ColStoreReader(path, **reader_kwargs)
                         opened.append(reader)
                         pairs.append((reader, True))
@@ -241,9 +249,10 @@ class ColStoreDataset(_ReaderBase):
     ) -> ColStoreDataset:
         """Grow the dataset in place; return ``self`` so calls can be chained.
 
-        ``source`` is anything the constructor accepts: a path (opened and
-        owned), a reader or dataset (borrowed), or a list/tuple mixing them.
-        The first child establishes the schema; later children must match it.
+        ``source`` is anything the constructor accepts: a path -- a file, a glob,
+        or a directory of shards -- (opened and owned), a reader or dataset
+        (borrowed), or a list/tuple mixing them. The first child establishes the
+        schema; later children must match it.
         A schema mismatch leaves the dataset unchanged and closes anything this
         call opened.
         """

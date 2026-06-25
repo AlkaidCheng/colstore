@@ -51,6 +51,52 @@ def test_append_accepts_a_reader_as_data(tmp_path):
     ds.close()
 
 
+# ---- ColStoreDataset over a directory ---------------------------------------
+
+
+def test_dataset_constructed_from_a_directory(tmp_path):
+    for i in range(3):
+        colstore.append(tmp_path, {"x": np.arange(i * 10, i * 10 + 10, dtype=np.int64)})
+    ds = colstore.ColStoreDataset(tmp_path)  # a directory, not just open()
+    assert ds.n_rows == 30
+    np.testing.assert_array_equal(ds.array("x"), np.arange(30))
+    ds.close()
+    # a one-element list naming the directory behaves identically
+    ds = colstore.ColStoreDataset([tmp_path])
+    assert ds.n_rows == 30
+    ds.close()
+
+
+def test_dataset_from_empty_directory_is_empty(tmp_path):
+    (tmp_path / "ds").mkdir()
+    ds = colstore.ColStoreDataset(tmp_path / "ds")
+    assert ds.n_rows == 0
+    ds.close()
+
+
+def test_dataset_mixes_a_directory_and_a_file(tmp_path):
+    shard_dir = tmp_path / "ds"
+    colstore.append(shard_dir, {"x": np.arange(10, dtype=np.int64)})
+    colstore.append(shard_dir, {"x": np.arange(10, 20, dtype=np.int64)})
+    loose = colstore.store({"x": np.arange(20, 25, dtype=np.int64)}, tmp_path / "loose.cstore")
+    loose.close()
+    ds = colstore.ColStoreDataset([shard_dir, tmp_path / "loose.cstore"])
+    assert ds.n_rows == 25
+    np.testing.assert_array_equal(ds.array("x"), np.arange(25))  # dir shards then the file
+    ds.close()
+
+
+def test_dataset_append_grows_from_a_directory(tmp_path):
+    shard_dir = tmp_path / "ds"
+    colstore.append(shard_dir, {"x": np.arange(10, dtype=np.int64)})
+    colstore.append(shard_dir, {"x": np.arange(10, 20, dtype=np.int64)})
+    ds = colstore.ColStoreDataset()
+    ds.append(shard_dir)  # a directory source grows the in-memory dataset
+    assert ds.n_rows == 20
+    np.testing.assert_array_equal(ds.array("x"), np.arange(20))
+    ds.close()
+
+
 # ---- naming -----------------------------------------------------------------
 
 

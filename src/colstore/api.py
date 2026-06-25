@@ -56,11 +56,9 @@ def open(
     :func:`appender` write to (an empty directory is an empty dataset).
     """
     if isinstance(path, (str, os.PathLike)) and os.path.isdir(path):
-        # A directory is a managed shard dataset: its ``.cstore`` files are the
-        # shards, read in numeric order (an empty directory is an empty dataset).
-        from .shards import _list_shards
-
-        return ColStoreDataset(_list_shards(path), **kwargs)
+        # A directory is a managed shard dataset; the constructor expands it to
+        # its ``.cstore`` shards (an empty directory is an empty dataset).
+        return ColStoreDataset(path, **kwargs)
     if isinstance(path, str) and has_glob_magic(path):
         return ColStoreDataset(path, **kwargs)
     if isinstance(path, (str, os.PathLike)):
