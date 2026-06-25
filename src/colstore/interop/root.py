@@ -30,6 +30,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, cast
 
+import numpy as np
+
 from .. import api
 from .._base import _ReaderBase
 from .._sizes import resolve_batch_rows
@@ -293,11 +295,13 @@ def _ingest_batches(
 ) -> Iterator[ColumnBatch]:
     """Yield AsNumpy batches, one per output record.
 
-    A zero-row source still yields one typed (empty) batch so the schema is
-    captured. ``RDataFrame.Range`` is incompatible with implicit MT; disable
-    ``ROOT.EnableImplicitMT()`` before a chunked ingest.
+    A tree that fits the memory budget is read in a single ``AsNumpy`` (no ``Range``);
+    only a budget smaller than the tree falls back to ``Range`` chunks. A zero-row
+    source still yields one typed (empty) batch so the schema is captured. The
+    implicit-MT whole-tree fast path lives in :meth:`RootCppBackend.read_batches`
+    (``Range`` is incompatible with implicit MT, so chunked reads stay single-threaded).
     """
-    if total_rows == 0 or rows_per_batch is None:
+    if total_rows == 0 or rows_per_batch is None or total_rows <= rows_per_batch:
         yield rdf.AsNumpy(columns=columns)
         return
     for start in range(0, total_rows, rows_per_batch):
@@ -366,6 +370,7 @@ class RootCppBackend(RootBackend):
         keep_valid_only: bool,
         batch_size: int | str | None,
     ) -> tuple[Iterator[ColumnBatch], int]:
+        root = _import_root()
         rdf = _as_rdataframe(source, treename)
         selected = _select_storable_columns(rdf, columns, keep_valid_only)
         total = int(rdf.Count().GetValue())
@@ -377,6 +382,16 @@ class RootCppBackend(RootBackend):
             )
         else:
             rows_per_batch = resolve_batch_rows(batch_size)
+        # When the whole tree fits the budget and we own the RDataFrame, read it in
+        # one AsNumpy with implicit MT. The RDF fixes its thread-slot count at
+        # construction, so a fresh one is built INSIDE the MT context; Range (used
+        # only when the budget is smaller than the tree) is incompatible with it.
+        whole_tree = rows_per_batch is None or total <= rows_per_batch
+        if total > 0 and whole_tree and isinstance(source, (str, os.PathLike, dict)):
+            with _implicit_mt(root, _DEFAULT_MULTITHREADING):
+                mt_rdf = _as_rdataframe(source, treename)
+                batch = mt_rdf.AsNumpy(columns=selected)
+            return iter([batch]), total
         return _ingest_batches(rdf, selected, rows_per_batch, total), total
 
     def write(
@@ -623,6 +638,42 @@ def _batch_dict(view: Any) -> ColumnBatch:
         return cast(ColumnBatch, view.dict(copy=False))
     except ValueError:
         return cast(ColumnBatch, view.dict())
+
+
+class _InMemoryView:
+    """A row/column slice of in-memory columns, exposing the ``dict()`` accessor
+    :func:`_batch_dict` calls. The slice is a NumPy view, so a batch handed to a
+    ROOT backend copies nothing.
+    """
+
+    def __init__(self, columns: ColumnBatch) -> None:
+        self._columns = columns
+
+    def dict(self, copy: bool = True) -> ColumnBatch:
+        if copy:
+            return {name: array.copy() for name, array in self._columns.items()}
+        return self._columns
+
+
+class _InMemorySource:
+    """A reader-like wrapper over already-gathered column arrays.
+
+    A row/column subset export has no contiguous store to stream, so its columns
+    are gathered into memory. This exposes the small slice of the store-reader
+    protocol the ROOT backends consume -- ``dtypes``, ``n_rows``, and
+    ``[rows, columns]`` chunk indexing -- so that in-memory subset streams to ROOT
+    directly, rather than being written to a scratch ``.cstore`` and reopened only
+    to present the same protocol.
+    """
+
+    def __init__(self, data: ColumnBatch) -> None:
+        self._data = data
+        self.dtypes: dict[str, np.dtype[Any]] = {name: array.dtype for name, array in data.items()}
+        self.n_rows: int = len(next(iter(data.values()))) if data else 0
+
+    def __getitem__(self, key: tuple[Any, list[str]]) -> _InMemoryView:
+        rows, columns = key
+        return _InMemoryView({name: self._data[name][rows] for name in columns})
 
 
 def _warn_branch_renames(name_map: dict[str, str]) -> None:
@@ -898,8 +949,8 @@ class RootFormat(FileFormat):
         """Write a colstore ``selection`` to a ROOT file at ``dest``; see :func:`to_root`.
 
         A whole-store selection streams straight from the store; a row subset is
-        gathered into a scratch ``.cstore`` first and streamed from there.
-        ``**options`` carries the ROOT-backend write options (``compression_level``,
+        gathered into memory and streamed from there. ``**options`` carries the
+        ROOT-backend write options (``compression_level``,
         ``compression_algorithm``, ``output_format``, ``multithreading``).
         """
         impl = resolve_backend(backend, selection.store)
@@ -922,23 +973,15 @@ class RootFormat(FileFormat):
             )
         else:
             data = {name: selection.gather(name) for name in columns}
-            with tempfile.TemporaryDirectory() as scratch:
-                scratch_store = os.path.join(scratch, "selection.cstore")
-                reader = api.store(data, scratch_store, show_progress=False)
-                # Close the scratch reader before the directory is removed: on
-                # Windows a still-mapped file cannot be deleted (WinError 32).
-                try:
-                    impl.write(
-                        reader,
-                        columns=columns,
-                        dest=dest,
-                        treename=treename,
-                        batch_size=batch_size,
-                        show_progress=show_progress,
-                        **options,
-                    )
-                finally:
-                    reader.close()
+            impl.write(
+                cast(_ReaderBase, _InMemorySource(data)),
+                columns=columns,
+                dest=dest,
+                treename=treename,
+                batch_size=batch_size,
+                show_progress=show_progress,
+                **options,
+            )
         return Path(os.fspath(dest))
 
     def from_file(

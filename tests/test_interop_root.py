@@ -79,6 +79,33 @@ def test_streaming_batches_roundtrip(tmp_path, store, columns, backend):
     back.close()
 
 
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_read_whole_vs_chunked_agree(tmp_path, backend):
+    # The whole-file read (a single AsNumpy, implicit-MT for the ROOT backend) and
+    # the chunked Range read must reconstruct identical, row-intact data. Sorting by
+    # a key column and checking a correlated column catches any cross-column mixup
+    # (which per-column sorting in the other tests would miss).
+    n = 5000
+    data = {"key": np.arange(n, dtype=np.int64), "val": (np.arange(n) * 2).astype(np.float64)}
+    src = colstore.store(data, tmp_path / "rw.cstore", show_progress=False)
+    rp = tmp_path / "rw.root"
+    colstore.to_root(src, rp, treename="events", backend=backend, show_progress=False)
+
+    whole = colstore.from_root(rp, tmp_path / "whole.cstore", backend=backend, show_progress=False)
+    chunked = colstore.from_root(
+        rp, tmp_path / "chunk.cstore", backend=backend, batch_size=1500, show_progress=False
+    )
+    for back in (whole, chunked):
+        assert back.n_rows == n
+        order = np.argsort(np.asarray(back.array("key")))
+        np.testing.assert_array_equal(np.asarray(back.array("key"))[order], np.arange(n))
+        np.testing.assert_array_equal(
+            np.asarray(back.array("val"))[order], (np.arange(n) * 2).astype(np.float64)
+        )
+    whole.close()
+    chunked.close()
+
+
 @pytest.mark.skipif(not (_HAS_ROOT and _HAS_UPROOT), reason="needs both backends")
 def test_cross_backend_interchange(tmp_path, store, columns):
     # write with each backend, read back with the other
@@ -284,6 +311,22 @@ def test_saveas_row_subset(tmp_path, store, columns, backend):
     assert set(back.columns) == {"pt", "n"}
     assert back.n_rows == 5
     np.testing.assert_array_equal(np.sort(back.array("pt")), columns["pt"][5:10])
+    back.close()
+
+
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_saveas_row_subset_chunked(tmp_path, store, columns, backend):
+    # A row subset is gathered into memory and streamed straight to ROOT; a small
+    # batch_size forces several chunks, exercising the in-memory source's slicing.
+    root_path = tmp_path / "subchunk.root"
+    store[5:15, ["pt", "n"]].saveas(root_path, backend=backend, batch_size=4, show_progress=False)
+    back = colstore.ingest(
+        root_path, tmp_path / "subchunk.cstore", backend=backend, show_progress=False
+    )
+    assert set(back.columns) == {"pt", "n"}
+    assert back.n_rows == 10
+    np.testing.assert_array_equal(np.sort(back.array("pt")), columns["pt"][5:15])
+    np.testing.assert_array_equal(np.sort(back.array("n")), columns["n"][5:15])
     back.close()
 
 
