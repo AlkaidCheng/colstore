@@ -138,8 +138,9 @@ def store(
           ``"1 MB"`` is 1,000,000 bytes and ``"1 MiB"`` is 1,048,576.
 
     show_progress : bool, default ``True``
-        Whether to display a tqdm progress bar. The bar's postfix shows
-        cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
+        Whether to display a tqdm progress bar. The bar's postfix shows the
+        batch count and ``rows=...Mrows/s``; the byte rate is rendered by the
+        byte-counted bar itself.
     statistics : bool, default ``False``
         Record per-column statistics so later filters can skip data that cannot
         match. Most useful for selective queries on sorted or clustered data.
