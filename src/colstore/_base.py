@@ -46,7 +46,7 @@ if TYPE_CHECKING:
 # pairs before committing to the full O(K) pass. Sampling is skipped below
 # the size threshold, where the full pass is cheaper than the sampler's
 # fixed overhead (threshold set conservatively above the measured
-# crossover; see docs/optimization_series.md).
+# crossover; see docs/development/optimization_series.md).
 _SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
 _SORTEDNESS_SAMPLE_MIN_SIZE = 32768
 
@@ -60,7 +60,7 @@ def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
     array definitely unsorted, while an all-ascending sample still falls
     through to the full pass. Correctness is therefore unconditional; the
     sampling only changes the cost split between sorted and unsorted
-    selectors (see docs/optimization_series.md).
+    selectors (see docs/development/optimization_series.md).
     """
     n = indices.shape[0]
     if n <= 1:

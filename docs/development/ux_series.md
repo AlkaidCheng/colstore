@@ -178,7 +178,7 @@ itself to `pd.DataFrame(ds)` does not expand it into columns, so prefer
 
 `colstore.interop` exchanges colstore data with Apache Arrow (zero-copy), NumPy
 `.npz`, and ROOT through `ds.to("arrow")` / `ds.arrow()`, `ds.saveas(path)`, and
-`colstore.ingest(path, dest)`. See **[Interop](interop.md)** for the full registry,
+`colstore.ingest(path, dest)`. See **[Interop](../guide/interop.md)** for the full registry,
 the export/import verbs, and the ROOT kernels.
 
 ---

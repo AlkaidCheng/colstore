@@ -18,7 +18,7 @@
 // and multi-file alike, over a segment table.
 //
 // Measurements and the history behind each kernel are recorded in
-// docs/optimization_series.md; comments here state the contracts and the
+// docs/development/optimization_series.md; comments here state the contracts and the
 // present design.
 
 #pragma once

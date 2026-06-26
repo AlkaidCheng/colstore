@@ -72,8 +72,8 @@ ds[100:200].dict(copy=False)                # zero-copy views over the mmap
 :hidden:
 :caption: User guide
 
-Performance & internals <performance>
-Format interop <interop>
+Performance & internals <guide/performance>
+Format interop <guide/interop>
 ```
 
 ```{toctree}
@@ -87,8 +87,8 @@ API reference <api>
 :hidden:
 :caption: Development
 
-UX series <ux_series>
-Optimization series <optimization_series>
-Gather diagnostics <gather_diagnostics>
-Valgrind leak checking <valgrind_leak_checking>
+UX series <development/ux_series>
+Optimization series <development/optimization_series>
+Gather diagnostics <development/gather_diagnostics>
+Valgrind leak checking <development/valgrind_leak_checking>
 ```

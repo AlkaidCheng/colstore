@@ -36,7 +36,6 @@ exclude_patterns = [
     "_build",
     "Thumbs.db",
     ".DS_Store",
-    "README.md",  # the GitHub docs index, not a built page
 ]
 
 # -- Autodoc / autosummary ----------------------------------------------------
