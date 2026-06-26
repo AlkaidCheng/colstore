@@ -19,13 +19,30 @@ the output you ask for; the source file is never fully read into RAM.
 
 ## Table of contents
 
-**Guide** — [Install](#install) · [Quick start](#quick-start) · [Reader, writer, frame](#reader-writer-frame) · [Filtering and projection](#filtering-and-projection) · [Editing](#editing) · [Writing](#writing) · [Compaction](#compaction) · [Multiple files and datasets](#multiple-files-and-datasets) · [Introspection](#introspection)
-
-**Performance & tuning** — [Zero-copy reads](#zero-copy-reads) · [Configuration](#configuration) · [How reads parallelize](#how-reads-parallelize) · [NUMA placement](#numa-placement) · [How writes reach disk](#how-writes-reach-disk)
-
-**Format & internals** — [On-disk format](#on-disk-format) · [The segment table](#the-segment-table) · [Supported dtypes](#supported-dtypes)
-
-**About** — [Design philosophy](#design-philosophy) · [Documentation](#documentation) · [License](#license)
+- [**Guide**](#guide)
+  - [Install](#install)
+  - [Quick start](#quick-start)
+  - [Reader, writer, frame](#reader-writer-frame)
+  - [Filtering and projection](#filtering-and-projection)
+  - [Editing](#editing)
+  - [Writing](#writing)
+  - [Compaction](#compaction)
+  - [Multiple files and datasets](#multiple-files-and-datasets)
+  - [Introspection](#introspection)
+- [**Performance & tuning**](#performance--tuning)
+  - [Zero-copy reads](#zero-copy-reads)
+  - [Configuration](#configuration)
+  - [How reads parallelize](#how-reads-parallelize)
+  - [NUMA placement](#numa-placement)
+  - [How writes reach disk](#how-writes-reach-disk)
+- [**Format & internals**](#format--internals)
+  - [On-disk format](#on-disk-format)
+  - [The segment table](#the-segment-table)
+  - [Supported dtypes](#supported-dtypes)
+- [**About**](#about)
+  - [Design philosophy](#design-philosophy)
+  - [Documentation](#documentation)
+  - [License](#license)
 
 ## Guide
 
