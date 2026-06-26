@@ -519,23 +519,12 @@ and the realized path is the unbound default pool.
 Every write — `frame.write()`, `concat(..., out=...)`, `write_dataset` — chooses
 a path and a fill method:
 
-```
-write
-│
-├─ pure merge?  every output column an unchanged on-disk passthrough
-│  │            (e.g. concat of same-schema files, no edits)
-│  └─ yes ─► merge copy   : copy each source column's byte ranges straight
-│                           into the output (no materialization)
-│
-└─ no           a transform, a new/dropped/renamed column, an in-memory
-   │            or constant column, or a single source
-   └────────► streaming write : evaluate each column in bounded-memory
-                                 batches, then write each batch out
+![How a write reaches disk: merge copy vs streaming write, then the fill method](docs/assets/write_path_decision.svg)
 
-   both paths fill the destination body with one of:
-     pwrite  (default where os.pwrite exists)  large sequential writes
-     mmap    (fallback, e.g. Windows)          memory-mapped output
-```
+A write takes the **merge copy** route only when every output column is an
+unchanged on-disk passthrough — a same-schema `concat` with no edits, say; any
+transform, added, dropped, or renamed column, in-memory or constant column, or
+single source routes through the **streaming write** instead.
 
 **Why the fill method matters.** An `mmap`'d output is dirtied one page at a
 time; a parallel filesystem serves that pattern poorly — a 1 GB write faults
