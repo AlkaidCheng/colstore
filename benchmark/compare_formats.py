@@ -18,14 +18,20 @@ comparison page; this script asserts no verdict, it only measures::
 
     PYTHONPATH=src python benchmark/compare_formats.py --rows 5000000 --json compare.json
 
-Peak memory is read in a fresh process per format (RSS is process-wide), so the
-script re-invokes itself with ``--peak-read``; that flag is internal.
+The speed pass is repeated at every count in ``--threads`` (default: 1 and the
+OpenMP max), one subprocess per count with ``OMP_NUM_THREADS`` /
+``POLARS_MAX_THREADS`` / the pyarrow CPU count pinned before import, so single-
+vs multi-threaded performance is measured apples-to-apples across every format.
+Peak memory is read in a fresh process per format (RSS is process-wide). Both
+re-invoke the script with internal flags (``--bench-threads`` / ``--peak-read``).
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import os
 import resource
 import subprocess
 import sys
@@ -357,7 +363,7 @@ def _time_reads(
     }
 
 
-def run_speed(
+def measure_speed(
     specs: list[FormatSpec],
     workdir: Path,
     w: Workload,
@@ -366,31 +372,16 @@ def run_speed(
     warmup: int,
     params: dict[str, Any],
 ) -> list[_c.Result]:
-    """Time write, on-disk size, gather, scan, and mask for each available format."""
+    """Write, size, gather, scan, and mask each available format; return records (no output)."""
     rows = len(w.struct)
-    print(
-        f"\nDataset: {rows:,} rows x {len(w.names)} float64 cols "
-        f"({w.struct.nbytes / 1e6:.0f} MB raw). Gather K={len(w.idx):,} (sorted). "
-        f"Mask {w.mask.mean():.0%}. Best-of-{repeat}.\n"
-    )
-    header = (
-        f"{'format':16} {'write s':>8} {'file MB':>8} "
-        f"{'gather ms':>10} {'scan ms':>9} {'mask ms':>9}"
-    )
-    print(header)
-    print("-" * len(header))
-
     records: list[_c.Result] = []
     for spec in specs:
         if not spec.available:
-            print(f"{spec.name:16}  skipped (missing {', '.join(spec.requires)})")
             continue
         path = workdir / spec.filename
         start = time.perf_counter()
         spec.write(path, w)
         write_s = time.perf_counter() - start
-        size_mb = _file_mb(path)
-
         timed = _time_reads(spec, path, w, repeat=repeat, warmup=warmup)
         records.extend(
             _c.Result.from_stats(scenario, spec.name, params, stats, rows=rows)
@@ -400,7 +391,7 @@ def run_speed(
             _c.Result(
                 scenario="write",
                 variant=spec.name,
-                params={**params, "file_mb": round(size_mb, 1)},
+                params={**params, "file_mb": round(_file_mb(path), 1)},
                 median_ms=write_s * 1000.0,
                 min_ms=write_s * 1000.0,
                 p95_ms=write_s * 1000.0,
@@ -408,12 +399,26 @@ def run_speed(
                 rows=rows,
             )
         )
-        print(
-            f"{spec.name:16} {write_s:8.2f} {size_mb:8.1f} "
-            f"{timed['random_gather'].min_ms:10.1f} {timed['column_scan'].min_ms:9.2f} "
-            f"{timed['mask_filter'].min_ms:9.1f}"
-        )
     return records
+
+
+def _print_speed_table(records: list[_c.Result]) -> None:
+    """Print the per-format write / size / gather / scan / mask table for one thread count."""
+    by: dict[str, dict[str, _c.Result]] = {}
+    for r in records:
+        by.setdefault(r.variant, {})[r.scenario] = r
+    header = (
+        f"{'format':16} {'write s':>8} {'file MB':>8} "
+        f"{'gather ms':>10} {'scan ms':>9} {'mask ms':>9}"
+    )
+    print(header)
+    print("-" * len(header))
+    for variant, d in by.items():
+        wr, g, s, m = d["write"], d["random_gather"], d["column_scan"], d["mask_filter"]
+        print(
+            f"{variant:16} {wr.min_ms / 1000:8.2f} {wr.params['file_mb']:8.1f} "
+            f"{g.min_ms:10.1f} {s.min_ms:9.2f} {m.min_ms:9.1f}"
+        )
 
 
 def run_memory(specs: list[FormatSpec], args: argparse.Namespace) -> None:
@@ -476,6 +481,99 @@ def _peak_read(args: argparse.Namespace) -> None:
     print(f"PEAK_RSS_MB {peak_rss_mb():.0f}")
 
 
+# ---- threading sweep --------------------------------------------------------
+
+
+def _pin_threads(n: int) -> None:
+    """Pin the runtime-settable thread knobs to ``n`` (the env knobs are set by the parent)."""
+    from colstore import config
+
+    config.set_gather_thread_cap(n)
+    config.set_max_workers(n)
+    try:
+        import pyarrow as pa
+
+        pa.set_cpu_count(n)
+    except ImportError:
+        pass
+
+
+def _bench_at_threads(args: argparse.Namespace) -> None:
+    """Subprocess entry: pin threads to ``--bench-threads``, run the speed pass, write JSON."""
+    n = args.bench_threads
+    _pin_threads(n)
+    params = {
+        "rows": args.rows,
+        "cols": args.cols,
+        "gather_k": args.indices,
+        "mask_frac": args.mask_frac,
+        "threads": n,
+    }
+    with tempfile.TemporaryDirectory(prefix="colstore_cmp") as tmp:
+        w = make_workload(args.rows, args.cols, args.indices, args.mask_frac, args.seed)
+        records = measure_speed(
+            all_specs(), Path(tmp), w, repeat=args.repeat, warmup=args.warmup, params=params
+        )
+    _c.write_summary(args.json, records, meta=params)
+
+
+def _run_threads(args: argparse.Namespace, n: int) -> list[_c.Result]:
+    """Parent: run the speed pass at ``n`` threads in a subprocess with the env pinned."""
+    fd, name = tempfile.mkstemp(prefix="colstore_cmp_t", suffix=".json")
+    os.close(fd)
+    out_json = Path(name)
+    env = {**os.environ, "OMP_NUM_THREADS": str(n), "POLARS_MAX_THREADS": str(n)}
+    subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--bench-threads",
+            str(n),
+            "--rows",
+            str(args.rows),
+            "--cols",
+            str(args.cols),
+            "--indices",
+            str(args.indices),
+            "--mask-frac",
+            str(args.mask_frac),
+            "--seed",
+            str(args.seed),
+            "--repeat",
+            str(args.repeat),
+            "--warmup",
+            str(args.warmup),
+            "--json",
+            str(out_json),
+        ],
+        env=env,
+        check=True,
+    )
+    data = json.loads(out_json.read_text())
+    out_json.unlink(missing_ok=True)
+    return [_c.Result(**r) for r in data["results"]]
+
+
+def _print_speedup(by_n: dict[int, list[_c.Result]], threads: list[int]) -> None:
+    """Print the read-op speedup of the highest vs lowest thread count, per format."""
+    base, top = threads[0], threads[-1]
+
+    def by_variant(records: list[_c.Result]) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for r in records:
+            out.setdefault(r.variant, {})[r.scenario] = r.min_ms
+        return out
+
+    lo, hi = by_variant(by_n[base]), by_variant(by_n[top])
+    print(f"\nParallel speedup ({top}t vs {base}t), x faster:")
+    print(f"  {'format':16} {'gather':>8} {'scan':>8} {'mask':>8}")
+    for variant in lo:
+        g = lo[variant]["random_gather"] / hi[variant]["random_gather"]
+        s = lo[variant]["column_scan"] / hi[variant]["column_scan"]
+        m = lo[variant]["mask_filter"] / hi[variant]["mask_filter"]
+        print(f"  {variant:16} {g:8.2f} {s:8.2f} {m:8.2f}")
+
+
 # ---- entry point ------------------------------------------------------------
 
 
@@ -493,8 +591,16 @@ def main() -> None:
     )
     parser.add_argument("--mask-frac", type=float, default=0.3, help="boolean mask selectivity")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed")
+    parser.add_argument(
+        "--threads",
+        type=int,
+        nargs="+",
+        default=None,
+        help="thread counts to sweep (default: 1 and the OpenMP max)",
+    )
     parser.add_argument("--no-memory", action="store_true", help="skip the peak-memory pass")
-    # Internal: a fresh-process peak-RSS probe re-invoked by run_memory.
+    # Internal subprocess entry points, re-invoked by the parent.
+    parser.add_argument("--bench-threads", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--peak-read", help=argparse.SUPPRESS)
     parser.add_argument("--peak-kind", choices=("gather", "local"), help=argparse.SUPPRESS)
     parser.add_argument("--data-dir", type=Path, help=argparse.SUPPRESS)
@@ -503,30 +609,42 @@ def main() -> None:
     if args.peak_read:
         _peak_read(args)
         return
-
-    specs = all_specs()
-    params = {
-        "rows": args.rows,
-        "cols": args.cols,
-        "gather_k": args.indices,
-        "mask_frac": args.mask_frac,
-    }
-    if args.skip_bench:
-        present = [s.name for s in specs if s.available]
-        print("formats available:", ", ".join(present))
+    if args.bench_threads is not None:
+        _bench_at_threads(args)
         return
 
-    records: list[_c.Result] = []
-    with tempfile.TemporaryDirectory(prefix="colstore_cmp") as tmp:
-        w = make_workload(args.rows, args.cols, args.indices, args.mask_frac, args.seed)
-        records = run_speed(
-            specs, Path(tmp), w, repeat=args.repeat, warmup=args.warmup, params=params
-        )
+    specs = all_specs()
+    if args.skip_bench:
+        print("formats available:", ", ".join(s.name for s in specs if s.available))
+        return
+
+    threads = sorted(set(args.threads)) if args.threads else sorted({1, _c.max_threads()})
+    print(
+        f"\nDataset: {args.rows:,} rows x {args.cols} float64 cols "
+        f"({args.rows * args.cols * 8 / 1e6:.0f} MB raw). Gather K={args.indices:,} (sorted). "
+        f"Mask {args.mask_frac:.0%}. Best-of-{args.repeat}. Threads {threads}."
+    )
+    by_n: dict[int, list[_c.Result]] = {}
+    for n in threads:
+        by_n[n] = _run_threads(args, n)
+        print(f"\n=== {n} thread{'s' if n != 1 else ''} ===")
+        _print_speed_table(by_n[n])
+    if len(threads) >= 2:
+        _print_speedup(by_n, threads)
+
     if not args.no_memory:
         run_memory(specs, args)
 
     if args.json:
-        _c.write_summary(args.json, records, meta=params)
+        meta = {
+            "rows": args.rows,
+            "cols": args.cols,
+            "gather_k": args.indices,
+            "mask_frac": args.mask_frac,
+            "threads": threads,
+        }
+        all_records = [r for recs in by_n.values() for r in recs]
+        _c.write_summary(args.json, all_records, meta=meta)
         print(f"\nwrote {args.json}")
 
 
