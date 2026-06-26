@@ -16,9 +16,10 @@ import numpy as np
 import pytest
 
 import colstore
-from colstore import FILE_EXTENSION, ColStoreReader, FormatError, _sizes
+from colstore import ColStoreReader, FormatError, _sizes
 from colstore import format as fmt
 from colstore.format import (
+    FILE_EXTENSION,
     align_up,
     build_column_layout,
     read_header,
