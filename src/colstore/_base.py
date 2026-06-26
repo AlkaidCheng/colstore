@@ -93,6 +93,11 @@ class _ReaderBase(InteropMixin, abc.ABC):
     def n_rows(self) -> int:
         """Total number of logical rows visible through this reader."""
 
+    @property
+    @abc.abstractmethod
+    def paths(self) -> tuple[Path, ...]:
+        """The backing ``.cstore`` file paths, in order (empty for an empty dataset)."""
+
     @abc.abstractmethod
     def _gather_one(
         self,

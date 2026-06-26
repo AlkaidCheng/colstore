@@ -56,7 +56,7 @@ def test_open_list_returns_dataset(tmp_path):
     assert ds.shape == (len(ox), 2)
     assert ds.columns == ["x", "y"]
     assert {k: str(v) for k, v in ds.dtypes.items()} == {"x": "int64", "y": "float64"}
-    assert len(ds.path) == 2
+    assert len(ds.paths) == 2
     assert ds.needs_compaction is True
     assert "ColStoreDataset" in repr(ds)
     ds.close()
@@ -77,7 +77,7 @@ def test_open_empty_list_is_empty_dataset(tmp_path):
     assert isinstance(ds, ColStoreDataset)
     assert ds.n_rows == 0
     assert ds.columns == []
-    assert ds.path == ()
+    assert ds.paths == ()
     assert ds.needs_compaction is False
     ds.close()
 

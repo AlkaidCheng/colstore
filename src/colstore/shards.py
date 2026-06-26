@@ -187,8 +187,7 @@ def _validate_source_schema(
 
 def _source_files(source: ShardSource) -> list[Path]:
     """The physical ``.cstore`` files backing ``source`` (one for a single reader)."""
-    path = source.path
-    return list(path) if isinstance(path, tuple) else [path]
+    return list(source.paths)
 
 
 def _reject_self_append(source: ShardSource, directory: Path) -> None:

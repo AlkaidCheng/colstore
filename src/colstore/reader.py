@@ -336,6 +336,11 @@ class ColStoreReader(_ReaderBase):
         return self._path
 
     @property
+    def paths(self) -> tuple[Path, ...]:
+        """The backing files: a one-element tuple of this reader's :attr:`path`."""
+        return (self._path,)
+
+    @property
     def n_rows(self) -> int:
         """Number of rows in every column."""
         return self._n_rows

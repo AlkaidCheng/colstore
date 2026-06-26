@@ -360,7 +360,7 @@ def concat(
                 "output file; got nothing to write."
             )
         out_resolved = Path(out).resolve()
-        if any(Path(source).resolve() == out_resolved for source in dataset.path):
+        if any(Path(source).resolve() == out_resolved for source in dataset.paths):
             raise ValueError(
                 f"concat() out={os.fspath(out)!r} is also one of the sources; "
                 f"write to a new path."

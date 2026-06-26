@@ -283,7 +283,7 @@ class ColStoreDataset(_ReaderBase):
         return self._n_rows
 
     @property
-    def path(self) -> tuple[Path, ...]:
+    def paths(self) -> tuple[Path, ...]:
         """The child files' paths, in order (empty for borrowed-only/empty)."""
         return tuple(child.path for child in self._children)
 
