@@ -271,7 +271,7 @@ class ColStoreReader(_ReaderBase):
         # it gives both the single-record and multi-record paths a uniformly
         # validated file before any data read.
         columns_meta = self._manifest["columns"]
-        itemsizes = [np.dtype(col["dtype"]).itemsize for col in columns_meta]
+        itemsizes = format.itemsizes_of(columns_meta)
         record_starts_rows, record_starts_bytes, n_rows_per_record = format.read_record_index(
             self._path, data_offset, n_records, itemsizes
         )

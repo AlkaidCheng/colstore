@@ -177,7 +177,7 @@ class ColStoreWriter:
         # Even though read_record_index also validates each record, we need
         # the byte position past the last record for the seek.
         if self._n_records > 0:
-            itemsizes = [np.dtype(col["dtype"]).itemsize for col in self._schema]
+            itemsizes = fmt.itemsizes_of(self._schema)
             _, record_starts_bytes, n_rows_per_record = fmt.read_record_index(
                 self._path, data_offset, self._n_records, itemsizes
             )

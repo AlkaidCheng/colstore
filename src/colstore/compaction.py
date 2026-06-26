@@ -111,7 +111,7 @@ def compact_file(
         # Walk every record header to validate them and to learn each record's
         # body offset and row count. The reader's _gather_one path does the
         # same thing; we reuse the same helper.
-        itemsizes = [np.dtype(col["dtype"]).itemsize for col in columns]
+        itemsizes = fmt.itemsizes_of(columns)
         _, record_body_offsets, n_rows_per_record = fmt.read_record_index(
             src, src_data_offset, src_n_records, itemsizes
         )

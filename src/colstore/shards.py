@@ -21,9 +21,7 @@ import glob
 import os
 import re
 import shutil
-import tempfile
 import warnings
-from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from itertools import pairwise
@@ -266,29 +264,6 @@ def _assert_shard_absent(final: Path) -> None:
         raise FileExistsError(f"shard {final} already exists; shards are immutable.")
 
 
-@contextlib.contextmanager
-def _atomic_shard(final: Path) -> Iterator[str]:
-    """Yield a temp path to fill, then fsync it and rename it onto ``final``.
-
-    A reader never sees a partial shard: the content is built under a temporary
-    dotfile and published with one atomic rename, and a failure unlinks the temp
-    and re-raises (a crash leaves only an ignored temp). The fsync uses a writable
-    handle -- on Windows os.fsync maps to _commit(), which fails with EBADF on a
-    read-only descriptor -- and closes it before os.replace, which Windows requires.
-    """
-    fd, tmp = tempfile.mkstemp(dir=os.fspath(final.parent), prefix=f".{final.name}.", suffix=".tmp")
-    os.close(fd)
-    try:
-        yield tmp
-        with open(tmp, "r+b") as written:
-            os.fsync(written.fileno())
-        os.replace(tmp, final)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-
-
 def _write_shard_atomic(
     directory: Path,
     columns: Columns,
@@ -301,7 +276,7 @@ def _write_shard_atomic(
     """Write ``columns`` to ``directory/name`` atomically; return the shard path."""
     final = directory / name
     _assert_shard_absent(final)
-    with _atomic_shard(final) as tmp:
+    with fmt.atomic_publish(final) as tmp:
         fmt.write_dataset(
             columns, tmp, batch_size=batch_size, show_progress=show_progress, statistics=statistics
         )
@@ -367,7 +342,7 @@ def _copy_shard_atomic(src_file: Path, final: Path) -> None:
     A large source is split across a few concurrent I/O streams (see
     :func:`_copy_file`); the bytes never pass through Python.
     """
-    with _atomic_shard(final) as tmp:
+    with fmt.atomic_publish(final) as tmp:
         _copy_file(src_file, Path(tmp))
 
 
@@ -532,7 +507,7 @@ class Appender:
         if self._schema is None:
             self._schema = columns_meta
         if self._budget_pending:
-            bytes_per_row = sum(np.dtype(meta["dtype"]).itemsize for meta in columns_meta)
+            bytes_per_row = sum(fmt.itemsizes_of(columns_meta))
             self._rows_per_shard = resolve_batch_rows(
                 self._shard_size, bytes_per_row=bytes_per_row or 1
             )
