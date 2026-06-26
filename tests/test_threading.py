@@ -224,14 +224,14 @@ def test_clear_cached_cap_can_keep_in_process_value(tmp_path, monkeypatch):
         config.set_gather_thread_cap(original)
 
 
-def test_apply_cached_cap_if_present(tmp_path, monkeypatch):
+def test_apply_cached_cap(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     original = config.get_gather_thread_cap()
     try:
-        assert autotune.apply_cached_cap_if_present() is False
+        assert autotune.apply_cached_cap() is False
         autotune._write_cache(2, {1: 1.0, 2: 1.5})
         config.set_gather_thread_cap(7)
-        assert autotune.apply_cached_cap_if_present() is True
+        assert autotune.apply_cached_cap() is True
         assert config.get_gather_thread_cap() == 2
     finally:
         config.set_gather_thread_cap(original)

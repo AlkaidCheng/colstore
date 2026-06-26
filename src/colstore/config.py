@@ -594,3 +594,25 @@ def set_preview_precision(n: int) -> None:
     if n < 0:
         raise ValueError(f"preview_precision must be >= 0, got {n}.")
     _preview_precision = int(n)
+
+
+def use_passive_openmp_wait() -> bool:
+    """Opt into ``OMP_WAIT_POLICY=passive`` so idle OpenMP threads sleep.
+
+    The gather kernel runs short, bursty parallel regions; OpenMP's default
+    *active* wait makes idle worker threads busy-spin between them, burning CPU
+    on otherwise-idle cores. ``passive`` makes them sleep instead. This is
+    opt-in and never applied automatically: ``OMP_WAIT_POLICY`` is process-global
+    -- it governs every OpenMP runtime in the process (NumPy, numba, ...) -- and
+    the per-call gather thread cap already bounds colstore's own spinning.
+
+    The policy is read once, when the OpenMP runtime first starts its thread pool
+    (the first gather, or another OpenMP library's first parallel region), so set
+    it as early as possible -- ideally before the first read. Returns ``True`` if
+    this call set the variable, ``False`` if it was already set (and left
+    untouched).
+    """
+    if "OMP_WAIT_POLICY" in os.environ:
+        return False
+    os.environ["OMP_WAIT_POLICY"] = "passive"
+    return True

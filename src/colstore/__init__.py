@@ -20,43 +20,19 @@ Package-wide defaults (thread count, ``madvise`` hint, gather backend) live
 in :mod:`colstore.config` and can be changed at runtime.
 """
 
-import os as _os
-
-
-def use_passive_openmp_wait() -> bool:
-    """Opt in to ``OMP_WAIT_POLICY=passive`` for OpenMP threads. Returns success.
-
-    The gather kernel runs short, bursty parallel regions; OpenMP's
-    default *active* wait makes idle threads busy-spin between them.
-    ``passive`` makes them sleep instead. This is **opt-in and not called
-    automatically** because ``OMP_WAIT_POLICY`` is process-global (it
-    affects every OpenMP runtime: NumPy, numba, PyTorch, ...), and the
-    per-call thread cap already bounds colstore's own spinning.
-
-    Takes effect only if set **before** the OpenMP runtime initializes:
-    call it at the very top of the program, before importing colstore or
-    NumPy. Returns ``True`` if the variable was set, ``False`` if it was
-    already set (and left untouched).
-    """
-    if "OMP_WAIT_POLICY" in _os.environ:
-        return False
-    _os.environ["OMP_WAIT_POLICY"] = "passive"
-    return True
-
-
-from importlib.metadata import PackageNotFoundError
+from importlib.metadata import PackageNotFoundError as _PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
 try:
     __version__ = _pkg_version("colstore")
-except PackageNotFoundError:  # source checkout without an installed dist
+except _PackageNotFoundError:  # source checkout without an installed dist
     __version__ = "0.0.0+unknown"
 
 # If this machine has been calibrated before, apply the cached gather thread
 # cap now. Otherwise the static hardware-derived default from `config` stands.
 # Calibration itself never runs implicitly; the user calls `calibrate()` or
 # `ensure_calibrated()` explicitly.
-from . import interop, profiling, testing
+from . import autotune, interop, profiling, testing
 from ._query import QueryError, col
 from .api import (
     ColStoreInfo,
@@ -78,7 +54,6 @@ from .api import (
     update,
 )
 from .autotune import (
-    apply_cached_cap_if_present,
     calibrate,
     ensure_calibrated,
 )
@@ -91,9 +66,10 @@ from .config import (
     set_default_madvise,
     set_gather_thread_cap,
     set_max_workers,
+    use_passive_openmp_wait,
 )
 from .dataset import ColStoreDataset
-from .format import FILE_EXTENSION, FormatError
+from .format import FormatError
 from .frame import ColStoreFrame
 from .interop.root import from_root, to_root
 from .kernels import cpp_available, max_threads, numba_available
@@ -102,10 +78,9 @@ from .shards import Appender, append, appender
 from .view import ColumnView, TableView
 from .writer import ColStoreWriter
 
-apply_cached_cap_if_present()
+autotune.apply_cached_cap()
 
 __all__ = [
-    "FILE_EXTENSION",
     "Appender",
     "ColStoreDataset",
     "ColStoreFrame",

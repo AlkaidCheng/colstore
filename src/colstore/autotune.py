@@ -307,7 +307,7 @@ def ensure_calibrated(*, verbose: bool = False) -> int:
     return calibrate(persist=True, verbose=verbose)
 
 
-def apply_cached_cap_if_present() -> bool:
+def apply_cached_cap() -> bool:
     """Apply a cached cap if one exists for this machine; return whether it did.
 
     Called at import time so a previously calibrated machine benefits without
