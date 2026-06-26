@@ -50,7 +50,7 @@ from . import config
 from ._base import _indices_are_sorted, _ReaderBase
 from ._paths import expand_glob
 from .reader import ColStoreReader
-from .shards import _list_shards
+from .shards import list_shards
 
 # A single source: a path to open (owned), or an already-open reader/dataset
 # (borrowed). The constructor and append() accept one of these or a sequence.
@@ -196,7 +196,7 @@ class ColStoreDataset(_ReaderBase):
                 if isinstance(item, (str, os.PathLike)):
                     # A directory is a managed shard dataset (its ``.cstore`` files,
                     # in order); anything else is a literal path or a glob pattern.
-                    paths = _list_shards(item) if os.path.isdir(item) else expand_glob(item)
+                    paths = list_shards(item) if os.path.isdir(item) else expand_glob(item)
                     for path in paths:
                         reader = ColStoreReader(path, **reader_kwargs)
                         opened.append(reader)
