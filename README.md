@@ -9,7 +9,27 @@ and fancy-index gathers run through a parallel C++ kernel (OpenMP + software
 prefetching) bound via Cython. Process memory stays bounded by the size of
 the output you ask for; the source file is never fully read into RAM.
 
-## Install
+**What you get**
+
+- **Single-file or many.** Write one `.cstore`, or open many same-schema files — or a directory of shards — as one logical table.
+- **Bounded memory.** Reads are memory-mapped, so process memory tracks the output you ask for, not the file size; files larger than RAM are fine.
+- **Fast random access.** Fancy-index and boolean gathers run through a parallel C++/OpenMP kernel, dispatched per access pattern.
+- **Lazy reads and edits.** Indexing returns lazy views; `edit()` derives a new file from an existing one without touching the source.
+- **Zero-copy where the layout permits.** A compacted, native-byte-order store hands back read-only views of the page cache (`copy=False`).
+
+## Table of contents
+
+**Guide** — [Install](#install) · [Quick start](#quick-start) · [Reader, writer, frame](#reader-writer-frame) · [Filtering and projection](#filtering-and-projection) · [Editing](#editing) · [Writing](#writing) · [Compaction](#compaction) · [Multiple files and datasets](#multiple-files-and-datasets) · [Introspection](#introspection)
+
+**Performance & tuning** — [Zero-copy reads](#zero-copy-reads) · [Configuration](#configuration) · [How reads parallelize](#how-reads-parallelize) · [NUMA placement](#numa-placement) · [How writes reach disk](#how-writes-reach-disk)
+
+**Format & internals** — [On-disk format](#on-disk-format) · [The segment table](#the-segment-table) · [Supported dtypes](#supported-dtypes)
+
+**About** — [Design philosophy](#design-philosophy) · [Documentation](#documentation) · [License](#license)
+
+## Guide
+
+### Install
 
 ```bash
 pip install colstore
@@ -19,7 +39,7 @@ Building from source needs a C++17 compiler and CMake ≥ 3.18. On macOS install
 `libomp` (`brew install libomp`) to get the parallel kernel; without it the
 build still succeeds but the kernel runs single-threaded.
 
-## Quick start
+### Quick start
 
 ```python
 import colstore
@@ -47,7 +67,7 @@ ds[100:200].dict(copy=False)                 # read-only views, no copy (see Zer
 ds.head()                                    # peek: a table that renders in notebook + terminal
 ```
 
-## Reader, writer, frame: which to use
+### Reader, writer, frame
 
 colstore has three objects, one per job. Most code only ever needs
 `ColStoreReader`.
@@ -79,7 +99,7 @@ on disk by transforming its columns. Starting from raw arrays, reach for a write
 (or `store`); starting from a `.cstore` you want a modified copy of, reach for
 `edit()`, which gives you a frame.
 
-## Filtering with `query()` and `col()`
+### Filtering and projection
 
 Filter rows with a predicate **string** or a composable **`col()`
 expression** — both return a **lazy view**. Nothing is read until you
@@ -130,7 +150,7 @@ can't be overloaded). An unknown column, an unsupported construct, or a
 non-boolean condition raises `colstore.QueryError` immediately, reading no data.
 Everything behaves the same on a single file and a multi-file dataset.
 
-## Editing: derive a new file with `edit()`
+### Editing
 
 `reader.edit()` returns a `ColStoreFrame`: a lazy specification of a new file,
 read only when you materialize it. A frame has two independent parts — the
@@ -203,7 +223,7 @@ shared-subexpression reuse; the [edit lifecycle](docs/edit_lifecycle.svg) and
 [streaming commit](docs/edit_streaming_commit.svg) diagrams trace a frame from
 `edit()` to a written file.
 
-## Writing
+### Writing
 
 `colstore.store(data, path)` is the one-shot path; it dispatches on the
 input type:
@@ -257,7 +277,7 @@ don't implement `flock` (some networked or parallel filesystem mounts), the lock
 with a one-time warning and the write proceeds — there is no lock to contend for
 on such a mount, so concurrent-writer detection is simply unavailable there.
 
-## Compaction
+### Compaction
 
 A streaming write produces one record per `write()` call. Reads of
 slice and sorted-fancy index patterns scale near-flat with record count,
@@ -277,8 +297,7 @@ and `shutil.copyfileobj` on macOS/Windows; on both paths memory
 footprint is bounded by the kernel/I/O buffer (tens of KB) regardless
 of file size — files much larger than RAM compact fine.
 
-
-## Multiple files
+### Multiple files and datasets
 
 A run is often split across many same-schema `.cstore` files. Open them as one
 logical table — every read decomposes across the files and is stitched back
@@ -327,7 +346,7 @@ The written file reads back on the single-record fast path. See the [dataset
 read decomposition](docs/dataset_read_decomposition.svg) diagram for how a read
 is split across files and reassembled.
 
-### Growing a dataset by appending
+#### Growing a dataset by appending
 
 A dataset can also *be* a directory, grown one piece at a time. Each new piece is
 written as its own immutable `.cstore` *shard*, and the directory's contents are
@@ -367,7 +386,7 @@ leaves nothing behind. One writer holds the directory at a time. Pass
 min/max bounds in each shard, so a later filtered read can skip shards that
 cannot match.
 
-## Introspection
+### Introspection
 
 ```python
 i = colstore.info("data.cstore")
@@ -382,7 +401,42 @@ colstore.schema("data.cstore")
 Both `info` and `schema` read only the file header (no record bodies are
 scanned), so they're cheap on multi-GB files.
 
-## Configuration
+## Performance & tuning
+
+### Zero-copy reads
+
+Materializing a whole store normally copies every column out of the mapping into
+fresh arrays — doubling peak memory and reading+writing every byte before you
+touch it. When the layout allows it, `copy=False` instead returns **read-only
+views over the page cache itself**:
+
+```python
+ds = colstore.open("data.cstore")                  # ideally compacted first
+d = ds.dict(copy=False)                            # read-only ndarrays backed by the mmap
+total = d["energy"].sum()                          # computed straight from page-cache bytes
+
+ds["price"].array(copy=False)                      # one read-only column
+ds[100:200, ["price", "qty"]].frame(copy=False)    # a read-only DataFrame aliasing the mmap
+```
+
+`copy=False` is a **guarantee, not a hint**: it returns a real view or raises —
+never a silent copy. It is supported exactly when the store is **single-record**
+(`colstore.compact` produces these), the dtype is **native byte order**, and the
+selector is whole-store / an int / a slice of any step. A fancy or boolean
+selector needs a gather, which by definition copies, so it raises `ValueError`
+with the remedy; the whole-table forms are all-or-nothing and never return a mix
+of views and copies.
+
+`array`, `dict`, and `frame` all take `copy=False`; `recarray` always repacks
+(it interleaves the columns into one record buffer) and so ignores it. View
+creation is O(1) in column size and **halves peak resident memory** — the data
+stays page-cache-backed and reclaimable instead of committed to a second buffer.
+Views pin the mapping, so they stay valid after `ds.close()`. Because the views
+are read-only they cannot corrupt the store; use the default `copy=True` when you
+need to mutate. The full contract is in
+[Performance &amp; internals](docs/performance.md) §7.
+
+### Configuration
 
 ```python
 from colstore import (
@@ -416,40 +470,7 @@ data. On a filtered view, `ds.query(...).head()` previews the matching rows. The
 default row count and the size at which a preview warns are the `config`
 settings above.
 
-## Zero-copy reads (`copy=False`)
-
-Materializing a whole store normally copies every column out of the mapping into
-fresh arrays — doubling peak memory and reading+writing every byte before you
-touch it. When the layout allows it, `copy=False` instead returns **read-only
-views over the page cache itself**:
-
-```python
-ds = colstore.open("data.cstore")                  # ideally compacted first
-d = ds.dict(copy=False)                            # read-only ndarrays backed by the mmap
-total = d["energy"].sum()                          # computed straight from page-cache bytes
-
-ds["price"].array(copy=False)                      # one read-only column
-ds[100:200, ["price", "qty"]].frame(copy=False)    # a read-only DataFrame aliasing the mmap
-```
-
-`copy=False` is a **guarantee, not a hint**: it returns a real view or raises —
-never a silent copy. It is supported exactly when the store is **single-record**
-(`colstore.compact` produces these), the dtype is **native byte order**, and the
-selector is whole-store / an int / a slice of any step. A fancy or boolean
-selector needs a gather, which by definition copies, so it raises `ValueError`
-with the remedy; the whole-table forms are all-or-nothing and never return a mix
-of views and copies.
-
-`array`, `dict`, and `frame` all take `copy=False`; `recarray` always repacks
-(it interleaves the columns into one record buffer) and so ignores it. View
-creation is O(1) in column size and **halves peak resident memory** — the data
-stays page-cache-backed and reclaimable instead of committed to a second buffer.
-Views pin the mapping, so they stay valid after `ds.close()`. Because the views
-are read-only they cannot corrupt the store; use the default `copy=True` when you
-need to mutate. The full contract is in
-[Performance &amp; internals](docs/performance.md) §7.
-
-## How reads parallelize
+### How reads parallelize
 
 A gather's thread count is decided in two stages. A single-column read runs at
 the full gather thread cap; a multi-column read (`dict` / `recarray` / `frame`)
@@ -466,7 +487,7 @@ allowance so multi-socket hosts (with more memory channels) get a higher
 default; `colstore.calibrate()` refines it per host by measuring the saturation
 knee directly.
 
-## NUMA placement
+### NUMA placement
 
 On a multi-node (multi-socket) Linux host, the default `auto` policy interleaves
 a store's pages across nodes so the memory controllers share the load; on a
@@ -493,7 +514,7 @@ and the realized path is the unbound default pool.
 
 ![Gather thread binding status](docs/assets/gather_thread_binding_status.svg)
 
-## How writes reach disk
+### How writes reach disk
 
 Every write — `frame.write()`, `concat(..., out=...)`, `write_dataset` — chooses
 a path and a fill method:
@@ -539,7 +560,9 @@ The merge copy reuses the gather thread budget to copy its byte ranges in
 parallel; the streaming write fills one batch at a time within the configured
 memory budget. Output is byte-identical across every method.
 
-## On-disk format
+## Format & internals
+
+### On-disk format
 
 ![The .cstore on-disk format](docs/assets/file_format.svg)
 
@@ -564,7 +587,7 @@ fancy, unsorted fancy).
 
 ![Single-record vs multi-record column layout](docs/assets/record_layout.svg)
 
-## The segment table
+### The segment table
 
 A logical column is one contiguous index space to the reader, but on disk its
 bytes are scattered: a multi-record file holds one run of the column per record
@@ -596,7 +619,7 @@ table (`ColStoreDataset` memoizes it per column, since it depends only on the
 column and the mappings, not the rows a read requests). A single-record file is
 the degenerate case — one segment over the column's own memmap.
 
-## Supported dtypes
+### Supported dtypes
 
 All fixed-size NumPy dtypes are supported: `float32`/`float64`,
 `int8/16/32/64`, `uint8/16/32/64`, `bool`, `datetime64`, `timedelta64`,
@@ -605,7 +628,9 @@ into the dtype, e.g. `S16` or `U8`). Object dtype (variable-length
 strings, Python objects) is rejected at write time — the design point is
 zero-copy random access, which requires a fixed stride per row.
 
-## Design philosophy
+## About
+
+### Design philosophy
 
 A few choices shape everything above:
 
@@ -636,7 +661,7 @@ A few choices shape everything above:
   opening mid-write sees only the last committed state, and `copy=False` is a hard
   guarantee that raises rather than silently copying.
 
-## Documentation
+### Documentation
 
 In-depth guides live in [`docs/`](docs/):
 
@@ -652,6 +677,6 @@ In-depth guides live in [`docs/`](docs/):
 
 The [docs index](docs/README.md) lists everything, including the diagrams.
 
-## License
+### License
 
 MIT License - see [LICENSE](LICENSE) file for details.
