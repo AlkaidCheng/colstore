@@ -1,0 +1,25 @@
+/* colstore documentation — small refinements on top of the furo theme. */
+
+/* Lead paragraph under the landing-page title. */
+p.lead {
+  font-size: 1.25rem;
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--color-foreground-secondary);
+  margin-top: 0.25rem;
+  margin-bottom: 1.5rem;
+}
+
+/* Give the feature cards a touch more presence. */
+.sd-card {
+  border-radius: 0.5rem;
+}
+.sd-card .sd-card-title {
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+/* Tighten signatures so long gather/store signatures stay readable. */
+dl.py dt {
+  font-size: 0.95rem;
+}
