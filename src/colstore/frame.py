@@ -45,11 +45,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import config, kernels
+from ._pandas import _make_dataframe_no_consolidate
 from ._query import QueryError, _Expr, parse_query
 from ._render import render_table_html, render_table_text
 from ._sizes import resolve_batch_rows
 
 if TYPE_CHECKING:
+    import pandas as pd
+
     from ._base import _ReaderBase
     from .reader import ColStoreReader
 
@@ -1639,6 +1642,15 @@ class ColStoreFrame:
         sources = [np.ascontiguousarray(columns[name]) for name in names]
         dtype = np.dtype([(name, src.dtype) for name, src in zip(names, sources, strict=True)])
         return kernels.interleave_record_array(names, sources, dtype)
+
+    def frame(self) -> pd.DataFrame:
+        """Compute every column into a pandas DataFrame; writes no file.
+
+        The pandas analogue of :meth:`dict` / :meth:`recarray`: resolves any pending
+        :meth:`where` predicate, evaluates each column over the selected rows, and assembles
+        them into a DataFrame in column order with the computed dtypes. Requires pandas.
+        """
+        return _make_dataframe_no_consolidate(self.dict())
 
     # ---- Reduction terminals (full pass, scalar result) ----------------
 

@@ -101,8 +101,8 @@ colstore has three objects, one per job. Most code only ever needs
   add, drop, rename, cast (`astype({"pt": "float32"})`), or transform its columns
   — each edit returns a new frame (`inplace=True` to edit in place), so edits
   branch cheaply off a shared base. Then materialize in memory (`array(name)`
-  for one column, `dict()` / `recarray()` for all) or `.write(path)` to stream the
-  result to a new file. It never modifies the source store.
+  for one column, `dict()` / `recarray()` / `frame()` for all) or `.write(path)` to
+  stream the result to a new file. It never modifies the source store.
 
 **Which to use:**
 

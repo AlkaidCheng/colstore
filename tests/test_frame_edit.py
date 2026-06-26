@@ -302,6 +302,27 @@ def test_frame_recarray_fields_and_values(source, source_cols):
         assert np.array_equal(rec[name], arr)
 
 
+def test_frame_dataframe_matches_source_and_derived(source, source_cols):
+    pd = pytest.importorskip("pandas")
+    cf = source.edit()
+    df = cf.assign(a2=cf["a"] * 2).frame()
+    assert isinstance(df, pd.DataFrame)
+    assert list(df.columns) == ["a", "b", "c", "a2"]
+    assert len(df) == source.n_rows
+    for name, arr in source_cols.items():
+        assert np.array_equal(df[name].to_numpy(), arr)
+        assert df[name].dtype == arr.dtype  # no-consolidate keeps the per-column dtype
+    assert np.array_equal(df["a2"].to_numpy(), source_cols["a"] * 2)
+
+
+def test_frame_dataframe_respects_row_selection(source, source_cols):
+    pytest.importorskip("pandas")
+    df = source.edit().where("a >= 128").frame()
+    keep = source_cols["a"] >= 128
+    assert len(df) == int(np.count_nonzero(keep))
+    assert np.array_equal(df["a"].to_numpy(), source_cols["a"][keep])
+
+
 def test_frame_dict_reflects_derived_columns(source, source_cols):
     cf = source.edit()
     out = cf.assign(a2=cf["a"] * 2, s=cf["a"] + cf["b"]).dict()
