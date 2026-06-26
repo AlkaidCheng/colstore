@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from ._convert import arrow_to_columns, selection_to_arrow_table
+from ._convert import arrow_to_columns, selection_to_arrow_table, store_columns
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -36,9 +36,6 @@ class ParquetFormat(FileFormat):
         """Read a Parquet file into a ``.cstore`` and open it (extra kwargs -> store)."""
         import pyarrow.parquet
 
-        from .. import api
-
         pq: Any = pyarrow.parquet
         table = pq.read_table(os.fspath(source), columns=columns)
-        kwargs.setdefault("show_progress", False)
-        return api.store(arrow_to_columns(table), dest, **kwargs)
+        return store_columns(arrow_to_columns(table), dest, **kwargs)

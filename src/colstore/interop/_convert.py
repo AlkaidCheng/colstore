@@ -9,9 +9,12 @@ format applies it identically.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from ..reader import ColStoreReader
 
 # NumPy dtype kinds a .cstore column stores directly.
 _FIXED_KINDS = frozenset("fiubMmSU")
@@ -20,6 +23,19 @@ _FIXED_KINDS = frozenset("fiubMmSU")
 def _is_null(value: Any) -> bool:
     """Whether ``value`` is a null colstore cannot store (``None`` or a NaN float)."""
     return value is None or (isinstance(value, float) and value != value)
+
+
+def _reject_nulls(name: object) -> NoReturn:
+    """Raise the standard 'no null support' ``TypeError`` for column ``name``."""
+    raise TypeError(f"column {name!r} contains null values; colstore has no null support.")
+
+
+def store_columns(columns: dict[str, Any], dest: Any, **kwargs: Any) -> ColStoreReader:
+    """Store a column dict to ``dest`` via the top-level ``store()``, defaulting progress off."""
+    from .. import api
+
+    kwargs.setdefault("show_progress", False)
+    return api.store(columns, dest, **kwargs)
 
 
 def _coerce_object_strings(name: str, array: Any) -> np.ndarray[Any, Any]:
@@ -32,7 +48,7 @@ def _coerce_object_strings(name: str, array: Any) -> np.ndarray[Any, Any]:
     """
     values = list(np.asarray(array, dtype=object).ravel())
     if any(_is_null(value) for value in values):
-        raise TypeError(f"column {name!r} contains null values; colstore has no null support.")
+        _reject_nulls(name)
     all_bytes = bool(values) and all(isinstance(value, bytes) for value in values)
     all_str = bool(values) and all(isinstance(value, str) for value in values)
     if values and not (all_bytes or all_str):
@@ -75,7 +91,7 @@ def arrow_to_columns(table: Any) -> dict[str, np.ndarray[Any, Any]]:
             )
         chunked = table.column(name)
         if chunked.null_count:
-            raise TypeError(f"column {name!r} contains null values; colstore has no null support.")
+            _reject_nulls(name)
         if pa.types.is_string(kind) or pa.types.is_large_string(kind):
             columns[name] = np.array(chunked.to_pylist(), dtype="U")
         else:
@@ -101,9 +117,7 @@ def frame_to_columns(frame: Any) -> dict[str, np.ndarray[Any, Any]]:
     for name in frame.columns:
         series = frame[name]
         if series.isna().any():
-            raise TypeError(
-                f"column {str(name)!r} contains null values; colstore has no null support."
-            )
+            _reject_nulls(str(name))
         columns[str(name)] = storable_column(str(name), series.to_numpy())
     return columns
 

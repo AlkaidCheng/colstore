@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from ._convert import columns_to_frame, frame_to_columns
+from ._convert import columns_to_frame, frame_to_columns, store_columns
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -32,7 +32,7 @@ class JsonFormat(FileFormat):
         self, selection: Selection, dest: Any, *, orient: str = "records", **kwargs: Any
     ) -> None:
         """Write the selection to a JSON file (kwargs forwarded to ``DataFrame.to_json``)."""
-        data = {name: selection.gather(name) for name in selection.columns}
+        data = selection.gather_all()
         columns_to_frame(data).to_json(os.fspath(dest), orient=orient, **kwargs)
 
     def from_file(
@@ -47,12 +47,9 @@ class JsonFormat(FileFormat):
         """Read a JSON file into a ``.cstore`` and open it (extra kwargs -> store)."""
         import pandas as pd
 
-        from .. import api
-
         # dtype=False keeps the JSON-encoded type (a quoted "1" stays a string
         # instead of being inferred to int), so a string column round-trips.
         frame = pd.read_json(os.fspath(source), orient=orient, dtype=False)
         if columns is not None:
             frame = frame[columns]
-        kwargs.setdefault("show_progress", False)
-        return api.store(frame_to_columns(frame), dest, **kwargs)
+        return store_columns(frame_to_columns(frame), dest, **kwargs)

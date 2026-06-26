@@ -70,6 +70,10 @@ class Selection:
         """One selected column as an owning 1-D array."""
         return self.store._gather_one(name, self.row_indexer)
 
+    def gather_all(self) -> dict[str, NDArray[Any]]:
+        """Every selected column as a name -> owning array dict."""
+        return {name: self.gather(name) for name in self.columns}
+
     def column_chunks(self, name: str) -> list[NDArray[Any]]:
         """Zero-copy native views of one whole column, one per on-disk segment."""
         return self.store._column_chunks(name)
