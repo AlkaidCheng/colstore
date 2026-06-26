@@ -47,9 +47,9 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import config
-from ._base import _ReaderBase
+from ._base import _indices_are_sorted, _ReaderBase
 from ._paths import expand_glob
-from .reader import ColStoreReader, _indices_are_sorted
+from .reader import ColStoreReader
 from .shards import _list_shards
 
 # A single source: a path to open (owned), or an already-open reader/dataset
