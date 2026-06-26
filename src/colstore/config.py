@@ -314,15 +314,13 @@ def resolve_prefetch_distance(source_nbytes: int, indices_sorted: bool) -> int:
         return setting
 
     global _auto_prefetch_table, _auto_prefetch_table_loaded
-    if not _auto_prefetch_table_loaded:
-        from . import autotune  # deferred: autotune imports config at module level
+    from . import autotune  # deferred: autotune imports config at module level
 
+    if not _auto_prefetch_table_loaded:
         _auto_prefetch_table = autotune.load_cached_prefetch()
         _auto_prefetch_table_loaded = True
     if _auto_prefetch_table is None:
         return _DEFAULT_PREFETCH_DISTANCE
-
-    from . import autotune
 
     size_name = "resident" if source_nbytes <= autotune.llc_bytes() else "dram"
     order_name = "sorted" if indices_sorted else "unsorted"

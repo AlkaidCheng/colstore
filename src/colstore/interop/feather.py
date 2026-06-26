@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from ._convert import arrow_to_columns, selection_to_arrow_table
+from ._convert import arrow_to_columns, selection_to_arrow_table, store_columns
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -34,9 +34,6 @@ class FeatherFormat(FileFormat):
         """Read a Feather file into a ``.cstore`` and open it (extra kwargs -> store)."""
         import pyarrow.feather
 
-        from .. import api
-
         feather: Any = pyarrow.feather
         table = feather.read_table(os.fspath(source), columns=columns)
-        kwargs.setdefault("show_progress", False)
-        return api.store(arrow_to_columns(table), dest, **kwargs)
+        return store_columns(arrow_to_columns(table), dest, **kwargs)

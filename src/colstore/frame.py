@@ -1313,9 +1313,11 @@ class ColStoreFrame:
         validate_length(expr, self._n_rows)
         return expr
 
-    def _resolve_value_column(self, value: Any) -> Expr:
-        """Resolve an :meth:`apply` input -- a column name, a :func:`~colstore.col`
-        expression, or a frame expression -- to a frame :class:`Expr`."""
+    def _resolve_column_arg(self, value: Any, error: str) -> Expr:
+        """Resolve a column name, ``col()`` expression, or frame ``Expr`` to a frame ``Expr``.
+
+        Raises ``TypeError(error)`` for any other type.
+        """
         if isinstance(value, str):
             return self._resolve_column(value)
         if isinstance(value, _Expr):
@@ -1323,9 +1325,15 @@ class ColStoreFrame:
             return emitted
         if isinstance(value, Expr):
             return value
-        raise TypeError(
+        raise TypeError(error)
+
+    def _resolve_value_column(self, value: Any) -> Expr:
+        """Resolve an :meth:`apply` input -- a column name, a :func:`~colstore.col`
+        expression, or a frame expression -- to a frame :class:`Expr`."""
+        return self._resolve_column_arg(
+            value,
             f"apply() columns must be column names or expressions; got "
-            f"{type(value).__name__}. Bake any constants into the function instead."
+            f"{type(value).__name__}. Bake any constants into the function instead.",
         )
 
     def apply(self, func: Callable[..., Any], *cols: Any, out_dtype: Any = None) -> Expr:
@@ -1540,17 +1548,11 @@ class ColStoreFrame:
         """
         if weight is None:
             return None
-        if isinstance(weight, str):
-            expr: Expr = self._resolve_column(weight)
-        elif isinstance(weight, _Expr):
-            expr = weight._emit(_QueryValueBuilder(self._resolve_column))
-        elif isinstance(weight, Expr):
-            expr = weight
-        else:
-            raise TypeError(
-                f"weight must be a column name, a col() expression, or None; "
-                f"got {type(weight).__name__}."
-            )
+        expr = self._resolve_column_arg(
+            weight,
+            f"weight must be a column name, a col() expression, or None; "
+            f"got {type(weight).__name__}.",
+        )
         if result_dtype(expr).kind not in "iuf":
             raise TypeError("a where() weight must be a numeric column.")
         return expr

@@ -103,6 +103,19 @@ def _caption_meta(total_rows: int | None, total_cols: int, shown: int) -> str:
     return f"{total_rows:,} rows &times; {total_cols} columns &middot; showing {shown}"
 
 
+def _caption_div(inner_html: str) -> str:
+    """Wrap caption content in the house-style muted-monospace caption div."""
+    return (
+        '<div style="font-family:ui-monospace,monospace;font-size:90%;color:#57606a;'
+        f'margin-bottom:4px">{inner_html}</div>'
+    )
+
+
+def _preview_div(caption: str, table: str) -> str:
+    """Wrap a caption and table in the outer ``cstore-preview`` container with the shared style."""
+    return f'<div class="cstore-preview">{_STYLE}{caption}{table}</div>'
+
+
 def render_html(
     label: str,
     total_rows: int | None,
@@ -132,15 +145,12 @@ def render_html(
         body.append(f"<tr><th>{pos}</th>{tds}</tr>")
     meta = _caption_meta(total_rows, total_cols, len(index))
     label_html = f"<b>{html.escape(label)}</b> &middot; " if label else ""
-    caption = (
-        '<div style="font-family:ui-monospace,monospace;font-size:90%;color:#57606a;'
-        f'margin-bottom:4px">{label_html}{meta}</div>'
-    )
+    caption = _caption_div(f"{label_html}{meta}")
     table = (
         f'<table class="cstore-tbl"><thead><tr><th></th>{head}</tr></thead>'
         f'<tbody>{"".join(body)}</tbody></table>'
     )
-    return f'<div class="cstore-preview">{_STYLE}{caption}{table}</div>'
+    return _preview_div(caption, table)
 
 
 def render_text(
@@ -228,14 +238,11 @@ def render_table_html(caption: str, headers: list[str], rows: list[list[str]]) -
         + "</tr>"
         for row in rows
     )
-    cap = (
-        '<div style="font-family:ui-monospace,monospace;font-size:90%;color:#57606a;'
-        f'margin-bottom:4px">{html.escape(caption)}</div>'
-    )
+    cap = _caption_div(html.escape(caption))
     table = (
         f'<table class="cstore-tbl"><thead><tr>{head}</tr></thead>' f"<tbody>{body}</tbody></table>"
     )
-    return f'<div class="cstore-preview">{_STYLE}{cap}{table}</div>'
+    return _preview_div(cap, table)
 
 
 class Preview:

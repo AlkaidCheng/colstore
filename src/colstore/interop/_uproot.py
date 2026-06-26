@@ -27,6 +27,7 @@ from .root import (
     _resolve_file_list,
     _sanitized_name_map,
     _split_path_and_tree,
+    _unpack_single_tree_mapping,
     _warn_branch_renames,
     filter_storable,
     require_existing,
@@ -47,11 +48,7 @@ def _import_uproot() -> Any:
 def _resolve_source(source: Any, treename: str | None) -> tuple[Any, str | None]:
     """Split a uproot source into ``(files, tree_name)``; ``tree_name`` may be None."""
     if isinstance(source, dict):
-        if len(source) != 1:
-            raise ValueError(
-                f"A {{treename: files}} mapping must name exactly one tree; got {len(source)}."
-            )
-        ((tree, files),) = source.items()
+        tree, files = _unpack_single_tree_mapping(source)
         if treename is not None and treename != tree:
             raise ValueError(f"Conflicting tree names: treename={treename!r} but mapping {tree!r}.")
         return files, tree

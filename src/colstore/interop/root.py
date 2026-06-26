@@ -295,6 +295,16 @@ def _resolve_file_list(
     return bare, treename or embedded
 
 
+def _unpack_single_tree_mapping(source: dict[Any, Any]) -> tuple[Any, Any]:
+    """Validate a single-entry ``{treename: files}`` mapping and return ``(tree, files)``."""
+    if len(source) != 1:
+        raise ValueError(
+            f"A {{treename: files}} mapping must name exactly one tree; got {len(source)}."
+        )
+    ((tree, files),) = source.items()
+    return tree, files
+
+
 def _source_files_and_tree(
     root: ModuleType, source: RootSource, treename: str | None
 ) -> tuple[list[str] | None, str | None]:
@@ -311,11 +321,7 @@ def _source_files_and_tree(
         paths, tree = _resolve_file_list(source, treename)
         return paths, (tree if tree is not None else _resolve_tree_name(root, paths[0], None))
     if isinstance(source, dict):
-        if len(source) != 1:
-            raise ValueError(
-                f"A {{treename: files}} mapping must name exactly one tree; got {len(source)}."
-            )
-        ((tree, files),) = source.items()
+        tree, files = _unpack_single_tree_mapping(source)
         paths = (
             [os.fspath(f) for f in files]
             if isinstance(files, (list, tuple))

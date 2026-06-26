@@ -102,19 +102,46 @@ def _hardware_fingerprint() -> str:
     return f"v{_CALIBRATION_VERSION}|{processor}|phys={physical}|log={logical}|{platform.system()}"
 
 
-def load_cached_cap() -> int | None:
-    """Return the cached thread cap for this machine, or ``None`` if absent.
+def _load_cache_payload(path: Path) -> dict[str, Any] | None:
+    """Load a JSON calibration cache and check its fingerprint.
 
-    Never raises: a missing, unreadable, or stale cache simply returns
-    ``None`` so callers fall back to the static default.
+    Never raises: a missing, unreadable, malformed, or foreign-fingerprint cache
+    returns ``None`` so callers fall back to the compiled default.
     """
-    path = _cache_path()
     try:
         with open(path, encoding="utf-8") as handle:
             payload: dict[str, Any] = json.load(handle)
     except (OSError, ValueError):
         return None
     if payload.get("fingerprint") != _hardware_fingerprint():
+        return None
+    return payload
+
+
+def _persist_cache(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write ``payload`` as JSON to ``path``; skip silently on ``OSError``.
+
+    Calibration still applies in-process when the cache cannot be written (a
+    read-only home, etc.), so persistence is best-effort.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_cached_cap() -> int | None:
+    """Return the cached thread cap for this machine, or ``None`` if absent.
+
+    Never raises: a missing, unreadable, or stale cache simply returns
+    ``None`` so callers fall back to the static default.
+    """
+    payload = _load_cache_payload(_cache_path())
+    if payload is None:
         return None
     cap = payload.get("thread_cap")
     if isinstance(cap, int) and cap >= 1:
@@ -123,7 +150,6 @@ def load_cached_cap() -> int | None:
 
 
 def _write_cache(thread_cap: int, measurements: dict[int, float]) -> None:
-    path = _cache_path()
     payload = {
         "fingerprint": _hardware_fingerprint(),
         "thread_cap": thread_cap,
@@ -131,16 +157,7 @@ def _write_cache(thread_cap: int, measurements: dict[int, float]) -> None:
         "calibration_version": _CALIBRATION_VERSION,
         "timestamp": time.time(),
     }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        os.replace(tmp, path)  # atomic on POSIX
-    except OSError:
-        # Calibration still applies in-process even if the cache can't be
-        # written (read-only home, etc.); just skip persistence.
-        pass
+    _persist_cache(_cache_path(), payload)
 
 
 def _interleaved_samples_ms(
@@ -405,12 +422,8 @@ def load_cached_prefetch() -> dict[str, int] | None:
     Never raises; a missing, unreadable, stale, or malformed cache returns
     ``None`` so ``"auto"`` falls back to the compiled default distance.
     """
-    try:
-        with open(_prefetch_cache_path(), encoding="utf-8") as handle:
-            payload: dict[str, Any] = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    if payload.get("fingerprint") != _hardware_fingerprint():
+    payload = _load_cache_payload(_prefetch_cache_path())
+    if payload is None:
         return None
     table = payload.get("prefetch_distances")
     if not isinstance(table, dict):
@@ -434,15 +447,7 @@ def _write_prefetch_cache(table: dict[str, int], timings_ms: dict[str, dict[int,
         "calibration_version": _CALIBRATION_VERSION,
         "timestamp": time.time(),
     }
-    path = _prefetch_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    _persist_cache(_prefetch_cache_path(), payload)
 
 
 def calibrate_prefetch(
@@ -567,12 +572,8 @@ def load_cached_mask_density() -> float | None:
     cache returns ``None`` so resolution falls back to the compiled
     default gate.
     """
-    try:
-        with open(_mask_density_cache_path(), encoding="utf-8") as handle:
-            payload: dict[str, Any] = json.load(handle)
-    except (OSError, ValueError):
-        return None
-    if payload.get("fingerprint") != _hardware_fingerprint():
+    payload = _load_cache_payload(_mask_density_cache_path())
+    if payload is None:
         return None
     gate = payload.get("gate")
     if not isinstance(gate, (int, float)) or isinstance(gate, bool) or not 0.0 <= gate <= 1.0:
@@ -594,15 +595,7 @@ def _write_mask_density_cache(
         "calibration_version": _CALIBRATION_VERSION,
         "timestamp": time.time(),
     }
-    path = _mask_density_cache_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
-        os.replace(tmp, path)
-    except OSError:
-        pass
+    _persist_cache(_mask_density_cache_path(), payload)
 
 
 def calibrate_mask_density(

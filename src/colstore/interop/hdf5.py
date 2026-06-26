@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
-from ._convert import columns_to_frame, frame_to_columns, storable_column
+from ._convert import columns_to_frame, frame_to_columns, storable_column, store_columns
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ class Hdf5Format(FileFormat):
         **kwargs: Any,
     ) -> None:
         """Write the selection to an HDF5 file under ``key`` with the chosen ``backend``."""
-        data = {name: selection.gather(name) for name in selection.columns}
+        data = selection.gather_all()
         if backend == "h5py":
             _write_h5py(os.fspath(dest), key, data)
         elif backend == "pandas":
@@ -66,16 +66,13 @@ class Hdf5Format(FileFormat):
         **kwargs: Any,
     ) -> ColStoreReader:
         """Read an HDF5 file into a ``.cstore`` and open it; auto-detects the writer."""
-        from .. import api
-
         data = _read_hdf5(os.fspath(source), backend, key)
         if columns is not None:
             missing = [name for name in columns if name not in data]
             if missing:
                 raise ValueError(f"Column(s) not found in the HDF5 file: {', '.join(missing)}.")
             data = {name: data[name] for name in columns}
-        kwargs.setdefault("show_progress", False)
-        return api.store(data, dest, **kwargs)
+        return store_columns(data, dest, **kwargs)
 
 
 def _write_h5py(path: str, key: str, data: dict[str, np.ndarray[Any, Any]]) -> None:

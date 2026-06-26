@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
+from ._convert import store_columns
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ class NpzFormat(FileFormat):
         """
         # dict[str, Any] (not NDArray): np.savez's stub has a bool keyword, so a
         # **mapping of arrays only type-checks when the values widen to Any.
-        columns: dict[str, Any] = {name: selection.gather(name) for name in selection.columns}
+        columns: dict[str, Any] = selection.gather_all()
         # Write to an open handle, not the path: np.savez appends ".npz" to a path
         # argument (case-sensitively), so the file would otherwise not land exactly
         # at `dest`. A file object is written verbatim.
@@ -50,9 +51,6 @@ class NpzFormat(FileFormat):
         Extra keyword arguments pass through to :func:`colstore.store` (e.g.
         ``mode="recreate"`` to overwrite an existing ``dest``).
         """
-        from .. import api
-
         with np.load(source) as archive:
             columns = {name: archive[name] for name in archive.files}
-        kwargs.setdefault("show_progress", False)
-        return api.store(columns, dest, **kwargs)
+        return store_columns(columns, dest, **kwargs)

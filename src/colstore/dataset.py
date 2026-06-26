@@ -348,11 +348,6 @@ class ColStoreDataset(_ReaderBase):
             parts.append((file_index, slice(first - lo, last_excl - lo, step)))
         return parts
 
-    def _require_columns(self, column_names: list[str]) -> None:
-        unknown = [name for name in column_names if name not in self._column_dtypes]
-        if unknown:
-            raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
-
     # ---- Parallel fill across files ------------------------------------
     #
     # Every multi-file read preallocates one output and fills disjoint regions of

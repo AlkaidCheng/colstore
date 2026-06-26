@@ -106,3 +106,16 @@ else:
         """Release a previously-acquired lock. Idempotent: errors are suppressed."""
         with contextlib.suppress(OSError):
             fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def lock_or_raise(fd: int, target: object) -> None:
+    """Take the exclusive non-blocking lock on ``fd``; raise a clear ``OSError`` if held.
+
+    Wraps :func:`lock_exclusive_nonblocking` (which raises the cross-platform
+    :class:`BlockingIOError` on contention) with a standardized message. The caller
+    closes ``fd`` -- or its file -- in its own ``except``.
+    """
+    try:
+        lock_exclusive_nonblocking(fd)
+    except BlockingIOError as exc:
+        raise OSError(f"Another writer holds the lock on {target}; close it first.") from exc

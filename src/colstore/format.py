@@ -49,13 +49,13 @@ import sys
 import tempfile
 import time
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import IO, Any
 
 import numpy as np
 
-from . import _footer, _numa, config
+from . import _footer, _numa, config, kernels
 from ._sizes import parse_byte_size
 from .frame import Expr, evaluate, fusible_passthroughs, validate_length
 from .progress import progress_bar
@@ -177,6 +177,11 @@ def record_body_size(n_rows: int, itemsizes: list[int]) -> int:
     return align_up(raw_bytes, _RECORD_BODY_ALIGNMENT)
 
 
+def itemsizes_of(columns_meta: list[dict[str, Any]]) -> list[int]:
+    """Per-column element sizes in bytes, in stored order, from a columns-meta list."""
+    return [np.dtype(col["dtype"]).itemsize for col in columns_meta]
+
+
 def read_record_index(
     path: PathLike,
     data_offset: int,
@@ -205,8 +210,6 @@ def read_record_index(
         On wrong record magic, mismatched record index, CRC mismatch, or a
         file shorter than its records imply. All indicate file corruption.
     """
-    from . import kernels
-
     if kernels.cpp_available():
         return kernels.read_record_index(path, data_offset, n_records, itemsizes)
     return _read_record_index_walk(path, data_offset, n_records, itemsizes)
@@ -1212,6 +1215,22 @@ def _run_copy_jobs(jobs: list[Callable[[], None]], workers: int) -> None:
             future.result()
 
 
+def _open_source_maps(plan: list[CopyRun]) -> dict[str, np.memmap[Any, np.dtype[Any]]]:
+    """Open each distinct source path in ``plan`` once as a read-only mmap, keyed by path."""
+    src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
+    for src_path, _src_offset, _dst_offset, _nbytes in plan:
+        key = os.fspath(src_path)
+        if key not in src_maps:
+            src_maps[key] = np.memmap(key, dtype=np.uint8, mode="r")
+    return src_maps
+
+
+def _release_source_maps(src_maps: dict[str, np.memmap[Any, np.dtype[Any]]]) -> None:
+    """Unmap every source mapping (an open mapping pins pages and blocks rename on Windows)."""
+    for src in src_maps.values():
+        _release_memmap(src)
+
+
 def _copy_plan_mmap(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     """Fill the destination body by mmap memcpy, runs copied concurrently.
 
@@ -1222,11 +1241,7 @@ def _copy_plan_mmap(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     Windows and pins pages everywhere).
     """
     dst = np.memmap(dst_path, dtype=np.uint8, mode="r+")
-    src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
-    for src_path, _src_offset, _dst_offset, _nbytes in plan:
-        key = os.fspath(src_path)
-        if key not in src_maps:
-            src_maps[key] = np.memmap(key, dtype=np.uint8, mode="r")
+    src_maps = _open_source_maps(plan)
 
     def make_job(run: CopyRun) -> Callable[[], None]:
         src_path, src_offset, dst_offset, nbytes = run
@@ -1242,8 +1257,7 @@ def _copy_plan_mmap(dst_path: str, plan: list[CopyRun], workers: int) -> None:
         dst.flush()
     finally:
         _release_memmap(dst)
-        for src in src_maps.values():
-            _release_memmap(src)
+        _release_source_maps(src_maps)
 
 
 def _copy_plan_copy_file_range(dst_path: str, plan: list[CopyRun], workers: int) -> None:
@@ -1309,11 +1323,7 @@ def _copy_plan_pwrite(dst_path: str, plan: list[CopyRun], workers: int) -> None:
     locking; the caller's ``fsync`` flushes the buffered writes.
     """
     dst_fd = os.open(dst_path, os.O_WRONLY)
-    src_maps: dict[str, np.memmap[Any, np.dtype[Any]]] = {}
-    for src_path, _src_offset, _dst_offset, _nbytes in plan:
-        key = os.fspath(src_path)
-        if key not in src_maps:
-            src_maps[key] = np.memmap(key, dtype=np.uint8, mode="r")
+    src_maps = _open_source_maps(plan)
 
     def make_job(run: CopyRun) -> Callable[[], None]:
         src_path, src_offset, dst_offset, nbytes = run
@@ -1325,8 +1335,7 @@ def _copy_plan_pwrite(dst_path: str, plan: list[CopyRun], workers: int) -> None:
         _run_copy_jobs([make_job(run) for run in plan], workers)
     finally:
         os.close(dst_fd)
-        for src in src_maps.values():
-            _release_memmap(src)
+        _release_source_maps(src_maps)
 
 
 def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None:
@@ -1355,6 +1364,32 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
         _copy_plan_pwrite(dst_path, plan, workers)
         return
     _copy_plan_mmap(dst_path, plan, workers)
+
+
+@contextlib.contextmanager
+def atomic_publish(path: PathLike) -> Iterator[str]:
+    """Yield a temp path to fill, then fsync it and rename it onto ``path``.
+
+    A reader never sees a partial file: the content is built under a temporary
+    dotfile and published with one atomic rename, and a failure unlinks the temp
+    and re-raises (a crash leaves only an ignored temp). The fsync uses a writable
+    handle -- on Windows ``os.fsync`` maps to ``_commit()``, which fails with
+    ``EBADF`` on a read-only descriptor -- and closes it before ``os.replace``,
+    which Windows requires.
+    """
+    target = os.fspath(path)
+    directory = os.path.dirname(target) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(target)}.", suffix=".tmp")
+    os.close(fd)
+    try:
+        yield tmp
+        with open(tmp, "r+b") as written:
+            os.fsync(written.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def write_dataset_streaming(
@@ -1413,13 +1448,7 @@ def write_dataset_streaming(
     # >= 1), so the floor division below never divides by zero.
     batch_rows = max(1, min(n_rows, budget // bytes_per_row)) if n_rows else 0
 
-    target = os.fspath(path)
-    directory = os.path.dirname(target) or "."
-    fd, tmp_path = tempfile.mkstemp(
-        dir=directory, prefix=f".{os.path.basename(target)}.", suffix=".tmp"
-    )
-    os.close(fd)
-    try:
+    with atomic_publish(path) as tmp_path:
         with open(tmp_path, "wb") as output_file:
             write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
             write_record_header(output_file, record_index=0, n_rows=n_rows)
@@ -1458,17 +1487,3 @@ def write_dataset_streaming(
                         batch_rows,
                         rows,
                     )
-
-        # Reopen read/write (not read-only) for the durability fsync: on Windows
-        # os.fsync maps to _commit(), which fails with EBADF on a read-only
-        # descriptor. The body was flushed through the memmaps and the header
-        # through the writable handle above; this covers the whole file before
-        # the atomic rename. All handles are closed before os.replace, which
-        # Windows requires.
-        with open(tmp_path, "r+b") as written:
-            os.fsync(written.fileno())
-        os.replace(tmp_path, target)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_path)
-        raise
