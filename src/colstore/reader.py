@@ -26,8 +26,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import _footer, _numa, config, format, kernels
-from ._base import _ReaderBase
-from ._query import _Compare, _Expr
+from ._base import (
+    _SORTEDNESS_SAMPLE_FRACTIONS,  # noqa: F401
+    _SORTEDNESS_SAMPLE_MIN_SIZE,  # noqa: F401
+    _indices_are_sorted,
+    _ReaderBase,
+)
+from ._query import _Expr
 
 if TYPE_CHECKING:
     from .dataset import ColStoreDataset
@@ -57,36 +62,6 @@ def _dtype_is_native(dtype: np.dtype[Any]) -> bool:
     if byteorder in ("=", "|"):
         return True
     return (byteorder == "<") == bool(np.little_endian)
-
-
-# Sampled-rejection sortedness test: probe this many evenly spaced adjacent
-# pairs before committing to the full O(K) pass. Sampling is skipped below
-# the size threshold, where the full pass is cheaper than the sampler's
-# fixed overhead (threshold set conservatively above the measured
-# crossover; see docs/optimization_series.md).
-_SORTEDNESS_SAMPLE_FRACTIONS = np.linspace(0.0, 1.0, 16)
-_SORTEDNESS_SAMPLE_MIN_SIZE = 32768
-
-
-def _indices_are_sorted(indices: NDArray[np.int64]) -> bool:
-    """Non-decreasing test with a cheap sampled rejection pass first.
-
-    Semantics are identical to ``bool(np.all(indices[1:] >= indices[:-1]))``,
-    including ``True`` for lengths 0 and 1. The sampling pass is used only to
-    *reject* sortedness, never to prove it -- any sampled descent makes the
-    array definitely unsorted, while an all-ascending sample still falls
-    through to the full pass. Correctness is therefore unconditional; the
-    sampling only changes the cost split between sorted and unsorted
-    selectors (see docs/optimization_series.md).
-    """
-    n = indices.shape[0]
-    if n <= 1:
-        return True
-    if n >= _SORTEDNESS_SAMPLE_MIN_SIZE:
-        positions = (_SORTEDNESS_SAMPLE_FRACTIONS * (n - 2)).astype(np.int64)
-        if bool(np.any(indices[positions + 1] < indices[positions])):
-            return False
-    return bool(np.all(indices[1:] >= indices[:-1]))
 
 
 def _selector_row_count(row_indexer: Any, n_rows: int) -> int:
@@ -411,7 +386,7 @@ class ColStoreReader(_ReaderBase):
 
     def _try_skip_query_mask(self, expr: _Expr) -> NDArray[np.bool_] | None:
         """Build the row mask by skipping disjoint records, or None to read in full."""
-        if not self._is_multi_record or not isinstance(expr, _Compare):
+        if not self._is_multi_record:
             return None
         stats = self._record_stats
         if stats is None:

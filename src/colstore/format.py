@@ -177,6 +177,11 @@ def record_body_size(n_rows: int, itemsizes: list[int]) -> int:
     return align_up(raw_bytes, _RECORD_BODY_ALIGNMENT)
 
 
+def record_body_padding(body_bytes: int) -> int:
+    """Zero-padding bytes after a body of ``body_bytes`` to reach the next aligned boundary."""
+    return align_up(body_bytes, _RECORD_BODY_ALIGNMENT) - body_bytes
+
+
 def itemsizes_of(columns_meta: list[dict[str, Any]]) -> list[int]:
     """Per-column element sizes in bytes, in stored order, from a columns-meta list."""
     return [np.dtype(col["dtype"]).itemsize for col in columns_meta]
@@ -859,7 +864,7 @@ def write_dataset(
         # Pad the record body up to _RECORD_BODY_ALIGNMENT so any future
         # record (if this file were later opened for append) would start at
         # a naturally-aligned offset.
-        pad = align_up(body_bytes, _RECORD_BODY_ALIGNMENT) - body_bytes
+        pad = record_body_padding(body_bytes)
         if pad:
             output_file.write(b"\x00" * pad)
 

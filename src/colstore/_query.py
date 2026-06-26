@@ -164,6 +164,14 @@ class _Expr:
     def _columns(self) -> Iterator[str]:
         return iter(())
 
+    def predicate_bounds(self) -> tuple[str, np.ufunc, Any] | None:
+        """Lower this expression to ``(column, ufunc, scalar)`` block-pruning bounds.
+
+        ``None`` for any expression that is not a single ``col(name) <op> scalar``
+        comparison; :class:`_Compare` overrides it.
+        """
+        return None
+
     def _emit(self, builder: Any) -> Any:
         """Rebuild this expression through ``builder``, a node factory -- a fold
         over the tree. ``builder`` supplies ``column(name)`` / ``op(ufunc,

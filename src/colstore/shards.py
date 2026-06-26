@@ -33,7 +33,8 @@ import numpy as np
 
 from . import _lock
 from . import format as fmt
-from ._paths import _natural_sort_key
+from ._coerce import coerce_to_columns
+from ._paths import natural_sort_key
 from ._sizes import resolve_batch_rows
 
 if TYPE_CHECKING:
@@ -92,7 +93,7 @@ def _shard_name(template: str, index: int) -> str:
 def _validate_shard_name(name: str) -> None:
     """Require a shard name or template to carry the ``.cstore`` extension.
 
-    The dataset is read by globbing ``*.cstore`` (:func:`_list_shards`), so a shard
+    The dataset is read by globbing ``*.cstore`` (:func:`list_shards`), so a shard
     written under any other extension would not be seen by the reader.
     """
     if not name.endswith(fmt.FILE_EXTENSION):
@@ -119,14 +120,14 @@ def _next_index(directory: Path, template: str) -> int:
     return max(indices) + 1 if indices else 0
 
 
-def _list_shards(directory: PathLike) -> list[str]:
+def list_shards(directory: PathLike) -> list[str]:
     """The directory's shard files (``*.cstore``), in numeric filename order.
 
     The ``.colstore.lock`` sentinel and any ``.<name>.tmp`` orphan from a crashed
     append are excluded -- they do not end in ``.cstore`` / are dotfiles.
     """
     matches = glob.glob(os.path.join(os.fspath(directory), f"*{fmt.FILE_EXTENSION}"))
-    return sorted(matches, key=lambda path: _natural_sort_key(os.path.basename(path)))
+    return sorted(matches, key=lambda path: natural_sort_key(os.path.basename(path)))
 
 
 def _open_source(data: Any) -> tuple[ShardSource, bool] | None:
@@ -155,8 +156,6 @@ def _materialize_source(source: ShardSource) -> Columns:
 def _coerce_append_data(data: Any) -> Columns:
     """Materialize append data to a column dict: a :func:`colstore.store` input,
     an open reader/dataset, or a path to read."""
-    from . import api
-
     opened = _open_source(data)
     if opened is not None:
         source, owned = opened
@@ -165,7 +164,7 @@ def _coerce_append_data(data: Any) -> Columns:
         finally:
             if owned:
                 source.close()
-    return api._coerce_to_columns(data)
+    return coerce_to_columns(data)
 
 
 def _validate_source_schema(
@@ -227,7 +226,7 @@ def _write_shard_from_source(
 
 def _existing_schema(directory: Path) -> list[dict[str, Any]] | None:
     """The schema of the directory's first shard, or ``None`` if it has none."""
-    shards = _list_shards(directory)
+    shards = list_shards(directory)
     if not shards:
         return None
     manifest, _ = fmt.read_header(shards[0])

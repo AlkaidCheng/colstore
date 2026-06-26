@@ -47,14 +47,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from . import config
-from ._base import _ReaderBase
+from ._base import _indices_are_sorted, _ReaderBase
 from ._paths import expand_glob
-from .reader import ColStoreReader, _indices_are_sorted
-from .shards import _list_shards
+from .reader import ColStoreReader
+from .shards import list_shards
 
 # A single source: a path to open (owned), or an already-open reader/dataset
 # (borrowed). The constructor and append() accept one of these or a sequence.
-_SourceLike: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
+SourceLike: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
 
 # Segment ids are recorded as int32 bins for cross-column reuse; above this many
 # segments the dict path keeps an independent pass per column instead.
@@ -152,7 +152,7 @@ class ColStoreDataset(_ReaderBase):
 
     def __init__(
         self,
-        sources: _SourceLike | Sequence[_SourceLike] | None = None,
+        sources: SourceLike | Sequence[SourceLike] | None = None,
         **reader_kwargs: Any,
     ) -> None:
         self._children: list[ColStoreReader] = []
@@ -196,7 +196,7 @@ class ColStoreDataset(_ReaderBase):
                 if isinstance(item, (str, os.PathLike)):
                     # A directory is a managed shard dataset (its ``.cstore`` files,
                     # in order); anything else is a literal path or a glob pattern.
-                    paths = _list_shards(item) if os.path.isdir(item) else expand_glob(item)
+                    paths = list_shards(item) if os.path.isdir(item) else expand_glob(item)
                     for path in paths:
                         reader = ColStoreReader(path, **reader_kwargs)
                         opened.append(reader)
@@ -245,7 +245,7 @@ class ColStoreDataset(_ReaderBase):
         self._n_rows = int(self._offsets[-1])
 
     def append(
-        self, source: _SourceLike | Sequence[_SourceLike], **reader_kwargs: Any
+        self, source: SourceLike | Sequence[SourceLike], **reader_kwargs: Any
     ) -> ColStoreDataset:
         """Grow the dataset in place; return ``self`` so calls can be chained.
 

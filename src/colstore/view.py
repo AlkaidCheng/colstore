@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
     from ._base import _ReaderBase
 
-_RowIndexer = int | slice | np.ndarray | None
+RowIndexer = int | slice | np.ndarray | None
 
 
 def resolve_preview_n(n: int | None, available_rows: int, row_itemsize: int) -> int:
@@ -59,7 +59,7 @@ def row_width(store: _ReaderBase, columns: list[str]) -> int:
     return sum(store._native_dtype(c).itemsize for c in columns)
 
 
-def preview_index(indexer: _RowIndexer, n_rows: int) -> list[int]:
+def preview_index(indexer: RowIndexer, n_rows: int) -> list[int]:
     """Store row positions for a concrete row ``indexer`` -- the preview index column."""
     if isinstance(indexer, (int, np.integer)):
         return [int(indexer)]
@@ -77,7 +77,7 @@ def build_preview(
     total_rows: int | None,
     store: _ReaderBase,
     columns: list[str],
-    indexer: _RowIndexer,
+    indexer: RowIndexer,
 ) -> Preview:
     """Materialize a concrete row ``indexer`` into a dual-repr ``Preview``.
 
@@ -115,7 +115,7 @@ def resolve_drop(available: list[str], names: tuple[str, ...]) -> list[str]:
     return [c for c in available if c not in dropped]
 
 
-def edit_row_selection(indexer: _RowIndexer, n_rows: int) -> np.ndarray | None:
+def edit_row_selection(indexer: RowIndexer, n_rows: int) -> np.ndarray | None:
     """Normalize a resolved row indexer into a frame's row selection.
 
     ``None`` -- and a slice spanning every row -- means "all rows", which the
@@ -156,7 +156,7 @@ class _BaseView(InteropMixin):
         self._store = store
         self._row_part = row_part
 
-    def _resolve_row_indexer(self) -> _RowIndexer:
+    def _resolve_row_indexer(self) -> RowIndexer:
         """Normalize the row selector into None / int / slice / int-array / mask.
 
         All integer selectors are validated against ``n_rows`` here, and
@@ -247,7 +247,7 @@ class _BaseView(InteropMixin):
             return f"<ndarray shape={row_part.shape} dtype={row_part.dtype}>"
         return repr(row_part)
 
-    def _head_rows(self, n: int) -> _RowIndexer:
+    def _head_rows(self, n: int) -> RowIndexer:
         """A row indexer for the first ``n`` rows of this view's selection."""
         n = max(0, n)
         indexer = self._resolve_row_indexer()
@@ -261,7 +261,7 @@ class _BaseView(InteropMixin):
         selected = np.flatnonzero(indexer) if indexer.dtype == bool else indexer
         return selected[:n]
 
-    def _tail_rows(self, n: int) -> _RowIndexer:
+    def _tail_rows(self, n: int) -> RowIndexer:
         """A row indexer for the last ``n`` rows of this view's selection."""
         n = max(0, n)
         n_rows = self._store.n_rows
@@ -414,7 +414,7 @@ class ColumnView(_BaseView):
     def _row_width(self) -> int:
         return self._store._native_dtype(self._column_name).itemsize
 
-    def _preview(self, indexer: _RowIndexer) -> Preview:
+    def _preview(self, indexer: RowIndexer) -> Preview:
         """A single-column ``Preview`` over a concrete row ``indexer``."""
         values = ColumnView(self._store, indexer, self._column_name).array()
         index = preview_index(indexer, self._store.n_rows)
@@ -572,7 +572,7 @@ class TableView(_BaseView):
     def _row_width(self) -> int:
         return row_width(self._store, self._column_names)
 
-    def _preview(self, indexer: _RowIndexer) -> Preview:
+    def _preview(self, indexer: RowIndexer) -> Preview:
         """A multi-column ``Preview`` over a concrete row ``indexer``."""
         return build_preview("TableView", None, self._store, self._column_names, indexer)
 

@@ -14,9 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeAlias, overload
 
-import numpy as np
-
 from . import format as fmt
+from ._coerce import coerce_to_columns
 from ._paths import has_glob_magic
 from .compaction import compact_file
 from .dataset import ColStoreDataset
@@ -149,7 +148,7 @@ def store(
     if mode not in ("create", "recreate"):
         raise ValueError(f"Invalid mode {mode!r} for store(); expected 'create' or 'recreate'.")
 
-    columns = _coerce_to_columns(data)
+    columns = coerce_to_columns(data)
 
     # write_dataset is the single-record writer that includes a progress bar;
     # ColStoreWriter is for multi-record streams. For one-shot writes, write_dataset
@@ -161,57 +160,6 @@ def store(
         columns, path, batch_size=batch_size, show_progress=show_progress, statistics=statistics
     )
     return ColStoreReader(path, **open_kwargs)
-
-
-def _coerce_to_columns(
-    data: Any,
-) -> dict[str, np.ndarray[Any, np.dtype[Any]]]:
-    """Dispatch on the input type and return a uniform ``dict[name, ndarray]``."""
-    if isinstance(data, dict):
-        return {str(name): np.ascontiguousarray(array) for name, array in data.items()}
-    if isinstance(data, np.ndarray):
-        if data.dtype.names is None:
-            raise TypeError(
-                "store() received a plain ndarray; pass {name: array} as a dict "
-                "(or a structured ndarray with named fields)."
-            )
-        return {name: np.ascontiguousarray(data[name]) for name in data.dtype.names}
-    if _is_pandas_dataframe(data):
-        return _dataframe_to_columns(data)
-    raise TypeError(
-        f"store() does not know how to handle {type(data).__name__}. "
-        f"Expected dict[str, ndarray], structured ndarray, or pandas DataFrame."
-    )
-
-
-def _is_pandas_dataframe(data: Any) -> bool:
-    """Return whether ``data`` looks like a pandas DataFrame (duck-typed)."""
-    # Duck-typed (not isinstance) to avoid importing pandas at module load.
-    return (
-        hasattr(data, "columns")
-        and hasattr(data, "to_numpy")
-        and type(data).__name__ == "DataFrame"
-    )
-
-
-def _dataframe_to_columns(frame: Any) -> dict[str, np.ndarray[Any, np.dtype[Any]]]:
-    """Convert a pandas DataFrame to a column-name -> ndarray dict.
-
-    Object-dtype columns are rejected up front with a clearer message than
-    the writer's generic "unsupported dtype" error.
-    """
-    columns: dict[str, np.ndarray[Any, np.dtype[Any]]] = {}
-    for column_name in frame.columns:
-        series = frame[column_name]
-        array = series.to_numpy()
-        if array.dtype.kind == "O":
-            raise TypeError(
-                f"Column {column_name!r} (pandas dtype {series.dtype}) converts to "
-                f"an object array and cannot be stored. Cast it to a fixed-size NumPy "
-                f"dtype (e.g. float64, int64, or a fixed-width string like 'S16') first."
-            )
-        columns[str(column_name)] = array
-    return columns
 
 
 # ---- Foreign file formats: ingest / saveas -----------------------------
@@ -346,12 +294,12 @@ def compact(
 # ---- Concatenation: many files as one (lazy or written) ----------------
 
 
-_ConcatSource: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
+ConcatSource: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
 
 
 @overload
 def concat(
-    sources: Sequence[_ConcatSource],
+    sources: Sequence[ConcatSource],
     *,
     out: None = None,
     memory_budget: int | None = None,
@@ -359,14 +307,14 @@ def concat(
 ) -> ColStoreDataset: ...
 @overload
 def concat(
-    sources: Sequence[_ConcatSource],
+    sources: Sequence[ConcatSource],
     *,
     out: str | os.PathLike[str],
     memory_budget: int | None = None,
     **reader_kwargs: Any,
 ) -> ColStoreReader: ...
 def concat(
-    sources: Sequence[_ConcatSource],
+    sources: Sequence[ConcatSource],
     *,
     out: str | os.PathLike[str] | None = None,
     memory_budget: int | None = None,
