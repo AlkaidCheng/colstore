@@ -234,7 +234,7 @@ def test_orphan_temp_and_lock_are_not_shards(tmp_path):
     (tmp_path / ".shard_00001.cstore.tmp").write_bytes(b"partial junk")  # simulated crash orphan
     ds = colstore.open(tmp_path)  # ignores the temp and the .colstore.lock sentinel
     assert ds.n_rows == 4
-    assert all(not p.endswith(".tmp") for p in ds.path) if isinstance(ds.path, list) else True
+    assert all(not str(p).endswith(".tmp") for p in ds.paths)
     ds.close()
 
 
