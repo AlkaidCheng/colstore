@@ -174,6 +174,16 @@ def _parallel_copy(
     return out
 
 
+def _combine_operands(left: object, right: object) -> ColStoreDataset:
+    """Combine two reader/dataset operands into one dataset (backs the ``|`` operator).
+
+    The lazy import breaks the reader<->dataset cycle (``dataset`` imports ``reader``).
+    """
+    from .dataset import _combine_readers
+
+    return _combine_readers(left, right)
+
+
 class ColStoreReader(_ReaderBase):
     """Memory-mapped columnar store with lazy, NumPy-style indexing.
 
@@ -451,14 +461,10 @@ class ColStoreReader(_ReaderBase):
         operands -- it does not close them, so keep them alive for its
         lifetime. Combining with a path goes through :func:`colstore.open`.
         """
-        from .dataset import _combine_readers
-
-        return _combine_readers(self, other)
+        return _combine_operands(self, other)
 
     def __ror__(self, other: object) -> ColStoreDataset:
-        from .dataset import _combine_readers
-
-        return _combine_readers(other, self)
+        return _combine_operands(other, self)
 
     # ---- Lifecycle -----------------------------------------------------
 
