@@ -399,7 +399,7 @@ class ColStoreWriter:
         header = fmt.record_header_bytes(record_index, n_rows)
         arrays = [le_columns[m["name"]] for m in (self._schema or columns_meta)]
         body_bytes = sum(array.nbytes for array in arrays)
-        pad = fmt.align_up(body_bytes, fmt._RECORD_BODY_ALIGNMENT) - body_bytes
+        pad = fmt.record_body_padding(body_bytes)
         if not _HAS_WRITEV:
             self._emit_record_sequential(header, arrays, pad)
             return
