@@ -21,7 +21,6 @@ import glob
 import os
 import re
 import shutil
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from itertools import pairwise
@@ -37,6 +36,7 @@ from ._coerce import coerce_to_columns
 from ._paths import natural_sort_key
 from ._sizes import resolve_batch_rows
 from ._types import Columns, StrPath
+from .writer import warn_unclosed_and_close
 
 if TYPE_CHECKING:
     from .dataset import ColStoreDataset
@@ -588,14 +588,7 @@ class Appender:
 
     def __del__(self) -> None:
         if not self._closed:
-            warnings.warn(
-                f"Appender for {self._directory} was not closed explicitly; committing "
-                f"from __del__. Prefer 'with' or an explicit .close().",
-                ResourceWarning,
-                stacklevel=2,
-            )
-            with contextlib.suppress(Exception):
-                self.close()
+            warn_unclosed_and_close(self, "Appender", self._directory)
 
     def __repr__(self) -> str:
         return (
