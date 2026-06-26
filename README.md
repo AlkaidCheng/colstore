@@ -235,11 +235,11 @@ renders as a table in a terminal and as HTML in a notebook, and `report().record
 the cutflow as a list of per-cut dicts for saving (JSON, CSV, …). Unnamed cuts appear by
 position.
 
-![The frame's computational model](docs/frame_computational_model.svg)
+![The frame's computational model](docs/assets/frame_computational_model.svg)
 
-The [expression-graph diagram](docs/edit_expression_graph.svg) details the
-shared-subexpression reuse; the [edit lifecycle](docs/edit_lifecycle.svg) and
-[streaming commit](docs/edit_streaming_commit.svg) diagrams trace a frame from
+The [expression-graph diagram](docs/assets/edit_expression_graph.svg) details the
+shared-subexpression reuse; the [edit lifecycle](docs/assets/edit_lifecycle.svg) and
+[streaming commit](docs/assets/edit_streaming_commit.svg) diagrams trace a frame from
 `edit()` to a written file.
 
 ### Writing
@@ -362,7 +362,7 @@ reader = colstore.concat(["jan.cstore", "feb.cstore"], out="q1.cstore")
 ```
 
 The written file reads back on the single-record fast path. See the [dataset
-read decomposition](docs/dataset_read_decomposition.svg) diagram for how a read
+read decomposition](docs/assets/dataset_read_decomposition.svg) diagram for how a read
 is split across files and reassembled.
 
 #### Growing a dataset by appending
@@ -453,7 +453,7 @@ stays page-cache-backed and reclaimable instead of committed to a second buffer.
 Views pin the mapping, so they stay valid after `ds.close()`. Because the views
 are read-only they cannot corrupt the store; use the default `copy=True` when you
 need to mutate. The full contract is in
-[Performance &amp; internals](docs/performance.md) §7.
+[Performance &amp; internals](docs/guide/performance.md) §7.
 
 ### Configuration
 
@@ -657,7 +657,7 @@ A few choices shape everything above:
   interleaved A/B against the path it replaces, asserted output-identical, and
   carries a committed `benchmark/check_*.py`. Rejected and deferred alternatives
   are recorded with the measurement that closed them and a named reopen condition
-  (see the [optimization series](docs/optimization_series.md)), so an idea is not
+  (see the [optimization series](docs/development/optimization_series.md)), so an idea is not
   relitigated without new evidence.
 - **Zero-copy where the layout permits.** A compacted, native-byte-order store is
   contiguous on disk, so whole-column reads can hand back read-only views of the
@@ -671,19 +671,21 @@ A few choices shape everything above:
 
 ### Documentation
 
-In-depth guides live in [`docs/`](docs/):
+The full documentation — the guides below plus the complete API reference — is
+published at [alkaidcheng.github.io/colstore](https://alkaidcheng.github.io/colstore/).
+The guides also render in-repo under [`docs/`](docs/):
 
-- [Performance &amp; internals](docs/performance.md) — the file layout, the kernel
+- [Performance &amp; internals](docs/guide/performance.md) — the file layout, the kernel
   behind each access pattern, how reads parallelize, NUMA placement, and
   zero-copy.
-- [Gather diagnostics](docs/gather_diagnostics.md) — re-measure the thread,
+- [Format interop](docs/guide/interop.md) — convert to and from Parquet, Feather,
+  JSON, HDF5, NPZ, and ROOT, plus the zero-copy Arrow bridge.
+- [Gather diagnostics](docs/development/gather_diagnostics.md) — re-measure the thread,
   binding, and placement knobs on your own hardware.
-- [Optimization series](docs/optimization_series.md) — the cumulative record of
+- [Optimization series](docs/development/optimization_series.md) — the cumulative record of
   every optimization and the measurement behind it.
-- [Valgrind leak checking](docs/valgrind_leak_checking.md) — the native-leak
+- [Valgrind leak checking](docs/development/valgrind_leak_checking.md) — the native-leak
   Memcheck harness under `scripts/`.
-
-The [docs index](docs/README.md) lists everything, including the diagrams.
 
 ### License
 

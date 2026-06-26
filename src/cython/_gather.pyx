@@ -13,7 +13,7 @@ Each ``def`` below wraps one kernel: the single-record pair
 sorted, and unsorted kernels, the bin-reuse and uniform-layout families,
 and the boolean-mask kernel. Docstrings state the caller contract;
 kernel design lives in ``include/colstore/gather.hpp`` and the
-measurements behind each kernel in ``docs/optimization_series.md``.
+measurements behind each kernel in ``docs/development/optimization_series.md``.
 
 Contracts shared by every entry point:
 
