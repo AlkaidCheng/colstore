@@ -8,21 +8,16 @@ written -- then optionally compact the result to a single record.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Any, TypeAlias
 
-import numpy as np
-
-from .._types import StrPath
+from .._types import Columns, StrPath
 from ..compaction import compact_file
 from ..progress import progress_bar
 from ..reader import ColStoreReader
 from ..writer import ColStoreWriter
 
-ColumnBatch: TypeAlias = dict[str, np.ndarray[Any, np.dtype[Any]]]
-
 
 def write_column_batches(
-    batches: Iterable[ColumnBatch],
+    batches: Iterable[Columns],
     path: StrPath,
     *,
     mode: str = "create",

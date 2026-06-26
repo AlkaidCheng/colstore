@@ -36,7 +36,7 @@ from . import format as fmt
 from ._coerce import coerce_to_columns
 from ._paths import natural_sort_key
 from ._sizes import resolve_batch_rows
-from ._types import StrPath
+from ._types import Columns, StrPath
 
 if TYPE_CHECKING:
     from .dataset import ColStoreDataset
@@ -50,7 +50,6 @@ DEFAULT_SHARD_NAME = f"shard_{{index:05d}}{fmt.FILE_EXTENSION}"
 _LOCK_NAME = ".colstore.lock"
 _INDEX_FIELD = re.compile(r"\{index(?::[^}]*)?\}")
 
-Columns = dict[str, np.ndarray[Any, np.dtype[Any]]]
 
 #: Target bytes per copy stream: a single-file shard copy uses
 #: ``min(size // this, _PARALLEL_COPY_MAX_STREAMS)`` streams, so a file smaller

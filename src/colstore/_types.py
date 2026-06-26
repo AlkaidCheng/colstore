@@ -9,7 +9,12 @@ by the class-bearing aliases.
 from __future__ import annotations
 
 import os
-from typing import TypeAlias
+from typing import Any, TypeAlias
+
+import numpy as np
 
 #: A filesystem path accepted by the public read/write functions.
 StrPath: TypeAlias = str | os.PathLike[str]
+
+#: A column-name -> array mapping (a record's worth of columns, or a write batch).
+Columns: TypeAlias = dict[str, np.ndarray[Any, np.dtype[Any]]]
