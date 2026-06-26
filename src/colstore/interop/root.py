@@ -35,9 +35,10 @@ import numpy as np
 from .. import api
 from .._base import _ReaderBase
 from .._sizes import resolve_batch_rows
+from .._types import Columns, StrPath
 from ..progress import progress_bar
 from ..reader import ColStoreReader
-from ._streaming import ColumnBatch, StrPath, write_column_batches
+from ._streaming import write_column_batches
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -382,7 +383,7 @@ def _group_files_by_budget(counts: list[int], budget: int) -> list[list[int]]:
 
 def _file_group_batches(
     root: ModuleType, files: list[str], tree: str, columns: list[str], rows_per_batch: int
-) -> Iterator[ColumnBatch]:
+) -> Iterator[Columns]:
     """Yield AsNumpy batches over file groups, each group read in one implicit-MT
     ``AsNumpy``. Files are packed greedily up to ``rows_per_batch`` rows; a single
     file larger than the budget is ``Range``-chunked instead (``Range`` disables
@@ -409,7 +410,7 @@ def _ingest_batches(
     columns: list[str],
     rows_per_batch: int | None,
     total_rows: int,
-) -> Iterator[ColumnBatch]:
+) -> Iterator[Columns]:
     """Yield AsNumpy batches, one per output record.
 
     A tree that fits the memory budget is read in a single ``AsNumpy`` (no ``Range``);
@@ -451,7 +452,7 @@ class RootBackend(ABC):
         columns: list[str] | None,
         keep_valid_only: bool,
         batch_size: int | str | None,
-    ) -> tuple[Iterator[ColumnBatch], int]:
+    ) -> tuple[Iterator[Columns], int]:
         """Read ``source``; return ``(batches, total_rows)``, one batch per record."""
 
     @abstractmethod
@@ -486,7 +487,7 @@ class RootCppBackend(RootBackend):
         columns: list[str] | None,
         keep_valid_only: bool,
         batch_size: int | str | None,
-    ) -> tuple[Iterator[ColumnBatch], int]:
+    ) -> tuple[Iterator[Columns], int]:
         root = _import_root()
         files, tree = _source_files_and_tree(root, source, treename)
         rdf = root.RDataFrame(tree, files) if files is not None else source
@@ -748,21 +749,21 @@ def _sanitized_name_map(names: list[str]) -> dict[str, str]:
     return mapping
 
 
-def _relabel(chunk: ColumnBatch, name_map: dict[str, str]) -> ColumnBatch:
+def _relabel(chunk: Columns, name_map: dict[str, str]) -> Columns:
     """Return ``chunk`` with its keys renamed through ``name_map``."""
     return {name_map[name]: column for name, column in chunk.items()}
 
 
-def _batch_dict(view: Any) -> ColumnBatch:
+def _batch_dict(view: Any) -> Columns:
     """Materialize a view's columns, zero-copy where the layout allows it.
 
     A single-record store hands ROOT zero-copy memmap views; a dataset slice that
     spans files cannot be viewed contiguously, so it falls back to a copy.
     """
     try:
-        return cast(ColumnBatch, view.dict(copy=False))
+        return cast(Columns, view.dict(copy=False))
     except ValueError:
-        return cast(ColumnBatch, view.dict())
+        return cast(Columns, view.dict())
 
 
 class _InMemoryView:
@@ -771,10 +772,10 @@ class _InMemoryView:
     ROOT backend copies nothing.
     """
 
-    def __init__(self, columns: ColumnBatch) -> None:
+    def __init__(self, columns: Columns) -> None:
         self._columns = columns
 
-    def dict(self, copy: bool = True) -> ColumnBatch:
+    def dict(self, copy: bool = True) -> Columns:
         if copy:
             return {name: array.copy() for name, array in self._columns.items()}
         return self._columns
@@ -790,7 +791,7 @@ class _InMemorySource:
     ROOT directly.
     """
 
-    def __init__(self, data: ColumnBatch) -> None:
+    def __init__(self, data: Columns) -> None:
         self._data = data
         self.dtypes: dict[str, np.dtype[Any]] = {name: array.dtype for name, array in data.items()}
         self.n_rows: int = len(next(iter(data.values()))) if data else 0
@@ -994,9 +995,7 @@ def _resolve_chunk_rows(batch_size: int | str | None, row_nbytes: int) -> int | 
     return resolve_batch_rows(batch_size)
 
 
-def _snapshot(
-    root: ModuleType, data: ColumnBatch, treename: str, out_path: str, options: Any
-) -> None:
+def _snapshot(root: ModuleType, data: Columns, treename: str, out_path: str, options: Any) -> None:
     """Write ``data`` as a single tree with the given Snapshot ``options``."""
     root.RDF.FromNumpy(data).Snapshot(treename, out_path, list(data), options)
 

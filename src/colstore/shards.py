@@ -36,6 +36,7 @@ from . import format as fmt
 from ._coerce import coerce_to_columns
 from ._paths import natural_sort_key
 from ._sizes import resolve_batch_rows
+from ._types import Columns, StrPath
 
 if TYPE_CHECKING:
     from .dataset import ColStoreDataset
@@ -49,8 +50,6 @@ DEFAULT_SHARD_NAME = f"shard_{{index:05d}}{fmt.FILE_EXTENSION}"
 _LOCK_NAME = ".colstore.lock"
 _INDEX_FIELD = re.compile(r"\{index(?::[^}]*)?\}")
 
-PathLike = str | os.PathLike[str]
-Columns = dict[str, np.ndarray[Any, np.dtype[Any]]]
 
 #: Target bytes per copy stream: a single-file shard copy uses
 #: ``min(size // this, _PARALLEL_COPY_MAX_STREAMS)`` streams, so a file smaller
@@ -120,7 +119,7 @@ def _next_index(directory: Path, template: str) -> int:
     return max(indices) + 1 if indices else 0
 
 
-def list_shards(directory: PathLike) -> list[str]:
+def list_shards(directory: StrPath) -> list[str]:
     """The directory's shard files (``*.cstore``), in numeric filename order.
 
     The ``.colstore.lock`` sentinel and any ``.<name>.tmp`` orphan from a crashed
@@ -366,7 +365,7 @@ def _normalize_and_write_shard(
 
 
 def append(
-    directory: PathLike,
+    directory: StrPath,
     data: Any,
     *,
     name: str = DEFAULT_SHARD_NAME,
@@ -455,7 +454,7 @@ class Appender:
 
     def __init__(
         self,
-        directory: PathLike,
+        directory: StrPath,
         *,
         name: str = DEFAULT_SHARD_NAME,
         shard_size: int | str | None = None,
@@ -606,7 +605,7 @@ class Appender:
 
 
 def appender(
-    directory: PathLike,
+    directory: StrPath,
     *,
     name: str = DEFAULT_SHARD_NAME,
     shard_size: int | str | None = None,

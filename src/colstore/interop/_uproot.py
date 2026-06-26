@@ -16,8 +16,8 @@ from typing import Any, ClassVar
 import numpy as np
 
 from .._base import _ReaderBase
+from .._types import Columns
 from ..progress import progress_bar
-from ._streaming import ColumnBatch
 from .root import (
     _SCALAR_KINDS,
     RootBackend,
@@ -125,7 +125,7 @@ class UprootBackend(RootBackend):
         columns: list[str] | None,
         keep_valid_only: bool,
         batch_size: int | str | None,
-    ) -> tuple[Iterator[ColumnBatch], int]:
+    ) -> tuple[Iterator[Columns], int]:
         uproot = _import_uproot()
         files, tree = _resolve_source(source, treename)
         with uproot.open(os.fspath(_first_file(files))) as opened:
@@ -140,7 +140,7 @@ class UprootBackend(RootBackend):
             empty = {name: rep[name].array(entry_stop=0, library="np") for name in selected}
         total = _total_entries(uproot, files, tree_name)
 
-        def batches() -> Iterator[ColumnBatch]:
+        def batches() -> Iterator[Columns]:
             if total == 0:
                 yield empty
                 return
