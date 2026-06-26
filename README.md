@@ -72,12 +72,6 @@ ds.head()                                    # peek: a table that renders in not
 colstore has three objects, one per job. Most code only ever needs
 `ColStoreReader`.
 
-| | Job | Get one from | Output |
-|---|---|---|---|
-| **`ColStoreReader`** | Read an existing file | `colstore.open(path)` | NumPy arrays / DataFrames, in memory |
-| **`ColStoreWriter`** | Write a *new* file from data you hold | `colstore.create` / `recreate` / `update` (context manager) | a `.cstore` on disk |
-| **`ColStoreFrame`** | Derive a *new* file from an existing one | `reader.edit()` | a new `.cstore` on disk, plus a reader for it |
-
 - **`ColStoreReader`** is the read interface. `colstore.open(path)` returns one;
   index it for lazy views (`ds[rows, cols]`) and materialize with `.array()`,
   `.dict()`, `.recarray()`, or `.frame()`. This is what you use to get data out.
@@ -92,6 +86,14 @@ colstore has three objects, one per job. Most code only ever needs
   branch cheaply off a shared base. Then materialize in memory (`array(name)`
   for one column, `dict()` / `recarray()` for all) or `.write(path)` to stream the
   result to a new file. It never modifies the source store.
+
+**Which to use:**
+
+| | Job | Get one from | Output |
+|---|---|---|---|
+| **`ColStoreReader`** | Read an existing file | `colstore.open(path)` | NumPy arrays / DataFrames, in memory |
+| **`ColStoreWriter`** | Write a *new* file from data you hold | `colstore.create` / `recreate` / `update` (context manager) | a `.cstore` on disk |
+| **`ColStoreFrame`** | Derive a *new* file from an existing one | `reader.edit()` | a new `.cstore` on disk, plus a reader for it |
 
 The distinction people miss is **writer vs. frame**: a writer persists data you
 are already holding in memory, while a frame derives a new file from one already
@@ -519,23 +521,12 @@ and the realized path is the unbound default pool.
 Every write — `frame.write()`, `concat(..., out=...)`, `write_dataset` — chooses
 a path and a fill method:
 
-```
-write
-│
-├─ pure merge?  every output column an unchanged on-disk passthrough
-│  │            (e.g. concat of same-schema files, no edits)
-│  └─ yes ─► merge copy   : copy each source column's byte ranges straight
-│                           into the output (no materialization)
-│
-└─ no           a transform, a new/dropped/renamed column, an in-memory
-   │            or constant column, or a single source
-   └────────► streaming write : evaluate each column in bounded-memory
-                                 batches, then write each batch out
+![How a write reaches disk: merge copy vs streaming write, then the fill method](docs/assets/write_path_decision.svg)
 
-   both paths fill the destination body with one of:
-     pwrite  (default where os.pwrite exists)  large sequential writes
-     mmap    (fallback, e.g. Windows)          memory-mapped output
-```
+A write takes the **merge copy** route only when every output column is an
+unchanged on-disk passthrough — a same-schema `concat` with no edits, say; any
+transform, added, dropped, or renamed column, in-memory or constant column, or
+single source routes through the **streaming write** instead.
 
 **Why the fill method matters.** An `mmap`'d output is dirtied one page at a
 time; a parallel filesystem serves that pattern poorly — a 1 GB write faults
