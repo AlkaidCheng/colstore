@@ -73,6 +73,10 @@ ENV/
 # OS
 .DS_Store
 
+# Sphinx documentation build output and autosummary-generated stubs.
+docs/_build/
+docs/generated/
+
 # Archive
 *.zip
 
