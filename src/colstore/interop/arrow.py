@@ -153,8 +153,8 @@ class ArrowFormat(DataFormat):
                 return _chunks_to_array(pa, chunks, selection.native_dtype(name))
         return _array_from_values(pa, selection.gather(name))
 
-    # from_object is not overridden: Arrow import is a later addition, so
-    # can_import is False and an attempt raises the base class's clear error.
+    # ArrowFormat is export-only: from_object is left to the base class, so
+    # can_import is False and an import attempt raises its clear error.
 
 
 def to_c_array(arrow_obj: Any, requested_schema: Any) -> Any:

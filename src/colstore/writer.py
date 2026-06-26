@@ -116,7 +116,6 @@ class ColStoreWriter:
         self._schema: list[dict[str, Any]] | None = None
         self._n_records = 0
         self._committed_rows = 0
-        self._data_offset = 0  # set when header is written / read
         # Whether to write the statistics footer on close (off by default).
         self._statistics = statistics
         # Per-record statistics, one dict {name: (min, max, prunable)} per record,
@@ -132,12 +131,10 @@ class ColStoreWriter:
                 )
             self._file = open(self._path, "w+b")  # noqa: SIM115
             self._has_header = False
-            self._wrote_anything = False
         elif mode == "recreate":
             # Truncate if exists; otherwise create.
             self._file = open(self._path, "w+b")  # noqa: SIM115
             self._has_header = False
-            self._wrote_anything = False
         else:  # update
             if not self._path.exists():
                 raise FileNotFoundError(
@@ -146,7 +143,6 @@ class ColStoreWriter:
                 )
             self._file = open(self._path, "r+b")  # noqa: SIM115
             self._has_header = True
-            self._wrote_anything = True  # something is already there
 
         # Take the advisory lock BEFORE any destructive operations. In update
         # mode the load step below truncates orphan bytes past the last
@@ -168,20 +164,14 @@ class ColStoreWriter:
     # ---- internals ----------------------------------------------------
 
     def _load_existing_state_for_update(self) -> None:
-        """Read schema + counters from disk; seek to end of last committed record.
-
-        Reads the header through ``self._file`` rather than re-opening
-        the path. This is a small efficiency win on every platform (one
-        fewer ``open`` syscall) and matches the writer's lifecycle --
-        the file is already open and at offset 0 from the ``r+b`` open
-        above, so reading the header from it costs nothing extra.
-        """
+        """Read schema + counters from disk; seek to end of last committed record."""
         self._file.seek(0)
+        # Read the header through the already-open r+b handle (at offset 0) instead
+        # of re-opening the path: one fewer open syscall, the same bytes.
         manifest, data_offset = fmt.read_header_from_file(self._file)
         self._schema = manifest["columns"]
         self._n_records = int(manifest["n_records"])
         self._committed_rows = int(manifest["committed_rows"])
-        self._data_offset = data_offset
 
         # Walk records to find where the last one ends; that's where we append.
         # Even though read_record_index also validates each record, we need
@@ -217,15 +207,13 @@ class ColStoreWriter:
         """
         self._schema = columns_meta
         self._file.seek(0)
-        self._data_offset = fmt.write_header(
-            self._file, columns_meta, n_records=0, committed_rows=0
-        )
+        fmt.write_header(self._file, columns_meta, n_records=0, committed_rows=0)
         self._has_header = True
 
     def _commit_counters(self, stats_offset: int = 0) -> None:
         """Seek to the counters block, rewrite it, and fsync.
 
-        The 32-byte counters block is small enough that a single write is
+        The 64-byte counters block is small enough that a single write is
         typically atomic at the syscall level; the embedded CRC catches a
         torn write on next open if it isn't. ``stats_offset`` is the location
         of the statistics footer written just before this commit.
@@ -379,7 +367,6 @@ class ColStoreWriter:
 
         self._n_records += 1
         self._committed_rows += n_rows
-        self._wrote_anything = True
         # Capture this record's per-column min/max for the statistics footer.
         if self._statistics:
             self._record_stats_acc.append(

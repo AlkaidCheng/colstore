@@ -223,19 +223,16 @@ class _BaseView(InteropMixin):
         return position
 
     def _validate_fancy_index(self, indices: np.ndarray) -> np.ndarray:
-        """Fold negative indices and bounds-check the array against ``n_rows``.
-
-        ``min()`` is taken first and the negative-folding ``np.where`` runs only
-        when it is negative, so the common all-non-negative selector skips a full
-        ``(indices < 0).any()`` scan and its boolean temporary, leaving just the
-        two min/max bounds reductions. ``min() < 0`` is exactly
-        ``(indices < 0).any()``, and an index below ``-n_rows`` stays negative
-        after folding -- which the post-fold ``lo < 0`` check still rejects -- so
-        the result is identical to folding before computing the minimum.
-        """
+        """Fold negative indices and bounds-check the array against ``n_rows``."""
         n_rows = self._store.n_rows
         if indices.size == 0:
             return indices
+        # min() first: the negative-folding np.where runs only when some index is
+        # negative, so the common all-non-negative selector skips a full
+        # (indices < 0).any() scan and its boolean temporary. min() < 0 is exactly
+        # (indices < 0).any(), and an index below -n_rows stays negative after
+        # folding (the post-fold lo < 0 check still rejects it), so the result is
+        # identical to folding before computing the minimum.
         lo = indices.min()
         if lo < 0:
             indices = np.where(indices < 0, indices + n_rows, indices)

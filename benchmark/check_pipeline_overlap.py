@@ -510,7 +510,7 @@ def _print_summary(runs: list[tuple[Shape, PhaseRun, int, float]]) -> None:
         "                 could reclaim most of it (bounded by cores/bandwidth).\n"
         "Both are ceilings; realized wins are lower. read% (gather) is already\n"
         "OpenMP-parallel and bandwidth-bound -- little headroom there. Decide direction\n"
-        "from the node numbers, where the durability flush (Lustre) may dominate."
+        "from the node numbers, where the durability flush on a parallel filesystem may dominate."
     )
 
 

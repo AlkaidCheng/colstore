@@ -157,14 +157,14 @@ class _ReaderBase(InteropMixin, abc.ABC):
         return {name: self._native_dtype(name) for name in self._column_dtypes}
 
     def _native_dtype(self, column_name: str) -> np.dtype[Any]:
-        """One column's dtype in native byte order.
+        """One column's dtype in native byte order; raises ``KeyError`` for an
+        unknown name.
 
         The on-disk column is little-endian; a big-endian host reads it as a
-        non-native dtype that the gather/copy converts. Callers needing a single
-        column's native dtype use this instead of indexing :attr:`dtypes`, which
-        rebuilds the whole mapping on every access -- doing that once per column
-        is quadratic in the column count. Raises ``KeyError`` for an unknown name.
+        non-native dtype that the gather/copy converts.
         """
+        # Single-column lookup avoids rebuilding the whole :attr:`dtypes` mapping
+        # (which indexing dtypes does on every access -- quadratic per column).
         native: np.dtype[Any] = self._column_dtypes[column_name].newbyteorder("=")
         return native
 

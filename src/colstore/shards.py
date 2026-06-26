@@ -53,7 +53,9 @@ _INDEX_FIELD = re.compile(r"\{index(?::[^}]*)?\}")
 PathLike = str | os.PathLike[str]
 Columns = dict[str, np.ndarray[Any, np.dtype[Any]]]
 
-#: A single-file shard copy at least this size is split across multiple I/O streams.
+#: Target bytes per copy stream: a single-file shard copy uses
+#: ``min(size // this, _PARALLEL_COPY_MAX_STREAMS)`` streams, so a file smaller
+#: than twice this size copies in one stream.
 _PARALLEL_COPY_MIN_CHUNK = 128 * 1024 * 1024
 #: Upper bound on concurrent copy streams. The useful count is what the storage can
 #: serve in parallel (a handful saturates a parallel filesystem; more only contends),
@@ -329,9 +331,10 @@ def _copy_bytes(src_fd: int, dst_fd: int, offset: int, count: int) -> None:
 def _copy_file(src: Path, dst: Path) -> None:
     """Copy ``src`` to ``dst``, parallelizing a large file across a few I/O streams.
 
-    A file at least :data:`_PARALLEL_COPY_MIN_CHUNK` is split into up to
-    :data:`_PARALLEL_COPY_MAX_STREAMS` disjoint byte ranges copied concurrently; a
-    smaller file copies in one stream. The stream count is bounded by what the
+    The file is split into ``min(size // _PARALLEL_COPY_MIN_CHUNK,
+    _PARALLEL_COPY_MAX_STREAMS)`` disjoint byte ranges copied concurrently, so a
+    file smaller than twice :data:`_PARALLEL_COPY_MIN_CHUNK` copies in one stream.
+    The stream count is bounded by what the
     storage serves in parallel, not the core count, so the speedup comes from I/O
     width on a parallel filesystem without depending on the host's hardware. A
     platform with no positional copy primitive (Windows) copies in one stream.

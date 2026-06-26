@@ -3,13 +3,13 @@
 ``ds[mask].edit()`` keeps a boolean mask as the frame's row selection only when it
 will gather mask-natively -- a multi-record store at or above the density gate --
 and otherwise (a single-record store, or a sparse selection) lowers it to int64
-indices at construction, the sorted-fancy path the pre-change seam always took.
+indices at construction -- the sorted-fancy gather path.
 The mask-native kernel exists only for multi-record (interleaved) layouts; a
 single-record store is contiguous and gathered directly by index.
 
 This A/B times ``ds[...].edit()`` two ways across a density sweep -- ``lower``
-(convert the mask to indices with ``np.flatnonzero``, then gather: the pre-change
-behavior) vs ``mask`` (keep it where it gathers mask-natively). Each pays its own
+(convert the mask to indices with ``np.flatnonzero``, then gather) vs ``mask``
+(keep it where it gathers mask-natively). Each pays its own
 conversion inside the timed cell, so the comparison is apples-to-apples: on a
 multi-record store a dense mask wins (mask-native); a sparse selection, and any
 single-record store, read as parity (both lower to the same fancy gather). Both
@@ -49,7 +49,7 @@ def _build_store(directory: Path, n_records: int, rows: int):
 
 
 def _lower(store, mask, cols):
-    """The pre-change edit path: lower the mask to indices first, then gather."""
+    """Lower the mask to int64 indices first, then gather."""
     view = store[np.flatnonzero(mask), cols].edit()
     return view.dict() if isinstance(cols, list) else view.array(cols)
 

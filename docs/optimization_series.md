@@ -188,8 +188,8 @@ ceiling, with no regression at any record size up to single 10M-row records.
 **Deferred with data.** `posix_fallocate` preallocation for the one-shot
 write path measured a wash (buffered writes do not block on block
 allocation), and glibc emulates it by touching every block on filesystems
-without native fallocate support — including older Lustre — which would
-double the write cost precisely where the library deploys.
+without native fallocate support — including some parallel filesystems —
+which would double the write cost.
 
 ---
 
@@ -657,7 +657,7 @@ recorded under rejected alternatives.
 **Branch:** `fix/flock-unsupported-filesystem`
 
 **Problem.** The writer's advisory lock called `flock` unconditionally. Network
-and parallel filesystems that do not implement it (Lustre, GPFS, some NFS
+and parallel filesystems that do not implement it (certain NFS
 mounts) report `ENOTSUPP` (524), `EOPNOTSUPP`, or `ENOLCK`, which surfaced as an
 opaque "Unknown error 524" and blocked every streaming write there.
 
@@ -1038,7 +1038,7 @@ memory bandwidth and the reader-open CRC, leaving only small serial-overhead cac
 * **Fixed software prefetch / prefetch for unsorted gathers** —
   pessimization; the old fixed d8 cost 20–29%. (Stage 3 calibration)
 * **`posix_fallocate`** — measured wash, with a glibc-emulation hazard on
-  filesystems without native support (older Lustre). (Stage 4)
+  filesystems without native support (some parallel filesystems). (Stage 4)
 * **SIMD gather** — the bottleneck is outstanding-miss capacity, not
   instruction throughput; `vpgather` is microcoded on the target microarchitecture.
 * **Direction-templated strided kernel pair** — the single kernel's unused
@@ -1143,7 +1143,7 @@ memory bandwidth and the reader-open CRC, leaving only small serial-overhead cac
 * **NUMA follow-ups** — the cold `auto` vs `local` comparison across access
   patterns is resolved (see rejected alternatives: interleave wins or ties,
   no per-pattern flip). Still open: a strict single-threaded-reader variant,
-  and writer-side interleave scope on real Lustre paths.
+  and writer-side interleave scope on real parallel-filesystem paths.
 * **Thread-to-file NUMA co-location** (Round 4) — pinning each
   `gather_multifile_sorted` worker to the node owning the files its contiguous
   sorted-index chunk reads (the inverse of the rejected spread binding: sorted

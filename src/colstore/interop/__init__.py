@@ -10,7 +10,7 @@ colstore -- pulls in no heavy dependency.
 Examples
 --------
 >>> import colstore
->>> colstore.interop.data_formats()       # ['arrow']                # doctest: +SKIP
+>>> colstore.interop.data_formats()       # frozenset({'arrow'})     # doctest: +SKIP
 >>> table = ds.to("arrow")                # export, zero-copy        # doctest: +SKIP
 >>> import polars as pl
 >>> frame = pl.from_arrow(ds)             # via __arrow_c_stream__   # doctest: +SKIP

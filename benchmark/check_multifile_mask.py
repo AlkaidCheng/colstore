@@ -5,9 +5,9 @@ byte-identical output, swept over the file count:
 
 * ``per-file``  -- split the mask per file, gather each ``(file, column)`` portion
   on a threadpool via the child's own mask/flatnonzero path (current default for
-  sparse masks; the path PR #196 lost to at scale).
+  sparse masks; the route the index-lowering fancy gather lost to at scale).
 * ``fancy``     -- ``np.flatnonzero(mask)`` once, then the native multi-file sorted
-  fancy gather. This is the rejected PR #196 reroute, kept here as the reference
+  fancy gather. This is the index-lowering reroute, kept here as the reference
   it regressed against (materializes an int64 index array + a per-index segment
   search).
 * ``kernel``    -- the native segment mask kernel (``colstore_gather_segment_mask``)
@@ -59,7 +59,7 @@ def _per_file(ds: ColStoreDataset, mask: np.ndarray, names: list[str]) -> dict[s
 
 
 def _fancy(ds: ColStoreDataset, mask: np.ndarray, names: list[str]) -> dict[str, np.ndarray]:
-    """The rejected PR #196 reroute: lower the whole mask to indices, then fancy gather."""
+    """The index-lowering reroute: lower the whole mask to indices, then fancy gather."""
     return ds._fancy_many(names, np.flatnonzero(mask).astype(np.int64))
 
 

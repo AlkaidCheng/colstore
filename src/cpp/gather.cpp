@@ -733,18 +733,6 @@ void copy_multirecord_range(const std::uint8_t* COLSTORE_RESTRICT base,
   }
 }
 
-// Sorted multi-record fancy gather. ``indices`` must be non-decreasing
-// (caller-checked). Each thread locates the record of the first index in
-// its chunk with one branchless binary search, then walks the record cursor
-// forward monotonically -- the walk does O(K + R) total comparisons across
-// the whole call, versus O(K log R) searches for the unsorted kernel.
-// Offsets are computed in registers; there is no byte_offsets array.
-//
-// Prefetching: the look-ahead element's record is only known after walking,
-// so the prefetch is issued only when the look-ahead index still lies in
-// the *current* record (the common case for dense sorted reads, where rows
-// per record >> prefetch distance). It is a hint; skipping cross-record
-// look-aheads costs nothing but a few unprefetched boundary elements.
 // Strided range gather: a linear record walk over the arithmetic row stream
 // ``start + i*step``. Structurally the sorted kernel with the index-array
 // loads deleted -- the row is synthesized in a register, so the per-element

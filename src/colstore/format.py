@@ -3,7 +3,7 @@
 File layout::
 
     [magic 8B: b"CSTORE\\x00\\x01" -- constant for the life of the format]
-    [counters 32B: n_records(8) + committed_rows(8) + crc32(4) + reserved(12)]
+    [counters 64B: n_records(8) + committed_rows(8) + stats_offset(8) + crc32(4) + reserved(36)]
     [manifest_len 8B (u64 little-endian)]
     [manifest_json: format_version + columns + manifest_crc32]
     [zero-padding to 64-byte alignment]
@@ -11,10 +11,10 @@ File layout::
     [record_1 header 32B][record_1 body, padded to 8B]
     ...
 
-The mutable counters (``n_records``, ``committed_rows``, own CRC32) sit at
-fixed offset 8, separate from the immutable JSON manifest
+The mutable counters (``n_records``, ``committed_rows``, ``stats_offset``,
+own CRC32) sit at fixed offset 8, separate from the immutable JSON manifest
 (``format_version`` and per-column ``{name, dtype, encoding, nullable}``).
-This split lets the writer commit a session atomically: the 32-byte
+This split lets the writer commit a session atomically: the 64-byte
 counters block is rewritten in place without shifting any record byte
 offsets. Format evolution is tracked via ``format_version`` in the
 manifest, not by changing the magic. The canonical file extension is
@@ -303,8 +303,8 @@ def write_header(
     The on-disk header has four parts:
 
       * 8-byte magic (constant).
-      * 32-byte counters block at fixed offset 8 -- ``(n_records,
-        committed_rows, crc32)``. The writer rewrites this in place on
+      * 64-byte counters block at fixed offset 8 -- ``(n_records,
+        committed_rows, stats_offset, crc32)``. The writer rewrites this in place on
         :meth:`ColStoreWriter.close` without touching the manifest.
       * 8-byte manifest length prefix + JSON manifest (immutable schema).
       * Zero padding so the first record header lands at a 64-byte
@@ -332,12 +332,12 @@ def write_header(
 def write_counters(
     file: IO[bytes], n_records: int, committed_rows: int, stats_offset: int = 0
 ) -> None:
-    """Rewrite the 32-byte counters block at its fixed offset.
+    """Rewrite the 64-byte counters block at its fixed offset.
 
     Seeks to the counters block first, so callers don't need to know
     where it lives on disk. Used by :meth:`ColStoreWriter.close` to
     commit the new record count, row total, and statistics-footer offset
-    atomically. The 32-byte block is small enough that a single ``write()``
+    atomically. The 64-byte block is small enough that a single ``write()``
     is generally atomic on common filesystems; even if it isn't, the
     embedded CRC catches a torn write on the next open.
     """
@@ -380,8 +380,8 @@ def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
 
     The header_dict merges the immutable manifest fields
     (``format_version``, ``columns``, ``manifest_crc32``) with the mutable
-    counters (``n_records``, ``committed_rows``); callers need not know
-    they live in separate on-disk regions. Only the file header is
+    counters (``n_records``, ``committed_rows``, ``stats_offset``); callers
+    need not know they live in separate on-disk regions. Only the file header is
     validated (magic, counters CRC, format version, manifest CRC);
     per-record headers and truncation past the file header are validated
     by :func:`read_record_index`, which the caller runs next. Callers that
@@ -628,7 +628,6 @@ def _resolve_rows_per_step(
     *,
     n_rows: int,
     n_columns: int,
-    total_bytes: int,
     column_itemsizes: list[int],
 ) -> list[int]:
     """Resolve a fixed-size ``batch_size`` to per-column rows-per-progress-step.
@@ -714,8 +713,9 @@ def write_dataset(
         Write chunking for the progress bar; no effect on the bytes
         written. Semantics are documented on :func:`colstore.store`.
     show_progress : bool
-        Whether to display a tqdm progress bar. The bar's postfix shows
-        cumulative throughput as ``rows=...Mrows/s, data=...MB/s``.
+        Whether to display a tqdm progress bar. The bar's postfix shows the
+        batch count and ``rows=...Mrows/s``; the byte rate is rendered by the
+        byte-counted bar itself.
     statistics : bool, default ``False``
         Record per-column statistics so later filters can skip data that cannot
         match. Most useful for selective queries on sorted or clustered data.
@@ -738,7 +738,6 @@ def write_dataset(
             resolved_batch_size,
             n_rows=n_rows,
             n_columns=n_columns,
-            total_bytes=total_bytes,
             column_itemsizes=column_itemsizes,
         )
 
@@ -766,8 +765,7 @@ def write_dataset(
         # gate lives in _numa.writer_policy_scope so this path and the
         # streaming path agree. The one-shot colstore.store() (which is
         # what most callers use) routes through here, so this is the
-        # call site that actually fixes the warm-cache NUMA placement
-        # the original benchmark identified.
+        # call site that fixes warm-cache NUMA placement for one-shot writes.
         _numa.writer_policy_scope(),
     ):
         write_header(output_file, columns_meta, n_records=1, committed_rows=n_rows)
@@ -1019,7 +1017,7 @@ def _fill_streaming_mmap(
 
 # Whether the streaming pwrite fill overlaps each batch's write with the next
 # batch's read+transform via a single background writer (a benchmark hook; False
-# writes each batch inline, the prior serial behavior). The compute is
+# writes each batch inline, no read/write overlap). The compute is
 # memory-bandwidth-bound and the pwrite is filesystem-bound, so the next batch is
 # prepared while the current one is written.
 _STREAMING_OVERLAP_WRITE: bool = True

@@ -19,7 +19,7 @@ Three pieces plus a suppression file:
 
 ## Requirements
 
-- **Valgrind** on `PATH` (`module load valgrind` on Perlmutter, or
+- **Valgrind** on `PATH` (`module load valgrind` on an HPC cluster with environment modules, or
   `conda install -c conda-forge valgrind`).
 - The **native extension built with debug info**, so leak stacks resolve to
   source lines instead of `???`. The `--build` flag below does this

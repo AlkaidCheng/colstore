@@ -467,7 +467,6 @@ def test_resolve_rows_per_step_returns_per_column_list():
         "1024 B",
         n_rows=1000,
         n_columns=2,
-        total_bytes=12_000,
         column_itemsizes=[1, 8],  # int8 + float64
     )
     # 1024 / 1 = 1024 rows per step for the int8 column
@@ -481,7 +480,6 @@ def test_resolve_rows_per_step_int_divides_by_columns():
         100,
         n_rows=1000,
         n_columns=5,
-        total_bytes=20_000,
         column_itemsizes=[4] * 5,
     )
     assert rows_per_step == [20, 20, 20, 20, 20]
@@ -492,7 +490,6 @@ def test_resolve_rows_per_step_zero_rows_returns_single_pass():
         100,
         n_rows=0,
         n_columns=3,
-        total_bytes=0,
         column_itemsizes=[4, 4, 4],
     )
     assert rows_per_step == [0, 0, 0]

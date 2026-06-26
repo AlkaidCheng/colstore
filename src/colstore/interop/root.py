@@ -434,7 +434,7 @@ class RootBackend(ABC):
     @staticmethod
     @abstractmethod
     def available() -> bool:
-        """Whether this backend's backend is importable."""
+        """Whether this backend's underlying library is importable."""
 
     @abstractmethod
     def read_batches(
@@ -780,9 +780,8 @@ class _InMemorySource:
     A row/column subset export has no contiguous store to stream, so its columns
     are gathered into memory. This exposes the small slice of the store-reader
     protocol the ROOT backends consume -- ``dtypes``, ``n_rows``, and
-    ``[rows, columns]`` chunk indexing -- so that in-memory subset streams to ROOT
-    directly, rather than being written to a scratch ``.cstore`` and reopened only
-    to present the same protocol.
+    ``[rows, columns]`` chunk indexing -- so that an in-memory subset streams to
+    ROOT directly.
     """
 
     def __init__(self, data: ColumnBatch) -> None:

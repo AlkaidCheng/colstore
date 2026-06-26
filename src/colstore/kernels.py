@@ -1,8 +1,9 @@
-"""Gather backends: C++/Cython (default), NumPy, and optional Numba.
+"""Python wrapper layer over the compiled ``colstore._gather`` kernels.
 
-The C++ backend lives in the compiled extension ``colstore._gather``;
-when the extension is not built, the dispatcher falls back to NumPy with
-a one-time warning. NumPy is always available and is used for ``slice``
+Wraps the gather kernels (C++/Cython, with a NumPy fallback and optional
+Numba) plus record-index build, parallel copy-runs, and record interleave.
+When the compiled extension is not built, :func:`gather` falls back to NumPy
+with a one-time warning; NumPy is always available and is used for ``slice``
 and full-column reads where fancy indexing isn't required.
 """
 

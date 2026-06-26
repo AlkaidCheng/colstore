@@ -12,12 +12,10 @@ if TYPE_CHECKING:
 
 
 def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataFrame:
-    """Build a DataFrame from a column dict with one block per column.
+    """Build a DataFrame with one un-consolidated block per column.
 
-    Equivalent to ``pd.DataFrame(columns)`` through the public DataFrame API, but
-    skips the eager dtype-block consolidation -- wasted work for the
-    read-and-pass-along path. Falls back to ``pd.DataFrame(columns)``, emitting a
-    ``UserWarning``, when the pandas internals it builds on are unavailable.
+    Falls back to ``pd.DataFrame(columns)``, emitting a ``UserWarning``, when the
+    pandas internals it builds on are unavailable.
     """
     import pandas as pd
 
@@ -32,6 +30,8 @@ def _make_dataframe_no_consolidate(columns: dict[str, NDArray[Any]]) -> pd.DataF
 
         arrays = list(columns.values())
         n_rows = arrays[0].shape[0]
+        # consolidate=False skips pandas' eager dtype-block consolidation, which
+        # is wasted work for the read-and-pass-along materialization path.
         block_manager = create_block_manager_from_column_arrays(
             arrays,
             axes=[Index(list(columns)), RangeIndex(n_rows)],

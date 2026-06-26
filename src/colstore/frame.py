@@ -313,7 +313,7 @@ class Expr:
         return Cast(self, np.dtype(dtype))
 
     def where(self, cond: Any, other: Any = np.nan) -> Expr:
-        """Keep this column where ``cond`` is true, else ``other`` (pandas ``Series.where``).
+        """Keep this column where ``cond`` is true, else ``other``.
 
         ``cond`` is a boolean column expression and ``other`` a column or scalar;
         equivalent to ``numpy.where(cond, self, other)``.
@@ -910,7 +910,7 @@ class _QueryValueBuilder:
 
     ``column`` resolves a name against the frame's columns -- so a ``col()``
     reference picks up a column derived in the frame, not only a stored one --
-    while ``op`` and ``isin`` build the matching graph nodes.
+    while ``op``, ``isin``, and ``where`` build the matching graph nodes.
     """
 
     __slots__ = ("_resolve",)
@@ -1074,8 +1074,9 @@ class ColStoreFrame:
     Indexing by name returns the expression for a column, which composes with
     operators and elementwise NumPy ufuncs to build transformations; a frame does not
     slice or index rows or columns (that is the reader's role). The edit methods
-    (``assign`` / ``with_columns`` / ``drop`` / ``rename`` / ``astype``) return a
-    new frame by default -- pass ``inplace=True`` to edit this one -- so edits
+    (``assign`` / ``with_columns`` / ``drop`` / ``rename`` / ``astype`` /
+    ``select``) return a new frame by default -- pass ``inplace=True`` to edit
+    this one -- so edits
     branch cheaply off a shared base; ``frame[name] = ...`` and ``del`` always
     edit in place. Nothing is read until you materialize:
     :meth:`array` / :meth:`dict` / :meth:`recarray` evaluate columns into memory,

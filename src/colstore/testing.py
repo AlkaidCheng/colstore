@@ -139,7 +139,7 @@ def write_columns(
     """Write caller-provided ``columns`` as a multi-record store; return a reader.
 
     Unlike :func:`make_store` (which *generates* the data), this writes the
-    arrays you pass -- use it for crafted or non-random layouts. All columns
+    provided columns -- for crafted or non-random layouts. All columns
     must share a length; ``records`` is a record *count* (rows split uniformly
     via :func:`uniform_record_rows`) or an explicit per-record row-count
     sequence summing to that length. The caller owns the returned reader.

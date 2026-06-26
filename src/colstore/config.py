@@ -216,16 +216,13 @@ def get_gather_binding() -> bool:
 def set_gather_binding(enabled: bool) -> None:
     """Enable or disable reader-side spread thread-binding.
 
-    Off by default. A placement x binding x cap sweep on 2- and 8-node hosts
-    found spread binding slower than the unbound pool in every cell for the
-    large random-scatter conversions (``dict``/``recarray``/``frame``),
-    independent of NUMA data placement -- a random gather touches all nodes
-    regardless, so pinning threads one-per-node only adds remote-access and
-    cross-node coherence cost. The gate is retained and exposed so a host or
-    access pattern that shows a measured win can opt in; when enabled, binding
-    is still gated per gather on working set versus aggregate last-level cache
-    and on the host having multiple NUMA nodes, so it stays a no-op on
-    single-node and cache-resident workloads.
+    Off by default: spread binding measured slower than the unbound pool for the
+    large random-scatter conversions, independent of data placement (see the
+    module-level note on ``_gather_binding``). The gate is exposed so a host or
+    access pattern with a measured win can opt in; when enabled, binding is still
+    gated per gather on working set versus aggregate last-level cache and on the
+    host having multiple NUMA nodes, so it stays a no-op on single-node and
+    cache-resident workloads.
     """
     global _gather_binding
     _gather_binding = bool(enabled)
@@ -364,7 +361,7 @@ def set_mask_density_gate(gate: float | Literal["auto"]) -> None:
     measured density, so calibration exists to *raise* or disable the gate
     on hosts where sparse masks lose (e.g. single-core environments). An
     explicit float >= 0 overrides both; values above 1.0 disable the route
-    entirely, which is also the benchmark baseline toggle.
+    entirely.
     """
     global _mask_density_gate
     if gate == "auto":
@@ -506,9 +503,7 @@ def set_numa_policy(policy: NumaPolicy) -> None:
     ``numactl --cpunodebind=N --membind=N python ...`` (or ``OMP_PLACES`` /
     ``OMP_PROC_BIND``). This measured ~1.3-1.7x faster than the interleaved
     default for warm ``dict``/``recarray``/``frame`` at scale; confirm on
-    your own hardware. In-library thread/data co-location is planned but not
-    yet implemented, which is why the default is left at ``"auto"`` rather
-    than flipped to ``"local"``.
+    your own hardware.
     """
     if policy not in ("auto", "interleave", "local"):
         raise ValueError(f"numa policy must be 'auto', 'interleave', or 'local'; got {policy!r}.")
@@ -529,8 +524,8 @@ def set_write_method(method: WriteMethod) -> None:
     * ``"pwrite"`` -- large sequential ``os.pwrite`` calls. Far faster on a
       parallel filesystem, where mmap's page-granular dirtying is slow; also
       faster node-local.
-    * ``"mmap"`` -- store each batch/run through a memory-mapped output. The
-      pre-pwrite behavior; kept for parity and as the non-Unix fallback.
+    * ``"mmap"`` -- store each batch/run through a memory-mapped output; kept
+      for parity and as the non-Unix fallback.
 
     The default suits every filesystem measured so far; override only to force a
     method (e.g. to reproduce the mmap path, or on a platform where it wins).
