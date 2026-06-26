@@ -22,6 +22,22 @@ The speed pass is repeated at every count in ``--threads`` (default: 1 and the
 OpenMP max), one subprocess per count with ``OMP_NUM_THREADS`` /
 ``POLARS_MAX_THREADS`` / the pyarrow CPU count pinned before import, so single-
 vs multi-threaded performance is measured apples-to-apples across every format.
+
+A ``--threads 1 8`` run (5M x 8, gather K=1M; indicative, varies by machine)
+shows the split between colstore's zero-decode and its parallelism -- random
+gather, ms, with the 8-thread-over-1-thread speedup::
+
+    format         1 thr   8 thr  speedup
+    colstore        38.4    15.5     2.5x   parallel C++/OpenMP gather
+    arrow_feather   30.2    29.3     1.0x   raw-mmap take, single-threaded
+    parquet         69.0    46.0     1.5x
+    pandas         133.3    82.4     1.6x
+    polars         359.0    59.0     6.1x
+    npy             67.7    70.7     1.0x   numpy fancy-index, no threads
+    hdf5            94.5    96.6     1.0x
+
+Single-threaded, colstore and Arrow/Feather (both raw-mmap zero-decode) are in
+the same class; colstore's lead at scale is the parallel gather, not the format.
 Peak memory is read in a fresh process per format (RSS is process-wide). Both
 re-invoke the script with internal flags (``--bench-threads`` / ``--peak-read``).
 """
@@ -578,7 +594,9 @@ def _print_speedup(by_n: dict[int, list[_c.Result]], threads: list[int]) -> None
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     _c.add_common_args(
         parser,
         repeat=5,
