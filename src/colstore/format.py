@@ -55,7 +55,7 @@ from typing import IO, Any
 
 import numpy as np
 
-from . import _footer, _numa, config
+from . import _footer, _numa, config, kernels
 from ._sizes import parse_byte_size
 from .frame import Expr, evaluate, fusible_passthroughs, validate_length
 from .progress import progress_bar
@@ -210,8 +210,6 @@ def read_record_index(
         On wrong record magic, mismatched record index, CRC mismatch, or a
         file shorter than its records imply. All indicate file corruption.
     """
-    from . import kernels
-
     if kernels.cpp_available():
         return kernels.read_record_index(path, data_offset, n_records, itemsizes)
     return _read_record_index_walk(path, data_offset, n_records, itemsizes)
