@@ -12,11 +12,12 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeAlias, overload
+from typing import Any, overload
 
 from . import format as fmt
 from ._coerce import coerce_to_columns
 from ._paths import has_glob_magic
+from ._types import Source
 from .compaction import compact_file
 from .dataset import ColStoreDataset
 from .reader import ColStoreReader
@@ -294,12 +295,9 @@ def compact(
 # ---- Concatenation: many files as one (lazy or written) ----------------
 
 
-ConcatSource: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
-
-
 @overload
 def concat(
-    sources: Sequence[ConcatSource],
+    sources: Sequence[Source],
     *,
     out: None = None,
     memory_budget: int | None = None,
@@ -307,14 +305,14 @@ def concat(
 ) -> ColStoreDataset: ...
 @overload
 def concat(
-    sources: Sequence[ConcatSource],
+    sources: Sequence[Source],
     *,
     out: str | os.PathLike[str],
     memory_budget: int | None = None,
     **reader_kwargs: Any,
 ) -> ColStoreReader: ...
 def concat(
-    sources: Sequence[ConcatSource],
+    sources: Sequence[Source],
     *,
     out: str | os.PathLike[str] | None = None,
     memory_budget: int | None = None,

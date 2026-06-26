@@ -49,12 +49,9 @@ from numpy.typing import NDArray
 from . import config
 from ._base import _indices_are_sorted, _ReaderBase
 from ._paths import expand_glob
+from ._types import Source
 from .reader import ColStoreReader
 from .shards import list_shards
-
-# A single source: a path to open (owned), or an already-open reader/dataset
-# (borrowed). The constructor and append() accept one of these or a sequence.
-SourceLike: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
 
 # Segment ids are recorded as int32 bins for cross-column reuse; above this many
 # segments the dict path keeps an independent pass per column instead.
@@ -152,7 +149,7 @@ class ColStoreDataset(_ReaderBase):
 
     def __init__(
         self,
-        sources: SourceLike | Sequence[SourceLike] | None = None,
+        sources: Source | Sequence[Source] | None = None,
         **reader_kwargs: Any,
     ) -> None:
         self._children: list[ColStoreReader] = []
@@ -244,9 +241,7 @@ class ColStoreDataset(_ReaderBase):
             self._offsets[1:] = np.cumsum([child.n_rows for child in self._children])
         self._n_rows = int(self._offsets[-1])
 
-    def append(
-        self, source: SourceLike | Sequence[SourceLike], **reader_kwargs: Any
-    ) -> ColStoreDataset:
+    def append(self, source: Source | Sequence[Source], **reader_kwargs: Any) -> ColStoreDataset:
         """Grow the dataset in place; return ``self`` so calls can be chained.
 
         ``source`` is anything the constructor accepts: a path -- a file, a glob,
