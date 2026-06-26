@@ -604,8 +604,7 @@ class ColStoreReader(_ReaderBase):
         each column's multi-record gather skips the per-column recheck (``None``
         recomputes it on demand).
         """
-        if self._closed:
-            raise ValueError("ColStoreReader is closed.")
+        self._check_open()
         if (
             isinstance(row_indexer, np.ndarray)
             and row_indexer.dtype == np.bool_
@@ -667,8 +666,7 @@ class ColStoreReader(_ReaderBase):
         cost of keeping the file mapped until the last view is
         garbage-collected.
         """
-        if self._closed:
-            raise ValueError("ColStoreReader is closed.")
+        self._check_open()
         if self._is_multi_record:
             raise ValueError(
                 "Zero-copy reads require a single-record store: multi-record logical "
@@ -727,8 +725,7 @@ class ColStoreReader(_ReaderBase):
         Raises ``ValueError`` for a non-native on-disk dtype, which the
         raw-load kernel cannot byteswap (the caller falls back).
         """
-        if self._closed:
-            raise ValueError("ColStoreReader is closed.")
+        self._check_open()
         cached = self._segment_table_cache.get(column_name)
         if cached is not None:
             return cached
@@ -769,8 +766,7 @@ class ColStoreReader(_ReaderBase):
         Raises ``ValueError`` for a non-native on-disk dtype: a raw byte copy
         cannot byteswap, so the caller falls back to the materializing write.
         """
-        if self._closed:
-            raise ValueError("ColStoreReader is closed.")
+        self._check_open()
         disk_dtype = self._column_dtypes[column_name]
         if not _dtype_is_native(disk_dtype):
             raise ValueError(

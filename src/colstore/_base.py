@@ -31,6 +31,7 @@ from .view import (
     resolve_preview_n,
     resolve_select,
     row_width,
+    validate_columns,
 )
 
 if TYPE_CHECKING:
@@ -360,6 +361,10 @@ class _ReaderBase(InteropMixin, abc.ABC):
             return ColumnView(self, row_part, column_names[0])
         return TableView(self, row_part, column_names)
 
+    def _require_columns(self, column_names: list[str]) -> None:
+        """Raise ``KeyError`` for any name not among the store's columns."""
+        validate_columns(self.columns, column_names)
+
     def _parse_key(self, key: Any) -> tuple[Any, list[str], bool]:
         """Split a ``__getitem__`` key into row part, column names, singular flag."""
         if isinstance(key, tuple):
@@ -386,9 +391,7 @@ class _ReaderBase(InteropMixin, abc.ABC):
                 f"got {type(column_part).__name__}."
             )
 
-        unknown = [name for name in column_names if name not in self._column_dtypes]
-        if unknown:
-            raise KeyError(f"Unknown column(s): {unknown}. Available columns: {self.columns}")
+        self._require_columns(column_names)
         return row_part, column_names, is_single_column
 
     @staticmethod
