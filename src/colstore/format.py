@@ -57,6 +57,7 @@ import numpy as np
 
 from . import _footer, _numa, config, kernels
 from ._sizes import parse_byte_size
+from ._types import StrPath
 from .frame import Expr, evaluate, fusible_passthroughs, validate_length
 from .progress import progress_bar
 
@@ -109,9 +110,6 @@ _RECORD_BODY_ALIGNMENT = 8
 # written.
 _DEFAULT_ENCODING = "raw"  # reserved for future "zstd", "dict", etc.
 _DEFAULT_NULLABLE = False  # reserved for future null-bitmap support
-
-# Path-like accepted by every public function in this module.
-PathLike = str | os.PathLike[str]
 
 ColumnLayout = dict[str, tuple[int, np.dtype[Any]]]
 
@@ -188,7 +186,7 @@ def itemsizes_of(columns_meta: list[dict[str, Any]]) -> list[int]:
 
 
 def read_record_index(
-    path: PathLike,
+    path: StrPath,
     data_offset: int,
     n_records: int,
     itemsizes: list[int],
@@ -221,7 +219,7 @@ def read_record_index(
 
 
 def _read_record_index_walk(
-    path: PathLike,
+    path: StrPath,
     data_offset: int,
     n_records: int,
     itemsizes: list[int],
@@ -383,7 +381,7 @@ def write_record_header(file: IO[bytes], record_index: int, n_rows: int) -> None
     file.write(record_header_bytes(record_index, n_rows))
 
 
-def read_header(path: PathLike) -> tuple[dict[str, Any], int]:
+def read_header(path: StrPath) -> tuple[dict[str, Any], int]:
     """Read and validate the file header; return ``(header_dict, data_start_offset)``.
 
     The header_dict merges the immutable manifest fields
@@ -698,7 +696,7 @@ def _format_rows_per_sec(rows_per_sec: float) -> str:
 
 def write_dataset(
     columns: dict[str, np.ndarray[Any, np.dtype[Any]]],
-    path: PathLike,
+    path: StrPath,
     *,
     batch_size: int | str | None,
     show_progress: bool,
@@ -1157,7 +1155,7 @@ def _fill_streaming(
 # One merge-copy run: (source path, source byte offset, destination byte offset,
 # byte count). A plan is these runs in destination-write order; copied in order
 # they fill the body.
-CopyRun = tuple[PathLike, int, int, int]
+CopyRun = tuple[StrPath, int, int, int]
 
 # Override for the merge-copy strategy, for benchmarking only (not public API).
 # ``None`` autodetects (see _resolve_write_method); "pwrite", "mmap", or "cfr"
@@ -1372,7 +1370,7 @@ def _execute_copy_plan(dst_path: str, plan: list[CopyRun], workers: int) -> None
 
 
 @contextlib.contextmanager
-def atomic_publish(path: PathLike) -> Iterator[str]:
+def atomic_publish(path: StrPath) -> Iterator[str]:
     """Yield a temp path to fill, then fsync it and rename it onto ``path``.
 
     A reader never sees a partial file: the content is built under a temporary
@@ -1400,7 +1398,7 @@ def atomic_publish(path: PathLike) -> Iterator[str]:
 def write_dataset_streaming(
     specs: dict[str, Expr],
     n_rows: int,
-    path: PathLike,
+    path: StrPath,
     *,
     memory_budget: int | None = None,
     rows: np.ndarray[Any, np.dtype[Any]] | None = None,

@@ -7,18 +7,17 @@ written -- then optionally compact the result to a single record.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from typing import Any, TypeAlias
 
 import numpy as np
 
+from .._types import StrPath
 from ..compaction import compact_file
 from ..progress import progress_bar
 from ..reader import ColStoreReader
 from ..writer import ColStoreWriter
 
-StrPath: TypeAlias = str | os.PathLike[str]
 ColumnBatch: TypeAlias = dict[str, np.ndarray[Any, np.dtype[Any]]]
 
 

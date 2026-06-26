@@ -35,9 +35,10 @@ import numpy as np
 from .. import api
 from .._base import _ReaderBase
 from .._sizes import resolve_batch_rows
+from .._types import StrPath
 from ..progress import progress_bar
 from ..reader import ColStoreReader
-from ._streaming import ColumnBatch, StrPath, write_column_batches
+from ._streaming import ColumnBatch, write_column_batches
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
