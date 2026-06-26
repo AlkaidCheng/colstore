@@ -239,13 +239,11 @@ def _acquire_directory_lock(directory: Path) -> int:
     os.makedirs(directory, exist_ok=True)
     fd = os.open(directory / _LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        _lock.lock_exclusive_nonblocking(fd)
-    except BlockingIOError as exc:
-        os.close(fd)
-        raise OSError(f"Another writer holds the lock on {directory}; close it first.") from exc
+        _lock.lock_or_raise(fd, directory)
     except BaseException:
-        # An unexpected lock error (or interrupt) must not leak the open fd; it
-        # has no finalizer, so close it before the exception propagates.
+        # Any lock error -- the standardized lock-held OSError, an unexpected
+        # error, or an interrupt -- must not leak the open fd; it has no
+        # finalizer, so close it before the exception propagates.
         os.close(fd)
         raise
     return fd
@@ -346,6 +344,28 @@ def _copy_shard_atomic(src_file: Path, final: Path) -> None:
         _copy_file(src_file, Path(tmp))
 
 
+def _normalize_and_write_shard(
+    directory: Path,
+    columns: Columns,
+    shard_name: str,
+    *,
+    expected: list[dict[str, Any]] | None,
+    statistics: bool,
+    batch_size: int | str | None,
+    show_progress: bool,
+) -> Path:
+    """Normalize ``columns`` against ``expected`` and write them as a shard."""
+    fmt.normalize_columns(columns, expected_schema=expected)
+    return _write_shard_atomic(
+        directory,
+        columns,
+        shard_name,
+        statistics=statistics,
+        batch_size=batch_size,
+        show_progress=show_progress,
+    )
+
+
 def append(
     directory: PathLike,
     data: Any,
@@ -387,11 +407,11 @@ def append(
         if opened is None:
             # In-memory data (dict / structured array / DataFrame): materialize.
             columns = _coerce_append_data(data)
-            fmt.normalize_columns(columns, expected_schema=expected)
-            return _write_shard_atomic(
+            return _normalize_and_write_shard(
                 directory,
                 columns,
                 shard_name,
+                expected=expected,
                 statistics=statistics,
                 batch_size=batch_size,
                 show_progress=show_progress,
@@ -402,11 +422,11 @@ def append(
             if statistics:
                 # The streaming/copy paths record no footer, so materialize here.
                 columns = _materialize_source(source)
-                fmt.normalize_columns(columns, expected_schema=expected)
-                return _write_shard_atomic(
+                return _normalize_and_write_shard(
                     directory,
                     columns,
                     shard_name,
+                    expected=expected,
                     statistics=True,
                     batch_size=batch_size,
                     show_progress=show_progress,

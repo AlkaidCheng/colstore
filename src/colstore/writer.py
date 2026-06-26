@@ -153,10 +153,10 @@ class ColStoreWriter:
         # :mod:`colstore._lock` dispatches to fcntl.flock on POSIX and
         # msvcrt.locking on Windows; both raise BlockingIOError on contention.
         try:
-            _lock.lock_exclusive_nonblocking(self._file.fileno())
-        except BlockingIOError as e:
+            _lock.lock_or_raise(self._file.fileno(), self._path)
+        except OSError:
             self._file.close()
-            raise OSError(f"Another writer holds the lock on {self._path}; close it first.") from e
+            raise
 
         if mode == "update":
             self._load_existing_state_for_update()
