@@ -94,6 +94,23 @@ def _writev_full(fd: int, buffers: list[Any]) -> None:
             views[index] = views[index][written:]
 
 
+def warn_unclosed_and_close(resource: Any, label: str, identifier: object) -> None:
+    """Warn that a write resource was garbage-collected unclosed, then close best-effort.
+
+    The shared ``__del__`` safety net: emit a :class:`ResourceWarning` naming
+    ``label`` (e.g. ``"ColStoreWriter"``) and ``identifier`` (its path or directory),
+    then run a suppressed ``close()``. Callers should still close explicitly.
+    """
+    warnings.warn(
+        f"{label} for {identifier} was not closed explicitly; committing from "
+        f"__del__. Prefer 'with' or an explicit .close().",
+        ResourceWarning,
+        stacklevel=3,
+    )
+    with contextlib.suppress(Exception):
+        resource.close()
+
+
 class ColStoreWriter:
     """Append-only writer for a colstore file. See module docstring.
 
@@ -469,15 +486,7 @@ class ColStoreWriter:
         # Best-effort commit on GC. Users should call close() explicitly;
         # this is the safety net for forgotten close() calls.
         if not self._closed:
-            warnings.warn(
-                f"ColStoreWriter for {self._path} was not closed explicitly; "
-                f"committing from __del__. Prefer 'with' or an explicit "
-                f".close() call.",
-                ResourceWarning,
-                stacklevel=2,
-            )
-            with contextlib.suppress(Exception):
-                self.close()
+            warn_unclosed_and_close(self, "ColStoreWriter", self._path)
 
     def __repr__(self) -> str:
         return (
