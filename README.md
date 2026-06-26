@@ -72,12 +72,6 @@ ds.head()                                    # peek: a table that renders in not
 colstore has three objects, one per job. Most code only ever needs
 `ColStoreReader`.
 
-| | Job | Get one from | Output |
-|---|---|---|---|
-| **`ColStoreReader`** | Read an existing file | `colstore.open(path)` | NumPy arrays / DataFrames, in memory |
-| **`ColStoreWriter`** | Write a *new* file from data you hold | `colstore.create` / `recreate` / `update` (context manager) | a `.cstore` on disk |
-| **`ColStoreFrame`** | Derive a *new* file from an existing one | `reader.edit()` | a new `.cstore` on disk, plus a reader for it |
-
 - **`ColStoreReader`** is the read interface. `colstore.open(path)` returns one;
   index it for lazy views (`ds[rows, cols]`) and materialize with `.array()`,
   `.dict()`, `.recarray()`, or `.frame()`. This is what you use to get data out.
@@ -92,6 +86,14 @@ colstore has three objects, one per job. Most code only ever needs
   branch cheaply off a shared base. Then materialize in memory (`array(name)`
   for one column, `dict()` / `recarray()` for all) or `.write(path)` to stream the
   result to a new file. It never modifies the source store.
+
+**Which to use:**
+
+| | Job | Get one from | Output |
+|---|---|---|---|
+| **`ColStoreReader`** | Read an existing file | `colstore.open(path)` | NumPy arrays / DataFrames, in memory |
+| **`ColStoreWriter`** | Write a *new* file from data you hold | `colstore.create` / `recreate` / `update` (context manager) | a `.cstore` on disk |
+| **`ColStoreFrame`** | Derive a *new* file from an existing one | `reader.edit()` | a new `.cstore` on disk, plus a reader for it |
 
 The distinction people miss is **writer vs. frame**: a writer persists data you
 are already holding in memory, while a frame derives a new file from one already
