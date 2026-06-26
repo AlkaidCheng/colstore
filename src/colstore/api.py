@@ -294,12 +294,12 @@ def compact(
 # ---- Concatenation: many files as one (lazy or written) ----------------
 
 
-_ConcatSource: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
+ConcatSource: TypeAlias = "str | os.PathLike[str] | ColStoreReader | ColStoreDataset"
 
 
 @overload
 def concat(
-    sources: Sequence[_ConcatSource],
+    sources: Sequence[ConcatSource],
     *,
     out: None = None,
     memory_budget: int | None = None,
@@ -307,14 +307,14 @@ def concat(
 ) -> ColStoreDataset: ...
 @overload
 def concat(
-    sources: Sequence[_ConcatSource],
+    sources: Sequence[ConcatSource],
     *,
     out: str | os.PathLike[str],
     memory_budget: int | None = None,
     **reader_kwargs: Any,
 ) -> ColStoreReader: ...
 def concat(
-    sources: Sequence[_ConcatSource],
+    sources: Sequence[ConcatSource],
     *,
     out: str | os.PathLike[str] | None = None,
     memory_budget: int | None = None,

@@ -34,7 +34,7 @@ import numpy as np
 from . import _lock
 from . import format as fmt
 from ._coerce import coerce_to_columns
-from ._paths import _natural_sort_key
+from ._paths import natural_sort_key
 from ._sizes import resolve_batch_rows
 
 if TYPE_CHECKING:
@@ -127,7 +127,7 @@ def list_shards(directory: PathLike) -> list[str]:
     append are excluded -- they do not end in ``.cstore`` / are dotfiles.
     """
     matches = glob.glob(os.path.join(os.fspath(directory), f"*{fmt.FILE_EXTENSION}"))
-    return sorted(matches, key=lambda path: _natural_sort_key(os.path.basename(path)))
+    return sorted(matches, key=lambda path: natural_sort_key(os.path.basename(path)))
 
 
 def _open_source(data: Any) -> tuple[ShardSource, bool] | None:

@@ -24,7 +24,7 @@ def has_glob_magic(text: str) -> bool:
     return _GLOB_MAGIC.search(text) is not None
 
 
-def _natural_sort_key(text: str) -> list[int | str]:
+def natural_sort_key(text: str) -> list[int | str]:
     """Sort key ordering embedded numbers numerically, so ``run_2`` < ``run_10``.
 
     Splitting on digit runs yields alternating non-digit / digit chunks; the
@@ -51,4 +51,4 @@ def expand_glob(item: str | os.PathLike[str]) -> list[str]:
     matches = glob.glob(text, recursive=True)
     if not matches:
         raise FileNotFoundError(f"no files matched the pattern {text!r}.")
-    return sorted(matches, key=_natural_sort_key)
+    return sorted(matches, key=natural_sort_key)

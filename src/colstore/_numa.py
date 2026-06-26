@@ -203,8 +203,8 @@ if _AVAILABLE:
         # or many NUMA domains) still work.
         _max_allowed = max(_ALLOWED_NODES)
         _n_words = (_max_allowed // _BITS_PER_LONG) + 1
-        _NodemaskType = ctypes.c_ulong * _n_words
-        _INTERLEAVE_MASK = _NodemaskType()
+        NodemaskType = ctypes.c_ulong * _n_words
+        _INTERLEAVE_MASK = NodemaskType()
         for _node in _ALLOWED_NODES:
             _INTERLEAVE_MASK[_node // _BITS_PER_LONG] |= 1 << (_node % _BITS_PER_LONG)
         _MAXNODE = _maxnode_for_bitmap(_n_words)
