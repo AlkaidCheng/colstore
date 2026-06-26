@@ -78,6 +78,7 @@ ENV/
 
 # Private
 collect_perf_reference.sh
+conda-recipe/
 
 # Claude
 .claude/
