@@ -203,6 +203,11 @@ class _BaseView(InteropMixin):
             # parameter's contract applies to the resulting fancy read).
             return np.ascontiguousarray(row_array)
         if row_array.dtype.kind not in ("i", "u"):
+            if row_array.size == 0:
+                # A bare empty index (e.g. ``ds[[]]``) is float64 by NumPy's default
+                # dtype; it selects no rows, so treat it as an empty integer fancy
+                # index rather than rejecting it on the placeholder dtype.
+                return np.empty(0, dtype=np.int64)
             raise IndexError(
                 f"Row index array must be integer or boolean; got dtype {row_array.dtype}."
             )

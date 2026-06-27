@@ -518,6 +518,15 @@ def test_fancy_and_boolean_selectors_raise(single_record_store):
         dataset[mask, "f8"].array(copy=False)
 
 
+def test_empty_index_selects_no_rows(small_store):
+    """A bare empty index (float64 by NumPy's default dtype) selects no rows, not an error."""
+    for sel in ([], np.array([], dtype=np.float64), np.array([], dtype=np.int64)):
+        assert small_store[sel].recarray().shape[0] == 0
+    assert len(small_store[[], "price"].array()) == 0  # empty index + single column
+    with pytest.raises(IndexError, match="integer or boolean"):
+        small_store[[1.5, 2.5]].recarray()  # a non-empty non-integer index is still rejected
+
+
 def test_table_view_frame_copy_false_shares_memory(single_record_store):
     dataset, data = single_record_store
     df = dataset[:, ["f8", "i2"]].frame(copy=False)

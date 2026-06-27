@@ -54,6 +54,10 @@ log documents it and everything since.
 
 ### Fixed
 
+- [[#242](https://github.com/AlkaidCheng/colstore/pull/242)] A bare empty row index
+  (`ds[[]]`) now selects no rows instead of raising `IndexError`. NumPy types an empty
+  Python list as `float64`, which the row-index validator rejected; an empty selection
+  is now treated as an empty integer index, the same as `ds[np.array([], dtype=int)]`.
 - [[#237](https://github.com/AlkaidCheng/colstore/pull/237)] Converting a column
   expression with `np.asarray` no longer raises the NumPy 2.0 `__array__`
   copy-keyword `DeprecationWarning`.
