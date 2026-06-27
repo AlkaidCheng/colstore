@@ -78,6 +78,36 @@ def test_chained_indexing_consistent_with_direct(small_store):
     assert chained.mean() == direct.mean()
 
 
+def test_view_row_reindexing_chained_equals_direct(small_store, small_frame):
+    """Re-indexing a view by rows composes onto its selection: view[key] == ds[rows[key], cols]."""
+    price = small_frame["price"].to_numpy()
+    n = small_store.n_rows
+    # ColumnView row narrowing, every selector kind
+    np.testing.assert_array_equal(small_store["price"][:10].array(), price[:10])
+    np.testing.assert_array_equal(small_store["price"][[7, 2, 5]].array(), price[[7, 2, 5]])
+    mask = np.arange(n) % 5 == 0
+    np.testing.assert_array_equal(small_store["price"][mask].array(), price[mask])
+    np.testing.assert_array_equal(small_store["price"][::-1][:3].array(), price[::-1][:3])
+    # chained: compose onto a slice view, a fancy view, a mask view
+    np.testing.assert_array_equal(small_store[20:80, "price"][5:15].array(), price[25:35])
+    rows = np.array([10, 20, 30, 40, 50])
+    np.testing.assert_array_equal(small_store[rows, "price"][1:4].array(), price[rows][1:4])
+    np.testing.assert_array_equal(small_store[mask, "price"][:4].array(), price[mask][:4])
+    # TableView: column projection unchanged; row narrowing; (rows, cols)
+    tv = small_store[20:120, ["price", "qty"]]
+    assert isinstance(tv["price"], ColumnView)
+    assert tv[["price"]].columns == ["price"]
+    assert tv[("price", "qty")].columns == ["price", "qty"]  # all-string tuple stays columns
+    narrowed = tv[10:20]
+    assert isinstance(narrowed, TableView)
+    np.testing.assert_array_equal(narrowed.array("price"), price[30:40])
+    np.testing.assert_array_equal(tv[10:20, "price"].array(), price[30:40])
+    np.testing.assert_array_equal(tv[10:20, ["price"]].array("price"), price[30:40])
+    # bounds are the view's own length
+    with pytest.raises(IndexError, match="out of bounds for the view"):
+        small_store[:50, "price"][100]
+
+
 def test_table_view_dict_matches_source(small_store, small_frame):
     result = small_store[100:200, ["price", "qty"]].dict()
     assert set(result) == {"price", "qty"}

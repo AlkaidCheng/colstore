@@ -54,6 +54,12 @@ log documents it and everything since.
 
 ### Fixed
 
+- [[#244](https://github.com/AlkaidCheng/colstore/pull/244)] A view is now re-indexable
+  by rows, composed onto its current selection. `ds['col'][:100]` (previously
+  `TypeError: 'ColumnView' object is not subscriptable`) and `ds[rows, cols][:10]`
+  (previously rejected) now work, equal to `ds[:100, 'col']` and `ds[:10, cols]`. A
+  slice of a slice stays a slice; `view['col']` / `view[['a', 'b']]` still project
+  columns, and `view[rows, cols]` does both.
 - [[#243](https://github.com/AlkaidCheng/colstore/pull/243)] Row-selecting (fancy
   index, boolean mask, or strided slice) a fixed-width column wider than 8 bytes —
   e.g. a NumPy `<U3` / `S10` string — on a multi-record or multi-file store no longer

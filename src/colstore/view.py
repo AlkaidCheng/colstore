@@ -143,6 +143,73 @@ def edit_row_selection(indexer: RowIndexer, n_rows: int) -> np.ndarray | None:
     return array.astype(np.int64, copy=False)
 
 
+def _is_column_key(key: Any) -> bool:
+    """Whether a table index selects columns -- a name, or a non-empty list/tuple of names.
+
+    Distinguishes ``tv['a']`` / ``tv[['a', 'b']]`` (column projection) from a row
+    re-selection (a slice, integer array, mask, or an empty list, all routed to rows).
+    """
+    if isinstance(key, str):
+        return True
+    if isinstance(key, (list, tuple)) and len(key) > 0:
+        return all(isinstance(name, str) for name in key)
+    return False
+
+
+def compose_slices(start: int, step: int, length: int, key: slice) -> slice:
+    """Compose ``key`` (a slice over a length-``length`` view) onto the view's own
+    ``range(start, _, step)`` store rows, analytically -- a slice of a slice stays a
+    slice, with no index array materialized.
+    """
+    sub_start, sub_stop, sub_step = key.indices(length)
+    count = len(range(sub_start, sub_stop, sub_step))
+    if count == 0:
+        return slice(0, 0)
+    new_step = step * sub_step
+    new_start = start + sub_start * step
+    new_stop = new_start + count * new_step
+    # A reverse run that passes row 0 needs the open-ended sentinel: a negative
+    # numeric stop would otherwise be read as an offset from the end.
+    if new_step < 0 and new_stop < 0:
+        return slice(new_start, None, new_step)
+    return slice(new_start, new_stop, new_step)
+
+
+def key_to_view_indices(key: Any, length: int) -> int | np.ndarray:
+    """Normalize a row re-selection ``key`` into indices in ``[0, length)`` of a view.
+
+    Returns a scalar ``int`` for a scalar selector, else an ``int64`` array (a boolean
+    mask must match ``length``). Negatives fold against ``length``; non-integer
+    selectors raise. Bounds are the view's own row count, not the store's.
+    """
+    if isinstance(key, (int, np.integer)):
+        position = int(key)
+        if position < 0:
+            position += length
+        if not 0 <= position < length:
+            raise IndexError(f"Row index {key} out of bounds for the view's {length} rows.")
+        return position
+    if isinstance(key, slice):
+        return np.arange(*key.indices(length), dtype=np.int64)
+    array = np.asarray(key)
+    if array.dtype == bool:
+        if array.shape[0] != length:
+            raise IndexError(
+                f"Boolean mask length {array.shape[0]} does not match the view's {length} rows."
+            )
+        return np.flatnonzero(array)
+    if array.size == 0:
+        return np.empty(0, dtype=np.int64)
+    if array.dtype.kind not in ("i", "u"):
+        raise IndexError(f"Row index must be integer or boolean; got dtype {array.dtype}.")
+    array = array.astype(np.int64, copy=False)
+    if array.min() < 0:
+        array = np.where(array < 0, array + length, array)
+    if array.min() < 0 or array.max() >= length:
+        raise IndexError(f"Row index out of bounds for the view's {length} rows.")
+    return array
+
+
 class _BaseView(InteropMixin):
     """Shared row-indexer plumbing for the two view types.
 
@@ -246,6 +313,32 @@ class _BaseView(InteropMixin):
         if lo < 0 or indices.max() >= n_rows:
             raise IndexError(f"Row index out of bounds for n_rows {n_rows}.")
         return indices
+
+    def _compose_rows(self, key: Any) -> Any:
+        """Compose a row re-selection ``key`` onto this view's current rows.
+
+        ``view[key]`` selects ``key`` from the rows the view already covers, so it
+        reads the same store rows as ``ds[<view rows>[key], <view cols>]``. Returns a
+        store-relative selector (int / slice / int64 array) for a new view; a concrete
+        view composes with no I/O (only a ``col()`` / ``query`` view resolves first).
+        """
+        current = self._resolve_row_indexer()
+        if current is None:
+            return key  # whole store -- the key already addresses store rows
+        if isinstance(current, slice):
+            start, stop, step = current.indices(self._store.n_rows)
+            length = len(range(start, stop, step))
+            if isinstance(key, slice):
+                return compose_slices(start, step, length, key)
+            sub = key_to_view_indices(key, length)
+            return start + sub * step
+        if isinstance(current, (int, np.integer)):
+            positions = np.array([int(current)], dtype=np.int64)
+        else:
+            positions = np.flatnonzero(current) if current.dtype == bool else current
+        sub = key_to_view_indices(key, positions.shape[0])
+        result = positions[sub]
+        return int(result) if isinstance(sub, int) else result
 
     def _preview(self, indexer: RowIndexer) -> Preview:
         """A ``Preview`` over a concrete row ``indexer`` -- provided by each view type."""
@@ -359,6 +452,16 @@ class ColumnView(NDArrayOperatorsMixin, ColumnReductions, _BaseView):
     ) -> None:
         super().__init__(store, row_part)
         self._column_name = column_name
+
+    def __getitem__(self, key: Any) -> ColumnView:
+        """Narrow this column's rows: ``ds['x'][:100]`` reads the first 100 ``x``.
+
+        Composes ``key`` (a slice, integer, integer array, or boolean mask) onto the
+        view's current row selection, the same as ``ds[<view rows>[key], 'x']`` -- so
+        ``ds['x'][:100]`` equals ``ds[:100, 'x']``. To read the values, call
+        :meth:`array` (or ``np.asarray``).
+        """
+        return ColumnView(self._store, self._compose_rows(key), self._column_name)
 
     @property
     def column(self) -> str:
@@ -530,9 +633,11 @@ class TableView(_ColumnTable, _BaseView):
     :meth:`recarray`, or :meth:`frame`. There is no no-argument ``array()`` --
     several columns generally have different dtypes and cannot be packed into a
     single homogeneous ndarray; read one column by name (``view['col']`` /
-    ``view.array('col')``) or use :meth:`recarray` for all of them. Indexing
-    projects columns: ``view['col']`` yields a :class:`ColumnView`,
-    ``view[['a', 'b']]`` a narrowed ``TableView`` (the same as :meth:`select`).
+    ``view.array('col')``) or use :meth:`recarray` for all of them. Indexing by a
+    name projects a column (``view['col']`` → a :class:`ColumnView`) and by a list of
+    names a sub-table (``view[['a', 'b']]``, the same as :meth:`select`); a row
+    selector (``view[:100]``, ``view[idx]``, ``view[mask]``) narrows the rows, composed
+    onto the view's selection, and ``view[rows, cols]`` does both.
     """
 
     __slots__ = ("_column_names",)
@@ -545,6 +650,32 @@ class TableView(_ColumnTable, _BaseView):
     ) -> None:
         super().__init__(store, row_part)
         self._column_names = column_names
+
+    def __getitem__(self, key: Any) -> ColumnView | TableView:
+        """Narrow this table by columns or rows.
+
+        ``view['col']`` / ``view[['a', 'b']]`` project columns (as before); a row
+        selector -- ``view[:100]``, ``view[idx]``, ``view[mask]`` -- narrows the rows,
+        composed onto the view's current selection; and ``view[rows, cols]`` does both.
+        So ``ds[:1000, cols][:10]`` equals ``ds[:10, cols]``.
+        """
+        if _is_column_key(key):
+            return super().__getitem__(key)  # _ColumnTable: project columns
+        if isinstance(key, tuple):
+            if len(key) != 2:
+                raise IndexError(f"Expected at most 2 elements in indexing tuple; got {len(key)}.")
+            rows, cols = key
+            composed = self._compose_rows(rows)
+            if isinstance(cols, str):
+                validate_columns(self._column_names, [cols])
+                return ColumnView(self._store, composed, cols)
+            if isinstance(cols, (list, tuple)):
+                chosen = resolve_select(self._column_names, tuple(cols))
+                return TableView(self._store, composed, chosen)
+            raise IndexError(
+                f"Column selector must be a string or list of strings; got {type(cols).__name__}."
+            )
+        return TableView(self._store, self._compose_rows(key), self._column_names)
 
     @property
     def columns(self) -> list[str]:
