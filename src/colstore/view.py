@@ -22,7 +22,7 @@ from . import config
 from ._pandas import _make_dataframe_no_consolidate
 from ._query import _Expr
 from ._render import Preview, render_lazy_card, render_lazy_card_text
-from .frame import ColStoreFrame
+from .frame import ColStoreFrame, ColumnReductions
 from .interop import InteropMixin
 
 if TYPE_CHECKING:
@@ -326,7 +326,7 @@ class _BaseView(InteropMixin):
         return ColStoreFrame(self._store, columns, rows)
 
 
-class ColumnView(_BaseView):
+class ColumnView(ColumnReductions, _BaseView):
     """Lazy view of a single column produced by indexing with a string name.
 
     Materializes to a 1D ``numpy.ndarray`` via :meth:`array`. No other
@@ -384,6 +384,13 @@ class ColumnView(_BaseView):
         if not copy:
             return self._store._view_one(self._column_name, row_indexer)
         return self._store._gather_one(self._column_name, row_indexer)
+
+    def _reduction_frame(self) -> ColStoreFrame:
+        # A reader column reduces through its editing frame (the streaming engine).
+        return self.edit()
+
+    def _reduction_name(self) -> str:
+        return self._column_name
 
     def evaluate(self) -> ColumnView:
         """Resolve the (lazy) row selection now; return a view over the concrete rows.

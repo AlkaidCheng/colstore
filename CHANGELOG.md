@@ -8,6 +8,16 @@ log documents it and everything since.
 
 ### Added
 
+- [[#237](https://github.com/AlkaidCheng/colstore/pull/237)] Pandas-style terminals
+  on a single column. A reader/dataset column (`ds[name]`) and a frame column
+  (`frame[name]`) now offer reductions (`sum` / `mean` / `min` / `max` / `count`),
+  1-D materialization (`array()`), and the NumPy array interface, each over the
+  column's current row selection. Reductions are eager terminals whether spelled as a
+  method (`column.mean()`) or a NumPy reduction (`np.sum(column)`); on a frame column,
+  elementwise NumPy stays lazy (`np.log(frame[name])` builds an expression). The
+  reductions are shared through one `ColumnReductions` mixin and stream in bounded
+  memory. `np.asarray(frame)` yields the frame's data as a structured record array
+  (rather than its column names).
 - [[#231](https://github.com/AlkaidCheng/colstore/pull/231)] `ColStoreFrame.frame()`
   returning a pandas DataFrame, so the editing frame has the same materializers
   (`array` / `dict` / `recarray` / `frame`) as the reader and views.
@@ -23,6 +33,9 @@ log documents it and everything since.
 
 ### Fixed
 
+- [[#237](https://github.com/AlkaidCheng/colstore/pull/237)] Converting a column
+  expression with `np.asarray` no longer raises the NumPy 2.0 `__array__`
+  copy-keyword `DeprecationWarning`.
 - [[#235](https://github.com/AlkaidCheng/colstore/pull/235)] The HDF5 and JSON
   importers no longer reject a numeric column whose missing values are an in-band
   sentinel: float `NaN` and datetime/timedelta `NaT` now round-trip, matching the
