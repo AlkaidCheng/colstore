@@ -16,6 +16,7 @@ Examples
 >>> frame = pl.from_arrow(ds)             # via __arrow_c_stream__   # doctest: +SKIP
 """
 
+from . import cstore as _cstore  # noqa: F401  -- registers the native cstore file format
 from .base import (
     DataFormat,
     FileFormat,
