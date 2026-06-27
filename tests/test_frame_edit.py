@@ -17,6 +17,7 @@ import pytest
 import colstore
 from colstore import ColStoreFrame, col
 from colstore.format import write_dataset
+from colstore.frame import FrameColumn
 
 
 def _make_store(tmp_path, columns, name="src.cstore"):
@@ -510,9 +511,14 @@ def test_where_is_filter_alias(source):
 # -- frame[...] is column-name access only (no row/column indexing) --
 
 
-def test_getitem_string_returns_column_expression(source, source_cols):
+def test_getitem_string_returns_frame_column(source, source_cols):
     cf = source.edit()
-    assert cf["a"] is cf._columns["a"]  # the column's lazy expression, for building
+    column = cf["a"]
+    # frame[name] is a frame-aware column: it wraps the column's lazy expression
+    # (for building transforms) and carries the owning frame (for terminals).
+    assert isinstance(column, FrameColumn)
+    assert column._inner is cf._columns["a"]
+    assert column._frame is cf
     assert (
         cf.assign(s=cf["a"] + cf["b"]).dict()["s"].tolist()
         == (source_cols["a"] + source_cols["b"]).tolist()

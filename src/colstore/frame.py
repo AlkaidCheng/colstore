@@ -62,6 +62,7 @@ __all__ = [
     "CutInfo",
     "CutflowReport",
     "Expr",
+    "FrameColumn",
     "MemoryColumn",
     "NativeColumn",
     "UFunc",
@@ -114,6 +115,21 @@ def _check_operand(value: Any) -> None:
     raise TypeError(f"unsupported operand for a column expression: {type(value).__name__!r}.")
 
 
+def _unwrap(value: Any) -> Any:
+    """Normalize a :class:`FrameColumn` to the node it wraps.
+
+    A frame column is a frame-bound handle on a column expression; inside the
+    computation graph only the wrapped node matters (the owning frame is for the
+    terminals). Every point that takes a node normalizes through this one helper --
+    the node constructors on their children, and :func:`evaluate` / :func:`_iter_leaves`
+    / :func:`as_expr` on a node handed in directly -- so a frame column never persists
+    in a composed or stored graph. That keeps graphs free of frame back-references (and
+    the reference cycle a stored ``frame[name]`` would otherwise create), and leaves the
+    structural key unchanged, since a frame column shares its inner node's ``_key``.
+    """
+    return value._inner if isinstance(value, FrameColumn) else value
+
+
 class Expr:
     """A node in a deferred column computation graph.
 
@@ -161,7 +177,13 @@ class Expr:
 
     def __array_function__(
         self, func: Any, types: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> Expr:
+    ) -> Any:
+        if func in _NP_COLUMN_REDUCTIONS:
+            raise TypeError(
+                f"numpy.{func.__name__} reduces over rows, which a bare column "
+                "expression has none of; reduce a frame column -- frame[name].sum() "
+                "or np.sum(frame[name]) -- or reduce the frame with frame.sum(expr)."
+            )
         builder = _ARRAY_FUNCTIONS.get(func)
         if builder is None:
             raise TypeError(
@@ -170,10 +192,11 @@ class Expr:
             )
         return builder(*args, **kwargs)
 
-    def __array__(self, dtype: Any = None) -> NDArray[Any]:
+    def __array__(self, dtype: Any = None, copy: Any = None) -> NDArray[Any]:
         raise TypeError(
-            "a column expression cannot be converted to an array directly; attach "
-            "it as a column and read it back, or call evaluate() over a row range."
+            "a column expression cannot be converted to an array directly; index it "
+            "off a frame (frame[name]) and read that back, or call evaluate() over a "
+            "row range."
         )
 
     def __bool__(self) -> bool:
@@ -577,7 +600,7 @@ class UFunc(Expr):
 
     def __init__(self, ufunc: np.ufunc, inputs: tuple[Any, ...]) -> None:
         self._ufunc = ufunc
-        self._inputs = tuple(inputs)
+        self._inputs = tuple(_unwrap(child) for child in inputs)
         self._key = (
             "ufunc",
             ufunc.__name__,
@@ -599,6 +622,7 @@ class Cast(Expr):
     __slots__ = ("_dtype", "_input", "_key")
 
     def __init__(self, node: Expr, dtype: np.dtype[Any]) -> None:
+        node = _unwrap(node)
         self._input = node
         self._dtype = dtype
         self._key = ("cast", dtype.str, node._key)
@@ -615,6 +639,7 @@ class Isin(Expr):
     __slots__ = ("_key", "_target", "_values")
 
     def __init__(self, target: Expr, values: Any) -> None:
+        target = _unwrap(target)
         self._target = target
         self._values = np.asarray(values)
         self._key = ("isin", target._key, self._values.dtype.str, self._values.tobytes())
@@ -632,6 +657,7 @@ class Where(Expr):
     __slots__ = ("_a", "_b", "_cond", "_key")
 
     def __init__(self, cond: Any, a: Any, b: Any) -> None:
+        cond, a, b = _unwrap(cond), _unwrap(a), _unwrap(b)
         for value in (cond, a, b):
             _check_operand(value)
         if not any(isinstance(value, Expr) for value in (cond, a, b)):
@@ -672,6 +698,7 @@ class Apply(Expr):
     def __init__(
         self, func: Callable[..., Any], inputs: tuple[Expr, ...], out_dtype: Any = None
     ) -> None:
+        inputs = tuple(_unwrap(inp) for inp in inputs)
         self._func = func
         self._inputs = inputs
         self._declared = out_dtype is not None
@@ -743,6 +770,19 @@ def _np_clip(a: Any, a_min: Any = None, a_max: Any = None, **kwargs: Any) -> Exp
 # node it builds. Anything outside this table raises in ``Expr.__array_function__``.
 _ARRAY_FUNCTIONS: dict[Any, Callable[..., Expr]] = {np.where: _np_where, np.clip: _np_clip}
 
+# NumPy reduction functions and the matching eager column-reduction method. A frame
+# column routes these to the method (an eager terminal over the frame's selection); a
+# bare expression has no rows to reduce and rejects them. (np.min/np.amin and
+# np.max/np.amax are distinct objects, so both spellings are listed.)
+_NP_COLUMN_REDUCTIONS: dict[Any, str] = {
+    np.sum: "sum",
+    np.mean: "mean",
+    np.min: "min",
+    np.amin: "min",
+    np.max: "max",
+    np.amax: "max",
+}
+
 
 def evaluate(
     node: Expr,
@@ -759,6 +799,7 @@ def evaluate(
     selection runs the whole graph on empty typed arrays without touching any
     backing store, which is how :func:`result_dtype` recovers the dtype for free.
     """
+    node = _unwrap(node)  # a frame column evaluates as the node it wraps
     cached = memo.get(node._key)
     if cached is not None:
         return cached
@@ -816,8 +857,143 @@ def result_dtype(node: Expr) -> np.dtype[Any]:
     return evaluate(node, slice(0, 0), {}).dtype
 
 
+def _reject_reduction_params(axis: Any, dtype: Any, out: Any, extra: dict[str, Any]) -> None:
+    """Reject the NumPy reduction parameters a 1-D column reduction cannot honor.
+
+    A column reduces over all its rows to a scalar, so it accepts only the defaults
+    NumPy passes for ``np.sum(column)`` / ``np.mean(column)`` and friends (``axis``
+    of ``None``/``0``, no ``dtype`` / ``out``, and none of ``keepdims`` / ``where`` /
+    ``initial``). Anything else is rejected rather than silently ignored, so a caller
+    never receives a result that quietly disregards what they asked for; materialize
+    with ``.array()`` to use the full NumPy reduction surface.
+    """
+    rejected = []
+    if axis not in (None, 0):
+        rejected.append("axis (other than 0 or None)")
+    if dtype is not None:
+        rejected.append("dtype")
+    if out is not None:
+        rejected.append("out")
+    rejected.extend(sorted(extra))  # keepdims / where / initial / any other are unsupported
+    if rejected:
+        raise TypeError(
+            "a column reduces over all its rows to a scalar; the NumPy reduction "
+            f"parameter(s) {', '.join(rejected)} are not supported -- materialize the "
+            "column with .array() to reduce it with the full NumPy surface."
+        )
+
+
+class ColumnReductions:
+    """Pandas-style reductions for a single column, shared by every column handle.
+
+    A column reduces by streaming its values in bounded memory through the editing
+    frame, which is the reduction engine (:meth:`ColStoreFrame.sum` and friends).
+    The subclass names the column and the frame to reduce it over -- a
+    :class:`FrameColumn` already owns its frame, while a
+    :class:`~colstore.view.ColumnView` reduces through its editing frame -- so the
+    reductions behave identically wherever a column comes from.
+
+    The reductions accept the NumPy reduction parameters so a bare ``np.sum(column)``
+    / ``np.mean(column)`` dispatches to the streaming pass rather than materializing;
+    a 1-D column only honors their defaults (the whole column, to a scalar) and
+    rejects the rest rather than silently ignore them.
+    """
+
+    __slots__ = ()
+
+    def _reduction_frame(self) -> ColStoreFrame:
+        """The editing frame to reduce this column over."""
+        raise NotImplementedError
+
+    def _reduction_name(self) -> str:
+        """This column's name within :meth:`_reduction_frame`."""
+        raise NotImplementedError
+
+    def sum(self, axis: Any = None, dtype: Any = None, out: Any = None, **kwargs: Any) -> Any:
+        """Sum of this column over its selected rows (a bounded-memory streaming pass)."""
+        _reject_reduction_params(axis, dtype, out, kwargs)
+        return self._reduction_frame().sum(self._reduction_name())
+
+    def mean(self, axis: Any = None, dtype: Any = None, out: Any = None, **kwargs: Any) -> Any:
+        """Mean of this column over its selected rows."""
+        _reject_reduction_params(axis, dtype, out, kwargs)
+        return self._reduction_frame().mean(self._reduction_name())
+
+    def min(self, axis: Any = None, dtype: Any = None, out: Any = None, **kwargs: Any) -> Any:
+        """Minimum of this column over its selected rows."""
+        _reject_reduction_params(axis, dtype, out, kwargs)
+        return self._reduction_frame().min(self._reduction_name())
+
+    def max(self, axis: Any = None, dtype: Any = None, out: Any = None, **kwargs: Any) -> Any:
+        """Maximum of this column over its selected rows."""
+        _reject_reduction_params(axis, dtype, out, kwargs)
+        return self._reduction_frame().max(self._reduction_name())
+
+    def count(self) -> int:
+        """Number of rows in this column's selection."""
+        return self._reduction_frame().count()
+
+
+class FrameColumn(ColumnReductions, Expr):
+    """A frame's column: its expression, plus terminals bound to the owning frame.
+
+    Returned by ``frame[name]`` -- unlike :func:`~colstore.col`, which is owner-free,
+    a frame column knows its parent frame. It follows the frame's lazy model:
+
+    - **Elementwise operations are lazy** -- ``frame["a"] * 2``, ``np.log(frame["a"])``,
+      and ``frame.assign(x=frame["a"] + frame["b"])`` build expression nodes that
+      compute only when the frame is materialized (or :meth:`~Expr.compute` is called).
+    - **Reductions are eager terminals** -- ``frame["a"].sum()`` and the NumPy spelling
+      ``np.sum(frame["a"])`` both run a bounded-memory pass over the frame's current
+      row selection and return a scalar now.
+    - **Materializing the column** -- ``frame[name].array()`` / ``np.asarray(frame[name])``
+      gather the column itself over the selection (the same as ``frame.array(name)``).
+
+    For composition and evaluation it stands in for the wrapped expression: it shares
+    the inner node's ``_key`` and the graph walkers unwrap it.
+    """
+
+    __slots__ = ("_frame", "_inner", "_key", "_name")
+
+    def __init__(self, frame: ColStoreFrame, name: str, inner: Expr) -> None:
+        self._frame = frame
+        self._name = name
+        self._inner = inner
+        self._key = inner._key
+
+    def _reduction_frame(self) -> ColStoreFrame:
+        return self._frame
+
+    def _reduction_name(self) -> str:
+        return self._name
+
+    def __array_function__(
+        self, func: Any, types: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        method = _NP_COLUMN_REDUCTIONS.get(func)
+        if method is not None and args and args[0] is self:
+            # A NumPy reduction on a frame column is an eager terminal over the
+            # frame's selection -- the same as frame[name].sum() -- not a lazy node.
+            return getattr(self, method)(*args[1:], **kwargs)
+        return Expr.__array_function__(self, func, types, args, kwargs)
+
+    def array(self) -> NDArray[Any]:
+        """Materialize this column as a 1-D array over the frame's selected rows."""
+        return self._frame.array(self._name)
+
+    def __array__(self, dtype: Any = None, copy: Any = None) -> NDArray[Any]:
+        if copy is False:
+            raise ValueError(
+                "a frame column is materialized by gathering its selected rows and "
+                "cannot be created without copying; use np.asarray(...) or copy=True."
+            )
+        out = self._frame.array(self._name)
+        return out if dtype is None or out.dtype == dtype else out.astype(dtype)
+
+
 def _iter_leaves(node: Expr) -> Iterator[_Leaf]:
     """Yield the leaf nodes reachable from ``node`` (with repetition)."""
+    node = _unwrap(node)
     if isinstance(node, _Leaf):
         yield node
     elif isinstance(node, UFunc):
@@ -897,6 +1073,7 @@ def as_expr(value: Any, *, copy: bool = False) -> Expr:
     assignment syntax to the graph; native columns are constructed by the frame
     from its source store, not here.
     """
+    value = _unwrap(value)  # store the wrapped node, not the owner-bound wrapper
     if isinstance(value, Expr):
         return value
     if _is_scalar_operand(value):
@@ -1258,16 +1435,17 @@ class ColStoreFrame:
     def __contains__(self, name: object) -> bool:
         return name in self._columns
 
-    def __getitem__(self, key: Any) -> Expr:
-        """The named column's expression -- for building transforms, not data access.
+    def __getitem__(self, key: Any) -> FrameColumn:
+        """Column ``key`` as a :class:`FrameColumn` -- its expression bound to this frame.
 
-        ``frame["a"]`` returns column ``a``'s lazy expression, which composes with
-        operators and ufuncs (``frame["a"] * 2``, ``frame.assign(x=frame["a"] +
-        frame["b"])``). A frame does **not** slice or index rows or columns: filter with
+        It composes like a lazy expression (``frame["a"] * 2``, ``frame.assign(x=
+        frame["a"] + frame["b"])``) and, because it knows its owning frame, also offers
+        pandas-style terminals over the frame's current row selection:
+        ``frame["a"].mean()`` / ``.sum()`` / ``.array()`` / ``np.asarray(frame["a"])``.
+        A frame still does **not** slice or index rows or columns -- filter with
         :meth:`where`, project columns with :meth:`select`, and for positional or fancy
-        indexing :meth:`write` the frame to a ``.cstore`` and index the returned reader,
-        where the data is contiguous. (The reader / dataset is for viewing; the frame is
-        for filtering and editing.)
+        indexing :meth:`write` the frame and index the returned reader, where the data is
+        contiguous. (The reader / dataset is for viewing; the frame is for editing.)
         """
         if not isinstance(key, str):
             raise TypeError(
@@ -1277,7 +1455,7 @@ class ColStoreFrame:
                 f"write() the frame and index the returned reader."
             )
         try:
-            return self._columns[key]
+            return FrameColumn(self, key, self._columns[key])
         except KeyError:
             raise KeyError(
                 f"column {key!r} is not in the frame; have {list(self._columns)}."
@@ -1615,10 +1793,9 @@ class ColStoreFrame:
 
         The single-column counterpart of :meth:`dict` / :meth:`recarray` -- resolves any
         pending :meth:`where` predicate, then evaluates column ``name`` over the selected
-        rows. (``frame[name]`` returns the column's expression for building transforms;
-        evaluating that directly with ``Expr.compute`` ignores the frame's row selection.)
+        rows. Equivalent to ``frame[name].array()``.
         """
-        return evaluate(self[name], self._resolve_rows(), {})
+        return evaluate(self._resolve_column(name), self._resolve_rows(), {})
 
     def dict(self) -> dict[str, NDArray[Any]]:
         """Compute every column into memory as a ``name -> array`` mapping; writes no file.
@@ -1651,6 +1828,22 @@ class ColStoreFrame:
         them into a DataFrame in column order with the computed dtypes. Requires pandas.
         """
         return _make_dataframe_no_consolidate(self.dict())
+
+    def __array__(self, dtype: Any = None, copy: Any = None) -> NDArray[Any]:
+        """The frame as a structured (record) ndarray -- ``np.asarray(frame)``.
+
+        Materializes every column over the selected rows (the :meth:`recarray` form),
+        so a frame converts to NumPy as its data, not its column names. The record
+        array repacks the columns into one buffer, so ``copy=False`` raises rather
+        than allocate.
+        """
+        if copy is False:
+            raise ValueError(
+                "a frame's record array repacks its columns and cannot be created "
+                "without copying; use np.asarray(...) or copy=True."
+            )
+        out = self.recarray()
+        return out if dtype is None or out.dtype == dtype else out.astype(dtype)
 
     # ---- Reduction terminals (full pass, scalar result) ----------------
 
