@@ -5,6 +5,10 @@ variable-length string column is **coerced to fixed-width** (``U``); a nested
 (list / struct / object-of-objects) column is **rejected** with a clear error.
 These helpers centralize that policy and the Arrow / pandas bridges so every
 format applies it identically.
+
+A genuine null -- an out-of-band missing value (an object ``None``, a masked
+nullable dtype, or an Arrow validity bit) -- is rejected, but a NaN / NaT bit
+pattern in a native numeric column is a valid value and is stored.
 """
 
 from __future__ import annotations
@@ -21,7 +25,12 @@ _FIXED_KINDS = frozenset("fiubMmSU")
 
 
 def _is_null(value: Any) -> bool:
-    """Whether ``value`` is a null colstore cannot store (``None`` or a NaN float)."""
+    """Whether an object-array element has no fixed-width string form (``None`` or NaN).
+
+    Used only when coercing an *object* column to fixed-width strings, where a ``None``
+    or a NaN float is a missing string with no fixed-width representation. A NaN in a
+    native float column is a valid value and IS stored -- see :func:`frame_to_columns`.
+    """
     return value is None or (isinstance(value, float) and value != value)
 
 
@@ -116,9 +125,14 @@ def frame_to_columns(frame: Any) -> dict[str, np.ndarray[Any, Any]]:
     columns: dict[str, np.ndarray[Any, Any]] = {}
     for name in frame.columns:
         series = frame[name]
-        if series.isna().any():
+        array = series.to_numpy()
+        # NaN / NaT in a native float / complex / datetime / timedelta column is a valid
+        # bit pattern that round-trips losslessly; only an out-of-band null -- an object
+        # None or a masked nullable/extension dtype, which converts to an object array --
+        # has no fixed-width form.
+        if array.dtype.kind not in "fcmM" and series.isna().any():
             _reject_nulls(str(name))
-        columns[str(name)] = storable_column(str(name), series.to_numpy())
+        columns[str(name)] = storable_column(str(name), array)
     return columns
 
 

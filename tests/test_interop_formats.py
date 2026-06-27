@@ -196,6 +196,42 @@ def test_json_null_rejected(tmp_path):
         colstore.from_json(path, tmp_path / "n.cstore")
 
 
+def test_hdf5_float_nan_is_stored_not_null(tmp_path):
+    """A NaN in a native float column is a valid value, not a null -- it round-trips."""
+    _need("h5py", "pandas", "tables")
+    import pandas as pd
+
+    path = tmp_path / "nan.h5"
+    pd.DataFrame({"m": [120.5, np.nan, 88.1], "n": [1, 2, 3]}).to_hdf(path, key="frame", mode="w")
+    out = colstore.from_hdf(path, tmp_path / "nan.cstore").dict()
+    np.testing.assert_array_equal(np.isnan(out["m"]), [False, True, False])
+    assert out["m"][0] == 120.5 and out["m"][2] == 88.1
+    assert list(out["n"]) == [1, 2, 3]
+
+
+def test_json_float_nan_is_stored_not_null(tmp_path):
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    path = tmp_path / "nan.json"
+    pd.DataFrame({"m": [120.5, np.nan, 88.1]}).to_json(path, orient="records")
+    out = colstore.from_json(path, tmp_path / "nan.cstore").dict()
+    np.testing.assert_array_equal(np.isnan(out["m"]), [False, True, False])
+
+
+def test_hdf5_datetime_nat_is_stored_not_null(tmp_path):
+    """NaT is datetime64's in-band sentinel -- stored like float NaN, not rejected."""
+    _need("h5py", "pandas", "tables")
+    import pandas as pd
+
+    path = tmp_path / "nat.h5"
+    pd.DataFrame({"t": pd.to_datetime(["2021-01-01", None, "2021-01-03"])}).to_hdf(
+        path, key="frame", mode="w"
+    )
+    out = colstore.from_hdf(path, tmp_path / "nat.cstore").dict()
+    assert np.isnat(out["t"]).tolist() == [False, True, False]
+
+
 def test_nested_or_non_string_object_rejected():
     from colstore.interop._convert import storable_column
 
