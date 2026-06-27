@@ -475,13 +475,59 @@ class ColumnView(NDArrayOperatorsMixin, ColumnReductions, _BaseView):
             return None
 
 
-class TableView(_BaseView):
-    """Lazy view of multiple columns produced by any non-string indexing.
+class _ColumnTable:
+    """Column access shared by the store-backed, row-selected tables.
 
-    Materializes through one of :meth:`dict`, :meth:`recarray`, or
-    :meth:`frame`. There is intentionally no ``array`` method —
-    multiple columns generally have different dtypes and cannot be packed
-    into a single homogeneous ndarray.
+    A reader/dataset and a :class:`TableView` are both multi-column tables over a
+    store and a row selection, so they reach their columns the same way:
+    ``table[name]`` projects one column (a :class:`ColumnView`), ``table[[names]]``
+    narrows to a sub-table (a :class:`TableView`), and :meth:`array` reads one column
+    to a 1-D array. The concrete class supplies its column names and how it builds a
+    column view / sub-table over its own rows; this keeps that surface identical
+    wherever a table comes from.
+    """
+
+    __slots__ = ()
+
+    @property
+    def columns(self) -> list[str]:
+        """Names of this table's columns, in selection order."""
+        raise NotImplementedError
+
+    def _column_view(self, name: str) -> ColumnView:
+        raise NotImplementedError
+
+    def _sub_table(self, names: list[str]) -> TableView:
+        raise NotImplementedError
+
+    def __getitem__(self, key: Any) -> ColumnView | TableView:
+        """``table[name]`` → a column view; ``table[[names]]`` → a narrowed table."""
+        if isinstance(key, str):
+            validate_columns(self.columns, [key])
+            return self._column_view(key)
+        if isinstance(key, (list, tuple)):
+            return self._sub_table(resolve_select(self.columns, tuple(key)))
+        raise TypeError(
+            f"index a table by a column name (→ a column) or a list of names (→ a "
+            f"sub-table); got {type(key).__name__}. To select rows, index the reader "
+            "(ds[rows, cols]) or filter with where() / query()."
+        )
+
+    def array(self, name: str, copy: bool = True) -> np.ndarray:
+        """Materialize one column as a 1-D array -- the shortcut for ``table[name].array()``."""
+        return self._column_view(name).array(copy=copy)
+
+
+class TableView(_ColumnTable, _BaseView):
+    """View of multiple columns produced by any non-string indexing.
+
+    Materializes through :meth:`array` (one column, by name), :meth:`dict`,
+    :meth:`recarray`, or :meth:`frame`. There is no no-argument ``array()`` --
+    several columns generally have different dtypes and cannot be packed into a
+    single homogeneous ndarray; read one column by name (``view['col']`` /
+    ``view.array('col')``) or use :meth:`recarray` for all of them. Indexing
+    projects columns: ``view['col']`` yields a :class:`ColumnView`,
+    ``view[['a', 'b']]`` a narrowed ``TableView`` (the same as :meth:`select`).
     """
 
     __slots__ = ("_column_names",)
@@ -499,6 +545,12 @@ class TableView(_BaseView):
     def columns(self) -> list[str]:
         """Names of the columns selected by this view, in selection order."""
         return list(self._column_names)
+
+    def _column_view(self, name: str) -> ColumnView:
+        return ColumnView(self._store, self._row_part, name)
+
+    def _sub_table(self, names: list[str]) -> TableView:
+        return TableView(self._store, self._row_part, names)
 
     def _edit_columns(self) -> list[str]:
         return list(self._column_names)

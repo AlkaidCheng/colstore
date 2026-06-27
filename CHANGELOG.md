@@ -8,6 +8,13 @@ log documents it and everything since.
 
 ### Added
 
+- [[#240](https://github.com/AlkaidCheng/colstore/pull/240)] A `TableView` now exposes
+  the same column-access surface as the reader: index it by name for a column
+  (`ds[rows]['col']` → `ColumnView`) or by a list to narrow it
+  (`ds[rows][['a', 'b']]` → `TableView`), and read one column with `array(name)`. The
+  shared surface lives in one `_ColumnTable` mixin, so a reader/dataset and a table
+  view stay consistent. (A no-argument `array()` stays absent — several columns with
+  different dtypes do not pack into one homogeneous array.)
 - [[#239](https://github.com/AlkaidCheng/colstore/pull/239)] Elementwise operators and
   NumPy ufuncs on a reader/dataset column view now compute eagerly: `ds['a'] * 2`,
   `ds['a'] + ds['b']`, `ds['a'] > 0`, and `np.log(ds['a'])` materialize the selected
