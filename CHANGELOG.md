@@ -8,6 +8,14 @@ log documents it and everything since.
 
 ### Added
 
+- [[#241](https://github.com/AlkaidCheng/colstore/pull/241)] `saveas` now writes
+  colstore's own format: `ds[rows, cols].saveas('out.cstore')` (or `format="cstore"`)
+  saves a selection to a new `.cstore`, alongside the existing Parquet / Feather /
+  JSON / HDF5 / NPZ / ROOT targets. It streams through colstore's own writer (no
+  optional backend) without materializing the selection: a whole store — or a
+  multi-file dataset — is raw-copied / merged exactly like `concat()`, and a row/column
+  selection streams in bounded memory. (A `.cstore` is already native, so `ingest()` of
+  one points to `colstore.open()` instead.)
 - [[#240](https://github.com/AlkaidCheng/colstore/pull/240)] A `TableView` now exposes
   the same column-access surface as the reader: index it by name for a column
   (`ds[rows]['col']` → `ColumnView`) or by a list to narrow it

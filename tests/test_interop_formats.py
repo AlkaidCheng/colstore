@@ -5,6 +5,7 @@ nested-rejection policy, and HDF5's cross-writer reading.
 
 from __future__ import annotations
 
+import filecmp
 import importlib.util
 
 import numpy as np
@@ -83,7 +84,81 @@ def test_column_projection(tmp_path, store, columns, fmt, ext, backends, preserv
 
 
 def test_all_formats_registered():
-    assert {"parquet", "feather", "json", "hdf5"} <= interop.file_formats()
+    assert {"cstore", "parquet", "feather", "json", "hdf5"} <= interop.file_formats()
+
+
+# ---- native .cstore export -------------------------------------------------
+
+
+def test_cstore_native_export_roundtrip(tmp_path, store, columns):
+    """saveas('out.cstore') writes a new cstore; it needs no backend and keeps strings."""
+    out = tmp_path / "copy.cstore"
+    store.saveas(out)  # the native format, dispatched by the .cstore extension
+    back = colstore.open(out)
+    assert set(back.columns) == set(columns)
+    for name, values in columns.items():
+        if name == "s":
+            assert list(back.array("s")) == list(values)  # native handles strings
+        else:
+            np.testing.assert_array_equal(back.array(name), values)
+            assert back.dtypes[name] == values.dtype
+    back.close()
+
+
+def test_cstore_export_respects_selection(tmp_path, store, columns):
+    """A row+column selection writes only that subset to the new cstore."""
+    out = tmp_path / "sel.cstore"
+    store[2:5, ["i", "f"]].saveas(out)
+    back = colstore.open(out)
+    assert back.columns == ["i", "f"]
+    assert back.n_rows == 3
+    np.testing.assert_array_equal(back.array("i"), columns["i"][2:5])
+    back.close()
+
+
+def test_cstore_ingest_points_to_open(tmp_path, store):
+    """A .cstore is already native; ingest() declines and points at open()."""
+    p = tmp_path / "x.cstore"
+    store.saveas(p)
+    with pytest.raises(NotImplementedError, match="already native"):
+        colstore.ingest(p, tmp_path / "y.cstore")
+
+
+def test_cstore_export_rejects_unknown_kwarg(tmp_path, store):
+    """An unknown saveas keyword (e.g. a memory_budget typo) is rejected, not dropped."""
+    store.saveas(tmp_path / "ok.cstore", memory_budget=1 << 20)  # the one accepted knob
+    with pytest.raises(TypeError, match="memory_budget"):
+        store.saveas(tmp_path / "x.cstore", memory_budgett=1024)
+
+
+def test_cstore_export_whole_store_is_raw_copy(tmp_path):
+    """A whole-store saveas('.cstore') raw-copies the source -- nothing is materialized."""
+    src = tmp_path / "src.cstore"
+    colstore.store(
+        {"a": np.arange(40, dtype="f8"), "b": np.arange(40, dtype="i8")}, src, show_progress=False
+    )
+    out = tmp_path / "copy.cstore"
+    colstore.open(src).saveas(out)
+    assert filecmp.cmp(src, out, shallow=False)  # byte-identical: the source bytes were copied
+
+
+def test_cstore_export_of_dataset_matches_concat(tmp_path):
+    """dataset.saveas('.cstore') merges the shards exactly like concat() (byte-for-byte)."""
+    parts = []
+    for i in range(2):
+        p = tmp_path / f"p{i}.cstore"
+        colstore.store(
+            {"a": np.arange(i * 10, i * 10 + 10, dtype="f8"), "b": np.arange(10, dtype="i8")},
+            p,
+            show_progress=False,
+        )
+        parts.append(p)
+    dset = colstore.open(parts)
+    merged = tmp_path / "merged.cstore"
+    dset.saveas(merged)
+    concatenated = tmp_path / "concat.cstore"
+    colstore.concat(parts, out=concatenated)
+    assert filecmp.cmp(merged, concatenated, shallow=False)
 
 
 # ---- per-format sugar ------------------------------------------------------

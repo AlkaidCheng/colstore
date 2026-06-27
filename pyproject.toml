@@ -48,6 +48,7 @@ colstore = "colstore.cli:main"
 arrow = "colstore.interop.arrow:ArrowFormat"
 
 [project.entry-points."colstore.file_formats"]
+cstore = "colstore.interop.cstore:CStoreFormat"
 npz = "colstore.interop.npz:NpzFormat"
 root = "colstore.interop.root:RootFormat"
 parquet = "colstore.interop.parquet:ParquetFormat"
