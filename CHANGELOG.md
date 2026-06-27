@@ -8,6 +8,12 @@ log documents it and everything since.
 
 ### Added
 
+- [[#239](https://github.com/AlkaidCheng/colstore/pull/239)] Elementwise operators and
+  NumPy ufuncs on a reader/dataset column view now compute eagerly: `ds['a'] * 2`,
+  `ds['a'] + ds['b']`, `ds['a'] > 0`, and `np.log(ds['a'])` materialize the selected
+  rows and return an `ndarray` (operators previously raised). This completes the eager
+  read surface; reductions stay scalar terminals, and the deferred-expression world
+  remains the editing frame (`reader.edit()`).
 - [[#237](https://github.com/AlkaidCheng/colstore/pull/237)] Pandas-style terminals
   on a single column. A reader/dataset column (`ds[name]`) and a frame column
   (`frame[name]`) now offer reductions (`sum` / `mean` / `min` / `max` / `count`),

@@ -17,6 +17,7 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from numpy.lib.mixins import NDArrayOperatorsMixin
 
 from . import config
 from ._pandas import _make_dataframe_no_consolidate
@@ -326,13 +327,21 @@ class _BaseView(InteropMixin):
         return ColStoreFrame(self._store, columns, rows)
 
 
-class ColumnView(ColumnReductions, _BaseView):
+class ColumnView(NDArrayOperatorsMixin, ColumnReductions, _BaseView):
     """Lazy view of a single column produced by indexing with a string name.
 
     Materializes to a 1D ``numpy.ndarray`` via :meth:`array`. No other
     materialization method is available; calling :meth:`dict`,
     :meth:`recarray`, or :meth:`frame` here would not make sense and
     those methods are intentionally absent from this class.
+
+    A column view is an eager read surface, so the elementwise operators and
+    NumPy ufuncs it inherits compute immediately: ``ds[name] * 2``,
+    ``ds['a'] + ds['b']``, ``ds[name] > 0``, and ``np.log(ds[name])`` each gather
+    the selected rows and return a plain ``ndarray``. To build a *deferred*
+    transform that composes without reading, edit the store into a frame
+    (``reader.edit()``); to select rows by a column predicate, use
+    :func:`~colstore.col` / :meth:`~colstore.ColStoreReader.query`.
     """
 
     __slots__ = ("_column_name",)
@@ -384,6 +393,21 @@ class ColumnView(ColumnReductions, _BaseView):
         if not copy:
             return self._store._view_one(self._column_name, row_indexer)
         return self._store._gather_one(self._column_name, row_indexer)
+
+    def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any) -> Any:
+        """Apply a NumPy ufunc eagerly by materializing the column(s).
+
+        Backs the inherited operators (``*``, ``+``, ``>``, ...) and direct ufunc
+        calls (``np.log(ds[name])``): each column-view operand is gathered over its
+        selected rows and the ufunc runs on the resulting arrays, returning a plain
+        ``ndarray``. Reductions and other ufunc methods are declined so they fall
+        back to NumPy -- a column reduces through its :meth:`sum` / :meth:`mean`
+        terminals, not here.
+        """
+        if method != "__call__" or kwargs.get("out") is not None:
+            return NotImplemented
+        operands = [x.array() if isinstance(x, ColumnView) else x for x in inputs]
+        return ufunc(*operands, **kwargs)
 
     def _reduction_frame(self) -> ColStoreFrame:
         # A reader column reduces through its editing frame (the streaming engine).
