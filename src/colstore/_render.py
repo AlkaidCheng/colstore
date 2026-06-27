@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import html
 import math
+import shutil
 from typing import Any
 
 import numpy as np
@@ -153,6 +154,24 @@ def render_html(
     return _preview_div(caption, table)
 
 
+def _fit_columns(widths: list[int]) -> int:
+    """How many leading data columns fit the terminal width (always >= 1).
+
+    ``widths[0]`` is the index column (always shown); the rest are data columns,
+    added left to right until the row would exceed the terminal width, reserving
+    room for a trailing ``...`` column -- the horizontal fit pandas uses.
+    """
+    avail = shutil.get_terminal_size((80, 24)).columns
+    used = widths[0]
+    kept = 0
+    for w in widths[1:]:
+        if kept >= 1 and used + 2 + w + 5 > avail:  # +2 separator, +5 reserves "  ..."
+            break
+        used += 2 + w
+        kept += 1
+    return kept
+
+
 def render_text(
     label: str,
     total_rows: int | None,
@@ -161,24 +180,21 @@ def render_text(
     index: list[int],
     cells: list[list[str]],
 ) -> str:
-    """Render a preview as a fixed-width ASCII table (terminal repr)."""
-    shown_cols, truncated = _shown_columns(columns)
-    header = ["", *shown_cols] + (["..."] if truncated else [])
-    matrix = [header]
+    """Render a preview as a fixed-width ASCII table that fits the terminal width."""
+    matrix = [["", *columns]]
     for pos, row in zip(index, cells, strict=False):
-        vals = list(row[: len(shown_cols)])
-        if truncated:
-            vals.append("...")
-        matrix.append([str(pos), *vals])
-    ncol = len(header)
-    widths = [0] * ncol
+        matrix.append([str(pos), *row])
+    ncol = len(matrix[0])
+    widths = [min(max(len(r[j]) for r in matrix), _MAX_COLWIDTH) for j in range(ncol)]
+    kept = _fit_columns(widths)
+    truncated = kept < ncol - 1
+    shown_idx = range(kept + 1)  # the index column plus the data columns that fit
+    rows = []
     for r in matrix:
-        for j in range(ncol):
-            w = len(r[j])
-            if w > widths[j]:
-                widths[j] = w
-    widths = [min(w, _MAX_COLWIDTH) for w in widths]
-    rows = ["  ".join(r[j][: widths[j]].rjust(widths[j]) for j in range(ncol)) for r in matrix]
+        line = [r[j][: widths[j]].rjust(widths[j]) for j in shown_idx]
+        if truncated:
+            line.append("...")
+        rows.append("  ".join(line))
     shown = len(index)
     name = f"{label}: " if label else ""
     if shown == 0:
@@ -207,6 +223,17 @@ def render_lazy_card(label: str, columns: list[str]) -> str:
         f"<b>{html.escape(label)}</b> &middot; lazy selection &middot; {count}"
         f'<br><span style="color:#8b949e">[{shown}]</span><br>'
         "call <code>.head()</code> or <code>.evaluate()</code> to read rows</div>"
+    )
+
+
+def render_lazy_card_text(label: str, columns: list[str]) -> str:
+    """The text twin of :func:`render_lazy_card`: a short note that reads no data."""
+    shown, truncated = _shown_columns(columns)
+    cols = ", ".join(shown) + (", ..." if truncated else "")
+    n = len(columns)
+    return (
+        f"{label}: lazy selection, {n} column{'' if n == 1 else 's'} [{cols}]\n"
+        "call .head() or .evaluate() to read rows"
     )
 
 

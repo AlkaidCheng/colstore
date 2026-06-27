@@ -14,6 +14,13 @@ log documents it and everything since.
 - [[#229](https://github.com/AlkaidCheng/colstore/pull/229)] Online documentation
   built with Sphinx and published to GitHub Pages.
 
+### Changed
+
+- [[#236](https://github.com/AlkaidCheng/colstore/pull/236)] `TableView` and
+  `ColumnView` now repr as a formatted table that fits the terminal width (like a
+  pandas DataFrame / Series); `head()` / `tail()` previews fit the window too. The
+  reader and dataset keep their compact handle repr.
+
 ### Fixed
 
 - [[#235](https://github.com/AlkaidCheng/colstore/pull/235)] The HDF5 and JSON
