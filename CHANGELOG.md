@@ -8,6 +8,11 @@ log documents it and everything since.
 
 ### Added
 
+- [[#245](https://github.com/AlkaidCheng/colstore/pull/245)] `count()` is now available
+  on every object as the scalar row count: a reader/dataset returns its total (the same
+  as `n_rows`), a row-selected view the rows it selects (resolving a `col()` / `query`
+  predicate), and the editing frame the rows left after its filters. Previously only the
+  frame and a single column offered it (`ds[mask].count()` raised `AttributeError`).
 - [[#241](https://github.com/AlkaidCheng/colstore/pull/241)] `saveas` now writes
   colstore's own format: `ds[rows, cols].saveas('out.cstore')` (or `format="cstore"`)
   saves a selection to a new `.cstore`, alongside the existing Parquet / Feather /

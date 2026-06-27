@@ -108,6 +108,23 @@ def test_view_row_reindexing_chained_equals_direct(small_store, small_frame):
         small_store[:50, "price"][100]
 
 
+def test_count_is_scalar_row_count_everywhere(small_store, small_frame):
+    """count() returns the scalar row count on every object: reader, views, and frame."""
+    n = small_store.n_rows
+    assert small_store.count() == n  # reader/dataset == n_rows
+    assert small_store[:50].count() == 50  # TableView (slice)
+    assert small_store[:50, ["price", "qty"]].count() == 50  # TableView (rows + cols)
+    assert small_store["price"][:50].count() == 50  # ColumnView
+    mask = np.arange(n) % 3 == 0
+    assert small_store[mask].count() == int(mask.sum())  # mask view
+    assert small_store[mask, "price"].count() == int(mask.sum())
+    # a query() predicate view resolves and counts; the editing frame agrees
+    thresh = int(np.median(small_frame["qty"].to_numpy()))
+    expected = int((small_frame["qty"].to_numpy() > thresh).sum())
+    assert small_store.query(f"qty > {thresh}").count() == expected
+    assert small_store.edit().where(f"qty > {thresh}").count() == expected
+
+
 def test_table_view_dict_matches_source(small_store, small_frame):
     result = small_store[100:200, ["price", "qty"]].dict()
     assert set(result) == {"price", "qty"}

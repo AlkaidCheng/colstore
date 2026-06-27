@@ -209,6 +209,15 @@ class _ReaderBase(InteropMixin, abc.ABC):
         """``(n_rows, n_columns)``."""
         return self.n_rows, len(self._column_dtypes)
 
+    def count(self) -> int:
+        """Number of rows in the store -- a scalar, the same as :attr:`n_rows`.
+
+        Every colstore object answers ``count()`` with its own row count: a reader or
+        dataset returns its total, a row-selected view the rows it selects, and an
+        editing frame the rows left after its filters.
+        """
+        return self.n_rows
+
     # ---- Column selection ----------------------------------------------
 
     def select(self, *columns: str) -> TableView:
