@@ -52,9 +52,30 @@ def test_column_view_does_not_have_dict():
     assert not hasattr(ColumnView, "frame")
 
 
-def test_table_view_does_not_have_array():
-    """TableView does not implement array."""
-    assert not hasattr(TableView, "array")
+def test_table_view_array_and_indexing(small_store, small_frame):
+    """TableView reads one column by name and projects columns by indexing."""
+    tv = small_store[100:200, ["price", "qty"]]
+    # array(name) -> a 1-D ndarray, the same as the reader / a column view
+    np.testing.assert_array_equal(tv.array("price"), small_frame["price"].iloc[100:200].to_numpy())
+    # table[name] -> a ColumnView; table[[names]] -> a narrowed TableView
+    assert isinstance(tv["price"], ColumnView)
+    np.testing.assert_array_equal(tv["price"].array(), tv.array("price"))
+    assert isinstance(tv[["price"]], TableView)
+    assert tv[["price"]].columns == ["price"]
+    # no no-arg array(): heterogeneous columns can't pack into one homogeneous ndarray
+    with pytest.raises(TypeError):
+        tv.array()
+
+
+def test_chained_indexing_consistent_with_direct(small_store):
+    """ds[rows]['col'] matches ds[rows, 'col'] and stays a full eager column."""
+    chained = small_store[100:200]["price"]  # TableView -> ColumnView
+    direct = small_store[100:200, "price"]  # ColumnView directly
+    assert isinstance(chained, ColumnView)
+    np.testing.assert_array_equal(chained.array(), direct.array())
+    # the chained column behaves like any column: eager operators and reductions
+    np.testing.assert_array_equal(chained * 2, direct.array() * 2)
+    assert chained.mean() == direct.mean()
 
 
 def test_table_view_dict_matches_source(small_store, small_frame):
