@@ -534,22 +534,22 @@ class ColStoreDataset(_ReaderBase):
 
         Returns the column's ``(start_rows, segment_base)`` stitch, or ``None``
         -- the caller then takes the portable sort-once path -- when the kernel
-        is unavailable, the element size is unsupported, or any file cannot
-        supply native segments (e.g. a non-native on-disk dtype).
+        is unavailable or any file cannot supply native segments (e.g. a
+        non-native on-disk dtype). The kernel handles any fixed itemsize -- the
+        1/2/4/8-byte widths on its typed path, any other width (wide strings,
+        records) on its generic copy -- so the element size never declines it.
 
         The stitch is row-independent, so it is memoized per column (see the
-        class docstring). The cheap availability and element-size guards stay
-        live -- re-evaluated on every call -- so the memo holds only the
-        structure-dependent stitch and a build under one ``cpp_available()``
-        regime is never replayed under another.
+        class docstring). The cheap availability guard stays live -- re-evaluated
+        on every call -- so the memo holds only the structure-dependent stitch
+        and a build under one ``cpp_available()`` regime is never replayed under
+        another.
         """
         from . import kernels
 
         if not kernels.cpp_available():
             return None
         itemsize = self._column_dtypes[column_name].itemsize
-        if itemsize not in (1, 2, 4, 8):
-            return None
         cache = self._segment_table_cache
         if column_name not in cache:
             cache[column_name] = self._stitch_native_segment_table(column_name, itemsize)
@@ -778,8 +778,8 @@ class ColStoreDataset(_ReaderBase):
         when the selection is too sparse for the kernel's full-mask scan to pay
         off (below :func:`config.get_multifile_mask_density_gate`), or when any
         column cannot supply a native segment table (the same gate the fancy path
-        uses: extension unavailable, unsupported itemsize, or a non-native on-disk
-        dtype). The kernel scans the mask once for lock-free output offsets and
+        uses: extension unavailable or a non-native on-disk dtype). The kernel
+        scans the mask once for lock-free output offsets and
         once to gather, so the output is byte-identical to numpy mask indexing.
         """
         if self._n_rows == 0:

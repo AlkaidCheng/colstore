@@ -54,6 +54,12 @@ log documents it and everything since.
 
 ### Fixed
 
+- [[#243](https://github.com/AlkaidCheng/colstore/pull/243)] Row-selecting (fancy
+  index, boolean mask, or strided slice) a fixed-width column wider than 8 bytes —
+  e.g. a NumPy `<U3` / `S10` string — on a multi-record or multi-file store no longer
+  raises `TypeError: Unsupported element size`. The C++ gather kernels gained a generic
+  byte-copy path for any element width; the 1/2/4/8-byte typed fast path is unchanged
+  (byte-identical codegen).
 - [[#242](https://github.com/AlkaidCheng/colstore/pull/242)] A bare empty row index
   (`ds[[]]`) now selects no rows instead of raising `IndexError`. NumPy types an empty
   Python list as `float64`, which the row-index validator rejected; an empty selection
