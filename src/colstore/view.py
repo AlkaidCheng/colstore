@@ -340,6 +340,23 @@ class _BaseView(InteropMixin):
         result = positions[sub]
         return int(result) if isinstance(sub, int) else result
 
+    def count(self) -> int:
+        """Number of rows this view selects -- a scalar.
+
+        Resolves a ``col()`` / ``query`` predicate (reading only the columns it
+        references); a concrete row selection is counted without any I/O.
+        """
+        indexer = self._resolve_row_indexer()
+        if indexer is None:
+            return self._store.n_rows
+        if isinstance(indexer, (int, np.integer)):
+            return 1
+        if isinstance(indexer, slice):
+            return len(range(*indexer.indices(self._store.n_rows)))
+        if indexer.dtype == bool:
+            return int(indexer.sum())
+        return int(indexer.shape[0])
+
     def _preview(self, indexer: RowIndexer) -> Preview:
         """A ``Preview`` over a concrete row ``indexer`` -- provided by each view type."""
         raise NotImplementedError
