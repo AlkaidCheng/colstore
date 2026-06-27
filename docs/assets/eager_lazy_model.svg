@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="500" viewBox="0 0 880 500" role="img" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<title>Eager and lazy operations</title>
+<desc>A reader/dataset and a frame are complementary surfaces, compared row by row. Index or slice rows: a view returns another lazy sub-view; a frame raises, since frames do not index rows -- filter with where(), project with select(), or write() the frame and index the returned reader. Pick a column: ds['a'] gives a ColumnView, frame['a'] gives a FrameColumn (a lazy expression handle). Transform a column (times 2, np.log, astype): a ColumnView does not build expressions, so operators raise and a NumPy ufunc materializes the column eagerly, whereas a frame column builds a lazy deferred expression. Reduce a column (sum, np.sum): both return a scalar eagerly, after one bounded-memory pass. Materialize (array, dict, recarray, np.asarray, or write): both read the selected data into an ndarray or DataFrame, and a frame can also write a new .cstore. Reading is lazy; reductions are eager everywhere; only elementwise column work on a frame is deferred.</desc>
+<style>
+  .ttl{fill:#2C2C2A;font-size:16px;font-weight:600;}
+  .colh{fill:#8A8980;font-size:11px;font-weight:600;letter-spacing:0.05em;}
+  .nbox{fill:#F1EFE8;stroke:#888780;stroke-width:0.75;}
+  .gbox{fill:#E1F5EE;stroke:#0F6E56;stroke-width:0.75;}
+  .bbox{fill:#E6EEF4;stroke:#3F6E9E;stroke-width:0.75;}
+  .pbox{fill:#EAE6F4;stroke:#6B5BA6;stroke-width:0.75;}
+  .abox{fill:#FBF1DE;stroke:#B9852B;stroke-width:0.75;}
+  .hT{fill:#2C2C2A;font-size:14px;font-weight:600;} .hS{fill:#5F5E5A;font-size:11.5px;}
+  .op{fill:#2C2C2A;font-size:13px;font-weight:600;} .cd{fill:#5F5E5A;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  .tag{font-size:12px;font-weight:700;letter-spacing:0.03em;} .note{font-size:12px;}
+  .cN{fill:#2C2C2A;} .cG{fill:#04342C;} .cB{fill:#234567;} .cP{fill:#3A2F66;} .cA{fill:#6B4A12;} .cR{fill:#A2503C;}
+  .leg{fill:#5F5E5A;font-size:11.5px;}
+  @media (prefers-color-scheme: dark) {
+    .ttl{fill:#F1EFE8;} .op{fill:#F1EFE8;} .cd{fill:#C9C7BE;} .colh{fill:#9A998F;} .leg{fill:#C9C7BE;}
+    .nbox{fill:#2C2C2A;stroke:#888780;} .hT{fill:#F1EFE8;} .hS{fill:#C9C7BE;}
+    .gbox{fill:#04342C;stroke:#1D9E75;} .bbox{fill:#22323F;stroke:#6E9BC6;}
+    .pbox{fill:#2A2440;stroke:#9A8AD6;} .abox{fill:#3A2E18;stroke:#D6A24A;}
+    .cN{fill:#E2E0D8;} .cG{fill:#9FE1CB;} .cB{fill:#CFE0EF;} .cP{fill:#E0D7F2;} .cA{fill:#F0DBB0;} .cR{fill:#D78A77;}
+  }
+</style>
+
+<text class="ttl" x="440" y="28" text-anchor="middle">What a colstore operation returns</text>
+<text class="colh" x="16" y="76">OPERATION</text>
+
+<!-- headers -->
+<rect class="nbox" x="218" y="46" width="318" height="46" rx="7"/>
+<text class="hT" x="377" y="69" text-anchor="middle">VIEW &#183; ds[&#8230;]</text>
+<text class="hS" x="377" y="84" text-anchor="middle">a window over stored bytes</text>
+<rect class="nbox" x="546" y="46" width="318" height="46" rx="7"/>
+<text class="hT" x="705" y="69" text-anchor="middle">FRAME &#183; reader.edit()</text>
+<text class="hS" x="705" y="84" text-anchor="middle">a deferred computation</text>
+
+<!-- row 1: index -->
+<text class="op" x="16" y="126">Select / slice rows</text>
+<text class="cd" x="16" y="146">ds[rows] &#183; col() &#183; query()</text>
+<rect class="bbox" x="218" y="98" width="318" height="68" rx="7"/>
+<text class="tag cB" x="234" y="126">LAZY</text>
+<text class="note cB" x="234" y="146">another sub-view &#8212; reads nothing</text>
+<rect class="nbox" x="546" y="98" width="318" height="68" rx="7"/>
+<text class="tag cR" x="562" y="126">raises</text>
+<text class="note cN" x="562" y="146">use where() &#183; select() &#183; write()</text>
+
+<!-- row 2: pick a column -->
+<text class="op" x="16" y="200">Pick a column</text>
+<text class="cd" x="16" y="220">obj['a']</text>
+<rect class="gbox" x="218" y="172" width="318" height="68" rx="7"/>
+<text class="tag cG" x="234" y="200">ColumnView</text>
+<text class="note cG" x="234" y="220">a lazy view of one column</text>
+<rect class="gbox" x="546" y="172" width="318" height="68" rx="7"/>
+<text class="tag cG" x="562" y="200">FrameColumn</text>
+<text class="note cG" x="562" y="220">a lazy expression handle</text>
+
+<!-- row 3: transform -->
+<text class="op" x="16" y="274">Transform a column</text>
+<text class="cd" x="16" y="294">* 2 &#183; np.log &#183; astype</text>
+<rect class="pbox" x="218" y="246" width="318" height="68" rx="7"/>
+<text class="tag cP" x="234" y="274">EAGER</text>
+<text class="note cP" x="234" y="294">ds['a']*2, np.log() &#8594; ndarray</text>
+<rect class="bbox" x="546" y="246" width="318" height="68" rx="7"/>
+<text class="tag cB" x="562" y="274">LAZY</text>
+<text class="note cB" x="562" y="294">a deferred expression</text>
+
+<!-- row 4: reduce -->
+<text class="op" x="16" y="348">Reduce a column</text>
+<text class="cd" x="16" y="368">sum() &#183; np.sum()</text>
+<rect class="pbox" x="218" y="320" width="318" height="68" rx="7"/>
+<text class="tag cP" x="234" y="348">EAGER</text>
+<text class="note cP" x="234" y="368">a scalar &#8212; one pass now</text>
+<rect class="pbox" x="546" y="320" width="318" height="68" rx="7"/>
+<text class="tag cP" x="562" y="348">EAGER</text>
+<text class="note cP" x="562" y="368">a scalar &#8212; one pass now</text>
+
+<!-- row 5: materialize -->
+<text class="op" x="16" y="422">Materialize</text>
+<text class="cd" x="16" y="442">array &#183; dict &#183; recarray</text>
+<rect class="abox" x="218" y="394" width="318" height="68" rx="7"/>
+<text class="tag cA" x="234" y="422">MATERIALIZE</text>
+<text class="note cA" x="234" y="442">ndarray / DataFrame</text>
+<rect class="abox" x="546" y="394" width="318" height="68" rx="7"/>
+<text class="tag cA" x="562" y="422">MATERIALIZE</text>
+<text class="note cA" x="562" y="442">ndarray, or write() a new .cstore</text>
+
+<text class="leg" x="440" y="487" text-anchor="middle">Reading is lazy &#183; reductions are eager &#183; only a frame's column transforms are deferred</text>
+</svg>

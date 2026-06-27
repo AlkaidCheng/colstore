@@ -23,6 +23,7 @@ the output you ask for; the source file is never fully read into RAM.
   - [Install](#install)
   - [Quick start](#quick-start)
   - [Reader, writer, frame](#reader-writer-frame)
+  - [Eager and lazy operations](#eager-and-lazy-operations)
   - [Filtering and projection](#filtering-and-projection)
   - [Editing](#editing)
   - [Writing](#writing)
@@ -117,6 +118,33 @@ are already holding in memory, while a frame derives a new file from one already
 on disk by transforming its columns. Starting from raw arrays, reach for a writer
 (or `store`); starting from a `.cstore` you want a modified copy of, reach for
 `edit()`, which gives you a frame.
+
+### Eager and lazy operations
+
+A reader/dataset and a frame are complementary surfaces, and three rules cover when
+colstore reads data and when it defers the work:
+
+- **Reading is lazy.** Indexing, filtering, and projecting a reader return a **view**
+  (`ColumnView` / `TableView`) that holds no data; `edit()` returns a **frame**, a
+  deferred column-expression graph. Neither reads until you materialize (`array()` /
+  `dict()` / `recarray()` / `frame()`, or `np.asarray`) or `write()`.
+- **The reader is eager; the frame is lazy.** On a reader/view, work happens now:
+  **select rows by a column predicate with `col()` or `query()`** (or positionally with
+  `ds[rows]`) — each gives a lazy view — and compute on a column with operators or NumPy
+  ufuncs (`ds['a'] * 2`, `np.log(ds['a'])`), which materialize the selected rows into an
+  `ndarray`. A frame (`reader.edit()`) defers instead: `frame['a'] * 2` builds an
+  expression realized on materialize / `write()`, and it filters with `where()` and
+  projects with `select()` rather than indexing rows (`frame[rows]` raises).
+- **Reductions are eager everywhere.** `sum` / `mean` / `min` / `max` / `count`, and
+  the NumPy spelling `np.sum(column)`, run one bounded-memory pass and return a scalar
+  right away, on a view or a frame alike.
+
+![What a colstore operation returns: a reader view versus an editing frame, row by row](docs/assets/eager_lazy_model.svg)
+
+So pick the surface by the job: **read and compute now on the reader**
+(`ds[col('x') > 0, 'a'] * 2` selects rows by a predicate, then computes, eagerly), or
+**build a deferred transform** that composes and writes without materializing **on a
+frame** (`reader.edit()`). Either way, a reduction (`column.sum()`) gives a scalar now.
 
 ### Filtering and projection
 
