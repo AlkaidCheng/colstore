@@ -132,6 +132,64 @@ inline T load_unaligned(const std::uint8_t* address) {
   return value;
 }
 
+// --- Element store policy: typed fast path + generic memcpy fallback -------
+//
+// Every gather kernel writes one element per index through a Store, so the
+// element width is a policy rather than a hard-coded type. A column whose
+// itemsize is 1/2/4/8 selects TypedStore<T>, whose copy is the same
+// ``reinterpret_cast<T*>(out)[i] = load_unaligned<T>(src)`` the kernels always
+// used -- itemsize() is constexpr, so the emitted hot loop is unchanged. A
+// fixed-width column of any other size (wide strings such as ``<U3`` = 12
+// bytes or ``S10`` = 10 bytes) selects GenericStore, whose copy is a
+// runtime-sized memcpy. dispatch_store maps an itemsize to the right Store at
+// the extern "C" boundary, once per call and outside the hot loop; only
+// itemsize <= 0 is rejected (returns -1).
+template <typename T>
+struct TypedStore {
+  static constexpr std::int64_t itemsize() { return static_cast<std::int64_t>(sizeof(T)); }
+  inline void copy(std::uint8_t* out, std::ptrdiff_t i, const std::uint8_t* src) const {
+    reinterpret_cast<T*>(out)[i] = load_unaligned<T>(src);
+  }
+};
+
+struct GenericStore {
+  std::int64_t isz;
+  inline std::int64_t itemsize() const { return isz; }
+  inline void copy(std::uint8_t* out, std::ptrdiff_t i, const std::uint8_t* src) const {
+    std::memcpy(out + i * isz, src, static_cast<std::size_t>(isz));
+  }
+};
+
+// itemsize -> Store dispatch. The generic lambda is instantiated once per
+// Store type, so each kernel is implicitly instantiated for the typed widths
+// plus GenericStore; the only runtime cost is one switch per call. Returns 0
+// for any itemsize > 0 (1/2/4/8 typed, all others generic) and -1 only for
+// itemsize <= 0; the extern "C" entries forward that status and the Cython
+// layer raises on -1.
+template <typename F>
+inline int dispatch_store(int itemsize, F&& f) {
+  switch (itemsize) {
+    case 1:
+      f(TypedStore<std::uint8_t>{});
+      return 0;
+    case 2:
+      f(TypedStore<std::uint16_t>{});
+      return 0;
+    case 4:
+      f(TypedStore<std::uint32_t>{});
+      return 0;
+    case 8:
+      f(TypedStore<std::uint64_t>{});
+      return 0;
+    default:
+      if (itemsize > 0) {
+        f(GenericStore{static_cast<std::int64_t>(itemsize)});
+        return 0;
+      }
+      return -1;
+  }
+}
+
 // --- Reciprocal division by a per-gather constant --------------------------
 //
 // The uniform-record kernels recover a record index as ``idx / rows_per_record``
@@ -250,6 +308,7 @@ template <typename Policy, typename... State>
 struct has_prefetch_offset<
     Policy,
     std::void_t<decltype(Policy::prefetch_offset(std::declval<std::ptrdiff_t>(),
+                                                 std::declval<std::int64_t>(),
                                                  std::declval<State>()...))>,
     State...> : std::true_type {};
 
@@ -257,12 +316,11 @@ template <typename Policy, typename... State>
 inline constexpr bool has_prefetch_offset_v =
     has_prefetch_offset<Policy, void, State...>::value;
 
-template <typename T, typename Policy, typename... State>
+template <typename Store, typename Policy, typename... State>
 inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
                         std::uint8_t* COLSTORE_RESTRICT output,
-                        std::ptrdiff_t n_indices, int thread_cap,
+                        std::ptrdiff_t n_indices, const Store& store, int thread_cap,
                         std::ptrdiff_t prefetch_distance, State... state) {
-  T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
@@ -273,34 +331,35 @@ inline void gather_core(const std::uint8_t* COLSTORE_RESTRICT base,
   for (std::ptrdiff_t i = 0; i < n_indices; ++i) {
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
       if constexpr (has_prefetch_offset_v<Policy, State...>) {
-        COLSTORE_PREFETCH(base + Policy::prefetch_offset(i + prefetch_distance, state...));
+        COLSTORE_PREFETCH(
+            base + Policy::prefetch_offset(i + prefetch_distance, store.itemsize(), state...));
       } else {
-        COLSTORE_PREFETCH(base + Policy::offset(i + prefetch_distance, state...));
+        COLSTORE_PREFETCH(base + Policy::offset(i + prefetch_distance, store.itemsize(), state...));
       }
     }
-    dst[i] = load_unaligned<T>(base + Policy::offset(i, state...));
+    store.copy(output, i, base + Policy::offset(i, store.itemsize(), state...));
   }
 }
 
-template <typename T>
 struct IndexedPolicy {
-  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i, std::int64_t itemsize,
                                       const std::int64_t* COLSTORE_RESTRICT indices) {
-    return indices[i] * static_cast<std::ptrdiff_t>(sizeof(T));
+    return indices[i] * static_cast<std::ptrdiff_t>(itemsize);
   }
 };
 
-// Byte-offset gather: ``output[i]`` is the T at ``base + byte_offsets[i]``.
+// Byte-offset gather: ``output[i]`` is the element at ``base + byte_offsets[i]``.
 //
 // For the multi-record reader: addresses are non-uniform and pre-computed at
 // the Python level (record-header skips, per-record column offsets). Offsets
-// need not be T-aligned; source loads go through load_unaligned.
-// T is unused here (offsets are already in bytes); the parameter exists so
-// every policy is a class template and gather_entry can take them uniformly.
-template <typename T>
+// need not be element-aligned; the store's copy is alignment-safe.
+// itemsize is unused here (offsets are already in bytes); the parameter exists
+// so every policy's offset has the uniform (i, itemsize, state...) signature
+// and gather_entry can take them interchangeably.
 struct BytesPolicy {
-  static inline std::ptrdiff_t offset(std::ptrdiff_t i,
+  static inline std::ptrdiff_t offset(std::ptrdiff_t i, std::int64_t itemsize,
                                       const std::int64_t* COLSTORE_RESTRICT byte_offsets) {
+    (void)itemsize;
     return byte_offsets[i];
   }
 };
@@ -327,63 +386,21 @@ inline std::int64_t bin_record(const std::int64_t* rsr, std::int64_t len,
   return basep - rsr;
 }
 
-// Compile-time itemsize -> element-type dispatch. The generic lambda is
-// instantiated once per supported size, so the typed kernels are implicitly
-// instantiated here (no explicit instantiation lists needed) and the only
-// runtime cost is one switch per call, outside the hot loop. Returns false
-// for unsupported sizes; the extern "C" entries map that to -1 and the
-// Cython layer raises.
-template <typename T>
-struct TypeTag {
-  using type = T;
-};
-
-template <typename F>
-inline bool dispatch_itemsize(int itemsize, F&& f) {
-  switch (itemsize) {
-    case 1:
-      f(TypeTag<std::uint8_t>{});
-      return true;
-    case 2:
-      f(TypeTag<std::uint16_t>{});
-      return true;
-    case 4:
-      f(TypeTag<std::uint32_t>{});
-      return true;
-    case 8:
-      f(TypeTag<std::uint64_t>{});
-      return true;
-    default:
-      return false;
-  }
-}
-
-// Itemsize-dispatched entry for a gather_core kernel: one statement per
-// extern "C" wrapper. The state pack must match Policy<T>::offset's
-// parameters after the element index (enforced by the static_assert).
-template <template <typename> class Policy, typename... State>
+// Store-dispatched entry for a gather_core kernel: one statement per extern
+// "C" wrapper. The state pack must match Policy::offset's parameters after the
+// element index and itemsize (enforced by the static_assert).
+template <typename Policy, typename... State>
 inline int gather_entry(int itemsize, const std::uint8_t* base,
                         std::uint8_t* output, std::ptrdiff_t n, int thread_cap,
                         std::ptrdiff_t prefetch_distance, State... state) {
   static_assert(
-      std::is_invocable_r_v<std::ptrdiff_t,
-                            decltype(&Policy<std::uint64_t>::offset),
-                            std::ptrdiff_t, State...>,
-      "state pack does not match Policy::offset(i, ...)");
-  return dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    gather_core<T, Policy<T>>(base, output, n, thread_cap, prefetch_distance,
-                              state...);
-  })
-             ? 0
-             : -1;
-}
-
-// Itemsize dispatch returning the 0 / -1 status convention, for the
-// hand-written kernels that do not go through gather_core.
-template <typename F>
-inline int run_sized(int itemsize, F&& f) {
-  return dispatch_itemsize(itemsize, std::forward<F>(f)) ? 0 : -1;
+      std::is_invocable_r_v<std::ptrdiff_t, decltype(&Policy::offset),
+                            std::ptrdiff_t, std::int64_t, State...>,
+      "state pack does not match Policy::offset(i, itemsize, ...)");
+  return dispatch_store(itemsize, [&](auto store) {
+    gather_core<decltype(store), Policy>(base, output, n, store, thread_cap,
+                                         prefetch_distance, state...);
+  });
 }
 
 // Fused multi-file fancy gather (see header for the addressing contract).
@@ -397,15 +414,15 @@ inline int run_sized(int itemsize, F&& f) {
 // The prefetch recomputes the segment for the look-ahead index, like the
 // fused multi-record kernel; the search is cheap against the DRAM latency it
 // hides.
-template <typename T>
+template <typename Store>
 inline void gather_segment_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::ptrdiff_t n_indices,
                                    const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
                                    const std::int64_t* COLSTORE_RESTRICT segment_base,
-                                   std::int64_t n_segments, int thread_cap,
+                                   std::int64_t n_segments, const Store& store, int thread_cap,
                                    std::ptrdiff_t prefetch_distance) {
-  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t len = n_segments + 1;
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -419,13 +436,13 @@ inline void gather_segment_typed(const std::int64_t* COLSTORE_RESTRICT indices,
       const std::int64_t pidx = indices[i + prefetch_distance];
       const std::int64_t ps = bin_record(segment_starts_rows, len, pidx);
       COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
-          segment_base[ps] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+          segment_base[ps] + pidx * itemsize)));
     }
     const std::int64_t idx = indices[i];
     const std::int64_t s = bin_record(segment_starts_rows, len, idx);
-    const std::int64_t addr = segment_base[s] + idx * static_cast<std::int64_t>(sizeof(T));
-    dst[i] = load_unaligned<T>(
-        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+    const std::int64_t addr = segment_base[s] + idx * itemsize;
+    store.copy(output, i,
+               reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
   }
 }
 
@@ -433,16 +450,16 @@ inline void gather_segment_typed(const std::int64_t* COLSTORE_RESTRICT indices,
 // The prefetch search does NOT write bins (the look-ahead element may belong to
 // another thread's chunk -- a write there would race), matching the single-file
 // bins policy.
-template <typename T>
+template <typename Store>
 inline void gather_segment_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                         std::uint8_t* COLSTORE_RESTRICT output,
                                         std::int32_t* COLSTORE_RESTRICT bins,
                                         std::ptrdiff_t n_indices,
                                         const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
                                         const std::int64_t* COLSTORE_RESTRICT segment_base,
-                                        std::int64_t n_segments, int thread_cap,
+                                        std::int64_t n_segments, const Store& store, int thread_cap,
                                         std::ptrdiff_t prefetch_distance) {
-  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t len = n_segments + 1;
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
@@ -456,28 +473,29 @@ inline void gather_segment_bins_typed(const std::int64_t* COLSTORE_RESTRICT indi
       const std::int64_t pidx = indices[i + prefetch_distance];
       const std::int64_t ps = bin_record(segment_starts_rows, len, pidx);
       COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
-          segment_base[ps] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+          segment_base[ps] + pidx * itemsize)));
     }
     const std::int64_t idx = indices[i];
     const std::int64_t s = bin_record(segment_starts_rows, len, idx);
     bins[i] = static_cast<std::int32_t>(s);
-    const std::int64_t addr = segment_base[s] + idx * static_cast<std::int64_t>(sizeof(T));
-    dst[i] = load_unaligned<T>(
-        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+    const std::int64_t addr = segment_base[s] + idx * itemsize;
+    store.copy(output, i,
+               reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
   }
 }
 
 // Bins-provided multi-file gather: the segment is a sequential int32 read, no
 // search; the prefetch look-ahead reads its bin too. ``segment_base`` is this
 // column's bases.
-template <typename T>
+template <typename Store>
 inline void gather_segment_withbins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                             std::uint8_t* COLSTORE_RESTRICT output,
                                             const std::int32_t* COLSTORE_RESTRICT bins,
                                             std::ptrdiff_t n_indices,
                                             const std::int64_t* COLSTORE_RESTRICT segment_base,
-                                            int thread_cap, std::ptrdiff_t prefetch_distance) {
-  T* dst = reinterpret_cast<T*>(output);
+                                            const Store& store, int thread_cap,
+                                            std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = store.itemsize();
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 #ifdef _OPENMP
 #pragma omp parallel for schedule(static) num_threads(static_cast<int>(n_threads)) \
@@ -489,13 +507,12 @@ inline void gather_segment_withbins_typed(const std::int64_t* COLSTORE_RESTRICT 
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
       const std::int64_t ps = bins[i + prefetch_distance];
       COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
-          segment_base[ps] +
-          indices[i + prefetch_distance] * static_cast<std::int64_t>(sizeof(T)))));
+          segment_base[ps] + indices[i + prefetch_distance] * itemsize)));
     }
     const std::int64_t s = bins[i];
-    const std::int64_t addr = segment_base[s] + indices[i] * static_cast<std::int64_t>(sizeof(T));
-    dst[i] = load_unaligned<T>(
-        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+    const std::int64_t addr = segment_base[s] + indices[i] * itemsize;
+    store.copy(output, i,
+               reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
   }
 }
 
@@ -506,15 +523,15 @@ inline void gather_segment_withbins_typed(const std::int64_t* COLSTORE_RESTRICT 
 // load is the same ``segment_base[s] + idx * itemsize`` (the bases stay an array,
 // since multi-file segments live in different mmaps). The divide is exact for
 // every in-range index; the clamp guards only the degenerate idx == total.
-template <typename T>
+template <typename Store>
 inline void gather_segment_uniform_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                           std::uint8_t* COLSTORE_RESTRICT output,
                                           std::ptrdiff_t n_indices,
                                           std::int64_t rows_per_segment,
                                           const std::int64_t* COLSTORE_RESTRICT segment_base,
-                                          std::int64_t n_segments, int thread_cap,
-                                          std::ptrdiff_t prefetch_distance) {
-  T* dst = reinterpret_cast<T*>(output);
+                                          std::int64_t n_segments, const Store& store,
+                                          int thread_cap, std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = store.itemsize();
   const UniformDivisor div = make_uniform_divisor(static_cast<std::uint64_t>(rows_per_segment));
   const std::int64_t last = n_segments - 1;
   const auto segment_of = [&](std::int64_t idx) -> std::int64_t {
@@ -533,13 +550,12 @@ inline void gather_segment_uniform_typed(const std::int64_t* COLSTORE_RESTRICT i
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
       const std::int64_t pidx = indices[i + prefetch_distance];
       COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
-          segment_base[segment_of(pidx)] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+          segment_base[segment_of(pidx)] + pidx * itemsize)));
     }
     const std::int64_t idx = indices[i];
-    const std::int64_t addr =
-        segment_base[segment_of(idx)] + idx * static_cast<std::int64_t>(sizeof(T));
-    dst[i] = load_unaligned<T>(
-        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+    const std::int64_t addr = segment_base[segment_of(idx)] + idx * itemsize;
+    store.copy(output, i,
+               reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
   }
 }
 
@@ -547,16 +563,16 @@ inline void gather_segment_uniform_typed(const std::int64_t* COLSTORE_RESTRICT i
 // so the trailing columns of a multi-column read reuse the segment via
 // gather_segment_withbins (a sequential int32 read, no divide). The prefetch does
 // NOT write bins -- the look-ahead element may belong to another thread's chunk.
-template <typename T>
+template <typename Store>
 inline void gather_segment_uniform_bins_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                               std::uint8_t* COLSTORE_RESTRICT output,
                                               std::int32_t* COLSTORE_RESTRICT bins,
                                               std::ptrdiff_t n_indices,
                                               std::int64_t rows_per_segment,
                                               const std::int64_t* COLSTORE_RESTRICT segment_base,
-                                              std::int64_t n_segments, int thread_cap,
-                                              std::ptrdiff_t prefetch_distance) {
-  T* dst = reinterpret_cast<T*>(output);
+                                              std::int64_t n_segments, const Store& store,
+                                              int thread_cap, std::ptrdiff_t prefetch_distance) {
+  const std::int64_t itemsize = store.itemsize();
   const UniformDivisor div = make_uniform_divisor(static_cast<std::uint64_t>(rows_per_segment));
   const std::int64_t last = n_segments - 1;
   const auto segment_of = [&](std::int64_t idx) -> std::int64_t {
@@ -575,14 +591,14 @@ inline void gather_segment_uniform_bins_typed(const std::int64_t* COLSTORE_RESTR
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
       const std::int64_t pidx = indices[i + prefetch_distance];
       COLSTORE_PREFETCH(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(
-          segment_base[segment_of(pidx)] + pidx * static_cast<std::int64_t>(sizeof(T)))));
+          segment_base[segment_of(pidx)] + pidx * itemsize)));
     }
     const std::int64_t idx = indices[i];
     const std::int64_t s = segment_of(idx);
     bins[i] = static_cast<std::int32_t>(s);
-    const std::int64_t addr = segment_base[s] + idx * static_cast<std::int64_t>(sizeof(T));
-    dst[i] = load_unaligned<T>(
-        reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
+    const std::int64_t addr = segment_base[s] + idx * itemsize;
+    store.copy(output, i,
+               reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(addr)));
   }
 }
 
@@ -603,17 +619,16 @@ inline void gather_segment_uniform_bins_typed(const std::int64_t* COLSTORE_RESTR
 // genuinely sorted one -- so an inaccurate sortedness hint can only cost speed
 // (the re-search), never memory safety. (In-range indices remain a separate
 // caller guarantee, enforced upstream by the view layer.)
-template <typename T>
+template <typename Store>
 void gather_segment_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
                                    std::uint8_t* COLSTORE_RESTRICT output,
                                    std::ptrdiff_t n_indices,
                                    const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
                                    const std::int64_t* COLSTORE_RESTRICT segment_base,
-                                   std::int64_t n_segments, int thread_cap,
+                                   std::int64_t n_segments, const Store& store, int thread_cap,
                                    std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t len = n_segments + 1;
-  T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_indices, thread_cap);
 
   const auto walk_range = [&](std::ptrdiff_t lo, std::ptrdiff_t hi) {
@@ -645,8 +660,9 @@ void gather_segment_sorted_typed(const std::int64_t* COLSTORE_RESTRICT indices,
               static_cast<std::uintptr_t>(seg_base + j * itemsize)));
         }
       }
-      dst[i] = load_unaligned<T>(
-          reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(seg_base + idx * itemsize)));
+      store.copy(output, i,
+                 reinterpret_cast<const std::uint8_t*>(
+                     static_cast<std::uintptr_t>(seg_base + idx * itemsize)));
     }
   };
 
@@ -742,7 +758,7 @@ void copy_multirecord_range(const std::uint8_t* COLSTORE_RESTRICT base,
 // bounded by R regardless of step size. The same-record prefetch gate
 // mirrors the sorted kernel's, with the look-ahead row formed
 // arithmetically instead of loaded.
-template <typename T>
+template <typename Store>
 void gather_multirecord_strided_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                       std::uint8_t* COLSTORE_RESTRICT output,
                                       std::int64_t start,
@@ -753,11 +769,11 @@ void gather_multirecord_strided_typed(const std::uint8_t* COLSTORE_RESTRICT base
                                       const std::int64_t* COLSTORE_RESTRICT n_rows_per_record,
                                       std::int64_t n_records,
                                       std::int64_t col_prefix_bytes,
+                                      const Store& store,
                                       int thread_cap,
                                       std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t len = n_records + 1;  // entries in record_starts_rows
-  T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_out, thread_cap);
   const std::int64_t pf_jump = step * static_cast<std::int64_t>(prefetch_distance);
 
@@ -802,7 +818,7 @@ void gather_multirecord_strided_typed(const std::uint8_t* COLSTORE_RESTRICT base
           COLSTORE_PREFETCH(base + record_base + j * itemsize);
         }
       }
-      dst[i] = load_unaligned<T>(base + record_base + idx * itemsize);
+      store.copy(output, i, base + record_base + idx * itemsize);
     }
   };
 
@@ -835,7 +851,7 @@ void gather_multirecord_strided_typed(const std::uint8_t* COLSTORE_RESTRICT base
 // indices in the last record. The prefetch look-ahead reuses the same
 // arithmetic, so -- unlike the irregular kernels -- it needs no
 // same-record gating: every valid index yields a valid address.
-template <typename T>
+template <typename Store>
 void gather_multirecord_uniform_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                       const std::int64_t* COLSTORE_RESTRICT indices,
                                       std::uint8_t* COLSTORE_RESTRICT output,
@@ -846,10 +862,10 @@ void gather_multirecord_uniform_typed(const std::uint8_t* COLSTORE_RESTRICT base
                                       std::int64_t n_records,
                                       std::int64_t last_record_rows,
                                       std::int64_t col_prefix_bytes,
+                                      const Store& store,
                                       int thread_cap,
                                       std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t full_base = first_body_offset + col_prefix_bytes * rows_per_record;
   const std::int64_t per_record_step = record_stride_bytes - rows_per_record * itemsize;
   const std::int64_t last_first_row = (n_records - 1) * rows_per_record;
@@ -877,7 +893,7 @@ void gather_multirecord_uniform_typed(const std::uint8_t* COLSTORE_RESTRICT base
     if (prefetch_distance > 0 && i + prefetch_distance < n_indices) {
       COLSTORE_PREFETCH(base + offset_of(indices[i + prefetch_distance]));
     }
-    dst[i] = load_unaligned<T>(base + offset_of(indices[i]));
+    store.copy(output, i, base + offset_of(indices[i]));
   }
 }
 
@@ -888,7 +904,7 @@ void gather_multirecord_uniform_typed(const std::uint8_t* COLSTORE_RESTRICT base
 // the generic bins route (search -> reciprocal divide for the first column;
 // three metadata loads -> affine math for the rest) and per-column
 // arithmetic binning (reciprocal divide x C -> x 1).
-template <typename T>
+template <typename Store>
 void gather_multirecord_uniform_bins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                            const std::int64_t* COLSTORE_RESTRICT indices,
                                            std::uint8_t* COLSTORE_RESTRICT output,
@@ -900,10 +916,10 @@ void gather_multirecord_uniform_bins_typed(const std::uint8_t* COLSTORE_RESTRICT
                                            std::int64_t n_records,
                                            std::int64_t last_record_rows,
                                            std::int64_t col_prefix_bytes,
+                                           const Store& store,
                                            int thread_cap,
                                            std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t full_base = first_body_offset + col_prefix_bytes * rows_per_record;
   const std::int64_t per_record_step = record_stride_bytes - rows_per_record * itemsize;
   const std::int64_t last_first_row = (n_records - 1) * rows_per_record;
@@ -942,11 +958,11 @@ void gather_multirecord_uniform_bins_typed(const std::uint8_t* COLSTORE_RESTRICT
       off = full_base + r * per_record_step + idx * itemsize;
     }
     bins[i] = static_cast<std::int32_t>(r);
-    dst[i] = load_unaligned<T>(base + off);
+    store.copy(output, i, base + off);
   }
 }
 
-template <typename T>
+template <typename Store>
 void gather_multirecord_uniform_withbins_typed(const std::uint8_t* COLSTORE_RESTRICT base,
                                                const std::int64_t* COLSTORE_RESTRICT indices,
                                                std::uint8_t* COLSTORE_RESTRICT output,
@@ -958,10 +974,10 @@ void gather_multirecord_uniform_withbins_typed(const std::uint8_t* COLSTORE_REST
                                                std::int64_t n_records,
                                                std::int64_t last_record_rows,
                                                std::int64_t col_prefix_bytes,
+                                               const Store& store,
                                                int thread_cap,
                                                std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
-  T* dst = reinterpret_cast<T*>(output);
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t full_base = first_body_offset + col_prefix_bytes * rows_per_record;
   const std::int64_t per_record_step = record_stride_bytes - rows_per_record * itemsize;
   const std::int64_t last_record = n_records - 1;
@@ -987,7 +1003,7 @@ void gather_multirecord_uniform_withbins_typed(const std::uint8_t* COLSTORE_REST
       const std::ptrdiff_t j = i + prefetch_distance;
       COLSTORE_PREFETCH(base + offset_of(indices[j], bins[j]));
     }
-    dst[i] = load_unaligned<T>(base + offset_of(indices[i], bins[i]));
+    store.copy(output, i, base + offset_of(indices[i], bins[i]));
   }
 }
 
@@ -1022,7 +1038,7 @@ inline std::int64_t count_mask_range(const std::uint8_t* mask, std::int64_t lo,
 // thread mapping uses an explicit parallel-for over all n_threads chunks (not
 // omp_get_thread_num), so every chunk's output region is filled even if the team
 // is granted fewer threads than requested.
-template <typename T>
+template <typename Store>
 int gather_segment_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
                                 std::uint8_t* COLSTORE_RESTRICT output,
                                 std::int64_t n_rows,
@@ -1030,11 +1046,11 @@ int gather_segment_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
                                 const std::int64_t* COLSTORE_RESTRICT segment_starts_rows,
                                 const std::int64_t* COLSTORE_RESTRICT segment_base,
                                 std::int64_t n_segments,
+                                const Store& store,
                                 int thread_cap,
                                 std::ptrdiff_t prefetch_distance) {
-  const std::int64_t itemsize = static_cast<std::int64_t>(sizeof(T));
+  const std::int64_t itemsize = store.itemsize();
   const std::int64_t len = n_segments + 1;
-  T* dst = reinterpret_cast<T*>(output);
   const std::ptrdiff_t n_threads = resolve_thread_count(n_rows, thread_cap);
   const std::int64_t chunk = (n_rows + n_threads - 1) / n_threads;
 
@@ -1094,7 +1110,7 @@ int gather_segment_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
                    load_unaligned<std::uint64_t>(mask + j) == MASK_ALL_ONES) {
               j += 8;
             }
-            std::memcpy(dst + out, seg_addr(seg_base, i * itemsize),
+            std::memcpy(output + out * itemsize, seg_addr(seg_base, i * itemsize),
                         static_cast<std::size_t>((j - i) * itemsize));
             out += j - i;
             i = j;
@@ -1102,7 +1118,7 @@ int gather_segment_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
           }
           if (out + 8 <= quota) {
             for (int b = 0; b < 8; ++b) {
-              dst[out] = load_unaligned<T>(seg_addr(seg_base, (i + b) * itemsize));
+              store.copy(output, out, seg_addr(seg_base, (i + b) * itemsize));
               out += mask[i + b];
             }
             i += 8;
@@ -1110,7 +1126,7 @@ int gather_segment_mask_typed(const std::uint8_t* COLSTORE_RESTRICT mask,
           }
         }
         if (mask[i]) {
-          dst[out] = load_unaligned<T>(seg_addr(seg_base, i * itemsize));
+          store.copy(output, out, seg_addr(seg_base, i * itemsize));
           ++out;
         }
         ++i;
@@ -1194,9 +1210,8 @@ int colstore_gather_multirecord_strided(
     const std::int64_t* record_starts_bytes, const std::int64_t* n_rows_per_record,
     std::int64_t n_records, std::int64_t col_prefix_bytes, int itemsize, int thread_cap,
     std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_strided_typed<T>(base, output, start, step, n_out, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_multirecord_strided_typed(base, output, start, step, n_out, record_starts_rows, record_starts_bytes, n_rows_per_record, n_records, col_prefix_bytes, store, thread_cap, prefetch_distance);
   });
 }
 
@@ -1205,9 +1220,8 @@ int colstore_gather_multirecord_uniform(
     std::ptrdiff_t n, std::int64_t rows_per_record, std::int64_t record_stride_bytes,
     std::int64_t first_body_offset, std::int64_t n_records, std::int64_t last_record_rows,
     std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_uniform_typed<T>(base, indices, output, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_multirecord_uniform_typed(base, indices, output, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, store, thread_cap, prefetch_distance);
   });
 }
 
@@ -1217,9 +1231,8 @@ int colstore_gather_multirecord_uniform_bins(
     std::int64_t record_stride_bytes, std::int64_t first_body_offset,
     std::int64_t n_records, std::int64_t last_record_rows,
     std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_uniform_bins_typed<T>(base, indices, output, bins, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_multirecord_uniform_bins_typed(base, indices, output, bins, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, store, thread_cap, prefetch_distance);
   });
 }
 
@@ -1229,9 +1242,8 @@ int colstore_gather_multirecord_uniform_withbins(
     std::int64_t record_stride_bytes, std::int64_t first_body_offset,
     std::int64_t n_records, std::int64_t last_record_rows,
     std::int64_t col_prefix_bytes, int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_multirecord_uniform_withbins_typed<T>(base, indices, output, bins, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_multirecord_uniform_withbins_typed(base, indices, output, bins, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, store, thread_cap, prefetch_distance);
   });
 }
 
@@ -1241,10 +1253,9 @@ int colstore_gather_segment(const std::int64_t* indices,
                               const std::int64_t* segment_base,
                               std::int64_t n_segments, int itemsize, int thread_cap,
                               std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_segment_typed<T>(indices, output, n, segment_starts_rows, segment_base,
-                                        n_segments, thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_segment_typed(indices, output, n, segment_starts_rows, segment_base,
+                                     n_segments, store, thread_cap, prefetch_distance);
   });
 }
 
@@ -1253,11 +1264,10 @@ int colstore_gather_segment_bins(const std::int64_t* indices, std::uint8_t* outp
                                    const std::int64_t* segment_starts_rows,
                                    const std::int64_t* segment_base, std::int64_t n_segments,
                                    int itemsize, int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_segment_bins_typed<T>(indices, output, bins, n, segment_starts_rows,
-                                             segment_base, n_segments, thread_cap,
-                                             prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_segment_bins_typed(indices, output, bins, n, segment_starts_rows,
+                                          segment_base, n_segments, store, thread_cap,
+                                          prefetch_distance);
   });
 }
 
@@ -1265,10 +1275,9 @@ int colstore_gather_segment_withbins(const std::int64_t* indices, std::uint8_t* 
                                        const std::int32_t* bins, std::ptrdiff_t n,
                                        const std::int64_t* segment_base, int itemsize,
                                        int thread_cap, std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_segment_withbins_typed<T>(indices, output, bins, n, segment_base,
-                                                 thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_segment_withbins_typed(indices, output, bins, n, segment_base, store,
+                                              thread_cap, prefetch_distance);
   });
 }
 
@@ -1277,11 +1286,10 @@ int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* ou
                                      const std::int64_t* segment_base, std::int64_t n_segments,
                                      int itemsize, int thread_cap,
                                      std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_segment_sorted_typed<T>(indices, output, n, segment_starts_rows,
-                                               segment_base, n_segments, thread_cap,
-                                               prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_segment_sorted_typed(indices, output, n, segment_starts_rows,
+                                            segment_base, n_segments, store, thread_cap,
+                                            prefetch_distance);
   });
 }
 
@@ -1290,10 +1298,9 @@ int colstore_gather_segment_uniform(const std::int64_t* indices, std::uint8_t* o
                                       const std::int64_t* segment_base, std::int64_t n_segments,
                                       int itemsize, int thread_cap,
                                       std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_segment_uniform_typed<T>(indices, output, n, rows_per_segment, segment_base,
-                                                n_segments, thread_cap, prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_segment_uniform_typed(indices, output, n, rows_per_segment, segment_base,
+                                             n_segments, store, thread_cap, prefetch_distance);
   });
 }
 
@@ -1303,11 +1310,10 @@ int colstore_gather_segment_uniform_bins(const std::int64_t* indices, std::uint8
                                            const std::int64_t* segment_base,
                                            std::int64_t n_segments, int itemsize, int thread_cap,
                                            std::ptrdiff_t prefetch_distance) {
-  return colstore::run_sized(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    colstore::gather_segment_uniform_bins_typed<T>(indices, output, bins, n, rows_per_segment,
-                                                     segment_base, n_segments, thread_cap,
-                                                     prefetch_distance);
+  return colstore::dispatch_store(itemsize, [&](auto store) {
+    colstore::gather_segment_uniform_bins_typed(indices, output, bins, n, rows_per_segment,
+                                                  segment_base, n_segments, store, thread_cap,
+                                                  prefetch_distance);
   });
 }
 
@@ -1437,11 +1443,11 @@ int colstore_gather_segment_mask(const std::uint8_t* mask, std::uint8_t* output,
                                    int itemsize, int thread_cap,
                                    std::ptrdiff_t prefetch_distance) {
   int status = -1;
-  colstore::dispatch_itemsize(itemsize, [&](auto tag) {
-    using T = typename decltype(tag)::type;
-    status = colstore::gather_segment_mask_typed<T>(mask, output, n_rows, n_out,
-                                                      segment_starts_rows, segment_base,
-                                                      n_segments, thread_cap, prefetch_distance);
+  colstore::dispatch_store(itemsize, [&](auto store) {
+    status = colstore::gather_segment_mask_typed(mask, output, n_rows, n_out,
+                                                   segment_starts_rows, segment_base,
+                                                   n_segments, store, thread_cap,
+                                                   prefetch_distance);
   });
   return status;
 }

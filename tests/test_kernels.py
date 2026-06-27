@@ -141,16 +141,24 @@ def test_kernel_handles_fixed_width_non_numeric_dtypes(dtype):
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")
-def test_kernel_rejects_unsupported_itemsize():
-    """Itemsizes outside {1,2,4,8} raise a clean error from the kernel."""
+@pytest.mark.parametrize("dtype", ["|S5", "<U3", "<U7", "V3"])
+def test_kernel_gathers_wide_itemsize(dtype):
+    """Itemsizes outside {1,2,4,8} gather via the generic memcpy path."""
     from colstore import _gather  # type: ignore[attr-defined]
 
-    # |S5 is a 5-byte fixed-width string -- size 5 is not in the supported set.
-    source = np.array(["hello", "world"], dtype="|S5")
-    indices = np.array([1, 0], dtype=np.int64)
-    output = np.empty(2, dtype="|S5")
-    with pytest.raises(TypeError, match="element size"):
-        _gather.gather(source, indices, output, 0)
+    dtype = np.dtype(dtype)
+    # A deterministic source whose elements are wider than the typed set
+    # (|S5 = 5, <U3 = 12, <U7 = 28, V3 = 3 bytes), built from raw bytes so it
+    # works for every fixed-width kind including void.
+    rng = np.random.default_rng(0)
+    source = rng.integers(0, 256, size=16 * dtype.itemsize, dtype=np.uint8).view(dtype)
+    indices = np.array([15, 0, 8, 1, 14, 2, 7, 7], dtype=np.int64)
+    output = np.empty(indices.shape[0], dtype=dtype)
+    _gather.gather(source, indices, output, 0)
+    # Compare raw bytes: robust across every fixed-width kind (void and
+    # unicode equality operators are unreliable, but the gather is a byte copy).
+    oracle = np.ascontiguousarray(source[indices])
+    assert np.array_equal(output.view(np.uint8), oracle.view(np.uint8))
 
 
 @pytest.mark.skipif(not cpp_available(), reason="C++ gather extension not built")

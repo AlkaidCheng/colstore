@@ -106,6 +106,28 @@ def sortedness_store(tmp_path):
     return path, full, total
 
 
+def test_wide_string_column_row_gather(tmp_path):
+    """A fixed-width string wider than 8 bytes row-gathers on a multi-record store.
+
+    Fancy index, boolean mask, and strided slice of a ``<U3`` (12-byte) column
+    previously raised ``TypeError: Unsupported element size``; the generic gather
+    path now handles any width. Each is checked against the NumPy oracle.
+    """
+    rows_per_record = [5, 7, 4, 8]  # multi-record, irregular
+    total = sum(rows_per_record)
+    words = np.array([f"w{i:02d}" for i in range(total)], dtype="<U3")  # 12 bytes/element
+    path = tmp_path / "wide.cstore"
+    write_records(path, {"s": words, "x": np.arange(total, dtype=np.int64)}, rows_per_record)
+    with opened(path) as ds:
+        assert ds._is_multi_record
+        fancy = np.array([9, 0, total - 1, 3, 9, 1], dtype=np.int64)
+        assert list(ds[fancy].dict()["s"]) == list(words[fancy])
+        mask = np.zeros(total, dtype=bool)
+        mask[::3] = True
+        assert list(ds[mask, "s"].array()) == list(words[mask])
+        assert list(ds[1:total:2].dict()["s"]) == list(words[1:total:2])
+
+
 @pytest.mark.parametrize("size", [100, THRESHOLD * 2])
 def test_routing_unchanged_for_sorted_and_unsorted(sortedness_store, monkeypatch, size):
     path, full, total = sortedness_store

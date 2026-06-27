@@ -10,10 +10,11 @@
 //   multi-record reader where addresses are non-uniform.
 //
 // The multi-record kernels below them serve range, strided, sorted,
-// unsorted, bin-reuse, and uniform-layout reads. All are templated on
-// element size only -- a single set of four instantiations (sizes 1/2/4/8)
-// covers every fixed-width numeric dtype plus fixed-width strings,
-// datetime64, and timedelta64. A single segment-mask kernel (see
+// unsorted, bin-reuse, and uniform-layout reads. Each is templated on a store
+// policy: a typed load/store for the 1/2/4/8-byte widths and a generic byte
+// copy for any other fixed width, so one instantiation set covers every
+// fixed-width dtype -- numeric, fixed-width strings (any width), datetime64,
+// and timedelta64. A single segment-mask kernel (see
 // colstore_gather_segment_mask) serves all boolean-mask reads, single-file
 // and multi-file alike, over a segment table.
 //
@@ -148,7 +149,8 @@ void colstore_copy_multirecord_range(const std::uint8_t* base,
 // reorder, no scratch. ``segment_starts_rows`` has ``n_segments + 1`` entries;
 // ``segment_base`` has ``n_segments``. Caller guarantees native byte order and
 // every index in ``[0, segment_starts_rows[n_segments])``. Dispatched on
-// itemsize (1/2/4/8 bytes; any other returns -1).
+// itemsize: 1/2/4/8-byte widths take a typed copy, any other a generic byte
+// copy; only itemsize <= 0 returns -1.
 int colstore_gather_segment(const std::int64_t* indices,
                               std::uint8_t* output, std::ptrdiff_t n,
                               const std::int64_t* segment_starts_rows,
@@ -203,7 +205,8 @@ int colstore_gather_segment_sorted(const std::int64_t* indices, std::uint8_t* ou
 // ``segment_base`` stays an array because the segments live in different mmaps, so
 // no ``segment_starts_rows`` is needed. The caller (the dataset detects the grid)
 // guarantees every index in ``[0, n_segments * rows_per_segment)`` and native byte
-// order. Dispatched on itemsize (1/2/4/8 bytes; any other returns -1).
+// order. Dispatched on itemsize: 1/2/4/8-byte widths take a typed copy, any
+// other a generic byte copy; only itemsize <= 0 returns -1.
 int colstore_gather_segment_uniform(const std::int64_t* indices, std::uint8_t* output,
                                       std::ptrdiff_t n, std::int64_t rows_per_segment,
                                       const std::int64_t* segment_base, std::int64_t n_segments,

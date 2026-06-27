@@ -2,11 +2,11 @@
 # distutils: language = c++
 """Cython bindings for the size-dispatched C++ gather kernels.
 
-The C++ kernels are templated on element size (1/2/4/8 bytes), not on NumPy
-dtype kind: one set of four instantiations per kernel covers every
-fixed-width numeric dtype, plus fixed-width bytes/unicode strings,
-datetime64, and timedelta64 -- anything whose itemsize is one of those four
-sizes.
+The C++ kernels store each element through a width policy, not a fixed NumPy
+dtype kind: the 1/2/4/8-byte widths take a typed fast path and any other
+fixed itemsize (wide strings, void records) takes a generic memcpy path, so
+every fixed-width dtype -- numeric, fixed-width bytes/unicode strings,
+datetime64, and timedelta64 -- is covered regardless of element size.
 
 Each ``def`` below wraps one kernel: the single-record pair
 (:func:`gather` / :func:`gather_bytes`), the multi-record range, strided,
@@ -212,7 +212,7 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     Parameters
     ----------
     source : numpy.ndarray
-        1D array with a fixed-size dtype (itemsize 1/2/4/8 bytes).
+        1D array with any fixed-size dtype (any positive itemsize).
     indices : numpy.ndarray
         1D ``int64`` array of element positions into ``source``.
     output : numpy.ndarray
@@ -225,7 +225,7 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
     ------
     TypeError
         If dtypes mismatch, ``indices`` is not int64, or the element size
-        is not supported.
+        is not a positive number of bytes.
     ValueError
         If shapes are incompatible.
     """
@@ -256,8 +256,7 @@ def gather(cnp.ndarray source, cnp.ndarray indices, cnp.ndarray output,
         status = colstore_gather_indexed(base, indices_ptr, output_ptr, n_indices, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -303,7 +302,7 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
     ------
     TypeError
         If ``byte_offsets`` is not int64, or the output element size is
-        not supported.
+        not a positive number of bytes.
     ValueError
         If shapes are incompatible.
     """
@@ -329,8 +328,7 @@ def gather_bytes(cnp.ndarray source, cnp.ndarray byte_offsets,
         status = colstore_gather_bytes(base, offsets_ptr, output_ptr, n_indices, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -351,7 +349,7 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
     reader derives the triple from ``slice.indices``, which clamps) and
     that the dtype is in native byte order (raw typed loads cannot
     byteswap). ``record_starts_rows`` has ``n_records + 1`` entries and the
-    other two index arrays have ``n_records``; an unsupported ``itemsize``
+    other two index arrays have ``n_records``; a non-positive ``itemsize``
     raises :class:`TypeError`.
     """
     _require_1d((output, record_starts_rows, record_starts_bytes, n_rows_per_record), "output and index arrays must be 1D.")
@@ -384,7 +382,7 @@ def gather_multirecord_strided(cnp.ndarray source, cnp.ndarray output,
     with nogil:
         status = colstore_gather_multirecord_strided(base, output_ptr, start, step, n, rsr, rsb, nrr, n_records, col_prefix_bytes, itemsize, thread_cap, pd)
     if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
+        raise TypeError(f"Invalid element size: {itemsize} bytes; itemsize must be positive.")
 
 
 def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
@@ -433,7 +431,7 @@ def gather_multirecord_uniform(cnp.ndarray source, cnp.ndarray indices,
     with nogil:
         status = colstore_gather_multirecord_uniform(base, indices_ptr, output_ptr, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, itemsize, thread_cap, pd)
     if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
+        raise TypeError(f"Invalid element size: {itemsize} bytes; itemsize must be positive.")
 
 
 def gather_multirecord_uniform_bins(cnp.ndarray source, cnp.ndarray indices,
@@ -484,7 +482,7 @@ def gather_multirecord_uniform_bins(cnp.ndarray source, cnp.ndarray indices,
     with nogil:
         status = colstore_gather_multirecord_uniform_bins(base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, itemsize, thread_cap, pd)
     if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
+        raise TypeError(f"Invalid element size: {itemsize} bytes; itemsize must be positive.")
 
 
 def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
@@ -532,7 +530,7 @@ def gather_multirecord_uniform_withbins(cnp.ndarray source, cnp.ndarray indices,
     with nogil:
         status = colstore_gather_multirecord_uniform_withbins(base, indices_ptr, output_ptr, bins_ptr, n, rows_per_record, record_stride_bytes, first_body_offset, n_records, last_record_rows, col_prefix_bytes, itemsize, thread_cap, pd)
     if status != 0:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
+        raise TypeError(f"Invalid element size: {itemsize} bytes; itemsize must be positive.")
 
 
 def copy_multirecord_range(cnp.ndarray source, cnp.ndarray output,
@@ -637,7 +635,7 @@ def gather_segment(cnp.ndarray indices, cnp.ndarray output,
     ------
     TypeError
         If ``indices`` or any segment array is not ``int64``, or the element
-        size is unsupported.
+        size is not a positive number of bytes.
     ValueError
         If shapes are 1D-inconsistent or lengths disagree.
     """
@@ -669,8 +667,7 @@ def gather_segment(cnp.ndarray indices, cnp.ndarray output,
         status = colstore_gather_segment(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -713,8 +710,7 @@ def gather_segment_uniform(cnp.ndarray indices, cnp.ndarray output,
         status = colstore_gather_segment_uniform(indices_ptr, output_ptr, n, rows_per_segment, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -762,8 +758,7 @@ def gather_segment_uniform_bins(cnp.ndarray indices, cnp.ndarray output, cnp.nda
         status = colstore_gather_segment_uniform_bins(indices_ptr, output_ptr, bins_ptr, n, rows_per_segment, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -811,8 +806,7 @@ def gather_segment_sorted(cnp.ndarray indices, cnp.ndarray output,
         status = colstore_gather_segment_sorted(indices_ptr, output_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -863,7 +857,7 @@ def gather_segment_mask(cnp.ndarray mask, cnp.ndarray output,
     with nogil:
         status = colstore_gather_segment_mask(mask_ptr, output_ptr, n_rows, n_out, ssr, sb, n_segments, itemsize, thread_cap, pd)
     if status == -1:
-        raise TypeError(f"unsupported itemsize {itemsize}.")
+        raise TypeError(f"Invalid element size: {itemsize} bytes; itemsize must be positive.")
     if status != 0:
         raise ValueError("output length does not match the mask's selected count.")
 
@@ -976,8 +970,7 @@ def gather_segment_bins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray bin
         status = colstore_gather_segment_bins(indices_ptr, output_ptr, bins_ptr, n, ssr, sb, n_segments, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 
@@ -1020,8 +1013,7 @@ def gather_segment_withbins(cnp.ndarray indices, cnp.ndarray output, cnp.ndarray
         status = colstore_gather_segment_withbins(indices_ptr, output_ptr, bins_ptr, n, sb, itemsize, thread_cap, pd)
     if status != 0:
         raise TypeError(
-            f"Unsupported element size: {itemsize} bytes. The C++ kernel "
-            f"handles 1, 2, 4, and 8 byte elements."
+            f"Invalid element size: {itemsize} bytes; itemsize must be positive."
         )
 
 def build_flags() -> set:

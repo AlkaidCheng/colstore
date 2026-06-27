@@ -127,12 +127,15 @@ def test_empty_indices_is_noop():
     assert out.shape == (0,)
 
 
-def test_unsupported_itemsize_raises():
-    starts, seg_base, _oracle, _keep = build_segments([[8], [8]], np.float64)
-    idx = np.zeros(4, dtype=np.int64)
-    out = np.empty(4, dtype=np.dtype("V3"))  # 3-byte element: unsupported
-    with pytest.raises(TypeError, match="element size"):
-        _gather.gather_segment(idx, out, starts, seg_base)
+@pytest.mark.parametrize("dtype", ["<U3", "|S5"])
+def test_wide_itemsize_gathers(dtype):
+    """Elements outside {1,2,4,8} bytes gather via the generic memcpy path."""
+    dtype = np.dtype(dtype)
+    starts, seg_base, oracle, _keep = build_segments([[8], [8]], dtype)
+    idx = np.array([0, 15, 7, 3, 8, 1], dtype=np.int64)
+    out = np.empty(len(idx), dtype=dtype)
+    _gather.gather_segment(idx, out, starts, seg_base)
+    assert np.array_equal(out.view(np.uint8), np.ascontiguousarray(oracle[idx]).view(np.uint8))
 
 
 def test_segment_starts_length_mismatch_raises():
