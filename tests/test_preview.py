@@ -257,3 +257,40 @@ def test_repr_html_escapes_string_columns(tmp_path):
         rendered = ds.head()._repr_html_()
         assert "<td>a&lt;b</td>" in rendered
         assert "<td>x&amp;y</td>" in rendered
+
+
+# ---- view repr: a formatted table (Reader/Dataset keep the compact repr) -----
+
+
+def test_view_repr_is_a_table(pstore):
+    r = repr(pstore[:5])
+    assert "pt" in r and "q" in r  # the data, not the programmatic form
+    assert "showing" in r and "columns" in r  # the table footer
+    assert "TableView(columns=" not in r
+    rc = repr(pstore["pt"])  # a single column reprs as a one-column table
+    assert "pt" in rc and "showing" in rc and "ColumnView(column=" not in rc
+
+
+def test_lazy_view_repr_is_a_card_without_reading(pstore):
+    r = repr(pstore[col("pt") > 5])
+    assert "lazy selection" in r and ".head()" in r and ".evaluate()" in r
+    assert "showing" not in r  # no data table -- the predicate was not evaluated
+
+
+def test_reader_repr_unchanged(pstore):
+    r = repr(pstore)
+    assert r.startswith("ColStoreReader(") and "shape=" in r and "columns=" in r
+
+
+def test_view_repr_fits_terminal_width(tmp_path, monkeypatch):
+    data = {f"c{i}": np.arange(4, dtype=np.float64) for i in range(30)}
+    ds = colstore.store(data, tmp_path / "w.cstore", show_progress=False)
+    try:
+        monkeypatch.setenv("COLUMNS", "40")
+        narrow = repr(ds[:4])
+        assert "..." in narrow and "c29" not in narrow  # trailing columns elided
+        monkeypatch.setenv("COLUMNS", "10000")
+        wide = repr(ds[:4])
+        assert "c29" in wide and "..." not in wide  # all columns fit a wide terminal
+    finally:
+        ds.close()

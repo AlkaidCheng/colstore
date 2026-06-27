@@ -21,7 +21,7 @@ import numpy as np
 from . import config
 from ._pandas import _make_dataframe_no_consolidate
 from ._query import _Expr
-from ._render import Preview, render_lazy_card
+from ._render import Preview, render_lazy_card, render_lazy_card_text
 from .frame import ColStoreFrame
 from .interop import InteropMixin
 
@@ -241,11 +241,25 @@ class _BaseView(InteropMixin):
             raise IndexError(f"Row index out of bounds for n_rows {n_rows}.")
         return indices
 
-    @staticmethod
-    def _summarize_row_part(row_part: Any) -> str:
-        if isinstance(row_part, np.ndarray):
-            return f"<ndarray shape={row_part.shape} dtype={row_part.dtype}>"
-        return repr(row_part)
+    def _preview(self, indexer: RowIndexer) -> Preview:
+        """A ``Preview`` over a concrete row ``indexer`` -- provided by each view type."""
+        raise NotImplementedError
+
+    def __repr__(self) -> str:
+        """A formatted preview table (pandas-style), matching the notebook display.
+
+        A view still carrying a ``col()`` / ``query`` predicate shows a lazy card
+        rather than a table -- a repr must not read the predicate columns to fill
+        one; call :meth:`head` or :meth:`evaluate` to opt in.
+        """
+        label = type(self).__name__
+        if isinstance(self._row_part, _Expr):
+            return render_lazy_card_text(label, self._edit_columns())
+        try:
+            return repr(self._preview(self._head_rows(self._preview_n(None))))
+        except Exception:
+            n = len(self._edit_columns())
+            return f"<{label}: {n} column{'' if n == 1 else 's'}>"
 
     def _head_rows(self, n: int) -> RowIndexer:
         """A row indexer for the first ``n`` rows of this view's selection."""
@@ -331,12 +345,6 @@ class ColumnView(_BaseView):
     ) -> None:
         super().__init__(store, row_part)
         self._column_name = column_name
-
-    def __repr__(self) -> str:
-        return (
-            f"ColumnView(column={self._column_name!r}, "
-            f"rows={self._summarize_row_part(self._row_part)}, lazy=True)"
-        )
 
     @property
     def column(self) -> str:
@@ -455,12 +463,6 @@ class TableView(_BaseView):
     ) -> None:
         super().__init__(store, row_part)
         self._column_names = column_names
-
-    def __repr__(self) -> str:
-        return (
-            f"TableView(columns={self._column_names!r}, "
-            f"rows={self._summarize_row_part(self._row_part)}, lazy=True)"
-        )
 
     @property
     def columns(self) -> list[str]:
