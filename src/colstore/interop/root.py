@@ -28,7 +28,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, ClassVar, TypeAlias, cast
+from typing import Any, ClassVar, TypeAlias, cast
 
 import numpy as np
 
@@ -41,15 +41,18 @@ from ..reader import ColStoreReader
 from ._streaming import write_column_batches
 from .base import FileFormat, Selection
 
-if TYPE_CHECKING:
-    import ROOT
+#: PyROOT's ``RDataFrame`` / ``RNode`` node types. ROOT ships no type stubs, so they
+#: are opaque to the type checker; aliasing them to ``Any`` lets this module annotate
+#: ROOT objects without importing ROOT (the backend imports it lazily at call time).
+RDataFrame: TypeAlias = Any
+RNode: TypeAlias = Any
 
 #: The backend selector accepted by :func:`from_root` / :func:`to_root`.
 RootBackendName: TypeAlias = str
 
 #: A ROOT source accepted by :func:`from_root`.
 RootSource: TypeAlias = (
-    "ROOT.RDataFrame | str | os.PathLike[str] "
+    "RDataFrame | str | os.PathLike[str] "
     "| list[str | os.PathLike[str]] | dict[str, str | list[str]]"
 )
 
@@ -150,7 +153,7 @@ def filter_storable(
 
 
 def _select_storable_columns(
-    rdf: ROOT.RDF.RNode,
+    rdf: RNode,
     requested: list[str] | None,
     keep_valid_only: bool,
 ) -> list[str]:
@@ -174,7 +177,7 @@ def _select_storable_columns(
     return filter_storable(names, is_storable, keep_valid_only)
 
 
-def _bytes_per_row(rdf: ROOT.RDF.RNode, columns: list[str]) -> int:
+def _bytes_per_row(rdf: RNode, columns: list[str]) -> int:
     """Estimate bytes per row from a one-row sample of the selected columns."""
     sample = rdf.Range(0, 1).AsNumpy(columns=columns)
     total = 0
@@ -406,7 +409,7 @@ def _file_group_batches(
 
 
 def _ingest_batches(
-    rdf: ROOT.RDF.RNode,
+    rdf: RNode,
     columns: list[str],
     rows_per_batch: int | None,
     total_rows: int,
