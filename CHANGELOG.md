@@ -104,8 +104,10 @@ log documents it and everything since.
   gather backend. `set_default_backend()` and the per-open `backend=` argument now
   accept only `"cpp"` (default) and `"numpy"`; the `numba_available()` function and
   the `numba` install extra are removed. Numba was never the default backend, and
-  importing it (with its LLVM stack) dominated `import colstore` time — dropping it
-  speeds the import several-fold with no change to the C++ or NumPy gather paths.
+  importing it (with its LLVM stack) was the largest single cost in `import colstore`.
+  Removing it — together with no longer scanning installed entry points when
+  registering the built-in formats — makes `import colstore` about 2.5x faster, with
+  no change to the C++ or NumPy gather paths.
 - [[#232](https://github.com/AlkaidCheng/colstore/pull/232)] `FILE_EXTENSION` is no
   longer exported from the top-level `colstore` namespace; it remains available as
   `colstore.format.FILE_EXTENSION`.

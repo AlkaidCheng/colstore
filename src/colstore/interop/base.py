@@ -119,7 +119,10 @@ class Format:
             raise TypeError(
                 f"{cls.__name__} must subclass DataFormat or FileFormat (it sets no 'kind')."
             )
-        register(cls(), override=override)
+        # Auto-registration: the class declares its own name, so skip the entry-point
+        # claim scan (an importlib.metadata.entry_points() walk over every installed
+        # distribution) -- it would only confirm the name the class already owns.
+        register(cls(), override=override, _check_claims=False)
 
 
 class DataFormat(Format):
@@ -202,12 +205,16 @@ def _entry_point_class(name: str) -> str | None:
     return None
 
 
-def register(fmt: Format, *, override: bool = False) -> None:
+def register(fmt: Format, *, override: bool = False, _check_claims: bool = True) -> None:
     """Register ``fmt`` under its :attr:`~Format.name` and any :attr:`~Format.aliases`.
 
     Usually automatic -- defining a :class:`Format` subclass registers it -- but
     callable directly for a dynamically built format. A name or alias already taken
     by a different format raises ``ValueError`` unless ``override=True``.
+
+    ``_check_claims`` guards a name against an entry point that declares a *different*
+    class. That scans the installed entry points, so auto-registration -- where the
+    class owns the name it declares -- passes ``False`` to skip the walk.
     """
     names = (fmt.name, *sorted(fmt.aliases))
     if not override:
@@ -218,12 +225,13 @@ def register(fmt: Format, *, override: bool = False) -> None:
                     f"format name {nm!r} is already registered to {type(existing).__name__!r}; "
                     f"choose another name/alias or pass override=True."
                 )
-            claimed = _entry_point_class(nm)
-            if claimed is not None and claimed != type(fmt).__name__:
-                raise ValueError(
-                    f"format name {nm!r} is claimed by the {claimed!r} entry point; "
-                    f"choose another name/alias or pass override=True."
-                )
+            if _check_claims:
+                claimed = _entry_point_class(nm)
+                if claimed is not None and claimed != type(fmt).__name__:
+                    raise ValueError(
+                        f"format name {nm!r} is claimed by the {claimed!r} entry point; "
+                        f"choose another name/alias or pass override=True."
+                    )
         collision = _extension_collision(fmt)
         if collision is not None:
             ext, owner = collision
