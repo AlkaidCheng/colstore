@@ -75,6 +75,11 @@ ds[100:200, 'price']                 # ColumnView
 ds[100:200, ['price', 'qty']]        # TableView
 ds[[1, 5, 9], ['price', 'qty']]      # TableView (fancy rows + cols)
 
+# Views compose -- re-index one by a column or by rows, and it equals the direct form.
+ds[100:200]['price']                 # ColumnView          == ds[100:200, 'price']
+ds['price'][:100]                    # ColumnView (first 100) == ds[:100, 'price']
+ds[100:200, ['price', 'qty']][:10]   # TableView (first 10 rows of the selection)
+
 # Materialize through one of the materialization methods.
 ds['price'].array()                          # 1D ndarray
 ds.array('price')                            # 1D ndarray (shortcut for ds['price'].array())
@@ -130,14 +135,18 @@ colstore reads data and when it defers the work:
   `dict()` / `recarray()` / `frame()`, or `np.asarray`) or `write()`.
 - **The reader is eager; the frame is lazy.** On a reader/view, work happens now:
   **select rows by a column predicate with `col()` or `query()`** (or positionally with
-  `ds[rows]`) — each gives a lazy view — and compute on a column with operators or NumPy
-  ufuncs (`ds['a'] * 2`, `np.log(ds['a'])`), which materialize the selected rows into an
-  `ndarray`. A frame (`reader.edit()`) defers instead: `frame['a'] * 2` builds an
+  `ds[rows]`) — each gives a lazy view — and compute on a column with operators, NumPy
+  ufuncs, or membership (`ds['a'] * 2`, `np.log(ds['a'])`, `ds['a'].isin(keep)`), which
+  materialize the selected rows into an `ndarray` (a boolean mask, for `isin`, that you
+  index with: `ds[ds['id'].isin(keep)]`). A frame (`reader.edit()`) defers instead:
+  `frame['a'] * 2` and `frame['a'].isin(keep)` build an
   expression realized on materialize / `write()`, and it filters with `where()` and
   projects with `select()` rather than indexing rows (`frame[rows]` raises).
-- **Reductions are eager everywhere.** `sum` / `mean` / `min` / `max` / `count`, and
-  the NumPy spelling `np.sum(column)`, run one bounded-memory pass and return a scalar
-  right away, on a view or a frame alike.
+- **Reductions are eager everywhere.** `sum` / `mean` / `min` / `max` / `std` / `var` /
+  `count`, and the NumPy spelling `np.sum(column)` / `np.std(column, ddof=1)`, run one
+  bounded-memory pass and return a scalar right away, on a view or a frame alike;
+  `count()` is also the row total on a reader, dataset, or view (`ds.count()`,
+  `ds[mask].count()`).
 
 ![What a colstore operation returns: a reader view versus an editing frame, row by row](docs/assets/eager_lazy_model.svg)
 
@@ -221,7 +230,7 @@ cf = cf.select("close", "open", "ratio")         # project columns; filter() ali
 cf.n_rows                                        # how many rows the frame selects (resolves it)
 cf.report()                                      # cutflow per named cut (raw / weighted / both)
 cf.dict(); cf.recarray(); cf.array("ratio")      # materialize the selected rows in memory
-cf.sum("ratio"); cf.mean("pt"); cf.max("eta"); cf.count()   # full-pass scalar reductions
+cf.sum("ratio"); cf.mean("pt"); cf.std("pt"); cf.max("eta"); cf.count()   # full-pass scalar reductions
 for batch in cf.iter_batches("256 MiB"):  ...    # or stream bounded in-memory frames (any format)
 reader = cf.write("derived.cstore")              # or write a new .cstore (returns a reader)
 
@@ -323,6 +332,20 @@ file fails fast with a clear error instead of corrupting it. On filesystems that
 don't implement `flock` (some networked or parallel filesystem mounts), the lock is skipped
 with a one-time warning and the write proceeds — there is no lock to contend for
 on such a mount, so concurrent-writer detection is simply unavailable there.
+
+**Export a selection.** `saveas` writes any reader / dataset / view selection to a file,
+choosing the format by the destination extension:
+
+```python
+ds[rows, cols].saveas("subset.cstore")   # a new .cstore (its own native format)
+dataset.saveas("merged.cstore")          # whole multi-file dataset -> one file (like concat)
+ds[rows, cols].saveas("subset.parquet")  # or Parquet / Feather / HDF5 / JSON / NPZ / ROOT
+```
+
+Writing a `.cstore` streams in bounded memory and raw-copies unchanged columns (so a whole
+store or dataset is copied / merged, not materialized); the foreign formats convert the
+selection. See **[Format interop](docs/guide/interop.md)** for the full set and `ingest()` /
+`from_*` to read them back.
 
 ### Compaction
 
