@@ -46,7 +46,7 @@ from numpy.typing import NDArray
 
 from . import config, kernels
 from ._pandas import _make_dataframe_no_consolidate
-from ._query import QueryError, _Expr, parse_query
+from ._query import QueryError, _Expr, isin_test_values, parse_query
 from ._render import render_table_html, render_table_text
 from ._sizes import resolve_batch_rows
 
@@ -283,6 +283,18 @@ class Expr:
 
     def __ne__(self, other: Any) -> Expr:  # type: ignore[override]
         return self._binop(other, np.not_equal)
+
+    def isin(self, values: Any) -> Expr:
+        """An expression: whether each value is in ``values`` -- a boolean mask (``np.isin``).
+
+        Deferred like the comparison operators, so it composes (``& | ~``) and assigns
+        (``frame.assign(in_set=frame['id'].isin(keep))``); it realizes on materialize /
+        :meth:`~Expr.compute`. To *filter* a frame, give the row predicate to
+        :meth:`~ColStoreFrame.where` as a :func:`~colstore.col` expression
+        (``frame.where(col('id').isin(keep))``). On a reader/dataset column (``ds[name]``)
+        the same ``isin`` call is eager instead (a boolean ``ndarray`` to index with).
+        """
+        return Isin(self, values)
 
     # -- bitwise / boolean-mask combinators --
     def __and__(self, other: Any) -> Expr:
@@ -641,7 +653,7 @@ class Isin(Expr):
     def __init__(self, target: Expr, values: Any) -> None:
         target = _unwrap(target)
         self._target = target
-        self._values = np.asarray(values)
+        self._values = isin_test_values(values)
         self._key = ("isin", target._key, self._values.dtype.str, self._values.tobytes())
 
 

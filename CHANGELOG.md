@@ -8,6 +8,12 @@ log documents it and everything since.
 
 ### Added
 
+- [[#247](https://github.com/AlkaidCheng/colstore/pull/247)] `isin()` on a column.
+  `ds[name].isin(values)` on a reader/dataset column is eager — a boolean `ndarray` to
+  use as a mask (`ds[ds['id'].isin(keep)]`); `frame[name].isin(values)` on a frame column
+  is lazy — a boolean expression to assign or compose, with a frame filtered the usual
+  way via `where(col('id').isin(...))`. A `set` / `frozenset` is expanded to its members.
+  (`col(name).isin(...)` already worked inside queries.)
 - [[#246](https://github.com/AlkaidCheng/colstore/pull/246)] `std()` and `var()` column
   reductions, alongside `sum` / `mean` / `min` / `max` / `count`. Available on a
   reader/dataset column (`ds[name].std()`) and a frame column (`frame[name].var()`) as

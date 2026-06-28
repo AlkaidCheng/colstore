@@ -21,7 +21,7 @@ from numpy.lib.mixins import NDArrayOperatorsMixin
 
 from . import config
 from ._pandas import _make_dataframe_no_consolidate
-from ._query import _Expr
+from ._query import _Expr, isin_test_values
 from ._render import Preview, render_lazy_card, render_lazy_card_text
 from .frame import ColStoreFrame, ColumnReductions
 from .interop import InteropMixin
@@ -518,6 +518,15 @@ class ColumnView(NDArrayOperatorsMixin, ColumnReductions, _BaseView):
         if not copy:
             return self._store._view_one(self._column_name, row_indexer)
         return self._store._gather_one(self._column_name, row_indexer)
+
+    def isin(self, values: Any) -> np.ndarray:
+        """Boolean mask of which selected rows' values are in ``values`` -- eager (``np.isin``).
+
+        Reads this column's selected rows and tests membership, returning a plain boolean
+        ``ndarray`` to use as a mask, e.g. ``ds[ds['id'].isin(keep)]``. On a frame column
+        (``frame[name]``) the same call is lazy instead (a boolean expression).
+        """
+        return np.isin(self.array(), isin_test_values(values))
 
     def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any) -> Any:
         """Apply a NumPy ufunc eagerly by materializing the column(s).

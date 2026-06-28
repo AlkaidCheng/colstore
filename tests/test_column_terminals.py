@@ -117,6 +117,41 @@ def test_numpy_std_var_dispatch_and_rejects(store):
         store["a"].std(keepdims=True)
 
 
+# ---- isin: eager on a view, lazy on a frame column -------------------------
+
+
+def test_column_isin_eager_on_view_lazy_on_frame(store):
+    a = np.arange(10, dtype=np.float64)
+    keep = [2.0, 5.0, 8.0]
+    # eager on a reader/dataset column -> a boolean ndarray, usable as a row mask
+    mask = store["a"].isin(keep)
+    assert isinstance(mask, np.ndarray) and mask.dtype == bool
+    np.testing.assert_array_equal(mask, np.isin(a, keep))
+    np.testing.assert_array_equal(store[store["a"].isin(keep)].dict()["a"], a[np.isin(a, keep)])
+    # a set is expanded to its members (NumPy would read a bare set as one object)
+    np.testing.assert_array_equal(store["a"].isin({2.0, 5.0, 8.0}), np.isin(a, keep))
+    # lazy on a frame column -> an Isin expression: assign / compose, realized on materialize
+    df = store.edit()
+    assert isinstance(df["a"].isin(keep), Isin)
+    np.testing.assert_array_equal(df.assign(m=df["a"].isin(keep)).array("m"), np.isin(a, keep))
+    np.testing.assert_array_equal(df.assign(m=~df["a"].isin(keep)).array("m"), ~np.isin(a, keep))
+    # filter a frame with a col() predicate (the canonical frame filter)
+    np.testing.assert_array_equal(df.where(col("a").isin(keep)).array("a"), a[np.isin(a, keep)])
+
+
+def test_isin_set_expands_across_all_routes(store):
+    """A set of test values is expanded for *every* isin route, not just the eager view."""
+    a = np.arange(10, dtype=np.float64)
+    keep = {2.0, 5.0, 8.0}
+    oracle = a[np.isin(a, list(keep))]
+    # the query-predicate route, ds[col().isin(set)], previously returned [] silently
+    np.testing.assert_array_equal(store[col("a").isin(keep)].dict()["a"], oracle)
+    np.testing.assert_array_equal(store[col("a").isin(frozenset(keep))].dict()["a"], oracle)
+    # consistent with the eager-mask and frame-where routes
+    np.testing.assert_array_equal(store[store["a"].isin(keep)].dict()["a"], oracle)
+    np.testing.assert_array_equal(store.edit().where(col("a").isin(keep)).array("a"), oracle)
+
+
 # ---- materialization: array() and the NumPy array interface ----------------
 
 
