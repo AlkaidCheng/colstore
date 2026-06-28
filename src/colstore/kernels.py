@@ -1,7 +1,7 @@
 """Python wrapper layer over the compiled ``colstore._gather`` kernels.
 
-Wraps the gather kernels (C++/Cython, with a NumPy fallback and optional
-Numba) plus record-index build, parallel copy-runs, and record interleave.
+Wraps the gather kernels (C++/Cython, with a NumPy fallback) plus
+record-index build, parallel copy-runs, and record interleave.
 When the compiled extension is not built, :func:`gather` falls back to NumPy
 with a one-time warning; NumPy is always available and is used for ``slice``
 and full-column reads where fancy indexing isn't required.
@@ -23,28 +23,10 @@ except ImportError as exc:
     _CPP_IMPORT_ERROR = exc
     _CPP_AVAILABLE = False
 
-try:
-    from numba import njit, prange
-
-    _NUMBA_AVAILABLE = True
-
-    @njit(parallel=True, cache=True, boundscheck=False, fastmath=True)  # type: ignore[untyped-decorator]
-    def _numba_gather_kernel(source: np.ndarray, indices: np.ndarray, output: np.ndarray) -> None:
-        for i in prange(indices.shape[0]):
-            output[i] = source[indices[i]]
-
-except ImportError:
-    _NUMBA_AVAILABLE = False
-
 
 def cpp_available() -> bool:
     """Return whether the compiled C++ gather extension is importable."""
     return _CPP_AVAILABLE
-
-
-def numba_available() -> bool:
-    """Return whether Numba is importable in this environment."""
-    return _NUMBA_AVAILABLE
 
 
 def max_threads() -> int:
@@ -175,7 +157,7 @@ def gather(
     dtype : numpy.dtype
         Output dtype; native byte order.
     backend : str, optional
-        ``"cpp"`` (default), ``"numpy"``, or ``"numba"``. Falls back to
+        ``"cpp"`` (default) or ``"numpy"``. Falls back to
         NumPy with a warning if the requested backend is unavailable, and
         silently for dtype kinds or byte orders the compiled kernels
         cannot handle. The C++ kernel decides serial vs parallel execution
@@ -233,23 +215,8 @@ def gather(
         # width strings) or non-native byte order fall through to NumPy.
         backend = "numpy"
 
-    if backend == "numba":
-        if _NUMBA_AVAILABLE and kernel_compatible:
-            output = out if out is not None else np.empty(indices.shape[0], dtype=dtype)
-            _numba_gather_kernel(source, indices, output)
-            return output
-        if not _NUMBA_AVAILABLE:
-            warnings.warn(
-                "Requested 'numba' backend but Numba is not installed; falling back to NumPy.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-        backend = "numpy"
-
     if backend != "numpy":
-        raise ValueError(
-            f"Unknown gather backend {backend!r}; expected 'cpp', 'numpy', or 'numba'."
-        )
+        raise ValueError(f"Unknown gather backend {backend!r}; expected 'cpp' or 'numpy'.")
     result = np.asarray(source[indices], dtype=dtype)
     if out is not None:
         out[:] = result

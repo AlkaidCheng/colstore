@@ -57,7 +57,7 @@ def test_set_default_madvise_roundtrips():
 
 
 def test_default_backend_starts_as_cpp():
-    assert get_default_backend() in ("cpp", "numpy", "numba")
+    assert get_default_backend() in ("cpp", "numpy")
 
 
 def test_set_default_backend_roundtrips():

@@ -229,7 +229,7 @@ class _BaseView(InteropMixin):
 
         All integer selectors are validated against ``n_rows`` here, and
         negative positions are folded to their non-negative equivalents. This
-        makes every gather backend (NumPy, C++, Numba) agree on bounds and
+        makes every gather backend (NumPy, C++) agree on bounds and
         wraparound semantics, instead of leaving the unchecked kernels to read
         out of bounds on a memmap. A ``col()`` / ``query`` predicate is evaluated
         against the store first -- reading the columns it references -- into a

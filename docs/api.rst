@@ -93,7 +93,6 @@ Configuration & diagnostics
    get_default_madvise
    max_threads
    cpp_available
-   numba_available
    use_passive_openmp_wait
 
 Exceptions

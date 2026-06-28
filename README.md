@@ -520,7 +520,7 @@ from colstore import config
 
 set_max_workers(8)                 # parallel gathers across columns
 set_default_madvise("sequential")  # OS read-ahead hint for sorted-index reads
-set_default_backend("cpp")         # gather kernel: cpp | numpy | numba
+set_default_backend("cpp")         # gather kernel: cpp | numpy
 set_gather_thread_cap(16)          # threads per gather (default scales with socket count)
 config.set_numa_policy("auto")     # page placement: auto (interleave on multi-node) | local
 config.set_write_method("auto")    # write fill: auto (pwrite where available) | pwrite | mmap
