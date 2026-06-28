@@ -8,6 +8,14 @@ log documents it and everything since.
 
 ### Added
 
+- [[#246](https://github.com/AlkaidCheng/colstore/pull/246)] `std()` and `var()` column
+  reductions, alongside `sum` / `mean` / `min` / `max` / `count`. Available on a
+  reader/dataset column (`ds[name].std()`) and a frame column (`frame[name].var()`) as
+  eager scalar terminals over the column's selected rows; `np.std(column)` /
+  `np.var(column)` dispatch to the same bounded-memory streaming pass. `ddof` sets the
+  delta degrees of freedom (`ddof=0` population, `ddof=1` sample). The variance is a
+  numerically stable one-pass computation. (median / quantile are intentionally not
+  provided — they need the full column in memory.)
 - [[#245](https://github.com/AlkaidCheng/colstore/pull/245)] `count()` is now available
   on every object as the scalar row count: a reader/dataset returns its total (the same
   as `n_rows`), a row-selected view the rows it selects (resolving a `col()` / `query`
