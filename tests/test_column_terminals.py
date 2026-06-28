@@ -85,6 +85,38 @@ def test_reductions_share_one_mixin():
     assert issubclass(ColumnView, ColumnReductions)
 
 
+# ---- std / var (with ddof) -------------------------------------------------
+
+
+def test_column_view_std_var(store):
+    a = np.arange(10, dtype=np.float64)
+    assert store["a"].var() == pytest.approx(np.var(a))  # population (ddof=0)
+    assert store["a"].std() == pytest.approx(np.std(a))
+    assert store["a"].var(ddof=1) == pytest.approx(np.var(a, ddof=1))  # sample
+    assert store["a"].std(ddof=1) == pytest.approx(np.std(a, ddof=1))
+    assert store["b"].std() == pytest.approx(np.std(a))  # integer column
+    hot = store[col("a") >= 5, "a"]  # over a row selection
+    assert hot.std() == pytest.approx(np.std(a[a >= 5]))
+
+
+def test_frame_column_std_var(store):
+    df = store.edit()
+    a = np.arange(10, dtype=np.float64)
+    assert df["a"].std() == pytest.approx(np.std(a))
+    assert df["a"].var(ddof=1) == pytest.approx(np.var(a, ddof=1))
+    assert df.std("a") == pytest.approx(np.std(a))  # frame.std(name) form
+    assert df.where("a >= 5")["a"].std() == pytest.approx(np.std(a[a >= 5]))
+
+
+def test_numpy_std_var_dispatch_and_rejects(store):
+    a = np.arange(10, dtype=np.float64)
+    # np.std(col) / np.var(col) dispatch to the streaming method, not materialize
+    assert np.std(store["a"]) == pytest.approx(np.std(a))
+    assert np.var(store["a"], ddof=1) == pytest.approx(np.var(a, ddof=1))
+    with pytest.raises(TypeError):  # an unsupported NumPy param is rejected, not ignored
+        store["a"].std(keepdims=True)
+
+
 # ---- materialization: array() and the NumPy array interface ----------------
 
 

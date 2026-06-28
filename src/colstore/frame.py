@@ -929,6 +929,20 @@ class ColumnReductions:
         _reject_reduction_params(axis, dtype, out, kwargs)
         return self._reduction_frame().max(self._reduction_name())
 
+    def var(
+        self, axis: Any = None, dtype: Any = None, out: Any = None, ddof: int = 0, **kwargs: Any
+    ) -> float:
+        """Variance of this column over its selected rows (``ddof`` delta degrees of freedom)."""
+        _reject_reduction_params(axis, dtype, out, kwargs)
+        return self._reduction_frame().var(self._reduction_name(), ddof=ddof)
+
+    def std(
+        self, axis: Any = None, dtype: Any = None, out: Any = None, ddof: int = 0, **kwargs: Any
+    ) -> float:
+        """Standard deviation of this column over its selected rows (``ddof`` deg. of freedom)."""
+        _reject_reduction_params(axis, dtype, out, kwargs)
+        return self._reduction_frame().std(self._reduction_name(), ddof=ddof)
+
     def count(self) -> int:
         """Number of rows in this column's selection."""
         return self._reduction_frame().count()
@@ -1951,6 +1965,42 @@ class ColStoreFrame:
             batch_max = batch.max()
             acc = batch_max if acc is None else np.maximum(acc, batch_max)
         return acc if acc is not None else float("nan")
+
+    def var(self, column: Any, ddof: int = 0) -> float:
+        """Variance of ``column`` over the selected rows -- a full bounded-memory pass.
+
+        Uses a numerically stable one-pass variance in float64: each batch's mean and
+        squared deviations are combined with Chan's parallel update, so it never forms
+        the cancellation-prone "mean of squares minus square of mean". ``ddof`` is the
+        delta degrees of freedom -- ``ddof=0`` the population variance, ``ddof=1`` the
+        sample variance. A NaN in the data propagates; a selection with ``ddof`` or
+        fewer rows gives ``nan``.
+        """
+        expr = self._reduction_expr(column, "var", "biuf", "numeric")
+        n = 0
+        mean = 0.0
+        m2 = 0.0
+        for batch in self._stream_column(expr):
+            count = len(batch)
+            if count == 0:
+                continue
+            values = batch.astype(np.float64, copy=False)
+            batch_mean = float(values.mean())
+            batch_m2 = float(((values - batch_mean) ** 2).sum())
+            delta = batch_mean - mean
+            total = n + count
+            mean += delta * count / total
+            m2 += batch_m2 + delta * delta * n * count / total
+            n = total
+        return m2 / (n - ddof) if n - ddof > 0 else float("nan")
+
+    def std(self, column: Any, ddof: int = 0) -> float:
+        """Standard deviation of ``column`` over the selected rows -- ``sqrt`` of :meth:`var`.
+
+        Same stable one-pass computation and ``ddof`` convention as :meth:`var`. A NaN
+        propagates; a selection with ``ddof`` or fewer rows gives ``nan``.
+        """
+        return float(np.sqrt(self.var(column, ddof=ddof)))
 
     def _batch_column(
         self, name: str, expr: Expr, rows: Rows, memo: Memo, buffers: Buffers, rows_per_batch: int
