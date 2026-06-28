@@ -73,6 +73,13 @@ log documents it and everything since.
 
 ### Fixed
 
+- [[#253](https://github.com/AlkaidCheng/colstore/pull/253)] An all-null column imported
+  from a foreign file — a pandas object column that is entirely `NaN`, or an all-null /
+  null-typed Arrow column — is now stored as an all-`NaN` `float64` column instead of
+  raising "colstore has no null support". Such a column carries no data and no recoverable
+  type, so float `NaN` (colstore's in-band missing value) is the natural fixed-width form;
+  a column that *mixes* nulls with real values still raises. Affects `ingest` /
+  `from_parquet` / `from_feather` / `from_json` / `from_hdf`.
 - [[#244](https://github.com/AlkaidCheng/colstore/pull/244)] A view is now re-indexable
   by rows, composed onto its current selection. `ds['col'][:100]` (previously
   `TypeError: 'ColumnView' object is not subscriptable`) and `ds[rows, cols][:10]`

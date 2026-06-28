@@ -7,8 +7,10 @@ These helpers centralize that policy and the Arrow / pandas bridges so every
 format applies it identically.
 
 A genuine null -- an out-of-band missing value (an object ``None``, a masked
-nullable dtype, or an Arrow validity bit) -- is rejected, but a NaN / NaT bit
-pattern in a native numeric column is a valid value and is stored.
+nullable dtype, or an Arrow validity bit) -- mixed with real values is rejected,
+but a NaN / NaT bit pattern in a native numeric column is a valid value and is
+stored. A column whose values are *all* null carries no data, so it is stored as an
+all-NaN ``float64`` column rather than rejected.
 """
 
 from __future__ import annotations
@@ -37,6 +39,17 @@ def _is_null(value: Any) -> bool:
 def _reject_nulls(name: object) -> NoReturn:
     """Raise the standard 'no null support' ``TypeError`` for column ``name``."""
     raise TypeError(f"column {name!r} contains null values; colstore has no null support.")
+
+
+def _all_null_column(length: int) -> np.ndarray[Any, Any]:
+    """A fully-null column as fixed-width ``float64`` NaN.
+
+    A column whose every value is null carries no data and no type to preserve, so it
+    stores as the canonical in-band "missing" form -- ``float64`` NaN, which round-trips
+    losslessly -- instead of being rejected for having out-of-band nulls. A column that
+    mixes nulls with real values has no fixed-width form and still raises.
+    """
+    return np.full(length, np.nan, dtype=np.float64)
 
 
 def store_columns(columns: dict[str, Any], dest: Any, **kwargs: Any) -> ColStoreReader:
@@ -91,14 +104,16 @@ def arrow_to_columns(table: Any) -> dict[str, np.ndarray[Any, Any]]:
                 f"column {name!r} has nested Arrow type {kind}; colstore stores only "
                 f"fixed-width columns."
             )
-        if pa.types.is_null(kind):
-            raise TypeError(f"column {name!r} is all-null; colstore has no null support.")
+        chunked = table.column(name)
+        n = len(chunked)
+        if pa.types.is_null(kind) or (n > 0 and chunked.null_count == n):
+            columns[name] = _all_null_column(n)
+            continue
         if pa.types.is_timestamp(kind) and kind.tz is not None:
             raise TypeError(
                 f"column {name!r} is a timezone-aware timestamp; colstore has no "
                 f"timezone-aware type (convert to UTC-naive first)."
             )
-        chunked = table.column(name)
         if chunked.null_count:
             _reject_nulls(name)
         if pa.types.is_string(kind) or pa.types.is_large_string(kind):
@@ -131,6 +146,9 @@ def frame_to_columns(frame: Any) -> dict[str, np.ndarray[Any, Any]]:
         # None or a masked nullable/extension dtype, which converts to an object array --
         # has no fixed-width form.
         if array.dtype.kind not in "fcmM" and series.isna().any():
+            if series.isna().all():
+                columns[str(name)] = _all_null_column(len(series))
+                continue
             _reject_nulls(str(name))
         columns[str(name)] = storable_column(str(name), array)
     return columns

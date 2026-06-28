@@ -307,6 +307,58 @@ def test_hdf5_datetime_nat_is_stored_not_null(tmp_path):
     assert np.isnat(out["t"]).tolist() == [False, True, False]
 
 
+def test_all_null_object_column_stored_as_float_nan():
+    """A pandas all-null column carries no data, so it stores as float64 NaN, not rejected.
+
+    A column that mixes nulls with real values has no fixed-width form and still raises.
+    """
+    pytest.importorskip("pandas")
+    import pandas as pd
+
+    from colstore.interop._convert import frame_to_columns
+
+    cols = frame_to_columns(
+        pd.DataFrame({"id": [1, 2, 3], "sel": pd.Series([np.nan] * 3, dtype=object)})
+    )
+    assert cols["sel"].dtype == np.float64 and np.isnan(cols["sel"]).all()
+    assert list(cols["id"]) == [1, 2, 3]
+    with pytest.raises(TypeError, match="null"):
+        frame_to_columns(pd.DataFrame({"x": pd.Series(["a", None, "c"], dtype=object)}))
+
+
+def test_parquet_all_null_column_stored_as_float_nan(tmp_path):
+    """An all-null Parquet column (typed or null-typed) stores as float64 NaN, not rejected."""
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    table = pa.table(
+        {
+            "typed": pa.array([None, None, None], type=pa.int64()),
+            "untyped": pa.array([None, None, None]),
+            "real": pa.array([1, 2, 3], type=pa.int64()),
+        }
+    )
+    pq.write_table(table, str(tmp_path / "an.parquet"))
+    out = colstore.from_parquet(tmp_path / "an.parquet", tmp_path / "an.cstore").dict()
+    for name in ("typed", "untyped"):
+        assert out[name].dtype == np.float64 and np.isnan(out[name]).all()
+    assert list(out["real"]) == [1, 2, 3]
+
+
+def test_hdf5_all_null_column_ingests_as_float_nan(tmp_path):
+    """An all-null column in a pandas HDF5 file ingests without error as float64 NaN."""
+    _need("h5py", "pandas", "tables")
+    import pandas as pd
+
+    path = tmp_path / "an.h5"
+    pd.DataFrame({"sel": pd.Series([np.nan] * 3, dtype=object), "n": [1, 2, 3]}).to_hdf(
+        path, key="frame", format="table", mode="w"
+    )
+    out = colstore.from_hdf(path, tmp_path / "an.cstore").dict()
+    assert out["sel"].dtype == np.float64 and np.isnan(out["sel"]).all()
+    assert list(out["n"]) == [1, 2, 3]
+
+
 def test_nested_or_non_string_object_rejected():
     from colstore.interop._convert import storable_column
 
