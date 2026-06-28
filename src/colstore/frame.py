@@ -580,6 +580,10 @@ class ConstColumn(_Leaf):
 
     __slots__ = ("_dtype", "_key", "_value")
 
+    # ``np.asarray(value).dtype`` is typed ``Any`` by NumPy's stubs; pin the slot so
+    # the ``dtype`` property does not leak that ``Any`` through its return type.
+    _dtype: np.dtype[Any]
+
     def __init__(self, value: Any, dtype: Any = None) -> None:
         if not _is_scalar_operand(value):
             raise TypeError(
