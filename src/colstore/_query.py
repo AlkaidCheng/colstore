@@ -398,6 +398,19 @@ class _Compare(_Expr):
         )
 
 
+def isin_test_values(values: Any) -> NDArray[Any]:
+    """Normalize ``isin`` test values to a 1-D array -- a set/frozenset becomes its members.
+
+    NumPy reads a bare ``set`` as a single object element rather than the values it holds,
+    so it is expanded to a list first; a list, tuple, or array passes straight through.
+    Shared by every ``isin`` surface (the query predicate, the editing-frame node, and the
+    eager column view) so they expand membership sets identically.
+    """
+    if isinstance(values, (set, frozenset)):
+        values = list(values)
+    return np.asarray(values)
+
+
 class _Isin(_Expr):
     """A membership test ``target in values`` (``np.isin``)."""
 
@@ -405,11 +418,11 @@ class _Isin(_Expr):
 
     def __init__(self, target: _Expr, values: Any) -> None:
         self._target = target
-        self._values = values
+        self._values = isin_test_values(values)
 
     def _evaluate(self, read_column: ReadColumn) -> Any:
         target = _operand(self._target, read_column)
-        target, members = _align_strings(target, np.asarray(self._values))
+        target, members = _align_strings(target, self._values)
         return np.isin(target, members)
 
     def _columns(self) -> Iterator[str]:
