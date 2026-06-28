@@ -7,16 +7,13 @@ import pandas as pd
 import pytest
 
 import colstore
-from colstore.kernels import cpp_available, numba_available
+from colstore.kernels import cpp_available
 
 # Index validation runs against every available gather backend so the
-# C++/Numba kernels are held to the same bounds/negative-index contract as
-# NumPy.
+# C++ kernel is held to the same bounds/negative-index contract as NumPy.
 _BACKENDS = ["numpy"]
 if cpp_available():
     _BACKENDS.append("cpp")
-if numba_available():
-    _BACKENDS.append("numba")
 
 
 @pytest.fixture

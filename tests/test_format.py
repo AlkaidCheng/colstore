@@ -25,13 +25,11 @@ from colstore.format import (
     read_header,
     write_dataset,
 )
-from colstore.kernels import cpp_available, numba_available
+from colstore.kernels import cpp_available
 
 _BACKENDS = ["numpy"]
 if cpp_available():
     _BACKENDS.append("cpp")
-if numba_available():
-    _BACKENDS.append("numba")
 
 
 def test_file_extension_is_cstore():
@@ -183,7 +181,7 @@ def test_fixed_width_unicode_roundtrip(tmp_path, backend):
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_datetime64_roundtrip(tmp_path, backend):
     values = np.array(["2020-01-01", "2021-06-15"], dtype="datetime64[ns]")
-    # cpp/numba backends must not warn here; they silently fall back to NumPy.
+    # the cpp backend must not warn here; it silently falls back to NumPy.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         store = colstore.store(

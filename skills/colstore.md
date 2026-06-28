@@ -29,7 +29,7 @@ zero-copy where possible.
 
 ```bash
 pip install colstore
-# optional extras, by need: pandas, arrow (pyarrow), hdf5 (h5py), uproot, numba, progress (tqdm)
+# optional extras, by need: pandas, arrow (pyarrow), hdf5 (h5py), uproot, progress (tqdm)
 pip install "colstore[arrow,pandas]"
 ```
 
@@ -263,7 +263,7 @@ colstore.max_threads()                 # kernel's available thread count
 colstore.set_max_workers(n)            # package-wide threads for multi-column reads
 colstore.set_gather_thread_cap(n)      # max OpenMP threads per single gather call
 colstore.ensure_calibrated()           # apply a cached per-machine thread cap, else calibrate once
-colstore.set_default_backend("cpp")    # "cpp" (default) | "numpy" | "numba"
+colstore.set_default_backend("cpp")    # "cpp" (default) | "numpy"
 colstore.set_default_madvise("normal") # mmap advice for new opens (NUMA/large-file tuning)
 ```
 
@@ -326,7 +326,7 @@ arguments.
 
 **Configuration & diagnostics**
 - `set_max_workers/get_max_workers`, `set_gather_thread_cap/get_gather_thread_cap`, `set_default_backend/get_default_backend`, `set_default_madvise/get_default_madvise`.
-- `calibrate(*, persist=True, rounds=10) -> int`, `ensure_calibrated() -> int`, `max_threads() -> int`, `cpp_available()`, `numba_available()`, `use_passive_openmp_wait()`.
+- `calibrate(*, persist=True, rounds=10) -> int`, `ensure_calibrated() -> int`, `max_threads() -> int`, `cpp_available()`, `use_passive_openmp_wait()`.
 
 **Exceptions:** `FormatError` (not a valid `.cstore`), `QueryError` (bad query/expression).
 

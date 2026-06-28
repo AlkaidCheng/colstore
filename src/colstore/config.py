@@ -19,7 +19,7 @@ except ImportError:
     _DEFAULT_MAX_WORKERS = os.cpu_count() or 1
 
 MadviseOption = Literal["normal", "sequential", "random", "willneed", "dontneed"]
-GatherBackend = Literal["cpp", "numpy", "numba"]
+GatherBackend = Literal["cpp", "numpy"]
 NumaPolicy = Literal["auto", "interleave", "local"]
 WriteMethod = Literal["auto", "pwrite", "mmap"]
 
@@ -152,7 +152,7 @@ def set_max_workers(n: int) -> None:
 def get_gather_thread_cap() -> int:
     """Return the maximum OpenMP threads a single gather kernel call may use.
 
-    This caps within-column parallelism in the C++/Numba backends. The default
+    This caps within-column parallelism in the C++ backend. The default
     is derived from the physical core count (see
     :func:`_default_gather_thread_cap`) or, if calibration has been run, the
     cached autotuned value.
@@ -453,10 +453,10 @@ def get_default_backend() -> GatherBackend:
 
 
 def set_default_backend(backend: GatherBackend) -> None:
-    """Set the default gather backend (``"cpp"``, ``"numpy"``, or ``"numba"``)."""
+    """Set the default gather backend (``"cpp"`` or ``"numpy"``)."""
     global _default_backend
-    if backend not in ("cpp", "numpy", "numba"):
-        raise ValueError(f"backend must be 'cpp', 'numpy', or 'numba'; got {backend!r}.")
+    if backend not in ("cpp", "numpy"):
+        raise ValueError(f"backend must be 'cpp' or 'numpy'; got {backend!r}.")
     _default_backend = backend
 
 
@@ -603,7 +603,7 @@ def use_passive_openmp_wait() -> bool:
     *active* wait makes idle worker threads busy-spin between them, burning CPU
     on otherwise-idle cores. ``passive`` makes them sleep instead. This is
     opt-in and never applied automatically: ``OMP_WAIT_POLICY`` is process-global
-    -- it governs every OpenMP runtime in the process (NumPy, numba, ...) -- and
+    -- it governs every OpenMP runtime in the process (NumPy, the C++ kernel, ...) -- and
     the per-call gather thread cap already bounds colstore's own spinning.
 
     The policy is read once, when the OpenMP runtime first starts its thread pool

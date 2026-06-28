@@ -207,8 +207,8 @@ class ColStoreReader(_ReaderBase):
         If ``True``, attempt to lock every column's pages in RAM. Failures
         emit a warning rather than raising. Defaults to ``False``.
     backend : str or None, optional
-        Gather backend used for fancy-index reads (``"cpp"``, ``"numpy"``,
-        or ``"numba"``). ``None`` uses the package-wide default. Applies to
+        Gather backend used for fancy-index reads (``"cpp"`` or
+        ``"numpy"``). ``None`` uses the package-wide default. Applies to
         single-record stores; multi-record stores require the compiled C++
         extension and always use it for fancy-index reads.
     max_workers : int or None, optional

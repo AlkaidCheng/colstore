@@ -72,7 +72,7 @@ from .dataset import ColStoreDataset
 from .format import FormatError
 from .frame import ColStoreFrame
 from .interop.root import from_root, to_root
-from .kernels import cpp_available, max_threads, numba_available
+from .kernels import cpp_available, max_threads
 from .reader import ColStoreReader
 from .shards import Appender, append, appender
 from .view import ColumnView, TableView
@@ -115,7 +115,6 @@ __all__ = [
     "ingest",
     "interop",
     "max_threads",
-    "numba_available",
     "open",
     "profiling",
     "recreate",
