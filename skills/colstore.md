@@ -327,7 +327,7 @@ arguments.
 - `col(name) -> expression` — lazy column reference; compose with `> < == != & | ~`, `.isin([...])`.
 
 **Format interop**
-- `convert(source, dest=None, *, format=None, dtypes=None, rename=None, output_dir=None, overwrite=False, on_mismatch="strict") -> ColStoreReader | Path | list` — convert files (one endpoint is `.cstore`); `source` is a path / glob / list; import returns a reader, export returns a `Path`, a glob 1:1 returns a list, a literal `dest` merges. `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` are import shortcuts.
+- `convert(source, dest=None, *, format=None, dtypes=None, batch_size=None, compact=True, rename=None, output_dir=None, overwrite=False, on_mismatch="strict") -> ColStoreReader | Path | list` — convert files (one endpoint is `.cstore`); `source` is a path / glob / list; import returns a reader, export returns a `Path`, a glob 1:1 returns a list, a literal `dest` merges. `batch_size` (int rows or `"256 MiB"`) streams a large import in bounded memory for ROOT / Parquet / Feather / HDF5 with a fixed-width numeric schema (else whole-file + warning). `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` are import shortcuts.
 - `saveas(source, dest, *, format=None)`, `to_root(source, path, ...)` — export by extension (returns `None`; a `.root` dest returns its path); a `.cstore` dest uses the native streaming writer (raw-copy / merge like `concat`), foreign formats convert (ROOT is numeric-only). Also `reader.saveas/.to(name)/.arrow()/.to_*`.
 
 **Configuration & diagnostics**

@@ -8,12 +8,15 @@ written -- then optionally compact the result to a single record.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 from .._types import Columns, StrPath
 from ..compaction import compact_file
 from ..progress import progress_bar
-from ..reader import ColStoreReader
 from ..writer import ColStoreWriter
+
+if TYPE_CHECKING:
+    from ..reader import ColStoreReader
 
 
 def write_column_batches(
@@ -75,4 +78,8 @@ def write_column_batches(
             n_records += 1
     if compact and n_records > 1:
         compact_file(path, None, show_progress=show_progress)
+    # Imported here, not at module level: the reader pulls in _base, which imports the
+    # interop package back, so a module-level import would make interop's own import a cycle.
+    from ..reader import ColStoreReader
+
     return ColStoreReader(path)

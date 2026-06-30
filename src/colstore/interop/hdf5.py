@@ -15,16 +15,18 @@ PyTables; the pandas backend needs them.
 
 from __future__ import annotations
 
+import contextlib
 import os
-from typing import TYPE_CHECKING, Any, ClassVar
+from collections.abc import Iterator
+from typing import Any, ClassVar
 
 import numpy as np
 
-from ._convert import columns_to_frame, frame_to_columns, storable_column, store_columns
+from .._sizes import resolve_batch_rows
+from .._types import Columns
+from ._convert import columns_to_frame, frame_to_columns, storable_column
+from ._stream_import import StreamPlan
 from .base import FileFormat, Selection
-
-if TYPE_CHECKING:
-    from ..reader import ColStoreReader
 
 #: Default group/key for an HDF5 dataset written by colstore.
 _DEFAULT_KEY = "data"
@@ -55,24 +57,40 @@ class Hdf5Format(FileFormat):
         else:
             raise ValueError(f"unknown hdf5 backend {backend!r}; expected 'h5py' or 'pandas'.")
 
-    def from_file(
+    def read_columns(
         self,
         source: Any,
-        dest: Any,
         *,
+        columns: list[str] | None = None,
         backend: str = "auto",
         key: str | None = None,
-        columns: list[str] | None = None,
         **kwargs: Any,
-    ) -> ColStoreReader:
-        """Read an HDF5 file into a ``.cstore`` and open it; auto-detects the writer."""
+    ) -> Columns:
+        """Read the whole HDF5 file into a column mapping; auto-detects the writer."""
         data = _read_hdf5(os.fspath(source), backend, key)
         if columns is not None:
             missing = [name for name in columns if name not in data]
             if missing:
                 raise ValueError(f"Column(s) not found in the HDF5 file: {', '.join(missing)}.")
             data = {name: data[name] for name in columns}
-        return store_columns(data, dest, **kwargs)
+        return data
+
+    def stream_import(
+        self,
+        source: Any,
+        *,
+        columns: list[str] | None = None,
+        batch_size: int | str | None,
+        backend: str = "auto",
+        key: str | None = None,
+        **kwargs: Any,
+    ) -> StreamPlan | str:
+        """Stream an h5py file (dataset slicing) or a pandas *table* store (chunked read).
+
+        The pandas *fixed* format (the ``DataFrame.to_hdf`` default) and any
+        variable-length-string / object column return a reason so the file is read whole.
+        """
+        return _hdf5_stream_plan(os.fspath(source), backend, key, columns, batch_size)
 
 
 def _write_h5py(path: str, key: str, data: dict[str, np.ndarray[Any, Any]]) -> None:
@@ -171,3 +189,140 @@ def _h5_columns(group: Any) -> dict[str, np.ndarray[Any, Any]]:
     if not columns:
         raise ValueError("no readable datasets found in the HDF5 group.")
     return columns
+
+
+# ---- Bounded-memory streaming import ---------------------------------------
+
+
+def _hdf5_stream_plan(
+    path: str,
+    backend: str,
+    key: str | None,
+    columns: list[str] | None,
+    batch_size: int | str | None,
+) -> StreamPlan | str:
+    """A :class:`StreamPlan` for an HDF5 file, or a reason string to read it whole.
+
+    Returns a reason when the layout cannot stream stably -- a pandas fixed-format store,
+    or any variable-length-string / object column.
+    """
+    import h5py
+
+    norm_key = None if key in ("", "/") else key
+    with h5py.File(path, "r") as handle:
+        pandas_key = _pandas_key(handle, norm_key)
+        if pandas_key is not None and backend in ("auto", "pandas"):
+            if "table" not in str(handle[pandas_key].attrs.get("pandas_type", "")):
+                return "pandas fixed-format HDF5 has no chunked reader"
+        elif backend == "pandas":
+            return "no pandas table found"  # the whole-file path raises the clear error
+        else:
+            pandas_key = None
+            names, n_rows, bytes_per_row, reason = _h5py_stream_plan(
+                _resolve_group(handle, norm_key), columns
+            )
+            if reason:
+                return reason
+    if pandas_key is not None:
+        reason = _pandas_object_reason(path, pandas_key, columns)
+        if reason:
+            return reason
+        rows = resolve_batch_rows(batch_size) if isinstance(batch_size, int) else None
+        if rows is None:  # a byte budget needs a per-row size; size it from the first chunk
+            rows = _pandas_rows_for_budget(path, pandas_key, columns, batch_size)
+        return StreamPlan(_pandas_stream_batches(path, pandas_key, columns, rows))
+    rows = resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row)
+    return StreamPlan(_h5py_stream_batches(path, norm_key, names, rows or n_rows), n_rows)
+
+
+def _h5py_stream_plan(group: Any, columns: list[str] | None) -> tuple[list[str], int, int, str]:
+    """Validate an h5py group for streaming; return (names, n_rows, bytes_per_row, reason)."""
+    import h5py
+
+    names = (
+        columns
+        if columns is not None
+        else [name for name in group if isinstance(group[name], h5py.Dataset)]
+    )
+    n_rows: int | None = None
+    bytes_per_row = 0
+    for name in names:
+        if name not in group or not isinstance(group[name], h5py.Dataset):
+            return [], 0, 0, f"column {name!r} is not a dataset"
+        dataset = group[name]
+        string_info = h5py.check_string_dtype(dataset.dtype)
+        if string_info is not None and string_info.length is None:
+            return [], 0, 0, f"column {name!r} is a variable-length string"
+        if n_rows is not None and len(dataset) != n_rows:
+            return [], 0, 0, f"column {name!r} has a different length"  # ragged group
+        n_rows = len(dataset)
+        bytes_per_row += dataset.dtype.itemsize
+    return list(names), n_rows or 0, max(1, bytes_per_row), ""
+
+
+def _h5py_stream_batches(
+    path: str, key: str | None, names: list[str], rows: int
+) -> Iterator[Columns]:
+    """Yield column dicts by slicing each h5py dataset over row ranges (file stays open)."""
+    import h5py
+
+    with h5py.File(path, "r") as handle:
+        group = _resolve_group(handle, key)
+        datasets = {name: group[name] for name in names}
+        n_rows = len(next(iter(datasets.values()))) if datasets else 0
+        starts = range(0, n_rows, rows) if n_rows else range(1)  # one empty batch when empty
+        for start in starts:
+            stop = min(start + rows, n_rows)
+            yield {name: _h5_slice(name, ds, start, stop) for name, ds in datasets.items()}
+
+
+def _h5_slice(name: str, dataset: Any, start: int, stop: int) -> np.ndarray[Any, Any]:
+    """One row range of an h5py dataset, as a fixed-width column (see :func:`_h5_columns`)."""
+    if "np_dtype" in dataset.attrs:  # an int64 view of a datetime/timedelta column
+        view: np.ndarray[Any, Any] = np.asarray(dataset[start:stop]).view(
+            np.dtype(dataset.attrs["np_dtype"])
+        )
+        return view
+    return storable_column(name, dataset[start:stop])  # numeric / bool / fixed bytes (S)
+
+
+def _pandas_object_reason(path: str, key: str, columns: list[str] | None) -> str:
+    """Empty if the selected pandas columns are non-object, else why streaming is unsafe."""
+    import pandas as pd
+
+    head = pd.read_hdf(path, key=key, stop=0)
+    names = columns if columns is not None else list(head.columns)
+    for name in names:
+        if name not in head.columns:
+            return f"column {name!r} not found in the pandas table"
+        if head[name].dtype == object or pd.api.types.is_extension_array_dtype(head[name].dtype):
+            return f"column {name!r} is an object or extension column"
+    return ""
+
+
+def _pandas_rows_for_budget(
+    path: str, key: str, columns: list[str] | None, batch_size: int | str | None
+) -> int:
+    """Resolve a ``batch_size`` byte budget to rows from the pandas table's per-row size."""
+    import pandas as pd
+
+    head = pd.read_hdf(path, key=key, stop=1)
+    if columns is not None:
+        head = head[columns]
+    bytes_per_row = max(1, sum(dtype.itemsize for dtype in head.dtypes))
+    return resolve_batch_rows(batch_size, bytes_per_row=bytes_per_row) or len(head)
+
+
+def _pandas_stream_batches(
+    path: str, key: str, columns: list[str] | None, rows: int
+) -> Iterator[Columns]:
+    """Yield column dicts from a pandas table read in ``rows``-sized chunks."""
+    import pandas as pd
+
+    # closing() releases the PyTables file handle even if the consumer raises
+    # mid-stream; a bare iterator only auto-closes on full consumption.
+    with contextlib.closing(pd.read_hdf(path, key=key, chunksize=rows)) as chunks:
+        for chunk in chunks:
+            if columns is not None:
+                chunk = chunk[columns]
+            yield frame_to_columns(chunk)

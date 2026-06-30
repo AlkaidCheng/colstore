@@ -16,7 +16,9 @@ Examples
 >>> frame = pl.from_arrow(ds)             # via __arrow_c_stream__   # doctest: +SKIP
 """
 
+from .._sizes import resolve_batch_rows
 from . import cstore as _cstore  # noqa: F401  -- registers the native cstore file format
+from ._stream_import import StreamPlan
 from .base import (
     DataFormat,
     FileFormat,
@@ -38,6 +40,7 @@ __all__ = [
     "Format",
     "InteropMixin",
     "Selection",
+    "StreamPlan",
     "data_formats",
     "file_format_for_extension",
     "file_format_for_path",
@@ -45,4 +48,5 @@ __all__ = [
     "from_object",
     "get",
     "register",
+    "resolve_batch_rows",
 ]
