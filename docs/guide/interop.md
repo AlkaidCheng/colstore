@@ -105,7 +105,10 @@ type — fill or drop nulls first; an *all*-null column stores as `float64` NaN)
 `convert` also takes the multi-file and bounded-memory options: `source` may be a
 glob or list (a literal `dest` merges them, a `{index}` / `{stem}` template or a
 `rename` mapping names them one-to-one), and `batch_size` (an `int` row count or a
-`"256 MiB"` byte budget) streams a large import in bounded memory — see
+`"256 MiB"` byte budget) streams a large conversion in bounded memory in **either**
+direction — import reads the foreign file in row-batches, export writes it in
+row-batches (`ds.saveas(dest, batch_size=...)` streams a write too). A target with no
+appendable path is written whole with a warning. See
 [Writing a custom file format](#writing-a-custom-file-format) for which schemas can
 stream.
 
@@ -232,16 +235,19 @@ Set two class attributes and override the methods for the directions you support
 | direction | override | required for | returns |
 | --- | --- | --- | --- |
 | export (colstore → file) | `to_file(self, selection, dest, **kw)` | `saveas` / export | `None` |
+| streaming export | `stream_export(self, selection, dest, *, batch_size, **kw)` | bounded-memory export | `None` if written, or a reason `str` |
 | import (file → colstore) | `read_columns(self, source, *, columns=None, **kw)` | `convert` / import | a `{name: ndarray}` column dict |
 | streaming import | `stream_import(self, source, *, columns=None, batch_size, **kw)` | bounded-memory import | a `StreamPlan`, or a reason `str` |
 
-`from_file` is a **template you do not override** — it calls `read_columns` for a
-whole-file read, or, when `batch_size` is set and `stream_import` returns a
-`StreamPlan`, streams the file in bounded memory; either way it applies `dtypes`,
-compacts the result, and on a non-streamable file reads it whole with a warning. (A
-format that needs full control over import may override `from_file` directly, as ROOT
-does.) Register the format with an [entry point](#discovery) (for a pip-installable
-package) or `colstore.interop.register(MyFormat())` at runtime.
+`write_file` and `from_file` are **templates you do not override**. `write_file` calls
+`to_file` for a whole-selection write, or, when `batch_size` is set and `stream_export`
+returns `None` (it wrote the file), streams the write in bounded memory; a returned reason
+string warns and writes whole. `from_file` mirrors it for import: it calls `read_columns`,
+or streams when `stream_import` returns a `StreamPlan`, then applies `dtypes`, compacts, and
+on a non-streamable file reads whole with a warning. (A format that needs full control over a
+direction may override the template directly, as ROOT does.) Register the format with an
+[entry point](#discovery) (for a pip-installable package) or
+`colstore.interop.register(MyFormat())` at runtime.
 
 ### A minimal format
 
@@ -307,3 +313,32 @@ The Parquet and Feather formats are worked examples of this gate built on the Ar
 helpers in `colstore.interop._stream_import` (`arrow_stream_dtypes` pins the per-column
 dtype from the schema or returns a reason; `columns_from_arrow_batch` converts a batch and
 rejects a stray null), and HDF5 shows the h5py / pandas variants.
+
+### Adding streaming export
+
+To write a large file in bounded memory, override `stream_export` to pull row-batches from
+`selection.iter_batches` and append each to the open file. Return `None` once the file is
+written, or a reason string to decline — the base then writes the whole selection via
+`to_file` and warns:
+
+```python
+    def stream_export(self, selection, dest, *, batch_size, **kwargs):
+        if kwargs:                                   # an option this path cannot carry
+            return f"streaming export cannot carry {sorted(kwargs)}"
+        with open(dest, "w") as handle:
+            wrote_header = False
+            for batch in selection.iter_batches(batch_size, copy=False):
+                if not wrote_header:
+                    handle.write("# " + "\t".join(batch) + "\n")
+                    wrote_header = True
+                np.savetxt(handle, np.column_stack(list(batch.values())), delimiter="\t")
+        return None
+```
+
+`selection.iter_batches(batch_size, copy=False)` yields `{name: ndarray}` batches sized by
+`batch_size`, reusing per-column buffers across batches — so write each batch before drawing
+the next, and do not hold it. An empty selection yields one zero-row batch, so the schema is
+still written. A target whose writer cannot append (a single-object container like NPZ, or a
+write option the incremental writer cannot carry) returns a reason and is written whole. The
+Parquet (row-group writer), Feather (Arrow IPC), and HDF5 (resizable datasets) formats are
+worked examples; ROOT and the native `.cstore` reuse their already-bounded whole-file writers.
