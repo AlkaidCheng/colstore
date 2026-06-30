@@ -1,4 +1,4 @@
-"""Tests for the file-format layer: colstore.ingest / saveas, extension dispatch,
+"""Tests for the file-format layer: colstore.convert / saveas, extension dispatch,
 and the NPZ format. Framework dispatch is also exercised with a dummy file format,
 independent of any optional backend.
 """
@@ -50,24 +50,24 @@ def sample(tmp_path):
 def test_npz_roundtrip_all_dtypes(tmp_path, sample):
     ds, cols = sample
     ds.saveas(tmp_path / "out.npz")
-    back = colstore.ingest(tmp_path / "out.npz", tmp_path / "back.cstore")
+    back = colstore.convert(tmp_path / "out.npz", tmp_path / "back.cstore")
     assert back.columns == list(cols)
     for name, expected in cols.items():
         np.testing.assert_array_equal(back.array(name), expected)
         assert back.dtypes[name] == expected.dtype
 
 
-def test_ingest_returns_reader(tmp_path, sample):
+def test_convert_returns_reader(tmp_path, sample):
     ds, _ = sample
     ds.saveas(tmp_path / "o.npz")
-    back = colstore.ingest(tmp_path / "o.npz", tmp_path / "b.cstore")
+    back = colstore.convert(tmp_path / "o.npz", tmp_path / "b.cstore")
     assert isinstance(back, colstore.ColStoreReader)
 
 
 def test_saveas_selection_rows_and_columns(tmp_path, sample):
     ds, cols = sample
     ds[1:4, ["i", "f"]].saveas(tmp_path / "sel.npz")
-    back = colstore.ingest(tmp_path / "sel.npz", tmp_path / "sel.cstore")
+    back = colstore.convert(tmp_path / "sel.npz", tmp_path / "sel.cstore")
     assert back.columns == ["i", "f"]
     np.testing.assert_array_equal(back.array("i"), cols["i"][1:4])
     np.testing.assert_array_equal(back.array("f"), cols["f"][1:4])
@@ -76,7 +76,7 @@ def test_saveas_selection_rows_and_columns(tmp_path, sample):
 def test_saveas_single_column(tmp_path, sample):
     ds, cols = sample
     ds["i"].saveas(tmp_path / "one.npz")
-    back = colstore.ingest(tmp_path / "one.npz", tmp_path / "one.cstore")
+    back = colstore.convert(tmp_path / "one.npz", tmp_path / "one.cstore")
     assert back.columns == ["i"]
     np.testing.assert_array_equal(back.array("i"), cols["i"])
 
@@ -85,28 +85,28 @@ def test_module_saveas_matches_method(tmp_path, sample):
     ds, _ = sample
     colstore.saveas(ds, tmp_path / "m.npz")
     ds.saveas(tmp_path / "d.npz")
-    a = colstore.ingest(tmp_path / "m.npz", tmp_path / "m.cstore")
-    b = colstore.ingest(tmp_path / "d.npz", tmp_path / "d.cstore")
+    a = colstore.convert(tmp_path / "m.npz", tmp_path / "m.cstore")
+    b = colstore.convert(tmp_path / "d.npz", tmp_path / "d.cstore")
     np.testing.assert_array_equal(a.recarray(), b.recarray())
 
 
 def test_compress_option(tmp_path, sample):
     ds, cols = sample
     ds.saveas(tmp_path / "z.npz", compress=True)
-    back = colstore.ingest(tmp_path / "z.npz", tmp_path / "z.cstore")
+    back = colstore.convert(tmp_path / "z.npz", tmp_path / "z.cstore")
     np.testing.assert_array_equal(back.array("i"), cols["i"])
 
 
 # ---- format override and extension dispatch ---------------------------------
 
 
-def test_format_override_on_saveas_and_ingest(tmp_path, sample):
+def test_format_override_on_saveas_and_convert(tmp_path, sample):
     ds, cols = sample
     # a path whose extension does not name the format; force it with format=
     ds.saveas(tmp_path / "noext", format="npz")
     assert (tmp_path / "noext").exists()  # written exactly at dest
     assert not (tmp_path / "noext.npz").exists()  # no ".npz" appended
-    back = colstore.ingest(tmp_path / "noext", tmp_path / "o.cstore", format="npz")
+    back = colstore.convert(tmp_path / "noext", tmp_path / "o.cstore", format="npz")
     np.testing.assert_array_equal(back.array("i"), cols["i"])
 
 
@@ -117,7 +117,7 @@ def test_saveas_writes_exact_dest_even_for_uppercase_ext(tmp_path, sample):
     ds.saveas(tmp_path / "UP.NPZ")
     assert (tmp_path / "UP.NPZ").exists()
     assert not (tmp_path / "UP.NPZ.npz").exists()
-    back = colstore.ingest(tmp_path / "UP.NPZ", tmp_path / "u.cstore")
+    back = colstore.convert(tmp_path / "UP.NPZ", tmp_path / "u.cstore")
     np.testing.assert_array_equal(back.array("i"), cols["i"])
 
 
@@ -125,7 +125,7 @@ def test_saveas_overwrites_existing_file(tmp_path, sample):
     ds, cols = sample
     np.savez(tmp_path / "w.npz", junk=np.arange(9))
     ds.saveas(tmp_path / "w.npz")
-    back = colstore.ingest(tmp_path / "w.npz", tmp_path / "w.cstore")
+    back = colstore.convert(tmp_path / "w.npz", tmp_path / "w.cstore")
     assert back.columns == list(cols)
 
 
@@ -158,20 +158,20 @@ def test_bytes_path_dispatches():
     assert interop.file_format_for_path(b"data.npz").name == "npz"
 
 
-def test_ingest_show_progress_does_not_collide(tmp_path, sample):
+def test_convert_show_progress_does_not_collide(tmp_path, sample):
     ds, _ = sample
     ds.saveas(tmp_path / "p.npz")
-    back = colstore.ingest(tmp_path / "p.npz", tmp_path / "p.cstore", show_progress=False)
+    back = colstore.convert(tmp_path / "p.npz", tmp_path / "p.cstore", show_progress=False)
     assert back.columns == ds.columns
 
 
-def test_ingest_existing_dest_and_mode_recreate(tmp_path, sample):
+def test_convert_existing_dest_and_overwrite(tmp_path, sample):
     ds, _ = sample
     ds.saveas(tmp_path / "o.npz")
-    colstore.ingest(tmp_path / "o.npz", tmp_path / "d.cstore").close()
+    colstore.convert(tmp_path / "o.npz", tmp_path / "d.cstore").close()
     with pytest.raises(FileExistsError):
-        colstore.ingest(tmp_path / "o.npz", tmp_path / "d.cstore").close()
-    back = colstore.ingest(tmp_path / "o.npz", tmp_path / "d.cstore", mode="recreate")
+        colstore.convert(tmp_path / "o.npz", tmp_path / "d.cstore").close()
+    back = colstore.convert(tmp_path / "o.npz", tmp_path / "d.cstore", overwrite=True)
     assert back.columns == ds.columns
 
 
@@ -187,7 +187,7 @@ def test_file_format_for_extension_is_case_insensitive():
 def test_unknown_extension_raises(tmp_path, sample):
     ds, _ = sample
     with pytest.raises(KeyError, match="no file format handles extension"):
-        colstore.ingest(tmp_path / "x.unknownext", tmp_path / "o.cstore")
+        colstore.convert(tmp_path / "x.unknownext", tmp_path / "o.cstore")
     with pytest.raises(KeyError, match="no file format handles extension"):
         ds.saveas(tmp_path / "x.unknownext")
 
@@ -204,22 +204,22 @@ def test_data_format_name_rejected_for_files(tmp_path, sample):
     with pytest.raises(TypeError, match="not a file format"):
         ds.saveas(tmp_path / "x.npz", format="dicttest")
     with pytest.raises(TypeError, match="not a file format"):
-        colstore.ingest(tmp_path / "x.npz", tmp_path / "o.cstore", format="dicttest")
+        colstore.convert(tmp_path / "x.npz", tmp_path / "o.cstore", format="dicttest")
 
 
 # ---- the dtype contract on import -------------------------------------------
 
 
-def test_ingest_2d_array_rejected(tmp_path):
+def test_convert_2d_array_rejected(tmp_path):
     np.savez(tmp_path / "bad.npz", a=np.arange(6).reshape(2, 3))
     with pytest.raises(ValueError, match="1D"):
-        colstore.ingest(tmp_path / "bad.npz", tmp_path / "o.cstore")
+        colstore.convert(tmp_path / "bad.npz", tmp_path / "o.cstore")
 
 
-def test_ingest_ragged_columns_rejected(tmp_path):
+def test_convert_ragged_columns_rejected(tmp_path):
     np.savez(tmp_path / "ragged.npz", a=np.arange(5), b=np.arange(3))
     with pytest.raises(ValueError):
-        colstore.ingest(tmp_path / "ragged.npz", tmp_path / "o.cstore")
+        colstore.convert(tmp_path / "ragged.npz", tmp_path / "o.cstore")
 
 
 # ---- framework dispatch with a dummy file format ----------------------------
@@ -243,7 +243,7 @@ def test_dispatch_routes_to_format_by_extension(tmp_path, sample):
     ds[:, ["i", "f"]].saveas(tmp_path / "out.rec", opt=1)
     assert record[-1] == ("to_file", ["i", "f"], {"opt": 1})
 
-    back = colstore.ingest(tmp_path / "in.rec", tmp_path / "o.cstore", key="v")
+    back = colstore.convert(tmp_path / "in.rec", tmp_path / "o.cstore", key="v")
     assert record[-1] == ("from_file", str(tmp_path / "in.rec"), {"key": "v"})
     assert back.columns == ["x"]
 

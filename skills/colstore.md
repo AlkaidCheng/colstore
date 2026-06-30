@@ -239,17 +239,23 @@ ds.saveas("out.parquet")            # by extension or format=...; HDF5 ext is .h
 ds[rows, cols].saveas("subset.cstore")     # ".cstore" too -> colstore's own writer
 colstore.to_root(ds, "out.root")    # ROOT (needs uproot/ROOT; numeric columns only)
 
-# import a foreign file into a new .cstore and open it (returns a reader):
-r = colstore.ingest("in.parquet", "out.cstore")            # format inferred from extension
+# convert a file into a new .cstore and open it (returns a reader):
+r = colstore.convert("in.parquet", "out.cstore")           # format inferred from extension
 r = colstore.from_parquet("in.parquet", "out.cstore")      # also from_feather/json/npz/hdf/root
+colstore.convert("*.h5", "all.cstore")                     # glob+literal dest merges; a {index} template is 1:1
 ```
 
+`convert(source, dest=None)` moves files between colstore's format and another (one endpoint
+must be `.cstore`), inferring direction from the extensions: a foreign file imports and returns
+the opened reader; a `.cstore` exports and returns the dest `Path`; `.cstore`→`.cstore` copies /
+merges. `source` may be a path, a glob, or a list; with many inputs, a literal `dest` merges
+them, a `{index}`/`{stem}` template or a `rename` dict/callable names them 1:1, and no `dest`
+auto-names by swapping the extension. An existing output raises unless `overwrite=True`.
 Saving to `.cstore` uses colstore's own writer: it streams in bounded memory and raw-copies
 unchanged columns, so a whole store — or a multi-file dataset — is copied / merged exactly like
 `concat()`, never materialized. `saveas` writes a file and returns `None` (a `.root` target returns
-its path); it does *not* hand back a reader — use `ingest` / `from_*`, which import a foreign file
-into a new `.cstore` and return one. `ingest` rejects a `.cstore` source (already native — open it
-with `colstore.open()`). ROOT export is numeric-only (ROOT branches have no fixed-width string
+its path); it does *not* hand back a reader — use `convert` / `from_*`, which import a foreign file
+into a new `.cstore` and return one. ROOT export is numeric-only (ROOT branches have no fixed-width string
 type), and its default multithreaded write does not preserve row order (pass `multithreading=False`
 to keep it). Enumerate what's available at runtime with `colstore.interop.file_formats()` /
 `colstore.interop.data_formats()`.
@@ -321,7 +327,7 @@ arguments.
 - `col(name) -> expression` — lazy column reference; compose with `> < == != & | ~`, `.isin([...])`.
 
 **Format interop**
-- `ingest(source, dest, *, format=None) -> ColStoreReader` and `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` — import.
+- `convert(source, dest=None, *, format=None, dtypes=None, rename=None, output_dir=None, overwrite=False, on_mismatch="strict") -> ColStoreReader | Path | list` — convert files (one endpoint is `.cstore`); `source` is a path / glob / list; import returns a reader, export returns a `Path`, a glob 1:1 returns a list, a literal `dest` merges. `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` are import shortcuts.
 - `saveas(source, dest, *, format=None)`, `to_root(source, path, ...)` — export by extension (returns `None`; a `.root` dest returns its path); a `.cstore` dest uses the native streaming writer (raw-copy / merge like `concat`), foreign formats convert (ROOT is numeric-only). Also `reader.saveas/.to(name)/.arrow()/.to_*`.
 
 **Configuration & diagnostics**

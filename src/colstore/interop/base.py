@@ -158,7 +158,7 @@ class DataFormat(Format):
 class FileFormat(Format):
     """A format whose external representation is an on-disk file.
 
-    The :attr:`extensions` it claims drive ``colstore.ingest`` / ``saveas``
+    The :attr:`extensions` it claims drive ``colstore.convert`` / ``saveas``
     dispatch. Override :meth:`to_file` to support export (colstore -> file) and
     :meth:`from_file` to support import (file -> ``.cstore``).
     """
@@ -308,12 +308,12 @@ def from_object(name: str, obj: Any, dest: Any, *args: Any, **kwargs: Any) -> Co
 
     Dispatches to the named :class:`DataFormat`'s :meth:`~DataFormat.from_object`.
     Raises ``TypeError`` if ``name`` is a file format (read a file with
-    :func:`colstore.ingest`) and ``NotImplementedError`` if the format does not
+    :func:`colstore.convert`) and ``NotImplementedError`` if the format does not
     support import.
     """
     fmt = get(name)
     if not isinstance(fmt, DataFormat):
-        raise TypeError(f"{name!r} is a {fmt.kind} format; import a file with colstore.ingest().")
+        raise TypeError(f"{name!r} is a {fmt.kind} format; import a file with colstore.convert().")
     return fmt.from_object(obj, dest, *args, **kwargs)
 
 
