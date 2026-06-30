@@ -8,6 +8,15 @@ log documents it and everything since.
 
 ### Added
 
+- [[#254](https://github.com/AlkaidCheng/colstore/pull/254)] A `dtypes` override on
+  import. `colstore.ingest(src, dest, dtypes={"flag": "bool"})` (and the `from_parquet`
+  / `from_feather` / `from_json` / `from_hdf` / `from_npz` sugar) coerces named columns
+  to a target dtype as they are read — handy to give a column one dtype across files
+  whose schemas differ (e.g. a flag that is `bool` in some files and all-null in others,
+  which would otherwise mismatch as `b1` vs `f8` on a multi-file open). An all-null
+  column fills the target's zero (`False` / `0`) for a bool / integer dtype and keeps
+  `NaN` for a float dtype; a column with real values is cast. An override naming a
+  column the file lacks raises `KeyError`.
 - [[#247](https://github.com/AlkaidCheng/colstore/pull/247)] `isin()` on a column.
   `ds[name].isin(values)` on a reader/dataset column is eager — a boolean `ndarray` to
   use as a mask (`ds[ds['id'].isin(keep)]`); `frame[name].isin(values)` on a frame column

@@ -172,6 +172,7 @@ def ingest(
     dest: str | os.PathLike[str],
     *,
     format: str | None = None,
+    dtypes: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> ColStoreReader:
     """Import a foreign file into a new ``.cstore`` at ``dest`` and open it.
@@ -183,9 +184,20 @@ def ingest(
     ``dest`` must not already exist (pass ``mode="recreate"`` to overwrite it). List
     the available file formats with :func:`colstore.interop.file_formats`; importing
     an in-memory object instead uses :func:`colstore.interop.from_object`.
+
+    ``dtypes`` maps a column name to a target dtype (``{"flag": "bool"}``) and coerces
+    that column on import -- handy to give a column the same dtype across files whose
+    schemas differ (e.g. a flag that is ``bool`` in some files and all-null in others).
+    A missing value (``NaN``) becomes the target's empty value when cast to a bool /
+    integer / string dtype (``False`` / ``0`` / ``""``), keeps ``NaN`` for a float dtype,
+    and becomes ``NaT`` for a datetime / timedelta dtype. Real values follow NumPy
+    ``astype`` rules, so a too-narrow target may truncate or overflow them without error.
+    Applies to the column-based formats (Parquet / Feather / JSON / HDF5 / NPZ).
     """
     from . import interop
 
+    if dtypes is not None:
+        kwargs["dtypes"] = dtypes
     return interop.file_format_for_path(source, format).from_file(source, dest, **kwargs)
 
 

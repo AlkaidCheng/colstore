@@ -359,6 +359,90 @@ def test_hdf5_all_null_column_ingests_as_float_nan(tmp_path):
     assert list(out["n"]) == [1, 2, 3]
 
 
+def test_apply_dtype_overrides_coerces_and_fills():
+    """An override casts real values; an all-null column fills its target's zero."""
+    from colstore.interop._convert import apply_dtype_overrides
+
+    allnull = np.full(3, np.nan, dtype=np.float64)
+    out = apply_dtype_overrides(
+        {"flag": allnull.copy(), "kept": allnull.copy(), "real": np.array([0.0, 1.0, 0.0])},
+        {"flag": "bool", "kept": "float32", "real": "bool"},
+    )
+    assert out["flag"].dtype == np.bool_ and out["flag"].tolist() == [False, False, False]
+    assert out["kept"].dtype == np.float32 and np.isnan(out["kept"]).all()  # float target keeps NaN
+    assert out["real"].dtype == np.bool_ and out["real"].tolist() == [False, True, False]
+    # an all-null column to an integer target fills 0
+    intout = apply_dtype_overrides({"c": allnull.copy()}, {"c": "int64"})
+    assert intout["c"].dtype == np.int64 and intout["c"].tolist() == [0, 0, 0]
+    # a name the file lacks is a hard error, not a silent skip
+    with pytest.raises(KeyError, match="unknown column"):
+        apply_dtype_overrides({"a": allnull.copy()}, {"missing": "bool"})
+
+
+def test_apply_dtype_overrides_missing_values_are_safe():
+    """A NaN (missing) in a float source becomes the target's empty value, never garbage.
+
+    ``float NaN -> int`` is undefined in NumPy, so a NaN among real values must not fall
+    through to a bare cast; it fills 0 / False / '' / NaT by target kind, consistently
+    whether the column is all-null or partly null.
+    """
+    import warnings
+
+    from colstore.interop._convert import apply_dtype_overrides
+
+    part = np.array([1.5, np.nan, 3.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # an undefined NaN->int cast would warn; it must not
+        to_int = apply_dtype_overrides({"c": part.copy()}, {"c": "int64"})["c"]
+    assert to_int.tolist() == [1, 0, 3]
+    # NaN -> False, not the truthy value a bare cast would give
+    to_bool = apply_dtype_overrides({"c": np.array([0.0, np.nan, 2.0])}, {"c": "bool"})["c"]
+    assert to_bool.tolist() == [False, False, True]
+    # a missing string cell is empty whether the column is all-null or partly null
+    to_str = apply_dtype_overrides({"c": part.copy()}, {"c": "U5"})["c"]
+    assert to_str.tolist() == ["1.5", "", "3.0"]
+    # datetime / timedelta missing values become NaT, not the epoch
+    to_dt = apply_dtype_overrides({"c": np.full(3, np.nan)}, {"c": "datetime64[ns]"})["c"]
+    assert np.isnat(to_dt).all()
+
+
+def test_hdf5_dtype_override_unifies_schema(tmp_path):
+    """A column that is all-null in one file and real bool in another reads as one schema.
+
+    The reported case: ``dtypes={"sel": "bool"}`` coerces the all-null column to bool
+    ``False`` and leaves the real bool column untouched, so a glob open sees one schema.
+    """
+    _need("h5py", "pandas", "tables")
+    import pandas as pd
+
+    a, b = tmp_path / "a.h5", tmp_path / "b.h5"
+    pd.DataFrame({"id": [1, 2, 3], "sel": pd.Series([np.nan] * 3, dtype=object)}).to_hdf(
+        a, key="frame", format="table", mode="w"
+    )
+    pd.DataFrame({"id": [4, 5, 6], "sel": [True, False, True]}).to_hdf(
+        b, key="frame", format="table", mode="w"
+    )
+    ra = colstore.from_hdf(a, tmp_path / "a.cstore", dtypes={"sel": "bool"})
+    rb = colstore.from_hdf(b, tmp_path / "b.cstore", dtypes={"sel": "bool"})
+    assert ra.dtypes["sel"] == np.bool_ and ra.array("sel").tolist() == [False, False, False]
+    assert rb.array("sel").tolist() == [True, False, True]
+    ds = colstore.open(str(tmp_path / "*.cstore"))  # no schema mismatch across the two files
+    assert ds.n_rows == 6 and ds.dtypes["sel"] == np.bool_
+
+
+def test_parquet_dtype_override(tmp_path):
+    """The dtype override reaches the Arrow column path too (Parquet / Feather)."""
+    pa = pytest.importorskip("pyarrow")
+    import pyarrow.parquet as pq
+
+    table = pa.table({"sel": pa.array([None, None, None], type=pa.float64()), "n": [1, 2, 3]})
+    pq.write_table(table, str(tmp_path / "ov.parquet"))
+    out = colstore.from_parquet(
+        tmp_path / "ov.parquet", tmp_path / "ov.cstore", dtypes={"sel": "bool"}
+    )
+    assert out.dtypes["sel"] == np.bool_ and out.array("sel").tolist() == [False, False, False]
+
+
 def test_nested_or_non_string_object_rejected():
     from colstore.interop._convert import storable_column
 

@@ -52,10 +52,58 @@ def _all_null_column(length: int) -> np.ndarray[Any, Any]:
     return np.full(length, np.nan, dtype=np.float64)
 
 
-def store_columns(columns: dict[str, Any], dest: Any, **kwargs: Any) -> ColStoreReader:
-    """Store a column dict to ``dest`` via the top-level ``store()``, defaulting progress off."""
+# Target kinds whose zero value (``0`` / ``False`` / ``""``) is the natural stand-in for
+# a NaN (missing) source value: a NaN has no representation there, and ``float -> int``
+# of a NaN is undefined in NumPy, so the position is filled explicitly rather than cast.
+# Float / complex targets keep the NaN, and datetime / timedelta targets get NaT, both
+# through ``astype``.
+_MISSING_FILL_KINDS = frozenset("biuSU")
+
+
+def apply_dtype_overrides(
+    columns: dict[str, np.ndarray[Any, Any]], dtypes: dict[str, Any] | None
+) -> dict[str, np.ndarray[Any, Any]]:
+    """Coerce named columns to a target dtype after the format-specific conversion.
+
+    Each ``name -> dtype`` entry casts ``columns[name]`` with ``astype``. A NaN in a float
+    source is treated as missing: cast to a bool / integer / string target it becomes that
+    target's empty value (``False`` / ``0`` / ``""``) rather than an undefined ``astype``
+    result, while a float target keeps the NaN and a datetime / timedelta target gets NaT.
+    Real values follow NumPy ``astype`` rules, so a narrower target may truncate or overflow
+    them without error. Raises ``KeyError`` for a name the file lacks, so a typo in an
+    override is caught rather than silently ignored.
+    """
+    for name, spec in (dtypes or {}).items():
+        if name not in columns:
+            raise KeyError(
+                f"dtype override names unknown column {name!r}; file has {sorted(columns)}."
+            )
+        target = np.dtype(spec)
+        column = columns[name]
+        if column.dtype == target:
+            continue
+        if column.dtype.kind == "f" and target.kind in _MISSING_FILL_KINDS:
+            mask = np.isnan(column)
+            out = np.zeros(len(column), dtype=target)
+            if not mask.all():
+                out[~mask] = column[~mask].astype(target)
+            columns[name] = out
+        else:
+            columns[name] = np.ascontiguousarray(column.astype(target))
+    return columns
+
+
+def store_columns(
+    columns: dict[str, Any], dest: Any, *, dtypes: dict[str, Any] | None = None, **kwargs: Any
+) -> ColStoreReader:
+    """Store a column dict to ``dest`` via the top-level ``store()``, defaulting progress off.
+
+    ``dtypes`` coerces named columns to a target dtype first (see
+    :func:`apply_dtype_overrides`).
+    """
     from .. import api
 
+    apply_dtype_overrides(columns, dtypes)
     kwargs.setdefault("show_progress", False)
     return api.store(columns, dest, **kwargs)
 
