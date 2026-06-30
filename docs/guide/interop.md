@@ -14,10 +14,10 @@ The two kinds keep object-syntax and path-syntax separate, giving four verbs:
 |         | data format (object, by name)          | file format (path, by extension)        |
 | ------- | -------------------------------------- | --------------------------------------- |
 | export  | `ds.to("arrow")` / `ds.arrow()`        | `ds.saveas("out.npz")` / `colstore.saveas(ds, path)` |
-| import  | `colstore.interop.from_object("arrow", obj, dest)` | `colstore.ingest("in.root", dest)`      |
+| import  | `colstore.interop.from_object("arrow", obj, dest)` | `colstore.convert("in.root", dest)`     |
 
 `colstore.open` stays the native, magic-byte reader for `.cstore` files; foreign
-files are imported with `colstore.ingest`. Every export verb works on a whole
+files are converted with `colstore.convert`. Every export verb works on a whole
 store, a column, or any selection (`ds[rows, cols].saveas(...)`).
 
 ## Discovery
@@ -90,22 +90,30 @@ itself to `pd.DataFrame(ds)` does not expand it into columns, so prefer
 
 ## File formats
 
-`colstore.ingest(source, dest)` imports a foreign file into a new `.cstore` and
-returns an opened reader; `ds.saveas(dest)` (and `colstore.saveas(ds, dest)`)
-writes one out. The format is chosen from the path's extension; pass `format=` to
-override it. `ingest`'s `dest` must not already exist (`mode="recreate"`
-overwrites); `saveas` overwrites its target and rejects a selection with no
-columns. Only colstore's fixed-width dtypes round-trip, so a format's
-variable-length **string** columns are coerced to fixed-width, while **nested**
-(list / struct) columns, **non-string** object columns, and **null** values are
-rejected with a clear error (colstore has no null type — fill or drop nulls
-first).
+`colstore.convert(source, dest)` converts a file between colstore's format and
+another, inferring the direction from the extensions (one endpoint must be
+`.cstore`): a foreign file imports into a new `.cstore` and returns an opened
+reader, a `.cstore` exports to a foreign format and returns the output path.
+`ds.saveas(dest)` (and `colstore.saveas(ds, dest)`) is the export verb on an
+object. The format is chosen from the path's extension; pass `format=` to override
+it. An existing output raises unless `overwrite=True`. Only colstore's fixed-width
+dtypes round-trip, so a format's variable-length **string** columns are coerced to
+fixed-width, while **nested** (list / struct) columns, **non-string** object
+columns, and **null** values are rejected with a clear error (colstore has no null
+type — fill or drop nulls first; an *all*-null column stores as `float64` NaN).
+
+`convert` also takes the multi-file and bounded-memory options: `source` may be a
+glob or list (a literal `dest` merges them, a `{index}` / `{stem}` template or a
+`rename` mapping names them one-to-one), and `batch_size` (an `int` row count or a
+`"256 MiB"` byte budget) streams a large import in bounded memory — see
+[Writing a custom file format](#writing-a-custom-file-format) for which schemas can
+stream.
 
 Each file format also has a named shortcut: `ds.to_npz` / `to_parquet` /
 `to_feather` / `to_json` / `to_hdf` (export, like `to_root`), and
 `colstore.from_npz` / `from_parquet` / `from_feather` / `from_json` / `from_hdf`
 (import, like `from_root`) — each is just the matching `saveas(..., format=...)`
-/ `ingest(..., format=...)`.
+/ `convert(..., format=...)`.
 
 ### NumPy `.npz`
 
@@ -115,7 +123,7 @@ strings) with no optional dependency. `compress=True` uses
 
 ```python
 ds.saveas("data.npz")        # or ds.to_npz("data.npz")
-back = colstore.ingest("data.npz", "data.cstore")   # or colstore.from_npz(...)
+back = colstore.convert("data.npz", "data.cstore")  # or colstore.from_npz(...)
 ```
 
 ### Parquet and Feather
@@ -211,3 +219,91 @@ A few behaviors differ between backends:
 - **RNTuple** is not auto-detected (auto-detection finds only TTrees); pass
   `treename=` to read one, or to re-read a file written with
   `output_format="rntuple"`.
+
+## Writing a custom file format
+
+A new file format is a `FileFormat` subclass that overrides a few methods. The base
+class handles the chores — extension dispatch, the import template, streaming, the
+`dtypes` override, compaction, and the fall-backs — so you write only the
+format-specific reads and writes, and every format behaves consistently.
+
+Set two class attributes and override the methods for the directions you support:
+
+| direction | override | required for | returns |
+| --- | --- | --- | --- |
+| export (colstore → file) | `to_file(self, selection, dest, **kw)` | `saveas` / export | `None` |
+| import (file → colstore) | `read_columns(self, source, *, columns=None, **kw)` | `convert` / import | a `{name: ndarray}` column dict |
+| streaming import | `stream_import(self, source, *, columns=None, batch_size, **kw)` | bounded-memory import | a `StreamPlan`, or a reason `str` |
+
+`from_file` is a **template you do not override** — it calls `read_columns` for a
+whole-file read, or, when `batch_size` is set and `stream_import` returns a
+`StreamPlan`, streams the file in bounded memory; either way it applies `dtypes`,
+compacts the result, and on a non-streamable file reads it whole with a warning. (A
+format that needs full control over import may override `from_file` directly, as ROOT
+does.) Register the format with an [entry point](#discovery) (for a pip-installable
+package) or `colstore.interop.register(MyFormat())` at runtime.
+
+### A minimal format
+
+```python
+import numpy as np
+from colstore.interop import FileFormat, register
+
+class TsvFormat(FileFormat):
+    name = "tsv"
+    extensions = frozenset({".tsv"})
+
+    def to_file(self, selection, dest, **kwargs):           # export
+        data = selection.gather_all()                       # {name: ndarray}
+        np.savetxt(dest, np.column_stack(list(data.values())),
+                   header="\t".join(data), delimiter="\t")
+
+    def read_columns(self, source, *, columns=None, **kwargs):   # whole-file import
+        names = open(source).readline().lstrip("# ").split()
+        table = np.loadtxt(source, skiprows=1, delimiter="\t", ndmin=2)
+        cols = {name: table[:, i] for i, name in enumerate(names)}
+        return cols if columns is None else {n: cols[n] for n in columns}
+
+register(TsvFormat())
+```
+
+That is enough for `colstore.convert("data.tsv", "out.cstore")` and `ds.saveas("x.tsv")`
+to work. A `convert(..., batch_size=...)` request also works: with no `stream_import`,
+the base reads the whole file and warns that streaming is unavailable.
+
+### Adding streaming
+
+To import a large file in bounded memory, override `stream_import` to return a
+`StreamPlan` — a lazy iterator of column batches plus the total row count:
+
+```python
+from colstore.interop import StreamPlan, resolve_batch_rows
+
+    def stream_import(self, source, *, columns=None, batch_size, **kwargs):
+        names = open(source).readline().lstrip("# ").split()
+        keep = names if columns is None else columns
+        rows = resolve_batch_rows(batch_size, bytes_per_row=8 * len(keep)) or 1 << 20
+
+        def batches():
+            reader = np.loadtxt(source, skiprows=1, delimiter="\t", ndmin=2)
+            for start in range(0, len(reader), rows):
+                chunk = reader[start : start + rows]
+                yield {name: chunk[:, names.index(name)] for name in keep}
+
+        return StreamPlan(batches(), total_rows=None)
+```
+
+`resolve_batch_rows` turns an `int` row count or a `"256 MiB"` byte budget into rows.
+**Every batch must carry the same columns and the same dtypes**, already converted to
+fixed-width NumPy columns: the writer locks the schema on the first batch and validates
+the rest, so a dtype that drifts between batches — a string whose width is inferred per
+batch, or a column that is null in one batch but typed in another — is rejected
+mid-stream. So `stream_import` should stream **only a stream-stable schema**: fixed-width
+numeric / bool / temporal columns with no nulls. When the file's schema is not
+stream-stable, return a **reason string** instead of a `StreamPlan` and the base reads it
+whole and warns — for example `return f"column {name!r} is a variable-width string"`.
+
+The Parquet and Feather formats are worked examples of this gate built on the Arrow
+helpers in `colstore.interop._stream_import` (`arrow_stream_dtypes` pins the per-column
+dtype from the schema or returns a reason; `columns_from_arrow_batch` converts a batch and
+rejects a stray null), and HDF5 shows the h5py / pandas variants.
