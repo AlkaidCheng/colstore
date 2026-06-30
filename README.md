@@ -347,6 +347,40 @@ store or dataset is copied / merged, not materialized); the foreign formats conv
 selection. See **[Format interop](docs/guide/interop.md)** for the full set and `ingest()` /
 `from_*` to read them back.
 
+**Import a foreign file.** `ingest` reads a Parquet / Feather / JSON / HDF5 / NPZ / ROOT
+file into a new `.cstore` and opens it (or use the `from_*` shortcuts):
+
+```python
+ds = colstore.ingest("in.parquet", "out.cstore")           # format from the extension
+ds = colstore.from_hdf("in.h5", "out.cstore")              # also from_parquet/feather/json/npz/root
+```
+
+Pass `dtypes={name: dtype}` to coerce named columns as they are read — useful to give a
+column the same dtype across files whose schemas differ (e.g. a flag that is `bool` in some
+files and all-null in others, which would otherwise mismatch as `b1` vs `f8` on a multi-file
+open):
+
+```python
+ds = colstore.ingest("in.h5", "out.cstore", dtypes={"flag": "bool"})
+```
+
+The coercion rule is exact. A column with **real values** is cast with NumPy `astype`, so a
+too-narrow target truncates (`1.9 → 1`) or overflows (`300 → int8`) without error — pick a
+target that fits. A **missing** value (a `NaN` in a float column, which is how an all-null or
+in-band-null column arrives) maps to the target's natural empty value:
+
+| Target dtype | A missing (`NaN`) value becomes |
+|---|---|
+| `float32` / `float64` | `NaN` (kept — float carries its own missing) |
+| `bool` | `False` |
+| integer / unsigned (`int64`, `uint16`, …) | `0` |
+| fixed string (`U`, `S`) | `""` (empty string) |
+| `datetime64` / `timedelta64` | `NaT` |
+
+This holds whether the column is entirely missing or only partly so. A `dtypes` entry naming
+a column the file does not have raises `KeyError`. (The override applies to the column-based
+formats — Parquet / Feather / JSON / HDF5 / NPZ — not ROOT.)
+
 ### Compaction
 
 A streaming write produces one record per `write()` call. Reads of
