@@ -92,6 +92,60 @@ class Hdf5Format(FileFormat):
         """
         return _hdf5_stream_plan(os.fspath(source), backend, key, columns, batch_size)
 
+    def stream_export(
+        self,
+        selection: Selection,
+        dest: Any,
+        *,
+        batch_size: int | str | None,
+        backend: str = "h5py",
+        key: str = _DEFAULT_KEY,
+        **kwargs: Any,
+    ) -> str | None:
+        """Stream the selection to an HDF5 file, one batch at a time (h5py backend only).
+
+        The h5py backend appends each batch to resizable datasets in bounded memory. The
+        pandas backend writes a whole-file fixed-format store (its default), which has no
+        appendable layout, so it declines and is written whole instead.
+        """
+        if backend == "pandas":
+            return "the pandas backend writes a whole-file fixed-format store"
+        if backend != "h5py":
+            raise ValueError(f"unknown hdf5 backend {backend!r}; expected 'h5py' or 'pandas'.")
+        _stream_h5py(os.fspath(dest), key, selection, batch_size)
+        return None
+
+
+def _h5_dataset_dtype(array: np.ndarray[Any, Any]) -> Any:
+    """The h5py dtype a column's dataset is created with.
+
+    h5py has no UTF-32 or datetime type, so a ``U`` column stores as a variable-length
+    string and a datetime / timedelta column as its ``int64`` view; everything else keeps
+    its own dtype (numeric, bool, fixed bytes ``S``).
+    """
+    import h5py
+
+    if array.dtype.kind == "U":
+        return h5py.string_dtype()
+    if array.dtype.kind in "Mm":
+        return np.dtype("i8")
+    return array.dtype
+
+
+def _h5_encode(array: np.ndarray[Any, Any]) -> np.ndarray[Any, Any]:
+    """A column's values in the form its dataset stores (see :func:`_h5_dataset_dtype`)."""
+    if array.dtype.kind == "U":
+        return array.astype(object)
+    if array.dtype.kind in "Mm":
+        return array.view("i8")
+    return array
+
+
+def _h5_stamp_dtype(dataset: Any, array: np.ndarray[Any, Any]) -> None:
+    """Record a datetime / timedelta column's real dtype so the reader can restore it."""
+    if array.dtype.kind in "Mm":
+        dataset.attrs["np_dtype"] = str(array.dtype)
+
 
 def _write_h5py(path: str, key: str, data: dict[str, np.ndarray[Any, Any]]) -> None:
     import h5py
@@ -99,15 +153,35 @@ def _write_h5py(path: str, key: str, data: dict[str, np.ndarray[Any, Any]]) -> N
     with h5py.File(path, "w") as handle:
         group = handle.create_group(key) if key not in (None, "", "/") else handle
         for name, array in data.items():
-            if array.dtype.kind == "U":
-                # h5py has no UTF-32 type; store as a variable-length string.
-                group.create_dataset(name, data=array.astype(object), dtype=h5py.string_dtype())
-            elif array.dtype.kind in "Mm":
-                # h5py has no datetime type; store the int64 view + the dtype to restore it.
-                dataset = group.create_dataset(name, data=array.view("i8"))
-                dataset.attrs["np_dtype"] = str(array.dtype)
-            else:
-                group.create_dataset(name, data=array)  # numeric, bool, fixed bytes (S)
+            dataset = group.create_dataset(
+                name, data=_h5_encode(array), dtype=_h5_dataset_dtype(array)
+            )
+            _h5_stamp_dtype(dataset, array)
+
+
+def _stream_h5py(path: str, key: str, selection: Selection, batch_size: int | str | None) -> None:
+    """Stream the selection into one resizable h5py dataset per column, appending each batch."""
+    import h5py
+
+    with h5py.File(path, "w") as handle:
+        group = handle.create_group(key) if key not in (None, "", "/") else handle
+        datasets: dict[str, Any] = {}
+        offset = 0
+        # copy=False is safe here: each dataset assignment copies the batch into the file
+        # synchronously, before the next batch is drawn into the reused buffer.
+        for batch in selection.iter_batches(batch_size, copy=False):
+            length = len(next(iter(batch.values())))
+            for name, array in batch.items():
+                if name not in datasets:
+                    datasets[name] = group.create_dataset(
+                        name, shape=(0,), maxshape=(None,), dtype=_h5_dataset_dtype(array)
+                    )
+                    _h5_stamp_dtype(datasets[name], array)
+                dataset = datasets[name]
+                dataset.resize(offset + length, axis=0)
+                if length:
+                    dataset[offset : offset + length] = _h5_encode(array)
+            offset += length
 
 
 def _read_hdf5(path: str, backend: str, key: str | None) -> dict[str, np.ndarray[Any, Any]]:

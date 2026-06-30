@@ -29,6 +29,8 @@ from importlib.metadata import entry_points
 from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     import numpy as np
     from numpy.typing import NDArray
 
@@ -87,6 +89,30 @@ class Selection:
     def is_whole_column(self) -> bool:
         """Whether the row selection covers every row in order (zero-copy eligible)."""
         return is_whole_column(self.row_indexer, self.store.n_rows)
+
+    def iter_batches(self, batch_size: int | str | None, *, copy: bool = True) -> Iterator[Columns]:
+        """Yield the selected rows as column dicts in bounded memory.
+
+        The streaming counterpart of :meth:`gather_all`, handed to a format's
+        :meth:`FileFormat.stream_export` so it can write a file far larger than memory
+        one batch at a time. Each row-batch is materialized into a fresh ``name -> array``
+        dict sized by ``batch_size`` -- an ``int`` row count or a ``"256 MiB"`` per-batch
+        byte budget. An empty selection yields one zero-row batch, so the schema is still
+        presented and a valid empty file is written. ``copy=False`` reuses per-column
+        buffers across batches for a write-and-discard consumer (a batch is then valid
+        only until the next is drawn).
+        """
+        from ..frame import ColStoreFrame
+        from ..view import edit_row_selection
+
+        rows = edit_row_selection(self.row_indexer, self.store.n_rows)
+        frame = ColStoreFrame(self.store, self.columns, rows)
+        produced = False
+        for batch in frame.iter_batches(batch_size, copy=copy):
+            produced = True
+            yield batch.dict()
+        if not produced:
+            yield self.gather_all()
 
 
 class Format:
@@ -161,22 +187,67 @@ class FileFormat(Format):
     """A format whose external representation is an on-disk file.
 
     The :attr:`extensions` it claims drive ``colstore.convert`` / ``saveas``
-    dispatch. Override :meth:`to_file` to support export (colstore -> file). For
-    import, override :meth:`read_columns` (the whole-file read) and, if the file can
-    be read in row-batches, :meth:`stream_import` (bounded-memory streaming); the
-    :meth:`from_file` template wires them together -- the stream-vs-whole-file branch,
-    the warn-and-fall-back when a file cannot stream, the per-batch dtype override, and
-    compaction -- so every format behaves consistently. A format that needs full control
-    (e.g. ROOT) may override :meth:`from_file` directly instead.
+    dispatch. For export (colstore -> file), override :meth:`to_file` (the whole-selection
+    write) and, if the file can be written in row-batches, :meth:`stream_export`
+    (bounded-memory streaming); for import (file -> colstore), override
+    :meth:`read_columns` (the whole-file read) and, if the file can be read in row-batches,
+    :meth:`stream_import`. The :meth:`write_file` / :meth:`from_file` templates wire each
+    pair together -- the stream-vs-whole branch, the warn-and-fall-back when a file cannot
+    stream, the per-batch dtype override, and compaction -- so every format behaves
+    consistently. A format that needs full control (e.g. ROOT) may override the template
+    directly instead.
     """
 
     kind: ClassVar[str] = "file"
     #: File extensions (lowercase, with the dot) this format handles.
     extensions: ClassVar[frozenset[str]] = frozenset()
 
+    def write_file(
+        self,
+        selection: Selection,
+        dest: Any,
+        *,
+        batch_size: int | str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Write ``selection`` to ``dest``, streaming in row-batches when asked and able.
+
+        The export counterpart of :meth:`from_file`, and the seam ``saveas`` /
+        ``colstore.convert`` route through. With ``batch_size`` set and
+        :meth:`stream_export` honoring it, the file is written one bounded batch at a time;
+        a returned reason string (or the default decline) warns and writes the whole
+        selection via :meth:`to_file`.
+        """
+        from ._stream_export import warn_whole_file_export
+
+        if batch_size is not None:
+            reason = self.stream_export(selection, dest, batch_size=batch_size, **kwargs)
+            if reason is None:
+                return None
+            warn_whole_file_export(dest, reason)
+        return self.to_file(selection, dest, **kwargs)
+
     def to_file(self, selection: Selection, dest: Any, *args: Any, **kwargs: Any) -> Any:
         """Write a colstore ``selection`` to a file at ``dest`` (override to support)."""
         raise NotImplementedError(f"the {self.name!r} format does not support export.")
+
+    def stream_export(
+        self,
+        selection: Selection,
+        dest: Any,
+        *,
+        batch_size: int | str | None,
+        **kwargs: Any,
+    ) -> str | None:
+        """Stream ``selection`` to ``dest`` in row-batches, or return a reason string.
+
+        ``None`` means the file was written incrementally; a reason string declines
+        streaming, so :meth:`write_file` writes the whole selection via :meth:`to_file`
+        and warns. The default declines. Override in a format that can write incrementally,
+        pulling batches from :meth:`Selection.iter_batches`; return a reason for a
+        selection or option set it cannot honor incrementally.
+        """
+        return "this format writes the whole selection"
 
     def from_file(
         self,
@@ -470,12 +541,22 @@ class InteropMixin:
             raise TypeError(f"{name!r} is a {fmt.kind} format; write a file with .saveas(path).")
         return fmt.to_object(self._interop_selection())
 
-    def saveas(self, dest: Any, *, format: str | None = None, **kwargs: Any) -> Any:
+    def saveas(
+        self,
+        dest: Any,
+        *,
+        format: str | None = None,
+        batch_size: int | str | None = None,
+        **kwargs: Any,
+    ) -> Any:
         """Write this selection to a file, choosing the format by ``dest``'s extension.
 
         ``ds.saveas("out.npz")`` writes the whole store; ``ds[rows, cols].saveas(...)``
         writes just the selection. Pass ``format=`` to override the extension (e.g.
-        ``format="npz"``). An existing file at ``dest`` is overwritten. List the
+        ``format="npz"``). ``batch_size`` (an ``int`` row count or a ``"256 MiB"`` per-batch
+        byte budget) streams the write in bounded memory for a format that supports it
+        (Parquet, Feather, HDF5, ROOT, ``.cstore``); a format that cannot stream warns and
+        writes the whole selection. An existing file at ``dest`` is overwritten. List the
         available file formats with :func:`colstore.interop.file_formats`. Raises
         ``TypeError`` for an in-memory data format (exported with :meth:`to` instead)
         and ``ValueError`` for a selection with no columns.
@@ -483,7 +564,9 @@ class InteropMixin:
         selection = self._interop_selection()
         if not selection.columns:
             raise ValueError("cannot write a file from a selection with no columns.")
-        return file_format_for_path(dest, format).to_file(selection, dest, **kwargs)
+        return file_format_for_path(dest, format).write_file(
+            selection, dest, batch_size=batch_size, **kwargs
+        )
 
     def to_npz(self, dest: Any, **kwargs: Any) -> Any:
         """Write this selection to a NumPy ``.npz`` file (``saveas(dest, format="npz")``)."""
