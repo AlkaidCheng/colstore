@@ -414,11 +414,13 @@ ds[1_000:2_000, ["price", "qty"]].dict()   # slices span the files transparently
 ds[[5, 1_000_000, 7], "price"].array()     # fancy and boolean selection too
 ```
 
-By default the files must share one schema — same column names, order, and dtypes — or
-`open` raises a `ValueError`. To open a set of files whose schemas drifted (a column that
-is `bool` in some files and all-null `float64` in others, say), pass `on_mismatch="drop"`:
-the dataset then exposes only the columns common to every file with one consistent dtype,
-warning about the rest. Reads stay zero-copy — only the dataset's exposed schema narrows.
+By default the files must share one schema — the same column names and dtypes — or `open`
+raises a `ValueError`. Column *order* need not match: reads are by name, so files that store
+the same columns in a different order open as one table (the dataset takes the first file's
+order). To open a set of files whose schemas drifted further (a column that is `bool` in
+some files and all-null `float64` in others, say), pass `on_mismatch="drop"`: the dataset
+then exposes only the columns common to every file with one consistent dtype, warning about
+the rest. Reads stay zero-copy — only the dataset's exposed schema narrows.
 
 ```python
 ds = colstore.open("run_*.cstore", on_mismatch="drop")   # drop columns that disagree

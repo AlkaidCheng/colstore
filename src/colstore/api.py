@@ -59,11 +59,12 @@ def open(
     :func:`appender` write to (an empty directory is an empty dataset).
 
     For a multi-file dataset, ``on_mismatch`` chooses how files whose schemas differ
-    are reconciled. ``"strict"`` (the default) requires every file to share one schema
-    (same column names, order, and dtypes) and raises :class:`ValueError` otherwise.
-    ``"drop"`` instead opens the files anyway, exposing only the columns common to every
-    file with one consistent dtype and warning about the rest -- useful for opening a set
-    of files where a column's dtype drifted between writes. It is moot for a single file.
+    are reconciled. ``"strict"`` (the default) requires every file to share one schema --
+    the same column names and dtypes, though the column *order* may differ since reads are
+    by name -- and raises :class:`ValueError` otherwise. ``"drop"`` instead opens the files
+    anyway, exposing only the columns common to every file with one consistent dtype and
+    warning about the rest -- useful for opening a set of files where a column's dtype
+    drifted between writes. It is moot for a single file.
     """
     if isinstance(path, (str, os.PathLike)) and os.path.isdir(path):
         # A directory is a managed shard dataset; the constructor expands it to
