@@ -424,7 +424,9 @@ class ColStoreWriter:
         # normalize_columns lets contiguous arrays through untouched but can
         # return strided views; writev needs real buffers, so copy only the
         # strided case (the same data movement tofile() would do internally).
-        buffers.extend(np.ascontiguousarray(array) for array in arrays)
+        # View each as raw bytes: writev casts buffers to byte granularity, which
+        # memoryview cannot do for datetime64 / timedelta64 directly.
+        buffers.extend(np.ascontiguousarray(array).view(np.uint8) for array in arrays)
         if pad:
             buffers.append(b"\x00" * pad)
         self._file.flush()

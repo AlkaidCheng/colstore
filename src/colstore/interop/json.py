@@ -16,6 +16,7 @@ import os
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ._convert import columns_to_frame, frame_to_columns, store_columns
+from ._stream_import import warn_whole_file
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -42,11 +43,20 @@ class JsonFormat(FileFormat):
         *,
         orient: str = "records",
         columns: list[str] | None = None,
+        batch_size: int | str | None = None,
+        compact: bool = True,
         **kwargs: Any,
     ) -> ColStoreReader:
-        """Read a JSON file into a ``.cstore`` and open it (extra kwargs -> store)."""
+        """Read a JSON file into a ``.cstore`` and open it (extra kwargs -> store).
+
+        ``batch_size`` is accepted for a uniform :func:`colstore.convert` surface but a
+        single-array JSON document has no row-batch reader, so the file is read whole
+        with a warning.
+        """
         import pandas as pd
 
+        if batch_size is not None:
+            warn_whole_file(source, "a single-array JSON document has no row-batch reader")
         # dtype=False keeps the JSON-encoded type (a quoted "1" stays a string
         # instead of being inferred to int), so a string column round-trips.
         frame = pd.read_json(os.fspath(source), orient=orient, dtype=False)

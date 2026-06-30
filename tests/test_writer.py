@@ -52,6 +52,24 @@ def test_writer_writes_multi_record(tmp_path):
         )
 
 
+def test_writer_multi_record_datetime_and_timedelta(tmp_path):
+    """A multi-record write of datetime64 / timedelta64 columns round-trips.
+
+    The writev path casts each buffer to bytes, which memoryview cannot do for a
+    temporal dtype directly, so the arrays are viewed as uint8 first.
+    """
+    path = tmp_path / "temporal.cstore"
+    times = np.array(["2020-01-01", "2021-06-15", "2022-12-31"], dtype="datetime64[ns]")
+    deltas = np.array([1, 2, 3], dtype="timedelta64[s]").astype("timedelta64[ns]")
+    with colstore.create(path) as w:
+        w.write({"t": times[:2], "d": deltas[:2]})
+        w.write({"t": times[2:], "d": deltas[2:]})
+    with colstore.open(path) as ds:
+        assert ds._is_multi_record is True
+        np.testing.assert_array_equal(ds.array("t"), times)
+        np.testing.assert_array_equal(ds.array("d"), deltas)
+
+
 def test_writer_close_is_idempotent(tmp_path):
     """Calling close() twice does not raise."""
     path = tmp_path / "idem.cstore"

@@ -192,6 +192,8 @@ def _import_to_cstore(
     *,
     format: str | None = None,
     dtypes: dict[str, Any] | None = None,
+    batch_size: int | str | None = None,
+    compact: bool = True,
     **kwargs: Any,
 ) -> ColStoreReader:
     """Materialize a foreign file into a new ``.cstore`` and open it (the import path)."""
@@ -199,6 +201,10 @@ def _import_to_cstore(
 
     if dtypes is not None:
         kwargs["dtypes"] = dtypes
+    if batch_size is not None:
+        # Streaming import in bounded memory; only the supporting formats accept these.
+        kwargs["batch_size"] = batch_size
+        kwargs["compact"] = compact
     return interop.file_format_for_path(source, format).from_file(source, dest, **kwargs)
 
 
@@ -218,6 +224,8 @@ def _convert_one(
     *,
     format: str | None = None,
     dtypes: dict[str, Any] | None = None,
+    batch_size: int | str | None = None,
+    compact: bool = True,
     overwrite: bool = False,
     **kwargs: Any,
 ) -> ColStoreReader | Path:
@@ -231,7 +239,15 @@ def _convert_one(
         )
     dest_path = _prepare_output(dest, overwrite)
     if not source_is_cstore:
-        return _import_to_cstore(source, dest, format=format, dtypes=dtypes, **kwargs)
+        return _import_to_cstore(
+            source,
+            dest,
+            format=format,
+            dtypes=dtypes,
+            batch_size=batch_size,
+            compact=compact,
+            **kwargs,
+        )
     if dtypes is not None:
         raise ValueError("dtypes= applies only when importing a foreign file into a .cstore.")
     reader = open(source)
@@ -332,6 +348,8 @@ def _convert_merge(
     *,
     format: str | None,
     dtypes: dict[str, Any] | None,
+    batch_size: int | str | None,
+    compact: bool,
     overwrite: bool,
     on_mismatch: OnMismatch,
     **kwargs: Any,
@@ -339,7 +357,14 @@ def _convert_merge(
     """Merge every input into the single file ``dest`` (a literal output path)."""
     if len(inputs) == 1:
         return _convert_one(
-            inputs[0], dest, format=format, dtypes=dtypes, overwrite=overwrite, **kwargs
+            inputs[0],
+            dest,
+            format=format,
+            dtypes=dtypes,
+            batch_size=batch_size,
+            compact=compact,
+            overwrite=overwrite,
+            **kwargs,
         )
     dest_is_cstore = _is_cstore_path(dest)
     if not dest_is_cstore and not any(_is_cstore_path(src) for src in inputs):
@@ -356,7 +381,15 @@ def _convert_merge(
                 readers.append(ColStoreReader(source))
             else:
                 part = os.path.join(scratch, f"part_{index:05d}.cstore")
-                _import_to_cstore(source, part, format=format, dtypes=dtypes, **kwargs)
+                _import_to_cstore(
+                    source,
+                    part,
+                    format=format,
+                    dtypes=dtypes,
+                    batch_size=batch_size,
+                    compact=compact,
+                    **kwargs,
+                )
                 readers.append(ColStoreReader(part))
         ColStoreDataset(readers, on_mismatch=on_mismatch).saveas(
             dest, format=None if dest_is_cstore else format
@@ -374,6 +407,8 @@ def convert(
     *,
     format: str | None = None,
     dtypes: dict[str, Any] | None = None,
+    batch_size: int | str | None = None,
+    compact: bool = True,
     rename: Mapping[str, str] | Callable[[str], str] | None = None,
     output_dir: str | os.PathLike[str] | None = None,
     overwrite: bool = False,
@@ -408,6 +443,16 @@ def convert(
     :func:`open`). ``format`` overrides the foreign endpoint's format, and ``dtypes``
     (import only) coerces columns as they are read (see :func:`open` for the rules).
 
+    ``batch_size`` (import only) reads the foreign file in row-batches and streams it into
+    the ``.cstore`` in bounded memory -- an ``int`` row count or a ``"256 MiB"`` *per-batch*
+    byte budget (peak memory is a few times the budget, from decode and conversion buffers,
+    not an exact ceiling); the default ``None`` reads it whole. Streaming applies to ROOT, Parquet,
+    Feather, and HDF5 when the file's schema is fixed-width numeric / temporal with no
+    nulls; a file that cannot stream stably (a variable-width string or null column, a
+    pandas fixed-format HDF5, or JSON / NPZ) falls back to a whole-file read with a
+    warning. ``compact`` (default ``True``) collapses the streamed multi-record result
+    into a single record; pass ``False`` to keep it multi-record and skip the rewrite.
+
     Returns a single result for a single ``source`` path or a merge, and a list (one per
     input) for a glob or list converted one-to-one.
     """
@@ -422,6 +467,8 @@ def convert(
             dest_text,
             format=format,
             dtypes=dtypes,
+            batch_size=batch_size,
+            compact=compact,
             overwrite=overwrite,
             on_mismatch=on_mismatch,
             **kwargs,
@@ -434,7 +481,14 @@ def convert(
         )
         results.append(
             _convert_one(
-                source_path, out, format=format, dtypes=dtypes, overwrite=overwrite, **kwargs
+                source_path,
+                out,
+                format=format,
+                dtypes=dtypes,
+                batch_size=batch_size,
+                compact=compact,
+                overwrite=overwrite,
+                **kwargs,
             )
         )
     return results[0] if scalar else results

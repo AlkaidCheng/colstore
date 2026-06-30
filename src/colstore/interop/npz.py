@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import numpy as np
 
 from ._convert import store_columns
+from ._stream_import import warn_whole_file
 from .base import FileFormat, Selection
 
 if TYPE_CHECKING:
@@ -45,12 +46,24 @@ class NpzFormat(FileFormat):
             else:
                 np.savez(handle, **columns)
 
-    def from_file(self, source: Any, dest: Any, **kwargs: Any) -> ColStoreReader:
+    def from_file(
+        self,
+        source: Any,
+        dest: Any,
+        *,
+        batch_size: int | str | None = None,
+        compact: bool = True,
+        **kwargs: Any,
+    ) -> ColStoreReader:
         """Read every array in ``source`` as a column and write a ``.cstore`` at ``dest``.
 
         Extra keyword arguments pass through to :func:`colstore.store` (e.g.
-        ``mode="recreate"`` to overwrite an existing ``dest``).
+        ``mode="recreate"`` to overwrite an existing ``dest``). ``batch_size`` is accepted
+        for a uniform :func:`colstore.convert` surface but ``np.load`` materializes whole
+        arrays, so the file is read whole with a warning.
         """
+        if batch_size is not None:
+            warn_whole_file(source, "np.load materializes whole arrays")
         with np.load(source) as archive:
             columns = {name: archive[name] for name in archive.files}
         return store_columns(columns, dest, **kwargs)

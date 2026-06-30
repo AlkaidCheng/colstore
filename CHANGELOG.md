@@ -8,6 +8,17 @@ log documents it and everything since.
 
 ### Added
 
+- [[#258](https://github.com/AlkaidCheng/colstore/pull/258)] A `batch_size` option on
+  `colstore.convert` for bounded-memory streaming import. With `batch_size` set (an `int`
+  row count or a `"256 MiB"` byte budget), a foreign file is read in row-batches and
+  streamed into the `.cstore` instead of materialized whole. It applies to Parquet,
+  Feather, and HDF5 (joining ROOT, which already streamed) when the file's schema is
+  fixed-width numeric / temporal with no nulls; a file that cannot stream stably — a
+  variable-width string or null column, a pandas *fixed*-format HDF5 (the `to_hdf`
+  default), or JSON / NPZ — falls back to a whole-file read with a warning, so
+  `batch_size` is best-effort and never silently corrupts or fails mid-stream. `compact`
+  (default `True`) collapses the streamed multi-record result into one record.
+
 - [[#255](https://github.com/AlkaidCheng/colstore/pull/255)] An `on_mismatch` policy on
   `colstore.open` for multi-file datasets. The default `"strict"` keeps the existing
   behavior (every file must share one schema, or a `ValueError` is raised);
