@@ -83,6 +83,13 @@ log documents it and everything since.
 
 ### Changed
 
+- [[#256](https://github.com/AlkaidCheng/colstore/pull/256)] A multi-file dataset no
+  longer requires its files to store columns in the same order. `colstore.open([...])`
+  now accepts files that share the same column names and dtypes in any order (the dataset
+  takes the first file's order); reads are by name, so the result is identical. Column
+  order was previously part of the strict schema check and a difference raised
+  `ValueError`. A different set of names, or a dtype disagreement, still raises (use
+  `on_mismatch="drop"` to open the common columns).
 - [[#236](https://github.com/AlkaidCheng/colstore/pull/236)] `TableView` and
   `ColumnView` now repr as a formatted table that fits the terminal width (like a
   pandas DataFrame / Series); `head()` / `tail()` previews fit the window too. The

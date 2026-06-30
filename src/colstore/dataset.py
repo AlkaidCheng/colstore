@@ -63,8 +63,9 @@ _INT32_MAX = (1 << 31) - 1
 SegmentTable: TypeAlias = tuple[NDArray[np.int64], NDArray[np.int64]]
 
 # How a dataset reconciles files whose schemas differ: ``"strict"`` requires every
-# file to share one schema (name, order, dtype) and raises otherwise; ``"drop"``
-# keeps only the columns common to every file with one consistent dtype.
+# file to share one schema (same column names and dtypes, any order) and raises
+# otherwise; ``"drop"`` keeps only the columns common to every file with one
+# consistent dtype.
 OnMismatch: TypeAlias = Literal["strict", "drop"]
 
 
@@ -227,21 +228,33 @@ class ColStoreDataset(_ReaderBase):
     def _validate_against(
         self, reader: ColStoreReader, reference: dict[str, np.dtype[Any]]
     ) -> None:
-        """Require ``reader`` to match the reference schema (names, order, dtype)."""
-        reference_names = list(reference)
-        names = list(reader._column_dtypes)
+        """Require ``reader`` to provide the reference columns at the same dtypes.
+
+        Column *order* may differ -- the dataset reads each column by name -- so only the
+        set of names and each name's dtype must match. A different set of names or a dtype
+        disagreement raises; ``on_mismatch='drop'`` relaxes this to the common columns.
+        """
+        reference_names = set(reference)
+        names = set(reader._column_dtypes)
         if names != reference_names:
+            detail = []
+            if missing := sorted(reference_names - names):
+                detail.append(f"is missing {missing}")
+            if extra := sorted(names - reference_names):
+                detail.append(f"has unexpected {extra}")
             raise ValueError(
-                f"Schema mismatch: {reader.path} has columns {names}, but the "
-                f"dataset schema is {reference_names} (same names and order required)."
+                f"Schema mismatch: {reader.path} {' and '.join(detail)} relative to the "
+                f"dataset columns {sorted(reference_names)}. Pass on_mismatch='drop' to "
+                f"open the columns common to all files."
             )
-        for name in reference_names:
+        for name in reference:
             child_dtype = reader._column_dtypes[name].str
             reference_dtype = reference[name].str
             if child_dtype != reference_dtype:
                 raise ValueError(
                     f"Schema mismatch: {reader.path} column {name!r} has dtype "
-                    f"'{child_dtype}', but the dataset schema has '{reference_dtype}'."
+                    f"'{child_dtype}', but the dataset schema has '{reference_dtype}'. "
+                    f"Pass on_mismatch='drop' to skip columns that disagree."
                 )
 
     @staticmethod
@@ -285,11 +298,12 @@ class ColStoreDataset(_ReaderBase):
         (borrowed), or a list/tuple mixing them.
 
         Under the default ``on_mismatch='strict'`` the first child establishes the
-        schema and later children must match it (same names, order, and dtypes), or a
-        :class:`ValueError` leaves the dataset unchanged and closes anything this call
-        opened. Under ``on_mismatch='drop'`` the dataset instead exposes only the columns
-        common to every file with one consistent dtype, warning about the rest; it raises
-        only if no column is common to all.
+        schema and later children must match it (same column names and dtypes; column
+        order may differ, since reads are by name), or a :class:`ValueError` leaves the
+        dataset unchanged and closes anything this call opened. Under
+        ``on_mismatch='drop'`` the dataset instead exposes only the columns common to
+        every file with one consistent dtype, warning about the rest; it raises only if no
+        column is common to all.
         """
         self._check_open()
         pairs = self._coerce_to_children(source, reader_kwargs)

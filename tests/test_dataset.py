@@ -436,15 +436,24 @@ def test_schema_mismatch_column_names(tmp_path):
         colstore.open([good[0], bad])
 
 
-def test_schema_mismatch_column_order(tmp_path):
-    good, _, _ = _build_files(tmp_path, [4])
-    reordered = _store_one(
-        tmp_path,
-        "reordered.cstore",
-        {"y": np.arange(3, dtype=np.float64), "x": np.arange(3, dtype=np.int64)},
+def test_reordered_columns_open_under_strict(tmp_path):
+    """Files that share names and dtypes but in a different order open without on_mismatch.
+
+    Reads are by name, so column order is not part of the schema; the dataset takes the
+    first file's order and stitches every file correctly.
+    """
+    good, ox, oy = _build_files(tmp_path, [4])  # f0: columns [x:int64, y:float64], rows 0..3
+    x2 = np.arange(4, 7, dtype=np.int64)
+    reordered = _store_one(  # same columns/dtypes, reversed order, rows 4..6
+        tmp_path, "reordered.cstore", {"y": (x2 * 1.5).astype(np.float64), "x": x2}
     )
-    with pytest.raises(ValueError, match="Schema mismatch"):
-        colstore.open([good[0], reordered])
+    ds = colstore.open([good[0], reordered])  # default strict -- no on_mismatch needed
+    assert ds.columns == ["x", "y"]  # first file's order
+    expect_x = np.concatenate([ox, x2])
+    expect_y = np.concatenate([oy, (x2 * 1.5).astype(np.float64)])
+    np.testing.assert_array_equal(ds.array("x"), expect_x)
+    np.testing.assert_array_equal(ds.array("y"), expect_y)
+    np.testing.assert_array_equal(ds[2:6, "y"].array(), expect_y[2:6])  # slice spans both files
 
 
 def test_schema_mismatch_dtype(tmp_path):
@@ -533,8 +542,8 @@ def test_on_mismatch_drop_moot_for_single_file(tmp_path):
     assert set(ds.columns) == {"id", "sel"}
 
 
-def test_on_mismatch_drop_reconciles_column_order(tmp_path):
-    """Column order may differ under 'drop' (reads are by name); 'strict' still requires it."""
+def test_on_mismatch_drop_handles_reordered_columns(tmp_path):
+    """'drop' also opens files whose shared columns are in a different order."""
     a = _store_one(
         tmp_path,
         "a.cstore",
@@ -545,8 +554,6 @@ def test_on_mismatch_drop_reconciles_column_order(tmp_path):
         "b.cstore",
         {"pt": np.arange(3, 6, dtype=np.float32), "id": np.arange(3, 6, dtype=np.int64)},
     )
-    with pytest.raises(ValueError, match="Schema mismatch"):
-        colstore.open([a, b])
     ds = colstore.open([a, b], on_mismatch="drop")
     assert set(ds.columns) == {"id", "pt"}
     assert ds.array("id").tolist() == [0, 1, 2, 3, 4, 5]
