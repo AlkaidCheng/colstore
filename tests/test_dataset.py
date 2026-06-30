@@ -458,6 +458,169 @@ def test_schema_mismatch_dtype(tmp_path):
         colstore.open([good[0], narrow])
 
 
+# ---- on_mismatch='drop' ------------------------------------------------
+
+
+def test_on_mismatch_drop_keeps_consistent_columns(tmp_path):
+    """A column with a dtype that drifted between files is dropped; the rest open as one."""
+    a = _store_one(
+        tmp_path,
+        "a.cstore",
+        {"id": np.arange(3, dtype=np.int64), "sel": np.array([True, False, True])},
+    )
+    b = _store_one(
+        tmp_path,
+        "b.cstore",
+        {"id": np.arange(3, 6, dtype=np.int64), "sel": np.full(3, np.nan, dtype=np.float64)},
+    )
+    with pytest.warns(RuntimeWarning, match="dropped column.*sel"):
+        ds = colstore.open([a, b], on_mismatch="drop")
+    assert ds.columns == ["id"]  # 'sel' (bool vs float64) dropped; 'id' kept
+    assert ds.n_rows == 6
+    assert ds.array("id").tolist() == [0, 1, 2, 3, 4, 5]
+
+
+def test_on_mismatch_drop_also_drops_columns_absent_from_a_file(tmp_path):
+    """A column missing from one file is not common to all, so 'drop' discards it."""
+    a = _store_one(
+        tmp_path,
+        "a.cstore",
+        {"id": np.arange(3, dtype=np.int64), "extra": np.arange(3, dtype=np.int64)},
+    )
+    b = _store_one(tmp_path, "b.cstore", {"id": np.arange(3, 6, dtype=np.int64)})
+    with pytest.warns(RuntimeWarning, match="extra"):
+        ds = colstore.open([a, b], on_mismatch="drop")
+    assert ds.columns == ["id"]
+
+
+def test_on_mismatch_drop_is_silent_noop_when_consistent(tmp_path, recwarn):
+    """Consistent files keep every column and warn about nothing under 'drop'."""
+    good, _, _ = _build_files(tmp_path, [4, 3])
+    ds = colstore.open(good, on_mismatch="drop")
+    assert ds.columns == colstore.open(good).columns
+    assert not [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)]
+
+
+def test_on_mismatch_drop_raises_when_no_common_column(tmp_path):
+    a = _store_one(tmp_path, "a.cstore", {"x": np.arange(3, dtype=np.int64)})
+    b = _store_one(tmp_path, "b.cstore", {"y": np.arange(3, dtype=np.int64)})
+    with pytest.raises(ValueError, match="no columns"):
+        colstore.open([a, b], on_mismatch="drop")
+
+
+def test_on_mismatch_invalid_value_raises(tmp_path):
+    good, _, _ = _build_files(tmp_path, [4])
+    with pytest.raises(ValueError, match="on_mismatch"):
+        colstore.open(good, on_mismatch="skip")
+
+
+def test_on_mismatch_strict_is_the_default(tmp_path):
+    """Omitting on_mismatch keeps the strict raise-on-mismatch behavior."""
+    a = _store_one(tmp_path, "a.cstore", {"x": np.arange(3, dtype=np.int64)})
+    b = _store_one(tmp_path, "b.cstore", {"x": np.arange(3, dtype=np.int32)})
+    with pytest.raises(ValueError, match="Schema mismatch"):
+        colstore.open([a, b])
+
+
+def test_on_mismatch_drop_moot_for_single_file(tmp_path):
+    """A single literal file is self-consistent, so on_mismatch is ignored (all columns kept)."""
+    a = _store_one(
+        tmp_path,
+        "a.cstore",
+        {"id": np.arange(3, dtype=np.int64), "sel": np.array([True, False, True])},
+    )
+    ds = colstore.open(a, on_mismatch="drop")
+    assert set(ds.columns) == {"id", "sel"}
+
+
+def test_on_mismatch_drop_reconciles_column_order(tmp_path):
+    """Column order may differ under 'drop' (reads are by name); 'strict' still requires it."""
+    a = _store_one(
+        tmp_path,
+        "a.cstore",
+        {"id": np.arange(3, dtype=np.int64), "pt": np.arange(3, dtype=np.float32)},
+    )
+    b = _store_one(  # same columns and dtypes, reversed order
+        tmp_path,
+        "b.cstore",
+        {"pt": np.arange(3, 6, dtype=np.float32), "id": np.arange(3, 6, dtype=np.int64)},
+    )
+    with pytest.raises(ValueError, match="Schema mismatch"):
+        colstore.open([a, b])
+    ds = colstore.open([a, b], on_mismatch="drop")
+    assert set(ds.columns) == {"id", "pt"}
+    assert ds.array("id").tolist() == [0, 1, 2, 3, 4, 5]
+
+
+def test_on_mismatch_drop_reads_kept_columns_correctly(tmp_path):
+    """After a column is dropped, reads of the kept columns stitch the files correctly."""
+    a = _store_one(
+        tmp_path,
+        "a.cstore",
+        {
+            "id": np.arange(4, dtype=np.int64),
+            "w": np.ones(4, dtype=np.float64),
+            "sel": np.array([True, False, True, False]),
+        },
+    )
+    b = _store_one(
+        tmp_path,
+        "b.cstore",
+        {
+            "id": np.arange(4, 8, dtype=np.int64),
+            "w": np.full(4, 2.0),
+            "sel": np.full(4, np.nan),  # dtype drift -> dropped
+        },
+    )
+    with pytest.warns(RuntimeWarning):
+        ds = colstore.open([a, b], on_mismatch="drop")
+    assert ds.columns == ["id", "w"]
+    assert ds[[0, 4, 7], "id"].array().tolist() == [0, 4, 7]  # fancy across files
+    assert ds[2:6, "w"].array().tolist() == [1.0, 1.0, 2.0, 2.0]  # slice spanning files
+
+
+def test_on_mismatch_drop_gather_correct_across_column_orders(tmp_path):
+    """Every read path returns correct values when files store the columns in different orders.
+
+    The gather is by name and per-file layout, so a column's byte offset differing between
+    files must not scramble values. Three files rotate the column order with distinct values
+    and mixed itemsizes (i8 / f4 / f8); each read is checked against a global oracle.
+    """
+
+    def write(name, order, base):
+        cols = {
+            "id": np.arange(base, base + 5, dtype=np.int64),
+            "pt": (np.arange(base, base + 5) * 1.5).astype(np.float32),
+            "w": (np.arange(base, base + 5) * 100.0).astype(np.float64),
+        }
+        return _store_one(tmp_path, name, {k: cols[k] for k in order})
+
+    files = [
+        write("a.cstore", ["id", "pt", "w"], 0),
+        write("b.cstore", ["w", "id", "pt"], 5),
+        write("c.cstore", ["pt", "w", "id"], 10),
+    ]
+    ds = colstore.open(files, on_mismatch="drop")  # consistent up to order: nothing dropped
+    assert ds.columns == ["id", "pt", "w"]  # first file's order
+    oid = np.arange(0, 15, dtype=np.int64)
+    opt = (np.arange(0, 15) * 1.5).astype(np.float32)
+    ow = (np.arange(0, 15) * 100.0).astype(np.float64)
+
+    whole = ds.dict()
+    for name, oracle in (("id", oid), ("pt", opt), ("w", ow)):
+        np.testing.assert_array_equal(whole[name], oracle)
+    np.testing.assert_array_equal(ds[3:13, "w"].array(), ow[3:13])  # slice spans all three
+    idx = [14, 0, 7, 3, 11, 5, 9]
+    np.testing.assert_array_equal(ds[idx, "w"].array(), ow[idx])  # unsorted fancy gather
+    np.testing.assert_array_equal(ds[idx, "id"].array(), oid[idx])
+    mask = np.zeros(15, dtype=bool)
+    mask[[1, 6, 12, 14]] = True
+    np.testing.assert_array_equal(ds[mask, "w"].array(), ow[mask])  # boolean mask across files
+    multi = ds[idx, ["id", "w"]].dict()
+    np.testing.assert_array_equal(multi["id"], oid[idx])
+    np.testing.assert_array_equal(multi["w"], ow[idx])
+
+
 # ---- The | operator ----------------------------------------------------
 
 
