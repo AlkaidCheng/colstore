@@ -59,7 +59,7 @@ def test_roundtrip(tmp_path, store, columns, fmt, ext, backends, preserves_dtype
     _need(*backends)
     path = tmp_path / f"x.{ext}"
     store.saveas(path)
-    back = colstore.ingest(path, tmp_path / f"b.{ext}.cstore")
+    back = colstore.convert(path, tmp_path / f"b.{ext}.cstore")
     assert set(back.columns) == set(columns)
     for name, values in columns.items():
         if name == "s":
@@ -77,7 +77,7 @@ def test_column_projection(tmp_path, store, columns, fmt, ext, backends, preserv
     _need(*backends)
     path = tmp_path / f"p.{ext}"
     store.saveas(path)
-    back = colstore.ingest(path, tmp_path / f"p.{ext}.cstore", columns=["i", "f"])
+    back = colstore.convert(path, tmp_path / f"p.{ext}.cstore", columns=["i", "f"])
     assert set(back.columns) == {"i", "f"}
     np.testing.assert_array_equal(back.array("i"), columns["i"])
     back.close()
@@ -116,12 +116,21 @@ def test_cstore_export_respects_selection(tmp_path, store, columns):
     back.close()
 
 
-def test_cstore_ingest_points_to_open(tmp_path, store):
-    """A .cstore is already native; ingest() declines and points at open()."""
+def test_convert_cstore_to_cstore_copies(tmp_path, store, columns):
+    """convert between two .cstore paths copies the store (both endpoints are native)."""
     p = tmp_path / "x.cstore"
     store.saveas(p)
-    with pytest.raises(NotImplementedError, match="already native"):
-        colstore.ingest(p, tmp_path / "y.cstore")
+    out = colstore.convert(p, tmp_path / "y.cstore")
+    assert out.n_rows == store.n_rows
+    np.testing.assert_array_equal(out.array("i"), columns["i"])
+
+
+def test_convert_foreign_to_foreign_rejected(tmp_path, store):
+    """convert needs one endpoint to be a .cstore; foreign -> foreign is rejected."""
+    pytest.importorskip("pyarrow")
+    store.saveas(tmp_path / "a.parquet")
+    with pytest.raises(ValueError, match="one endpoint"):
+        colstore.convert(tmp_path / "a.parquet", tmp_path / "b.feather")
 
 
 def test_cstore_export_rejects_unknown_kwarg(tmp_path, store):
@@ -193,7 +202,7 @@ def test_nested_column_rejected(tmp_path):
     path = tmp_path / "nested.parquet"
     pq.write_table(table, str(path))
     with pytest.raises(TypeError, match="nested"):
-        colstore.ingest(path, tmp_path / "nested.cstore")
+        colstore.convert(path, tmp_path / "nested.cstore")
 
 
 # ---- HDF5: cross-writer reading + backends + key ---------------------------
@@ -205,7 +214,7 @@ def test_hdf5_pandas_written_read_auto(tmp_path, columns):
 
     path = tmp_path / "pd.h5"
     pd.DataFrame(columns).to_hdf(path, key="frame", mode="w")
-    back = colstore.ingest(path, tmp_path / "pd.cstore")  # auto-detects pandas store
+    back = colstore.convert(path, tmp_path / "pd.cstore")  # auto-detects pandas store
     assert set(back.columns) == set(columns)
     assert list(back.array("s")) == list(columns["s"])
     back.close()
@@ -219,7 +228,7 @@ def test_hdf5_h5py_root_datasets_read(tmp_path):
     with h5py.File(path, "w") as f:  # datasets at the root, no group
         f.create_dataset("a", data=np.arange(5, dtype=np.int64))
         f.create_dataset("b", data=(np.arange(5) * 2.0))
-    back = colstore.ingest(path, tmp_path / "root.cstore")
+    back = colstore.convert(path, tmp_path / "root.cstore")
     assert set(back.columns) == {"a", "b"}
     np.testing.assert_array_equal(back.array("a"), np.arange(5))
     back.close()
@@ -230,13 +239,13 @@ def test_hdf5_backend_and_key(tmp_path, store, columns):
     # write with the pandas backend under a custom key, read it back
     p1 = tmp_path / "pdkey.h5"
     store.saveas(p1, backend="pandas", key="mytable")
-    back = colstore.ingest(p1, tmp_path / "pdkey.cstore", key="mytable")
+    back = colstore.convert(p1, tmp_path / "pdkey.cstore", key="mytable")
     np.testing.assert_array_equal(back.array("i"), columns["i"])
     back.close()
     # write with the h5py backend under a custom key
     p2 = tmp_path / "h5key.h5"
     store.saveas(p2, backend="h5py", key="grp")
-    back2 = colstore.ingest(p2, tmp_path / "h5key.cstore", key="grp")
+    back2 = colstore.convert(p2, tmp_path / "h5key.cstore", key="grp")
     np.testing.assert_array_equal(back2.array("i"), columns["i"])
     back2.close()
 

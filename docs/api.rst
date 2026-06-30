@@ -64,7 +64,7 @@ Format interop
    :toctree: generated
    :nosignatures:
 
-   ingest
+   convert
    saveas
    to_root
    from_parquet

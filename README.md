@@ -344,16 +344,26 @@ ds[rows, cols].saveas("subset.parquet")  # or Parquet / Feather / HDF5 / JSON / 
 
 Writing a `.cstore` streams in bounded memory and raw-copies unchanged columns (so a whole
 store or dataset is copied / merged, not materialized); the foreign formats convert the
-selection. See **[Format interop](docs/guide/interop.md)** for the full set and `ingest()` /
+selection. See **[Format interop](docs/guide/interop.md)** for the full set and `convert()` /
 `from_*` to read them back.
 
-**Import a foreign file.** `ingest` reads a Parquet / Feather / JSON / HDF5 / NPZ / ROOT
-file into a new `.cstore` and opens it (or use the `from_*` shortcuts):
+**Convert files.** `convert` moves files between colstore's format and another, inferring the
+direction from the extensions (one endpoint must be `.cstore`). A foreign file imports into a
+new `.cstore` and returns the opened reader; a `.cstore` exports to a foreign format. `source`
+may be a single path, a glob, or a list:
 
 ```python
-ds = colstore.ingest("in.parquet", "out.cstore")           # format from the extension
-ds = colstore.from_hdf("in.h5", "out.cstore")              # also from_parquet/feather/json/npz/root
+ds = colstore.convert("in.parquet", "out.cstore")      # import -> a reader (also from_parquet/...)
+colstore.convert("data.h5")                            # auto-name -> data.cstore
+colstore.convert("*.h5")                               # one .cstore per file
+colstore.convert("*.h5", "all.cstore")                 # a literal -o path merges into one file
+colstore.convert("*.h5", "run_{index}.cstore")         # template: run_0.cstore, run_1.cstore, ...
+colstore.convert("*.h5", rename=lambda stem: stem + "_v2")   # or an arbitrary name mapping
+colstore.convert("events.cstore", "events.parquet")    # export -> a Path
 ```
+
+An existing output raises unless `overwrite=True`; `output_dir=` redirects the outputs and
+`on_mismatch="drop"` reconciles schemas when merging.
 
 Pass `dtypes={name: dtype}` to coerce named columns as they are read — useful to give a
 column the same dtype across files whose schemas differ (e.g. a flag that is `bool` in some
@@ -361,7 +371,7 @@ files and all-null in others, which would otherwise mismatch as `b1` vs `f8` on 
 open):
 
 ```python
-ds = colstore.ingest("in.h5", "out.cstore", dtypes={"flag": "bool"})
+ds = colstore.convert("in.h5", "out.cstore", dtypes={"flag": "bool"})
 ```
 
 The coercion rule is exact. A column with **real values** is cast with NumPy `astype`, so a

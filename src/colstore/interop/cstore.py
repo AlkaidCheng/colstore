@@ -56,5 +56,5 @@ class CStoreFormat(FileFormat):
     def from_file(self, source: Any, dest: Any, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
             "a .cstore file is already native; open it with colstore.open() (or "
-            "compact() to rewrite it), not ingest()."
+            "compact() to rewrite it)."
         )

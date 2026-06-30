@@ -9,14 +9,16 @@ one obvious thing.
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+import shutil
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, overload
 
 from . import format as fmt
 from ._coerce import coerce_to_columns
-from ._paths import has_glob_magic
+from ._paths import expand_glob, has_glob_magic
 from ._types import Source
 from .compaction import compact_file
 from .dataset import ColStoreDataset, OnMismatch
@@ -176,10 +178,15 @@ def store(
     return ColStoreReader(path, **open_kwargs)
 
 
-# ---- Foreign file formats: ingest / saveas -----------------------------
+# ---- Foreign file formats: convert / saveas ----------------------------
 
 
-def ingest(
+def _is_cstore_path(path: str | os.PathLike[str]) -> bool:
+    """Whether ``path`` names colstore's own format, by its extension."""
+    return os.fspath(path).lower().endswith(fmt.FILE_EXTENSION)
+
+
+def _import_to_cstore(
     source: str | os.PathLike[str],
     dest: str | os.PathLike[str],
     *,
@@ -187,30 +194,250 @@ def ingest(
     dtypes: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> ColStoreReader:
-    """Import a foreign file into a new ``.cstore`` at ``dest`` and open it.
-
-    The format is chosen from ``source``'s extension (e.g. ``.npz``); pass
-    ``format=`` to override it (``format="npz"``). ``dest`` is required -- colstore
-    mmaps only its own format, so the foreign file is materialized into a ``.cstore``
-    first -- and the opened :class:`~colstore.reader.ColStoreReader` is returned.
-    ``dest`` must not already exist (pass ``mode="recreate"`` to overwrite it). List
-    the available file formats with :func:`colstore.interop.file_formats`; importing
-    an in-memory object instead uses :func:`colstore.interop.from_object`.
-
-    ``dtypes`` maps a column name to a target dtype (``{"flag": "bool"}``) and coerces
-    that column on import -- handy to give a column the same dtype across files whose
-    schemas differ (e.g. a flag that is ``bool`` in some files and all-null in others).
-    A missing value (``NaN``) becomes the target's empty value when cast to a bool /
-    integer / string dtype (``False`` / ``0`` / ``""``), keeps ``NaN`` for a float dtype,
-    and becomes ``NaT`` for a datetime / timedelta dtype. Real values follow NumPy
-    ``astype`` rules, so a too-narrow target may truncate or overflow them without error.
-    Applies to the column-based formats (Parquet / Feather / JSON / HDF5 / NPZ).
-    """
+    """Materialize a foreign file into a new ``.cstore`` and open it (the import path)."""
     from . import interop
 
     if dtypes is not None:
         kwargs["dtypes"] = dtypes
     return interop.file_format_for_path(source, format).from_file(source, dest, **kwargs)
+
+
+def _prepare_output(dest: str | os.PathLike[str], overwrite: bool) -> Path:
+    """Resolve ``dest`` to a ``Path`` and enforce the overwrite policy."""
+    dest_path = Path(os.fspath(dest))
+    if dest_path.exists():
+        if not overwrite:
+            raise FileExistsError(f"{dest_path} already exists; pass overwrite=True to replace it.")
+        dest_path.unlink()
+    return dest_path
+
+
+def _convert_one(
+    source: str | os.PathLike[str],
+    dest: str | os.PathLike[str],
+    *,
+    format: str | None = None,
+    dtypes: dict[str, Any] | None = None,
+    overwrite: bool = False,
+    **kwargs: Any,
+) -> ColStoreReader | Path:
+    """Convert one file; one endpoint must be a ``.cstore`` (see :func:`convert`)."""
+    source_is_cstore = _is_cstore_path(source)
+    dest_is_cstore = _is_cstore_path(dest)
+    if not source_is_cstore and not dest_is_cstore:
+        raise ValueError(
+            f"convert needs one endpoint to be a .cstore file; got "
+            f"{os.fspath(source)!r} -> {os.fspath(dest)!r}."
+        )
+    dest_path = _prepare_output(dest, overwrite)
+    if not source_is_cstore:
+        return _import_to_cstore(source, dest, format=format, dtypes=dtypes, **kwargs)
+    if dtypes is not None:
+        raise ValueError("dtypes= applies only when importing a foreign file into a .cstore.")
+    reader = open(source)
+    try:
+        reader.saveas(dest, format=format, **kwargs)
+    finally:
+        reader.close()
+    return open(dest) if dest_is_cstore else dest_path
+
+
+def _resolve_convert_inputs(
+    source: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+) -> tuple[list[str], bool]:
+    """Resolve a source to concrete input paths, flagging whether it was a single path.
+
+    A single literal path stays a one-element list (and is flagged scalar, so the result
+    is returned bare); a glob string or a list/tuple is expanded (globs inside a list too).
+    """
+    if isinstance(source, (str, os.PathLike)):
+        text = os.fspath(source)
+        if isinstance(source, str) and has_glob_magic(text):
+            return expand_glob(text), False
+        return [text], True
+    if isinstance(source, (list, tuple)):
+        resolved: list[str] = []
+        for item in source:
+            text = os.fspath(item)
+            if isinstance(item, str) and has_glob_magic(text):
+                resolved.extend(expand_glob(text))
+            else:
+                resolved.append(text)
+        return resolved, False
+    raise TypeError(
+        f"convert source must be a path, a glob, or a list of them; got {type(source).__name__}."
+    )
+
+
+def _target_extension(
+    inputs: list[str], dest: str | None, is_template: bool, format: str | None
+) -> str:
+    """The output file extension for a one-to-one conversion."""
+    if is_template and dest is not None:
+        return Path(dest).suffix
+    if format is not None:
+        from . import interop
+        from .interop import FileFormat
+
+        resolved = interop.get(format)
+        if not isinstance(resolved, FileFormat) or not resolved.extensions:
+            raise ValueError(f"format {format!r} is not a file format with an extension.")
+        return sorted(resolved.extensions)[0]
+    if _is_cstore_path(inputs[0]):
+        raise ValueError(
+            "converting .cstore files needs a target format; pass format= or a dest "
+            "with the target extension."
+        )
+    return fmt.FILE_EXTENSION
+
+
+def _resolve_output_path(
+    source: str,
+    index: int,
+    dest: str | None,
+    is_template: bool,
+    rename: Mapping[str, str] | Callable[[str], str] | None,
+    output_dir: str | os.PathLike[str] | None,
+    target_ext: str,
+) -> Path:
+    """The output path for one input under the naming rules (template / rename / auto)."""
+    source_path = Path(source)
+    if is_template and dest is not None:
+        out = Path(
+            dest.format(
+                index=index,
+                stem=source_path.stem,
+                name=source_path.name,
+                parent=str(source_path.parent),
+            )
+        )
+    elif rename is not None:
+        stem = (
+            rename(source_path.stem)
+            if callable(rename)
+            else rename.get(source_path.stem, source_path.stem)
+        )
+        filename = stem if stem.lower().endswith(target_ext.lower()) else stem + target_ext
+        out = source_path.with_name(filename)  # keep the source's directory
+    else:
+        out = source_path.with_suffix(target_ext)
+    if output_dir is not None:
+        out = Path(os.fspath(output_dir)) / out.name
+    return out
+
+
+def _convert_merge(
+    inputs: list[str],
+    dest: str,
+    *,
+    format: str | None,
+    dtypes: dict[str, Any] | None,
+    overwrite: bool,
+    on_mismatch: OnMismatch,
+    **kwargs: Any,
+) -> ColStoreReader | Path:
+    """Merge every input into the single file ``dest`` (a literal output path)."""
+    if len(inputs) == 1:
+        return _convert_one(
+            inputs[0], dest, format=format, dtypes=dtypes, overwrite=overwrite, **kwargs
+        )
+    dest_is_cstore = _is_cstore_path(dest)
+    if not dest_is_cstore and not any(_is_cstore_path(src) for src in inputs):
+        raise ValueError(
+            f"convert needs one endpoint to be a .cstore file; merging foreign files into "
+            f"{dest!r} has none."
+        )
+    dest_path = _prepare_output(dest, overwrite)
+    scratch = tempfile.mkdtemp(prefix="colstore_convert_")
+    readers: list[ColStoreReader] = []
+    try:
+        for index, source in enumerate(inputs):
+            if _is_cstore_path(source):
+                readers.append(ColStoreReader(source))
+            else:
+                part = os.path.join(scratch, f"part_{index:05d}.cstore")
+                _import_to_cstore(source, part, format=format, dtypes=dtypes, **kwargs)
+                readers.append(ColStoreReader(part))
+        ColStoreDataset(readers, on_mismatch=on_mismatch).saveas(
+            dest, format=None if dest_is_cstore else format
+        )
+    finally:
+        for reader in readers:
+            reader.close()
+        shutil.rmtree(scratch, ignore_errors=True)
+    return ColStoreReader(dest) if dest_is_cstore else dest_path
+
+
+def convert(
+    source: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    dest: str | os.PathLike[str] | None = None,
+    *,
+    format: str | None = None,
+    dtypes: dict[str, Any] | None = None,
+    rename: Mapping[str, str] | Callable[[str], str] | None = None,
+    output_dir: str | os.PathLike[str] | None = None,
+    overwrite: bool = False,
+    on_mismatch: OnMismatch = "strict",
+    **kwargs: Any,
+) -> ColStoreReader | Path | list[ColStoreReader | Path]:
+    """Convert files between colstore's format and another, one endpoint being ``.cstore``.
+
+    ``source`` is a single path, a glob, or a list of them; direction is inferred from the
+    extensions (one endpoint must be ``.cstore``, or :class:`ValueError` is raised):
+
+    - **foreign -> .cstore** (import) returns the opened
+      :class:`~colstore.reader.ColStoreReader`; ``.cstore -> foreign`` (export) returns the
+      output :class:`~pathlib.Path`; ``.cstore -> .cstore`` copies (or, across many inputs,
+      merges) and returns a reader.
+
+    ``dest`` selects how the outputs are written:
+
+    - **omitted** -- each input is converted one-to-one, auto-named by swapping its
+      extension (``convert("data.h5")`` -> ``data.cstore``; ``convert("*.h5")`` -> one
+      ``.cstore`` per file).
+    - **a literal path** -- every input is **merged** into that one file
+      (``convert("*.h5", "all.cstore")``).
+    - **a template** with ``{index}`` / ``{stem}`` / ``{name}`` / ``{parent}`` -- one-to-one
+      with custom names (``convert("*.h5", "run_{index}.cstore")``).
+
+    ``rename`` overrides the output name per input (one-to-one): a callable
+    ``stem -> new_stem`` or a mapping ``{stem: new_stem}`` (a stem absent from the mapping
+    keeps its name). ``output_dir`` writes the outputs into that directory. ``overwrite``
+    replaces existing outputs (off by default, so an existing output raises
+    :class:`FileExistsError`). ``on_mismatch`` reconciles schemas when merging (see
+    :func:`open`). ``format`` overrides the foreign endpoint's format, and ``dtypes``
+    (import only) coerces columns as they are read (see :func:`open` for the rules).
+
+    Returns a single result for a single ``source`` path or a merge, and a list (one per
+    input) for a glob or list converted one-to-one.
+    """
+    inputs, scalar = _resolve_convert_inputs(source)
+    if not inputs:
+        raise FileNotFoundError(f"convert: no files matched {source!r}.")
+    dest_text = None if dest is None else os.fspath(dest)
+    is_template = dest_text is not None and "{" in dest_text
+    if dest_text is not None and not is_template:
+        return _convert_merge(
+            inputs,
+            dest_text,
+            format=format,
+            dtypes=dtypes,
+            overwrite=overwrite,
+            on_mismatch=on_mismatch,
+            **kwargs,
+        )
+    target_ext = _target_extension(inputs, dest_text, is_template, format)
+    results: list[ColStoreReader | Path] = []
+    for index, source_path in enumerate(inputs):
+        out = _resolve_output_path(
+            source_path, index, dest_text, is_template, rename, output_dir, target_ext
+        )
+        results.append(
+            _convert_one(
+                source_path, out, format=format, dtypes=dtypes, overwrite=overwrite, **kwargs
+            )
+        )
+    return results[0] if scalar else results
 
 
 def saveas(
@@ -232,36 +459,36 @@ def saveas(
 def from_npz(
     source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
 ) -> ColStoreReader:
-    """Import a NumPy ``.npz`` file into a ``.cstore`` (``ingest(..., format="npz")``)."""
-    return ingest(source, dest, format="npz", **kwargs)
+    """Import a NumPy ``.npz`` file into a ``.cstore`` (``convert(..., format="npz")``)."""
+    return _import_to_cstore(source, dest, format="npz", **kwargs)
 
 
 def from_parquet(
     source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
 ) -> ColStoreReader:
-    """Import a Parquet file into a ``.cstore`` (``ingest(..., format="parquet")``)."""
-    return ingest(source, dest, format="parquet", **kwargs)
+    """Import a Parquet file into a ``.cstore`` (``convert(..., format="parquet")``)."""
+    return _import_to_cstore(source, dest, format="parquet", **kwargs)
 
 
 def from_feather(
     source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
 ) -> ColStoreReader:
-    """Import a Feather file into a ``.cstore`` (``ingest(..., format="feather")``)."""
-    return ingest(source, dest, format="feather", **kwargs)
+    """Import a Feather file into a ``.cstore`` (``convert(..., format="feather")``)."""
+    return _import_to_cstore(source, dest, format="feather", **kwargs)
 
 
 def from_json(
     source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
 ) -> ColStoreReader:
-    """Import a JSON file into a ``.cstore`` (``ingest(..., format="json")``)."""
-    return ingest(source, dest, format="json", **kwargs)
+    """Import a JSON file into a ``.cstore`` (``convert(..., format="json")``)."""
+    return _import_to_cstore(source, dest, format="json", **kwargs)
 
 
 def from_hdf(
     source: str | os.PathLike[str], dest: str | os.PathLike[str], **kwargs: Any
 ) -> ColStoreReader:
-    """Import an HDF5 file into a ``.cstore`` (``ingest(..., format="hdf5")``)."""
-    return ingest(source, dest, format="hdf5", **kwargs)
+    """Import an HDF5 file into a ``.cstore`` (``convert(..., format="hdf5")``)."""
+    return _import_to_cstore(source, dest, format="hdf5", **kwargs)
 
 
 # ---- Compaction --------------------------------------------------------

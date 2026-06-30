@@ -5,7 +5,7 @@ Both backends are exercised against real backends where installed (PyROOT for
 the available backends and skipped when neither is present. Covers round-trip
 parity, streaming in batches, cross-backend interchange, the ``keep_valid_only``
 policy, column selection, backend selection and errors, dataset export, and the
-``RootFormat`` (saveas / ingest) wiring.
+``RootFormat`` (saveas / convert) wiring.
 """
 
 from __future__ import annotations
@@ -332,7 +332,7 @@ def test_root_backend_rejects_int8(tmp_path):
             colstore.to_root(store, tmp_path / "i.root", backend="ROOT", show_progress=False)
     if _HAS_UPROOT:
         colstore.to_root(store, tmp_path / "iu.root", backend="uproot", show_progress=False)
-        back = colstore.ingest(
+        back = colstore.convert(
             tmp_path / "iu.root", tmp_path / "iu.cstore", backend="uproot", show_progress=False
         )
         assert back.dtypes["q"] == np.int8
@@ -400,15 +400,15 @@ def test_resolve_backend_names():
     assert root_mod.resolve_backend("auto").name in {"ROOT", "uproot"}
 
 
-# ---- RootFormat: saveas / ingest -------------------------------------------
+# ---- RootFormat: saveas / convert -------------------------------------------
 
 
 @pytest.mark.parametrize("backend", _BACKENDS)
-def test_saveas_and_ingest(tmp_path, store, columns, backend):
+def test_saveas_and_convert(tmp_path, store, columns, backend):
     root_path = tmp_path / "f.root"
     store.saveas(root_path, backend=backend, treename="events", show_progress=False)
     assert root_path.exists()
-    back = colstore.ingest(root_path, tmp_path / "f.cstore", backend=backend, show_progress=False)
+    back = colstore.convert(root_path, tmp_path / "f.cstore", backend=backend, show_progress=False)
     _assert_same_columns(back, columns)
     back.close()
 
@@ -417,7 +417,9 @@ def test_saveas_and_ingest(tmp_path, store, columns, backend):
 def test_saveas_row_subset(tmp_path, store, columns, backend):
     root_path = tmp_path / "sub.root"
     store[5:10, ["pt", "n"]].saveas(root_path, backend=backend, show_progress=False)
-    back = colstore.ingest(root_path, tmp_path / "sub.cstore", backend=backend, show_progress=False)
+    back = colstore.convert(
+        root_path, tmp_path / "sub.cstore", backend=backend, show_progress=False
+    )
     assert set(back.columns) == {"pt", "n"}
     assert back.n_rows == 5
     np.testing.assert_array_equal(np.sort(back.array("pt")), columns["pt"][5:10])
@@ -430,7 +432,7 @@ def test_saveas_row_subset_chunked(tmp_path, store, columns, backend):
     # batch_size forces several chunks, exercising the in-memory source's slicing.
     root_path = tmp_path / "subchunk.root"
     store[5:15, ["pt", "n"]].saveas(root_path, backend=backend, batch_size=4, show_progress=False)
-    back = colstore.ingest(
+    back = colstore.convert(
         root_path, tmp_path / "subchunk.cstore", backend=backend, show_progress=False
     )
     assert set(back.columns) == {"pt", "n"}

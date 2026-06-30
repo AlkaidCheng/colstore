@@ -17,7 +17,7 @@ log documents it and everything since.
   in others) without re-ingesting; reads stay zero-copy since only the dataset's exposed
   schema narrows. Raises only if no column is common to all files.
 - [[#254](https://github.com/AlkaidCheng/colstore/pull/254)] A `dtypes` override on
-  import. `colstore.ingest(src, dest, dtypes={"flag": "bool"})` (and the `from_parquet`
+  import. `colstore.convert(src, dest, dtypes={"flag": "bool"})` (and the `from_parquet`
   / `from_feather` / `from_json` / `from_hdf` / `from_npz` sugar) coerces named columns
   to a target dtype as they are read — handy to give a column one dtype across files
   whose schemas differ (e.g. a flag that is `bool` in some files and all-null in others,
@@ -50,8 +50,7 @@ log documents it and everything since.
   JSON / HDF5 / NPZ / ROOT targets. It streams through colstore's own writer (no
   optional backend) without materializing the selection: a whole store — or a
   multi-file dataset — is raw-copied / merged exactly like `concat()`, and a row/column
-  selection streams in bounded memory. (A `.cstore` is already native, so `ingest()` of
-  one points to `colstore.open()` instead.)
+  selection streams in bounded memory.
 - [[#240](https://github.com/AlkaidCheng/colstore/pull/240)] A `TableView` now exposes
   the same column-access surface as the reader: index it by name for a column
   (`ds[rows]['col']` → `ColumnView`) or by a list to narrow it
@@ -83,6 +82,16 @@ log documents it and everything since.
 
 ### Changed
 
+- [[#257](https://github.com/AlkaidCheng/colstore/pull/257)] `ingest` is renamed to
+  `convert` and generalized. `convert(source, dest)` now works in both directions —
+  foreign → `.cstore` (import, returns a reader), `.cstore` → foreign (export, returns the
+  output path), and `.cstore` → `.cstore` (copy / merge) — inferring the direction from the
+  extensions; converting between two foreign formats raises. `source` may be a single path,
+  a glob, or a list: with many inputs a literal `dest` merges them into one file, a `dest`
+  template (`run_{index}.cstore`) or a `rename` dict / callable names them one-to-one, and
+  omitting `dest` auto-names each by swapping its extension. `output_dir`, `overwrite` (an
+  existing output otherwise raises), and `on_mismatch` (for merges) round out the options.
+  The `ingest` name is removed; the `from_*` import shortcuts are unchanged.
 - [[#256](https://github.com/AlkaidCheng/colstore/pull/256)] A multi-file dataset no
   longer requires its files to store columns in the same order. `colstore.open([...])`
   now accepts files that share the same column names and dtypes in any order (the dataset
@@ -102,7 +111,7 @@ log documents it and everything since.
   null-typed Arrow column — is now stored as an all-`NaN` `float64` column instead of
   raising "colstore has no null support". Such a column carries no data and no recoverable
   type, so float `NaN` (colstore's in-band missing value) is the natural fixed-width form;
-  a column that *mixes* nulls with real values still raises. Affects `ingest` /
+  a column that *mixes* nulls with real values still raises. Affects `convert` /
   `from_parquet` / `from_feather` / `from_json` / `from_hdf`.
 - [[#244](https://github.com/AlkaidCheng/colstore/pull/244)] A view is now re-indexable
   by rows, composed onto its current selection. `ds['col'][:100]` (previously

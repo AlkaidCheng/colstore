@@ -1054,7 +1054,7 @@ class RootFormat(FileFormat):
 
     :meth:`to_file` / :meth:`from_file` carry the conversion; :func:`to_root` /
     :func:`from_root` are the typed module-level shorthands that delegate here, and
-    ``ds.saveas("x.root")`` / ``colstore.ingest("x.root", dest)`` reach them through
+    ``ds.saveas("x.root")`` / ``colstore.convert("x.root", dest)`` reach them through
     the registry.
     """
 
