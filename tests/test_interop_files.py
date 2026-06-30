@@ -5,6 +5,8 @@ independent of any optional backend.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pytest
 
@@ -205,6 +207,50 @@ def test_data_format_name_rejected_for_files(tmp_path, sample):
         ds.saveas(tmp_path / "x.npz", format="dicttest")
     with pytest.raises(TypeError, match="not a file format"):
         colstore.convert(tmp_path / "x.npz", tmp_path / "o.cstore", format="dicttest")
+
+
+def test_new_file_format_only_overrides_read_columns_and_stream_import(tmp_path):
+    """The FileFormat template gives a new format whole-file + streaming import for free.
+
+    A format overriding only read_columns (+ optional stream_import) gets the
+    stream-vs-whole branch, the warn-and-fall-back, the per-batch dtype override, and
+    compaction from the base from_file -- no per-format from_file code.
+    """
+    from colstore.interop import StreamPlan
+
+    class _RowsFmt(FileFormat):  # whole-file only -- no stream_import
+        name = "rowsfmt"
+        extensions = frozenset({".rows"})
+
+        def read_columns(self, source, *, columns=None, **kwargs):
+            return {"v": np.loadtxt(os.fspath(source), dtype=np.int64)}
+
+    src = tmp_path / "x.rows"
+    np.savetxt(src, np.arange(12), fmt="%d")
+    out = colstore.convert(src, tmp_path / "whole.cstore")  # template's whole-file path
+    assert out.array("v").tolist() == list(range(12))
+    # batch_size on a non-streaming format falls back to whole-file with a warning
+    with pytest.warns(RuntimeWarning, match="converted whole-file"):
+        colstore.convert(src, tmp_path / "fb.cstore", batch_size=4)
+
+    class _StreamRowsFmt(FileFormat):  # adds streaming
+        name = "srowsfmt"
+        extensions = frozenset({".srows"})
+
+        def read_columns(self, source, *, columns=None, **kwargs):
+            return {"v": np.loadtxt(os.fspath(source), dtype=np.int64)}
+
+        def stream_import(self, source, *, columns=None, batch_size, **kwargs):
+            data = np.loadtxt(os.fspath(source), dtype=np.int64)
+            rows = batch_size if isinstance(batch_size, int) else len(data)
+            batches = ({"v": data[i : i + rows]} for i in range(0, len(data), rows))
+            return StreamPlan(batches, len(data))
+
+    src2 = tmp_path / "y.srows"
+    np.savetxt(src2, np.arange(12), fmt="%d")
+    streamed = colstore.convert(src2, tmp_path / "s.cstore", batch_size=4)
+    assert streamed.array("v").tolist() == list(range(12))
+    assert colstore.info(tmp_path / "s.cstore").n_records == 1  # base compacted it
 
 
 # ---- the dtype contract on import -------------------------------------------

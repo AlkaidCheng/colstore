@@ -13,14 +13,11 @@ format (Parquet / Feather / HDF5 / NPZ) when those matter.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
-from ._convert import columns_to_frame, frame_to_columns, store_columns
-from ._stream_import import warn_whole_file
+from .._types import Columns
+from ._convert import columns_to_frame, frame_to_columns
 from .base import FileFormat, Selection
-
-if TYPE_CHECKING:
-    from ..reader import ColStoreReader
 
 
 class JsonFormat(FileFormat):
@@ -36,30 +33,24 @@ class JsonFormat(FileFormat):
         data = selection.gather_all()
         columns_to_frame(data).to_json(os.fspath(dest), orient=orient, **kwargs)
 
-    def from_file(
+    def read_columns(
         self,
         source: Any,
-        dest: Any,
         *,
-        orient: str = "records",
         columns: list[str] | None = None,
-        batch_size: int | str | None = None,
-        compact: bool = True,
+        orient: str = "records",
         **kwargs: Any,
-    ) -> ColStoreReader:
-        """Read a JSON file into a ``.cstore`` and open it (extra kwargs -> store).
+    ) -> Columns:
+        """Read the whole JSON file into a column mapping.
 
-        ``batch_size`` is accepted for a uniform :func:`colstore.convert` surface but a
-        single-array JSON document has no row-batch reader, so the file is read whole
-        with a warning.
+        A single-array JSON document has no row-batch reader, so :meth:`stream_import` is
+        not overridden -- a ``batch_size`` request reads the file whole with a warning.
         """
         import pandas as pd
 
-        if batch_size is not None:
-            warn_whole_file(source, "a single-array JSON document has no row-batch reader")
         # dtype=False keeps the JSON-encoded type (a quoted "1" stays a string
         # instead of being inferred to int), so a string column round-trips.
         frame = pd.read_json(os.fspath(source), orient=orient, dtype=False)
         if columns is not None:
             frame = frame[columns]
-        return store_columns(frame_to_columns(frame), dest, **kwargs)
+        return frame_to_columns(frame)

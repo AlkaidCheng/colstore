@@ -1123,6 +1123,10 @@ class RootFormat(FileFormat):
         compact: bool = True,
         mode: str = "create",
         show_progress: bool = True,
+        # ROOT overrides the from_file template directly (it reads jagged-branch trees
+        # through its own backends and streams by default); **kwargs keeps it
+        # signature-compatible with the base for the common parameters.
+        **kwargs: Any,
     ) -> ColStoreReader:
         """Read a ROOT ``source`` into a ``.cstore`` and open it. See :func:`from_root`."""
         impl = resolve_backend(backend, source)

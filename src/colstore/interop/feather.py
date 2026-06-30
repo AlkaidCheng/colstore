@@ -6,21 +6,18 @@ The on-disk container is the Arrow IPC / Feather v2 format.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 from .._sizes import resolve_batch_rows
-from ._convert import arrow_to_columns, selection_to_arrow_table, store_columns
+from .._types import Columns
+from ._convert import arrow_to_columns, selection_to_arrow_table
 from ._stream_import import (
+    StreamPlan,
     arrow_bytes_per_row,
     arrow_stream_dtypes,
     columns_from_arrow_batch,
-    stream_batches,
-    warn_whole_file,
 )
 from .base import FileFormat, Selection
-
-if TYPE_CHECKING:
-    from ..reader import ColStoreReader
 
 
 class FeatherFormat(FileFormat):
@@ -36,51 +33,35 @@ class FeatherFormat(FileFormat):
         feather: Any = pyarrow.feather
         feather.write_feather(selection_to_arrow_table(selection), os.fspath(dest), **kwargs)
 
-    def from_file(
-        self,
-        source: Any,
-        dest: Any,
-        *,
-        columns: list[str] | None = None,
-        batch_size: int | str | None = None,
-        compact: bool = True,
-        dtypes: dict[str, Any] | None = None,
-        show_progress: bool = False,
-        **kwargs: Any,
-    ) -> ColStoreReader:
-        """Read a Feather file into a ``.cstore`` and open it.
-
-        With ``batch_size`` set and a stream-stable, non-nullable schema, the file is
-        streamed at its Arrow record-batch granularity (coarsened toward the requested
-        size); otherwise it is read whole.
-        """
-        import pyarrow as pa
+    def read_columns(
+        self, source: Any, *, columns: list[str] | None = None, **kwargs: Any
+    ) -> Columns:
+        """Read the whole Feather file into a column mapping."""
         import pyarrow.feather
 
         feather: Any = pyarrow.feather
-        if batch_size is not None:
-            reader = pa.ipc.open_file(os.fspath(source))
-            stream_dtypes, reason = arrow_stream_dtypes(reader.schema, columns)
-            if not reason:
-                reason = _feather_null_reason(reader.schema, stream_dtypes)
-            if not reason:
-                rows = resolve_batch_rows(
-                    batch_size, bytes_per_row=arrow_bytes_per_row(stream_dtypes)
-                )
-                return stream_batches(
-                    _feather_batches(reader, columns, stream_dtypes, rows),
-                    dest,
-                    dtypes=dtypes,
-                    total_rows=None,
-                    compact=compact,
-                    show_progress=show_progress,
-                    desc=f"{os.fspath(dest)} <- feather",
-                )
-            warn_whole_file(source, reason)
-        table = feather.read_table(os.fspath(source), columns=columns)
-        return store_columns(
-            arrow_to_columns(table), dest, dtypes=dtypes, show_progress=show_progress, **kwargs
-        )
+        return arrow_to_columns(feather.read_table(os.fspath(source), columns=columns))
+
+    def stream_import(
+        self,
+        source: Any,
+        *,
+        columns: list[str] | None = None,
+        batch_size: int | str | None,
+        **kwargs: Any,
+    ) -> StreamPlan | str:
+        """Stream at the Arrow record-batch granularity for a stream-stable, non-nullable schema."""
+        import pyarrow as pa
+
+        reader = pa.ipc.open_file(os.fspath(source))
+        stream_dtypes, reason = arrow_stream_dtypes(reader.schema, columns)
+        if reason:
+            return reason
+        reason = _feather_null_reason(reader.schema, stream_dtypes)
+        if reason:
+            return reason
+        rows = resolve_batch_rows(batch_size, bytes_per_row=arrow_bytes_per_row(stream_dtypes))
+        return StreamPlan(_feather_batches(reader, columns, stream_dtypes, rows))
 
 
 def _feather_null_reason(schema: Any, dtypes: dict[str, Any]) -> str:

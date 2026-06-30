@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from .._types import Columns
 from .base import FileFormat, Selection
 
 
@@ -53,7 +54,9 @@ class CStoreFormat(FileFormat):
         frame = ColStoreFrame(selection.store, selection.columns, rows)
         frame.write(dest, memory_budget=memory_budget)
 
-    def from_file(self, source: Any, dest: Any, *args: Any, **kwargs: Any) -> Any:
+    def read_columns(
+        self, source: Any, *, columns: list[str] | None = None, **kwargs: Any
+    ) -> Columns:
         raise NotImplementedError(
             "a .cstore file is already native; open it with colstore.open() (or "
             "compact() to rewrite it)."

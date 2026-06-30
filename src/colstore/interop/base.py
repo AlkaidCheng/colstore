@@ -33,7 +33,9 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from .._base import _ReaderBase
+    from .._types import Columns
     from ..reader import ColStoreReader
+    from ._stream_import import StreamPlan
 
 
 def is_whole_column(row_indexer: Any, n_rows: int) -> bool:
@@ -159,8 +161,13 @@ class FileFormat(Format):
     """A format whose external representation is an on-disk file.
 
     The :attr:`extensions` it claims drive ``colstore.convert`` / ``saveas``
-    dispatch. Override :meth:`to_file` to support export (colstore -> file) and
-    :meth:`from_file` to support import (file -> ``.cstore``).
+    dispatch. Override :meth:`to_file` to support export (colstore -> file). For
+    import, override :meth:`read_columns` (the whole-file read) and, if the file can
+    be read in row-batches, :meth:`stream_import` (bounded-memory streaming); the
+    :meth:`from_file` template wires them together -- the stream-vs-whole-file branch,
+    the warn-and-fall-back when a file cannot stream, the per-batch dtype override, and
+    compaction -- so every format behaves consistently. A format that needs full control
+    (e.g. ROOT) may override :meth:`from_file` directly instead.
     """
 
     kind: ClassVar[str] = "file"
@@ -171,9 +178,75 @@ class FileFormat(Format):
         """Write a colstore ``selection`` to a file at ``dest`` (override to support)."""
         raise NotImplementedError(f"the {self.name!r} format does not support export.")
 
-    def from_file(self, source: Any, dest: Any, *args: Any, **kwargs: Any) -> ColStoreReader:
-        """Read ``source`` into a ``.cstore`` at ``dest`` and open it (override to support)."""
+    def from_file(
+        self,
+        source: Any,
+        dest: Any,
+        *,
+        columns: list[str] | None = None,
+        batch_size: int | str | None = None,
+        compact: bool = True,
+        dtypes: dict[str, Any] | None = None,
+        mode: str = "create",
+        statistics: bool = False,
+        show_progress: bool = False,
+        **kwargs: Any,
+    ) -> ColStoreReader:
+        """Read ``source`` into a ``.cstore`` at ``dest`` and open it.
+
+        The template: with ``batch_size`` set and :meth:`stream_import` returning a
+        :class:`~colstore.interop._stream_import.StreamPlan`, the file is streamed in
+        bounded memory; a returned reason string (or the default) warns and reads whole.
+        ``dtypes`` coerces columns (per batch when streaming), and ``compact`` collapses a
+        streamed multi-record result. Format-specific keywords flow to
+        :meth:`read_columns` / :meth:`stream_import`.
+        """
+        from ._convert import store_columns
+        from ._stream_import import warn_whole_file, write_stream
+
+        if batch_size is not None:
+            plan = self.stream_import(source, columns=columns, batch_size=batch_size, **kwargs)
+            if not isinstance(plan, str):
+                return write_stream(
+                    plan,
+                    dest,
+                    dtypes=dtypes,
+                    mode=mode,
+                    compact=compact,
+                    show_progress=show_progress,
+                    desc=f"{os.fspath(dest)} <- {self.name}",
+                )
+            warn_whole_file(source, plan)
+        return store_columns(
+            self.read_columns(source, columns=columns, **kwargs),
+            dest,
+            dtypes=dtypes,
+            mode=mode,
+            statistics=statistics,
+            show_progress=show_progress,
+        )
+
+    def read_columns(
+        self, source: Any, *, columns: list[str] | None = None, **kwargs: Any
+    ) -> Columns:
+        """Read the whole file into a column mapping (override to support import)."""
         raise NotImplementedError(f"the {self.name!r} format does not support import.")
+
+    def stream_import(
+        self,
+        source: Any,
+        *,
+        columns: list[str] | None = None,
+        batch_size: int | str | None,
+        **kwargs: Any,
+    ) -> StreamPlan | str:
+        """A :class:`StreamPlan` to stream ``source`` in row-batches, or a reason string.
+
+        The default declines streaming, so :meth:`from_file` reads the file whole. Override
+        in a format that can read in row-batches; return a reason string for a file whose
+        schema cannot stream stably (a variable-width string or null column, etc.).
+        """
+        return "this format reads the whole file"
 
     @property
     def can_export(self) -> bool:
@@ -183,7 +256,10 @@ class FileFormat(Format):
     @property
     def can_import(self) -> bool:
         """Whether this format implements import (file -> colstore)."""
-        return type(self).from_file is not FileFormat.from_file
+        return (
+            type(self).read_columns is not FileFormat.read_columns
+            or type(self).from_file is not FileFormat.from_file
+        )
 
 
 # Formats are discovered through packaging entry points -- one group per kind --

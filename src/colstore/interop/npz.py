@@ -8,16 +8,12 @@ length and a fixed-width dtype, as for any colstore write).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 
-from ._convert import store_columns
-from ._stream_import import warn_whole_file
+from .._types import Columns
 from .base import FileFormat, Selection
-
-if TYPE_CHECKING:
-    from ..reader import ColStoreReader
 
 
 class NpzFormat(FileFormat):
@@ -46,24 +42,16 @@ class NpzFormat(FileFormat):
             else:
                 np.savez(handle, **columns)
 
-    def from_file(
-        self,
-        source: Any,
-        dest: Any,
-        *,
-        batch_size: int | str | None = None,
-        compact: bool = True,
-        **kwargs: Any,
-    ) -> ColStoreReader:
-        """Read every array in ``source`` as a column and write a ``.cstore`` at ``dest``.
+    def read_columns(
+        self, source: Any, *, columns: list[str] | None = None, **kwargs: Any
+    ) -> Columns:
+        """Read every array in ``source`` as a column.
 
-        Extra keyword arguments pass through to :func:`colstore.store` (e.g.
-        ``mode="recreate"`` to overwrite an existing ``dest``). ``batch_size`` is accepted
-        for a uniform :func:`colstore.convert` surface but ``np.load`` materializes whole
-        arrays, so the file is read whole with a warning.
+        ``np.load`` materializes whole arrays, so :meth:`stream_import` is not overridden --
+        a ``batch_size`` request reads the file whole with a warning.
         """
-        if batch_size is not None:
-            warn_whole_file(source, "np.load materializes whole arrays")
         with np.load(source) as archive:
-            columns = {name: archive[name] for name in archive.files}
-        return store_columns(columns, dest, **kwargs)
+            data = {name: archive[name] for name in archive.files}
+        if columns is not None:
+            data = {name: data[name] for name in columns}
+        return data

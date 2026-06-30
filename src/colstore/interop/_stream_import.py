@@ -17,14 +17,31 @@ from __future__ import annotations
 import os
 import warnings
 from collections.abc import Iterator
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from .._types import Columns, StrPath
-from ..reader import ColStoreReader
 from ._convert import _reject_nulls, apply_dtype_overrides
 from ._streaming import write_column_batches
+
+if TYPE_CHECKING:
+    from ..reader import ColStoreReader
+
+
+@dataclass
+class StreamPlan:
+    """A streamable import: a lazy iterator of column batches and the total row count.
+
+    Returned by :meth:`FileFormat.stream_import` for a file that can be read in
+    row-batches; ``total_rows`` is used only for the progress bar (``None`` if unknown).
+    Every batch must carry the same columns and dtypes (the writer locks the schema on
+    the first), already converted to fixed-width NumPy columns.
+    """
+
+    batches: Iterator[Columns]
+    total_rows: int | None = None
 
 
 def warn_whole_file(source: Any, reason: str) -> None:
@@ -33,31 +50,32 @@ def warn_whole_file(source: Any, reason: str) -> None:
         f"batch_size: {os.fspath(source)} was converted whole-file because it cannot "
         f"stream ({reason}).",
         RuntimeWarning,
-        stacklevel=3,
+        stacklevel=4,
     )
 
 
-def stream_batches(
-    batches: Iterator[Columns],
+def write_stream(
+    plan: StreamPlan,
     dest: StrPath,
     *,
     dtypes: dict[str, Any] | None,
-    total_rows: int | None,
+    mode: str,
     compact: bool,
     show_progress: bool,
     desc: str | None,
 ) -> ColStoreReader:
-    """Stream pre-converted column batches to ``dest``, applying ``dtypes`` per batch."""
+    """Stream a :class:`StreamPlan` to ``dest``, applying ``dtypes`` per batch."""
 
     def overridden() -> Iterator[Columns]:
-        for batch in batches:
+        for batch in plan.batches:
             apply_dtype_overrides(batch, dtypes)
             yield batch
 
     return write_column_batches(
         overridden(),
         dest,
-        total_rows=total_rows,
+        mode=mode,
+        total_rows=plan.total_rows,
         compact=compact,
         show_progress=show_progress,
         desc=desc,
