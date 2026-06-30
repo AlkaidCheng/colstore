@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from .._sizes import parse_byte_size
 from .._types import Columns
 from .base import FileFormat, Selection
 
@@ -54,6 +55,22 @@ class CStoreFormat(FileFormat):
         frame = ColStoreFrame(selection.store, selection.columns, rows)
         frame.write(dest, memory_budget=memory_budget)
 
+    def stream_export(
+        self, selection: Selection, dest: Any, *, batch_size: int | str | None, **kwargs: Any
+    ) -> str | None:
+        """Stream the selection to a new ``.cstore`` with ``batch_size`` bounding memory.
+
+        A ``.cstore`` write already streams through the editing frame, so ``batch_size``
+        maps onto its ``memory_budget``: a ``"256 MiB"`` budget is used directly, an ``int``
+        row count is sized by the selection's per-row width.
+        """
+        if "memory_budget" in kwargs:
+            raise TypeError(
+                "pass either batch_size or memory_budget to a .cstore export, not both."
+            )
+        self.to_file(selection, dest, memory_budget=_budget_bytes(selection, batch_size), **kwargs)
+        return None
+
     def read_columns(
         self, source: Any, *, columns: list[str] | None = None, **kwargs: Any
     ) -> Columns:
@@ -61,3 +78,16 @@ class CStoreFormat(FileFormat):
             "a .cstore file is already native; open it with colstore.open() (or "
             "compact() to rewrite it)."
         )
+
+
+def _budget_bytes(selection: Selection, batch_size: int | str | None) -> int:
+    """Resolve a ``batch_size`` to a byte memory budget for the editing-frame writer.
+
+    A string is a byte budget read directly; an ``int`` row count is multiplied by the
+    selection's native per-row width so the streamed batch holds about that many rows.
+    """
+    if isinstance(batch_size, str):
+        return parse_byte_size(batch_size.strip())
+    rows = batch_size if isinstance(batch_size, int) else 1
+    bytes_per_row = sum(selection.native_dtype(name).itemsize for name in selection.columns)
+    return max(1, rows * max(1, bytes_per_row))

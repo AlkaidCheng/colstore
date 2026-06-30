@@ -252,7 +252,7 @@ def _convert_one(
         raise ValueError("dtypes= applies only when importing a foreign file into a .cstore.")
     reader = open(source)
     try:
-        reader.saveas(dest, format=format, **kwargs)
+        reader.saveas(dest, format=format, batch_size=batch_size, **kwargs)
     finally:
         reader.close()
     return open(dest) if dest_is_cstore else dest_path
@@ -392,7 +392,7 @@ def _convert_merge(
                 )
                 readers.append(ColStoreReader(part))
         ColStoreDataset(readers, on_mismatch=on_mismatch).saveas(
-            dest, format=None if dest_is_cstore else format
+            dest, format=None if dest_is_cstore else format, batch_size=batch_size
         )
     finally:
         for reader in readers:
@@ -443,15 +443,19 @@ def convert(
     :func:`open`). ``format`` overrides the foreign endpoint's format, and ``dtypes``
     (import only) coerces columns as they are read (see :func:`open` for the rules).
 
-    ``batch_size`` (import only) reads the foreign file in row-batches and streams it into
-    the ``.cstore`` in bounded memory -- an ``int`` row count or a ``"256 MiB"`` *per-batch*
-    byte budget (peak memory is a few times the budget, from decode and conversion buffers,
-    not an exact ceiling); the default ``None`` reads it whole. Streaming applies to ROOT, Parquet,
-    Feather, and HDF5 when the file's schema is fixed-width numeric / temporal with no
-    nulls; a file that cannot stream stably (a variable-width string or null column, a
-    pandas fixed-format HDF5, or JSON / NPZ) falls back to a whole-file read with a
-    warning. ``compact`` (default ``True``) collapses the streamed multi-record result
-    into a single record; pass ``False`` to keep it multi-record and skip the rewrite.
+    ``batch_size`` streams the conversion in bounded memory in **either** direction -- an
+    ``int`` row count or a ``"256 MiB"`` *per-batch* byte budget (peak memory is a few times
+    the budget, from decode and conversion buffers, not an exact ceiling); the default
+    ``None`` works whole-file. On **import** it reads the foreign file in row-batches when
+    its schema is fixed-width numeric / temporal with no nulls (ROOT, Parquet, Feather,
+    HDF5); a file that cannot stream stably (a variable-width string or null column, a
+    pandas fixed-format HDF5, or JSON / NPZ) falls back to a whole-file read with a warning.
+    On **export** it writes the foreign file in row-batches (Parquet row groups, Feather
+    record batches, resizable HDF5 datasets, a ROOT Snapshot, or a ``.cstore`` editing-frame
+    write); JSON / NPZ, the pandas HDF5 backend, and Feather with write options have no
+    appendable path and are written whole with a warning. ``compact`` (default ``True``,
+    import only) collapses the streamed multi-record ``.cstore`` into a single record; pass
+    ``False`` to keep it multi-record and skip the rewrite.
 
     Returns a single result for a single ``source`` path or a merge, and a list (one per
     input) for a glob or list converted one-to-one.

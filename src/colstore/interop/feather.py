@@ -17,6 +17,7 @@ from ._stream_import import (
     arrow_stream_dtypes,
     columns_from_arrow_batch,
 )
+from .arrow import columns_to_record_batch
 from .base import FileFormat, Selection
 
 
@@ -32,6 +33,30 @@ class FeatherFormat(FileFormat):
 
         feather: Any = pyarrow.feather
         feather.write_feather(selection_to_arrow_table(selection), os.fspath(dest), **kwargs)
+
+    def stream_export(
+        self, selection: Selection, dest: Any, *, batch_size: int | str | None, **kwargs: Any
+    ) -> str | None:
+        """Stream the selection to Feather, one Arrow record batch at a time.
+
+        The incremental IPC writer carries no ``write_feather`` options, so a call that
+        passes any (e.g. ``compression``) declines streaming and is written whole instead.
+        """
+        if kwargs:
+            return f"streaming export cannot carry the write option(s) {sorted(kwargs)}"
+        import pyarrow as pa
+
+        writer = None
+        try:
+            for batch in selection.iter_batches(batch_size):
+                record_batch = columns_to_record_batch(batch)
+                if writer is None:
+                    writer = pa.ipc.new_file(os.fspath(dest), record_batch.schema)
+                writer.write_batch(record_batch)
+        finally:
+            if writer is not None:
+                writer.close()
+        return None
 
     def read_columns(
         self, source: Any, *, columns: list[str] | None = None, **kwargs: Any

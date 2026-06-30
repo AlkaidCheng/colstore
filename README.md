@@ -363,10 +363,13 @@ colstore.convert("events.cstore", "events.parquet")    # export -> a Path
 ```
 
 An existing output raises unless `overwrite=True`; `output_dir=` redirects the outputs and
-`on_mismatch="drop"` reconciles schemas when merging. For a large import, `batch_size=`
-(an `int` row count or a `"256 MiB"` byte budget) streams the foreign file into the
-`.cstore` in bounded memory — supported for ROOT / Parquet / Feather / HDF5 with a
-fixed-width numeric schema, falling back to a whole-file read (with a warning) otherwise.
+`on_mismatch="drop"` reconciles schemas when merging. For a large conversion, `batch_size=`
+(an `int` row count or a `"256 MiB"` byte budget) streams it in bounded memory in **either**
+direction: on import it reads the foreign file in row-batches (ROOT / Parquet / Feather / HDF5
+with a fixed-width numeric schema); on export it writes the foreign file in row-batches
+(Parquet row groups, Feather record batches, resizable HDF5 datasets, a ROOT Snapshot, or a
+`.cstore` editing-frame write). A target with no appendable path (JSON / NPZ, the pandas HDF5
+backend, Feather with write options) is written whole with a warning.
 
 Pass `dtypes={name: dtype}` to coerce named columns as they are read — useful to give a
 column the same dtype across files whose schemas differ (e.g. a flag that is `bool` in some

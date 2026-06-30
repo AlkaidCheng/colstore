@@ -1110,6 +1110,17 @@ class RootFormat(FileFormat):
             )
         return Path(os.fspath(dest))
 
+    def stream_export(
+        self, selection: Selection, dest: Any, *, batch_size: int | str | None, **kwargs: Any
+    ) -> str | None:
+        """Stream the selection to ROOT at ``batch_size`` granularity.
+
+        :meth:`to_file` already writes through a bounded Snapshot loop, so streaming is
+        the same path with the caller's ``batch_size`` threaded into it.
+        """
+        self.to_file(selection, dest, batch_size=batch_size, **kwargs)
+        return None
+
     def from_file(
         self,
         source: Any,

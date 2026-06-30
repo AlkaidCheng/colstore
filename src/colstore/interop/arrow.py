@@ -127,6 +127,30 @@ def _chunks_to_array(
     return pa.chunked_array(arrays)
 
 
+def _arrow_arrays(pa: Any, columns: dict[str, np.ndarray[Any, Any]]) -> list[Any]:
+    """Each column wrapped as a :class:`pyarrow.Array` through :func:`_array_from_values`."""
+    return [_array_from_values(pa, np.ascontiguousarray(values)) for values in columns.values()]
+
+
+def columns_to_arrow_table(columns: dict[str, np.ndarray[Any, Any]]) -> Any:
+    """Build a :class:`pyarrow.Table` from a column dict through the zero-copy bridge.
+
+    Each column wraps via :func:`_array_from_values`, so the dtype mapping is identical to a
+    whole-selection export: a ``datetime64`` / ``timedelta64`` NaT keeps its sentinel value
+    (not an Arrow null) and an ``S`` fixed-width-bytes column keeps every byte (embedded NULs
+    and trailing padding included). pyarrow's own ``pa.table`` over the raw NumPy arrays would
+    instead coerce NaT to a null and truncate an ``S`` value at its first NUL.
+    """
+    pa = _require_pyarrow()
+    return pa.Table.from_arrays(_arrow_arrays(pa, columns), names=list(columns))
+
+
+def columns_to_record_batch(columns: dict[str, np.ndarray[Any, Any]]) -> Any:
+    """A column dict as a :class:`pyarrow.RecordBatch`; see :func:`columns_to_arrow_table`."""
+    pa = _require_pyarrow()
+    return pa.RecordBatch.from_arrays(_arrow_arrays(pa, columns), names=list(columns))
+
+
 class ArrowFormat(DataFormat):
     """Export colstore data to Apache Arrow, zero-copy where the layout permits."""
 

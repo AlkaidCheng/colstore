@@ -8,6 +8,16 @@ log documents it and everything since.
 
 ### Added
 
+- [[#259](https://github.com/AlkaidCheng/colstore/pull/259)] `batch_size` now streams the
+  **export** direction too (`colstore.convert(".cstore -> foreign", batch_size=...)` and
+  `ds.saveas(dest, batch_size=...)`), so a `.cstore` larger than memory can be written out
+  in bounded memory. Parquet writes one row group per batch, Feather one Arrow record batch,
+  HDF5 appends to resizable datasets, ROOT streams through its Snapshot, and a `.cstore`
+  export maps the budget onto its editing-frame writer. A target with no appendable path —
+  JSON / NPZ, the pandas HDF5 backend, or Feather with write options — is written whole with
+  a warning, matching the import side's best-effort contract. The largest saving is for the
+  formats that otherwise materialize every column first (HDF5 / JSON / NPZ): peak memory
+  stays flat as the file grows instead of scaling with it.
 - [[#258](https://github.com/AlkaidCheng/colstore/pull/258)] A `batch_size` option on
   `colstore.convert` for bounded-memory streaming import. With `batch_size` set (an `int`
   row count or a `"256 MiB"` byte budget), a foreign file is read in row-batches and

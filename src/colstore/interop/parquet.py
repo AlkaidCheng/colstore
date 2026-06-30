@@ -19,6 +19,7 @@ from ._stream_import import (
     arrow_stream_dtypes,
     columns_from_arrow_batch,
 )
+from .arrow import columns_to_arrow_table
 from .base import FileFormat, Selection
 
 
@@ -34,6 +35,30 @@ class ParquetFormat(FileFormat):
 
         pq: Any = pyarrow.parquet
         pq.write_table(selection_to_arrow_table(selection), os.fspath(dest), **kwargs)
+
+    def stream_export(
+        self, selection: Selection, dest: Any, *, batch_size: int | str | None, **kwargs: Any
+    ) -> str | None:
+        """Stream the selection to Parquet, one row-group per batch, in bounded memory.
+
+        ``kwargs`` are ``ParquetWriter`` options (e.g. ``compression``); the per-batch
+        size sets each row group, so ``row_group_size`` does not apply and the writer
+        rejects it.
+        """
+        import pyarrow.parquet
+
+        pq: Any = pyarrow.parquet
+        writer = None
+        try:
+            for batch in selection.iter_batches(batch_size):
+                table = columns_to_arrow_table(batch)
+                if writer is None:
+                    writer = pq.ParquetWriter(os.fspath(dest), table.schema, **kwargs)
+                writer.write_table(table)
+        finally:
+            if writer is not None:
+                writer.close()
+        return None
 
     def read_columns(
         self, source: Any, *, columns: list[str] | None = None, **kwargs: Any
