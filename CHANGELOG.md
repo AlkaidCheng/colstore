@@ -8,6 +8,14 @@ log documents it and everything since.
 
 ### Added
 
+- [[#255](https://github.com/AlkaidCheng/colstore/pull/255)] An `on_mismatch` policy on
+  `colstore.open` for multi-file datasets. The default `"strict"` keeps the existing
+  behavior (every file must share one schema, or a `ValueError` is raised);
+  `on_mismatch="drop"` opens the files anyway, exposing only the columns common to every
+  file with one consistent dtype and warning about the rest. Handy to open a set of files
+  where a column's dtype drifted between writes (e.g. `bool` in some, all-null `float64`
+  in others) without re-ingesting; reads stay zero-copy since only the dataset's exposed
+  schema narrows. Raises only if no column is common to all files.
 - [[#254](https://github.com/AlkaidCheng/colstore/pull/254)] A `dtypes` override on
   import. `colstore.ingest(src, dest, dtypes={"flag": "bool"})` (and the `from_parquet`
   / `from_feather` / `from_json` / `from_hdf` / `from_npz` sugar) coerces named columns

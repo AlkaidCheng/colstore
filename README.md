@@ -414,6 +414,16 @@ ds[1_000:2_000, ["price", "qty"]].dict()   # slices span the files transparently
 ds[[5, 1_000_000, 7], "price"].array()     # fancy and boolean selection too
 ```
 
+By default the files must share one schema — same column names, order, and dtypes — or
+`open` raises a `ValueError`. To open a set of files whose schemas drifted (a column that
+is `bool` in some files and all-null `float64` in others, say), pass `on_mismatch="drop"`:
+the dataset then exposes only the columns common to every file with one consistent dtype,
+warning about the rest. Reads stay zero-copy — only the dataset's exposed schema narrows.
+
+```python
+ds = colstore.open("run_*.cstore", on_mismatch="drop")   # drop columns that disagree
+```
+
 The result is a `ColStoreDataset`. It is empty-constructible and growable, and
 takes a mix of paths (which it opens and *owns*) and already-open readers or
 datasets (which it *borrows* and leaves open):

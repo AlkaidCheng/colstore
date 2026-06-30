@@ -19,7 +19,7 @@ from ._coerce import coerce_to_columns
 from ._paths import has_glob_magic
 from ._types import Source
 from .compaction import compact_file
-from .dataset import ColStoreDataset
+from .dataset import ColStoreDataset, OnMismatch
 from .reader import ColStoreReader
 from .writer import ColStoreWriter
 
@@ -29,7 +29,10 @@ def open(path: str | os.PathLike[str], **kwargs: Any) -> ColStoreReader: ...
 @overload
 def open(path: Sequence[str | os.PathLike[str]], **kwargs: Any) -> ColStoreDataset: ...
 def open(
-    path: str | os.PathLike[str] | Sequence[str | os.PathLike[str]], **kwargs: Any
+    path: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    *,
+    on_mismatch: OnMismatch = "strict",
+    **kwargs: Any,
 ) -> ColStoreReader | ColStoreDataset:
     """Open an existing ``.cstore`` file, or several as one logical dataset.
 
@@ -54,16 +57,24 @@ def open(
     A **directory** path returns a :class:`ColStoreDataset` over its ``.cstore``
     shards in numeric order -- the managed dataset that :func:`append` /
     :func:`appender` write to (an empty directory is an empty dataset).
+
+    For a multi-file dataset, ``on_mismatch`` chooses how files whose schemas differ
+    are reconciled. ``"strict"`` (the default) requires every file to share one schema
+    (same column names, order, and dtypes) and raises :class:`ValueError` otherwise.
+    ``"drop"`` instead opens the files anyway, exposing only the columns common to every
+    file with one consistent dtype and warning about the rest -- useful for opening a set
+    of files where a column's dtype drifted between writes. It is moot for a single file.
     """
     if isinstance(path, (str, os.PathLike)) and os.path.isdir(path):
         # A directory is a managed shard dataset; the constructor expands it to
         # its ``.cstore`` shards (an empty directory is an empty dataset).
-        return ColStoreDataset(path, **kwargs)
+        return ColStoreDataset(path, on_mismatch=on_mismatch, **kwargs)
     if isinstance(path, str) and has_glob_magic(path):
-        return ColStoreDataset(path, **kwargs)
+        return ColStoreDataset(path, on_mismatch=on_mismatch, **kwargs)
     if isinstance(path, (str, os.PathLike)):
+        # A single literal file is trivially self-consistent, so ``on_mismatch`` is moot.
         return ColStoreReader(path, **kwargs)
-    return ColStoreDataset(path, **kwargs)
+    return ColStoreDataset(path, on_mismatch=on_mismatch, **kwargs)
 
 
 def create(path: str | os.PathLike[str], *, statistics: bool = False) -> ColStoreWriter:

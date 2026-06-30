@@ -37,11 +37,12 @@ reversed selection all require a copying gather.
 from __future__ import annotations
 
 import os
+import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 from numpy.typing import NDArray
@@ -60,6 +61,11 @@ _INT32_MAX = (1 << 31) - 1
 # One column's native multi-file gather table: cumulative segment start rows and
 # each segment's absolute byte base (see _native_segment_table).
 SegmentTable: TypeAlias = tuple[NDArray[np.int64], NDArray[np.int64]]
+
+# How a dataset reconciles files whose schemas differ: ``"strict"`` requires every
+# file to share one schema (name, order, dtype) and raises otherwise; ``"drop"``
+# keeps only the columns common to every file with one consistent dtype.
+OnMismatch: TypeAlias = Literal["strict", "drop"]
 
 
 def _uniform_segment_rows(starts: NDArray[np.int64]) -> int | None:
@@ -150,8 +156,13 @@ class ColStoreDataset(_ReaderBase):
     def __init__(
         self,
         sources: Source | Sequence[Source] | None = None,
+        *,
+        on_mismatch: OnMismatch = "strict",
         **reader_kwargs: Any,
     ) -> None:
+        if on_mismatch not in ("strict", "drop"):
+            raise ValueError(f"on_mismatch must be 'strict' or 'drop'; got {on_mismatch!r}.")
+        self._on_mismatch: OnMismatch = on_mismatch
         self._children: list[ColStoreReader] = []
         self._owned: list[bool] = []
         self._column_dtypes: dict[str, np.dtype[Any]] = {}
@@ -233,6 +244,31 @@ class ColStoreDataset(_ReaderBase):
                     f"'{child_dtype}', but the dataset schema has '{reference_dtype}'."
                 )
 
+    @staticmethod
+    def _common_schema(
+        readers: list[ColStoreReader],
+    ) -> tuple[dict[str, np.dtype[Any]], list[str]]:
+        """The columns shared by every reader with one consistent dtype, and the rest.
+
+        A column is kept only if every reader has it under an identical dtype; the kept
+        columns take the first reader's order. The second return value lists every column
+        that appears in some reader but is not kept -- absent from a file or disagreeing on
+        dtype -- so the caller can report what ``on_mismatch='drop'`` discarded.
+        """
+        if not readers:
+            return {}, []
+        first = readers[0]._column_dtypes
+        kept = {
+            name: dtype
+            for name, dtype in first.items()
+            if all(
+                name in r._column_dtypes and r._column_dtypes[name].str == dtype.str
+                for r in readers[1:]
+            )
+        }
+        all_names = {name for reader in readers for name in reader._column_dtypes}
+        return kept, sorted(all_names - set(kept))
+
     def _rebuild_offsets(self) -> None:
         self._segment_table_cache.clear()
         self._uniform_grid_known = False
@@ -246,28 +282,52 @@ class ColStoreDataset(_ReaderBase):
 
         ``source`` is anything the constructor accepts: a path -- a file, a glob,
         or a directory of shards -- (opened and owned), a reader or dataset
-        (borrowed), or a list/tuple mixing them. The first child establishes the
-        schema; later children must match it.
-        A schema mismatch leaves the dataset unchanged and closes anything this
-        call opened.
+        (borrowed), or a list/tuple mixing them.
+
+        Under the default ``on_mismatch='strict'`` the first child establishes the
+        schema and later children must match it (same names, order, and dtypes), or a
+        :class:`ValueError` leaves the dataset unchanged and closes anything this call
+        opened. Under ``on_mismatch='drop'`` the dataset instead exposes only the columns
+        common to every file with one consistent dtype, warning about the rest; it raises
+        only if no column is common to all.
         """
         self._check_open()
         pairs = self._coerce_to_children(source, reader_kwargs)
+        dropped: list[str] = []
         try:
-            reference: dict[str, np.dtype[Any]] | None = (
-                dict(self._column_dtypes) if self._column_dtypes else None
-            )
-            for reader, _owned in pairs:
-                if reference is None:
-                    reference = dict(reader._column_dtypes)
-                else:
-                    self._validate_against(reader, reference)
+            if self._on_mismatch == "drop":
+                all_readers = self._children + [reader for reader, _ in pairs]
+                schema, dropped = self._common_schema(all_readers)
+                if all_readers and not schema:
+                    raise ValueError(
+                        "on_mismatch='drop' left no columns: the files share no column "
+                        "with one consistent dtype. Check the inputs, or select columns "
+                        "explicitly."
+                    )
+            else:
+                reference: dict[str, np.dtype[Any]] | None = (
+                    dict(self._column_dtypes) if self._column_dtypes else None
+                )
+                for reader, _owned in pairs:
+                    if reference is None:
+                        reference = dict(reader._column_dtypes)
+                    else:
+                        self._validate_against(reader, reference)
         except BaseException:
             for reader, owned in pairs:
                 if owned:
                     reader.close()
             raise
-        if not self._column_dtypes and pairs:
+        if self._on_mismatch == "drop" and pairs:
+            self._column_dtypes = schema
+            if dropped:
+                warnings.warn(
+                    "on_mismatch='drop': dropped column(s) not shared by every file with "
+                    f"one consistent dtype: {', '.join(dropped)}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        elif not self._column_dtypes and pairs:
             self._column_dtypes = dict(pairs[0][0]._column_dtypes)
         for reader, owned in pairs:
             self._children.append(reader)
