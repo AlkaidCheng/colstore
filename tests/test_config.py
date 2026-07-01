@@ -40,6 +40,21 @@ def test_set_max_workers_rejects_negative():
         set_max_workers(-1)
 
 
+def test_convert_auto_workers_roundtrips_and_validates():
+    from colstore import get_convert_auto_workers, set_convert_auto_workers
+
+    original = get_convert_auto_workers()
+    assert isinstance(original, int) and original >= 1
+    try:
+        set_convert_auto_workers(16)
+        assert get_convert_auto_workers() == 16
+        assert config.get_convert_auto_workers() == 16
+        with pytest.raises(ValueError):
+            set_convert_auto_workers(0)
+    finally:
+        set_convert_auto_workers(original)
+
+
 def test_default_madvise_is_a_known_option_or_none():
     advice = get_default_madvise()
     assert advice in ("normal", "sequential", "random", "willneed", "dontneed", None)

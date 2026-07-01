@@ -45,6 +45,16 @@ def _columns(text: str | None) -> list[str] | None:
     return [name.strip() for name in text.split(",") if name.strip()]
 
 
+def _max_workers(text: str) -> int | str:
+    """Parse ``--max-workers``: ``auto`` or a positive integer worker count."""
+    if text == "auto":
+        return "auto"
+    try:
+        return int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer or 'auto', got {text!r}") from None
+
+
 def _describe_plan(mode: str, groups: list[tuple[list[str], str]], *, verb: str) -> None:
     """Print the resolved input -> output plan (a merge of several inputs, or pairs)."""
     sources, dest = groups[0]
@@ -94,6 +104,7 @@ def _cmd_convert(args: argparse.Namespace) -> int:
             output_dir=args.output_dir,
             overwrite=args.overwrite,
             on_mismatch=args.on_mismatch,
+            max_workers=args.max_workers,
         )
     except _USER_ERRORS as error:
         print(f"convert: {error}", file=sys.stderr)
@@ -173,6 +184,14 @@ def _configure_parser(parser: argparse.ArgumentParser) -> None:
         default="strict",
         help="schema reconciliation when merging: 'strict' requires one shared schema, "
         "'drop' keeps the columns common to every input",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=_max_workers,
+        default=None,
+        metavar="N|auto",
+        help="convert this many files concurrently (threads); 'auto' uses the plateau count. "
+        "Peak memory scales with the worker count -- pair with --batch-size to bound it",
     )
     parser.add_argument(
         "--dry-run",

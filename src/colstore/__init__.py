@@ -58,10 +58,12 @@ from .autotune import (
     ensure_calibrated,
 )
 from .config import (
+    get_convert_auto_workers,
     get_default_backend,
     get_default_madvise,
     get_gather_thread_cap,
     get_max_workers,
+    set_convert_auto_workers,
     set_default_backend,
     set_default_madvise,
     set_gather_thread_cap,
@@ -108,6 +110,7 @@ __all__ = [
     "from_npz",
     "from_parquet",
     "from_root",
+    "get_convert_auto_workers",
     "get_default_backend",
     "get_default_madvise",
     "get_gather_thread_cap",
@@ -120,6 +123,7 @@ __all__ = [
     "recreate",
     "saveas",
     "schema",
+    "set_convert_auto_workers",
     "set_default_backend",
     "set_default_madvise",
     "set_gather_thread_cap",

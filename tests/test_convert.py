@@ -203,3 +203,38 @@ def test_convert_repeated_input_in_merge_warns(tmp_path):
             [tmp_path / "a.npz", tmp_path / "a.npz", tmp_path / "b.npz"], tmp_path / "m.cstore"
         )
     assert out.n_rows == 9  # a's rows included twice, plus b's
+
+
+# ---- max_workers: parallel batch convert ------------------------------------
+
+
+def test_convert_parallel_one_to_one_matches_sequential(tmp_path):
+    for name, ids in {"a": [0, 1], "b": [2, 3], "c": [4, 5], "d": [6, 7]}.items():
+        _npz(tmp_path, name, ids)
+    inputs = [tmp_path / f"{n}.npz" for n in ("a", "b", "c", "d")]
+    seq = colstore.convert(inputs, str(tmp_path / "seq_{stem}.cstore"))
+    par = colstore.convert(inputs, str(tmp_path / "par_{stem}.cstore"), max_workers=3)
+    auto = colstore.convert(inputs, str(tmp_path / "auto_{stem}.cstore"), max_workers="auto")
+    # a list per input, in input order, identical across sequential / threaded / auto
+    for s, p, a in zip(seq, par, auto, strict=True):
+        assert s.array("id").tolist() == p.array("id").tolist() == a.array("id").tolist()
+    assert [s.array("id").tolist() for s in seq] == [[0, 1], [2, 3], [4, 5], [6, 7]]
+
+
+def test_convert_merge_parallel_matches_sequential(tmp_path):
+    _npz(tmp_path, "a", [0, 1, 2])
+    _npz(tmp_path, "b", [3, 4, 5])
+    _npz(tmp_path, "c", [6, 7, 8])
+    inputs = [tmp_path / "a.npz", tmp_path / "b.npz", tmp_path / "c.npz"]
+    seq = colstore.convert(inputs, tmp_path / "seq.cstore")
+    par = colstore.convert(inputs, tmp_path / "par.cstore", max_workers=3)
+    assert seq.array("id").tolist() == par.array("id").tolist() == list(range(9))
+
+
+def test_convert_max_workers_rejects_bad_values(tmp_path):
+    _npz(tmp_path, "a", [1, 2])
+    for bad in (0, -1, "nope", 1.5, float("nan"), float("inf"), True):
+        with pytest.raises(ValueError, match="max_workers"):
+            colstore.convert(
+                tmp_path / "a.npz", tmp_path / "a.cstore", max_workers=bad, overwrite=True
+            )

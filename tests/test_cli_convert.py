@@ -386,3 +386,21 @@ def test_key_value_helper():
     for bad in ("noequals", "=value"):
         with pytest.raises(argparse.ArgumentTypeError):
             key_value(bad)
+
+
+@pytest.mark.parametrize("workers", ["2", "auto"])
+def test_max_workers_parallel_batch(tmp_path, workers):
+    for i in range(4):
+        _store(tmp_path / f"f{i}.cstore", id=np.arange(3, dtype=np.int64) + i * 3)
+    inputs = [tmp_path / f"f{i}.cstore" for i in range(4)]
+    code = _run([*inputs, "-o", tmp_path / f"all_{workers}.npz", "--max-workers", workers])
+    assert code == 0
+    back = colstore.convert(tmp_path / f"all_{workers}.npz", tmp_path / f"b_{workers}.cstore")
+    assert back.array("id").tolist() == list(range(12))
+
+
+def test_max_workers_bad_value_is_usage_error(tmp_path):
+    _store(tmp_path / "s.cstore")
+    with pytest.raises(SystemExit) as exc:  # argparse rejects a non-int, non-'auto' value
+        _run([tmp_path / "s.cstore", "-o", tmp_path / "s.npz", "--max-workers", "lots"])
+    assert exc.value.code == 2
