@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -191,6 +192,7 @@ def _import_to_cstore(
     dest: str | os.PathLike[str],
     *,
     format: str | None = None,
+    columns: list[str] | None = None,
     dtypes: dict[str, Any] | None = None,
     batch_size: int | str | None = None,
     compact: bool = True,
@@ -199,6 +201,8 @@ def _import_to_cstore(
     """Materialize a foreign file into a new ``.cstore`` and open it (the import path)."""
     from . import interop
 
+    if columns is not None:
+        kwargs["columns"] = columns
     if dtypes is not None:
         kwargs["dtypes"] = dtypes
     if batch_size is not None:
@@ -223,6 +227,7 @@ def _convert_one(
     dest: str | os.PathLike[str],
     *,
     format: str | None = None,
+    columns: list[str] | None = None,
     dtypes: dict[str, Any] | None = None,
     batch_size: int | str | None = None,
     compact: bool = True,
@@ -243,6 +248,7 @@ def _convert_one(
             source,
             dest,
             format=format,
+            columns=columns,
             dtypes=dtypes,
             batch_size=batch_size,
             compact=compact,
@@ -252,7 +258,8 @@ def _convert_one(
         raise ValueError("dtypes= applies only when importing a foreign file into a .cstore.")
     reader = open(source)
     try:
-        reader.saveas(dest, format=format, batch_size=batch_size, **kwargs)
+        target = reader if columns is None else reader[:, columns]
+        target.saveas(dest, format=format, batch_size=batch_size, **kwargs)
     finally:
         reader.close()
     return open(dest) if dest_is_cstore else dest_path
@@ -347,6 +354,7 @@ def _convert_merge(
     dest: str,
     *,
     format: str | None,
+    columns: list[str] | None,
     dtypes: dict[str, Any] | None,
     batch_size: int | str | None,
     compact: bool,
@@ -360,6 +368,7 @@ def _convert_merge(
             inputs[0],
             dest,
             format=format,
+            columns=columns,
             dtypes=dtypes,
             batch_size=batch_size,
             compact=compact,
@@ -377,20 +386,33 @@ def _convert_merge(
     readers: list[ColStoreReader] = []
     try:
         for index, source in enumerate(inputs):
-            if _is_cstore_path(source):
+            # With columns=, project every input to that schema before merging -- a foreign
+            # file as it is read, a native .cstore into a scratch part -- so an excluded column
+            # (unstorable, or mismatched across files) never reaches the merge, matching the
+            # single-file projection. Without columns=, a native input is merged in place.
+            if _is_cstore_path(source) and columns is None:
                 readers.append(ColStoreReader(source))
+                continue
+            part = os.path.join(scratch, f"part_{index:05d}.cstore")
+            if _is_cstore_path(source):
+                assert columns is not None  # a native input reaches here only to be projected
+                projected = ColStoreReader(source)
+                try:
+                    projected[:, columns].saveas(part)
+                finally:
+                    projected.close()
             else:
-                part = os.path.join(scratch, f"part_{index:05d}.cstore")
                 _import_to_cstore(
                     source,
                     part,
                     format=format,
+                    columns=columns,
                     dtypes=dtypes,
                     batch_size=batch_size,
                     compact=compact,
                     **kwargs,
                 )
-                readers.append(ColStoreReader(part))
+            readers.append(ColStoreReader(part))
         ColStoreDataset(readers, on_mismatch=on_mismatch).saveas(
             dest, format=None if dest_is_cstore else format, batch_size=batch_size
         )
@@ -401,11 +423,83 @@ def _convert_merge(
     return ColStoreReader(dest) if dest_is_cstore else dest_path
 
 
+def _warn_repeated_inputs(repeated: list[str]) -> None:
+    """Warn that some inputs were listed more than once (usually a mistake, but honored)."""
+    if repeated:
+        warnings.warn(
+            "convert received the same input more than once: "
+            f"{', '.join(map(repr, repeated))}; its rows are converted once per occurrence.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
+def plan_conversions(
+    source: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
+    dest: str | os.PathLike[str] | None = None,
+    *,
+    format: str | None = None,
+    rename: Mapping[str, str] | Callable[[str], str] | None = None,
+    output_dir: str | os.PathLike[str] | None = None,
+) -> tuple[str, list[tuple[list[str], str]], bool]:
+    """Resolve which inputs map to which outputs for :func:`convert`, without converting.
+
+    Returns ``(mode, groups, scalar)``: ``mode`` is ``"merge"`` (every input written into the
+    one ``dest``) or ``"one-to-one"`` (each input to its own output); ``groups`` pairs the input
+    paths with the resolved output -- a single all-inputs group for a merge, one group per file
+    otherwise; ``scalar`` flags a single bare source path. Drives both :func:`convert` and the
+    ``colstore convert --dry-run`` preview, so the previewed plan always matches what runs.
+    """
+    inputs, scalar = _resolve_convert_inputs(source)
+    if not inputs:
+        raise FileNotFoundError(f"convert: no files matched {source!r}.")
+    repeated = sorted({source for source in inputs if inputs.count(source) > 1})
+    dest_text = None if dest is None else os.fspath(dest)
+    is_template = dest_text is not None and "{" in dest_text
+    if dest_text is not None and not is_template:
+        _warn_repeated_inputs(repeated)  # a merge duplicates each repeat's rows
+        return "merge", [(inputs, dest_text)], scalar
+    target_ext = _target_extension(inputs, dest_text, is_template, format)
+    try:
+        groups = [
+            (
+                [source_path],
+                str(
+                    _resolve_output_path(
+                        source_path, index, dest_text, is_template, rename, output_dir, target_ext
+                    )
+                ),
+            )
+            for index, source_path in enumerate(inputs)
+        ]
+    except KeyError as bad_field:
+        raise ValueError(
+            f"unknown field {bad_field} in the output template {dest_text!r}; use the named "
+            "fields {index}, {stem}, {name}, or {parent}."
+        ) from None
+    except IndexError:
+        raise ValueError(
+            f"the output template {dest_text!r} uses a positional field; use the named "
+            "fields {index}, {stem}, {name}, or {parent}."
+        ) from None
+    outputs = [output for _, output in groups]
+    collisions = sorted({output for output in outputs if outputs.count(output) > 1})
+    if collisions:
+        raise ValueError(
+            "convert would write more than one input to the same output "
+            f"{', '.join(map(repr, collisions))}; disambiguate with an {{index}} template, "
+            "distinct --rename targets, or a literal dest to merge them into one file."
+        )
+    _warn_repeated_inputs(repeated)  # distinct outputs (e.g. {index}): a copy per repeat
+    return "one-to-one", groups, scalar
+
+
 def convert(
     source: str | os.PathLike[str] | Sequence[str | os.PathLike[str]],
     dest: str | os.PathLike[str] | None = None,
     *,
     format: str | None = None,
+    columns: list[str] | None = None,
     dtypes: dict[str, Any] | None = None,
     batch_size: int | str | None = None,
     compact: bool = True,
@@ -442,6 +536,8 @@ def convert(
     :class:`FileExistsError`). ``on_mismatch`` reconciles schemas when merging (see
     :func:`open`). ``format`` overrides the foreign endpoint's format, and ``dtypes``
     (import only) coerces columns as they are read (see :func:`open` for the rules).
+    ``columns`` converts only the named columns, in either direction (projected as the
+    foreign file is read on import, or selected from the store on export).
 
     ``batch_size`` streams the conversion in bounded memory in **either** direction -- an
     ``int`` row count or a ``"256 MiB"`` *per-batch* byte budget (peak memory is a few times
@@ -460,16 +556,16 @@ def convert(
     Returns a single result for a single ``source`` path or a merge, and a list (one per
     input) for a glob or list converted one-to-one.
     """
-    inputs, scalar = _resolve_convert_inputs(source)
-    if not inputs:
-        raise FileNotFoundError(f"convert: no files matched {source!r}.")
-    dest_text = None if dest is None else os.fspath(dest)
-    is_template = dest_text is not None and "{" in dest_text
-    if dest_text is not None and not is_template:
+    mode, groups, scalar = plan_conversions(
+        source, dest, format=format, rename=rename, output_dir=output_dir
+    )
+    if mode == "merge":
+        sources, merged_dest = groups[0]
         return _convert_merge(
-            inputs,
-            dest_text,
+            sources,
+            merged_dest,
             format=format,
+            columns=columns,
             dtypes=dtypes,
             batch_size=batch_size,
             compact=compact,
@@ -477,24 +573,20 @@ def convert(
             on_mismatch=on_mismatch,
             **kwargs,
         )
-    target_ext = _target_extension(inputs, dest_text, is_template, format)
-    results: list[ColStoreReader | Path] = []
-    for index, source_path in enumerate(inputs):
-        out = _resolve_output_path(
-            source_path, index, dest_text, is_template, rename, output_dir, target_ext
+    results: list[ColStoreReader | Path] = [
+        _convert_one(
+            sources[0],
+            out,
+            format=format,
+            columns=columns,
+            dtypes=dtypes,
+            batch_size=batch_size,
+            compact=compact,
+            overwrite=overwrite,
+            **kwargs,
         )
-        results.append(
-            _convert_one(
-                source_path,
-                out,
-                format=format,
-                dtypes=dtypes,
-                batch_size=batch_size,
-                compact=compact,
-                overwrite=overwrite,
-                **kwargs,
-            )
-        )
+        for sources, out in groups
+    ]
     return results[0] if scalar else results
 
 

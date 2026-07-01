@@ -148,3 +148,58 @@ def test_convert_overwrite_policy(tmp_path):
 def test_convert_empty_glob_raises(tmp_path):
     with pytest.raises(FileNotFoundError, match="no files matched"):
         colstore.convert(str(tmp_path / "nope_*.npz"))
+
+
+def test_convert_colliding_outputs_raise_before_writing(tmp_path):
+    # Two same-stem inputs from different directories resolve to one templated output.
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    colstore.store(
+        {"v": np.array([1, 1])}, tmp_path / "a" / "run.cstore", show_progress=False
+    ).close()
+    colstore.store(
+        {"v": np.array([2, 2])}, tmp_path / "b" / "run.cstore", show_progress=False
+    ).close()
+    with pytest.raises(ValueError, match="same output"):
+        colstore.convert(
+            [tmp_path / "a" / "run.cstore", tmp_path / "b" / "run.cstore"],
+            str(tmp_path / "{stem}.npz"),
+        )
+    assert not (tmp_path / "run.npz").exists()  # nothing written before the guard fires
+
+
+def test_convert_columns_projects_symmetrically(tmp_path):
+    colstore.store(
+        {"id": np.arange(4, dtype=np.int64), "x": np.arange(4) * 1.0, "y": np.arange(4) * 2.0},
+        tmp_path / "s.cstore",
+        show_progress=False,
+    ).close()
+    # export projection
+    colstore.convert(tmp_path / "s.cstore", tmp_path / "s.npz", columns=["id", "x"])
+    back = colstore.convert(tmp_path / "s.npz", tmp_path / "back.cstore")
+    assert back.columns == ["id", "x"]
+    # merge projection drops an excluded column that differs across inputs
+    colstore.store(
+        {"id": np.arange(2, dtype=np.int64), "k": np.arange(2)},
+        tmp_path / "m1.cstore",
+        show_progress=False,
+    ).close()
+    colstore.store(
+        {"id": np.arange(2, dtype=np.int64), "j": np.arange(2)},
+        tmp_path / "m2.cstore",
+        show_progress=False,
+    ).close()
+    merged = colstore.convert(
+        [tmp_path / "m1.cstore", tmp_path / "m2.cstore"], tmp_path / "m.cstore", columns=["id"]
+    )
+    assert merged.columns == ["id"] and merged.n_rows == 4
+
+
+def test_convert_repeated_input_in_merge_warns(tmp_path):
+    _npz(tmp_path, "a", [0, 1, 2])
+    _npz(tmp_path, "b", [3, 4, 5])
+    with pytest.warns(RuntimeWarning, match="same input"):
+        out = colstore.convert(
+            [tmp_path / "a.npz", tmp_path / "a.npz", tmp_path / "b.npz"], tmp_path / "m.cstore"
+        )
+    assert out.n_rows == 9  # a's rows included twice, plus b's
