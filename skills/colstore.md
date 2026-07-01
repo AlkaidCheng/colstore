@@ -209,6 +209,7 @@ counters block — a reader opening mid-write sees only the last committed state
 # open many same-schema files (or a shard directory) as one logical table:
 ds = colstore.open(["jan.cstore", "feb.cstore"])     # ColStoreDataset, same read API
 ds = colstore.open("shards_dir/")                     # a directory of shards
+ds = colstore.open([...], on_mismatch="drop")         # heterogeneous schemas: keep only the shared columns (warns)
 
 # combine sources — lazy view, or eagerly written in bounded memory:
 view   = colstore.concat(["jan.cstore", "feb.cstore"])               # lazy ColStoreReader/Dataset
@@ -236,6 +237,7 @@ only); foreign formats go through explicit verbs.
 ds.arrow()                          # zero-copy pyarrow Table  (== ds.to("arrow"))
 ds.to_parquet("out.parquet")        # also .to_feather/.to_json/.to_npz/.to_hdf
 ds.saveas("out.parquet")            # by extension or format=...; HDF5 ext is .h5/.hdf5 (not .hdf)
+ds.saveas("big.parquet", batch_size="256 MiB")   # stream the export in bounded memory
 ds[rows, cols].saveas("subset.cstore")     # ".cstore" too -> colstore's own writer
 colstore.to_root(ds, "out.root")    # ROOT (needs uproot/ROOT; numeric columns only)
 
@@ -243,6 +245,17 @@ colstore.to_root(ds, "out.root")    # ROOT (needs uproot/ROOT; numeric columns o
 r = colstore.convert("in.parquet", "out.cstore")           # format inferred from extension
 r = colstore.from_parquet("in.parquet", "out.cstore")      # also from_feather/json/npz/hdf/root
 colstore.convert("*.h5", "all.cstore")                     # glob+literal dest merges; a {index} template is 1:1
+colstore.convert("in.parquet", "out.cstore", columns=["pt", "eta"])  # project columns (either direction)
+colstore.convert("in.cstore", "out.parquet", batch_size="256 MiB")   # stream the export in bounded memory
+colstore.convert("*.h5", output_dir="out/", max_workers="auto")      # convert files in parallel (threads)
+```
+
+`convert` is also a **CLI** command (same rules; `--dry-run` previews the input → output plan):
+
+```bash
+colstore convert a.h5 b.h5 c.h5 -o all.cstore --max-workers auto     # merge many files in parallel
+colstore convert big.cstore -o big.parquet --columns pt,eta --batch-size "256 MiB"
+colstore convert "*.parquet" --output-dir out/ --on-mismatch drop --dry-run
 ```
 
 `convert(source, dest=None)` moves files between colstore's format and another (one endpoint
@@ -250,7 +263,17 @@ must be `.cstore`), inferring direction from the extensions: a foreign file impo
 the opened reader; a `.cstore` exports and returns the dest `Path`; `.cstore`→`.cstore` copies /
 merges. `source` may be a path, a glob, or a list; with many inputs, a literal `dest` merges
 them, a `{index}`/`{stem}` template or a `rename` dict/callable names them 1:1, and no `dest`
-auto-names by swapping the extension. An existing output raises unless `overwrite=True`.
+auto-names by swapping the extension. An existing output raises unless `overwrite=True` (and two
+inputs that would resolve to the same output raise before writing; the same input listed twice is
+honored but warns). `columns=` converts only the named columns (either direction); `dtypes` (import
+only) coerces named columns to a target dtype as they are read (`{"flag": "bool"}`); `compact`
+(default `True`, import only) collapses a streamed multi-record result into one record; `batch_size`
+(int rows or `"256 MiB"`) streams the conversion in
+bounded memory in **either** direction — import reads row-batches, export writes them (Parquet /
+Feather / HDF5 / ROOT with a fixed-width numeric schema; a format that can't stream falls back
+whole-file with a warning); `max_workers` (an int or `"auto"` = the throughput plateau) converts
+multiple files concurrently on a thread pool — peak memory scales with the worker count, so pair
+it with `batch_size` to bound the total. `convert` is also a CLI command (`colstore convert`).
 Saving to `.cstore` uses colstore's own writer: it streams in bounded memory and raw-copies
 unchanged columns, so a whole store — or a multi-file dataset — is copied / merged exactly like
 `concat()`, never materialized. `saveas` writes a file and returns `None` (a `.root` target returns
@@ -268,6 +291,7 @@ Reads parallelize across an OpenMP kernel. Defaults are good; tune only with mea
 colstore.max_threads()                 # kernel's available thread count
 colstore.set_max_workers(n)            # package-wide threads for multi-column reads
 colstore.set_gather_thread_cap(n)      # max OpenMP threads per single gather call
+colstore.set_convert_auto_workers(n)   # worker count for convert(max_workers="auto") (default 8)
 colstore.ensure_calibrated()           # apply a cached per-machine thread cap, else calibrate once
 colstore.set_default_backend("cpp")    # "cpp" (default) | "numpy"
 colstore.set_default_madvise("normal") # mmap advice for new opens (NUMA/large-file tuning)
@@ -305,7 +329,7 @@ All names are importable from the top-level `colstore` package. Signatures show 
 arguments.
 
 **Opening & reading**
-- `open(path | [paths]) -> ColStoreReader | ColStoreDataset` — open a file, or several as one dataset.
+- `open(path | [paths], *, on_mismatch="strict", **reader_kwargs) -> ColStoreReader | ColStoreDataset` — open a file, or several as one dataset; `on_mismatch="drop"` opens files with differing schemas keeping only the columns shared by all (warns).
 - `ColStoreReader(path, *, madvise=, mlock=, backend=, max_workers=)` — indexing → `ColumnView`/`TableView`; `.array/.dict/.recarray/.frame(copy=True)`, `.count()`, `.query/.where/.select/.drop`, `.head/.tail`, `.edit()`, `.arrow/.to/.saveas/.to_*`; props `.shape/.n_rows/.columns/.dtypes`.
 - `ColumnView`, `TableView` — lazy views that compose (re-index with `view[rows]`, `view[name]`, `view[["a","b"]]`); `.evaluate()` fixes the row mask; `.count()`. A `ColumnView` (one column) materializes with `.array()` only and is an eager compute handle: `.sum/.mean/.min/.max/.std/.var`, operators/ufuncs → `ndarray`, `.isin([...])` → boolean mask. A `TableView` has the table materializers (`.array(name)/.dict/.recarray/.frame`) and `.select/.drop`.
 - `info(path) -> ColStoreInfo`, `schema(path) -> list[dict]` — metadata without reading bodies.
@@ -323,15 +347,15 @@ arguments.
 - `appender(directory) -> Appender` / `Appender.write(data)`, `.flush()`, `.close()` — stream shards.
 
 **Editing**
-- `ColStoreFrame` (via `reader.edit()`) — transform: `.with_columns/.assign/.astype/.drop/.rename/.apply` (or in place: `fr[col] = expr`, `del fr[col]`); row cuts: `.filter/.where/.report` (cutflow); reduce: `.sum/.mean/.std/.var/.min/.max/.count`; materialize: `.array/.dict/.recarray/.frame`; stream: `.iter_batches/.write(path)`. All transforms take `inplace=`.
+- `ColStoreFrame` (via `reader.edit()`) — transform: `.with_columns/.assign/.astype/.drop/.rename/.apply` (or in place: `fr[col] = expr`, `del fr[col]`); row cuts: `.filter/.where/.report` (cutflow); reduce: `.sum/.mean/.std/.var/.min/.max/.count`; materialize: `.array/.dict/.recarray/.frame`; stream: `.iter_batches/.write(path)`. All transforms except `.apply` take `inplace=` (`.apply` builds a column expression, returning an `Expr` to feed into `with_columns`, not a frame).
 - `col(name) -> expression` — lazy column reference; compose with `> < == != & | ~`, `.isin([...])`.
 
 **Format interop**
-- `convert(source, dest=None, *, format=None, dtypes=None, batch_size=None, compact=True, rename=None, output_dir=None, overwrite=False, on_mismatch="strict") -> ColStoreReader | Path | list` — convert files (one endpoint is `.cstore`); `source` is a path / glob / list; import returns a reader, export returns a `Path`, a glob 1:1 returns a list, a literal `dest` merges. `batch_size` (int rows or `"256 MiB"`) streams a large import in bounded memory for ROOT / Parquet / Feather / HDF5 with a fixed-width numeric schema (else whole-file + warning). `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` are import shortcuts.
-- `saveas(source, dest, *, format=None)`, `to_root(source, path, ...)` — export by extension (returns `None`; a `.root` dest returns its path); a `.cstore` dest uses the native streaming writer (raw-copy / merge like `concat`), foreign formats convert (ROOT is numeric-only). Also `reader.saveas/.to(name)/.arrow()/.to_*`.
+- `convert(source, dest=None, *, format=None, columns=None, dtypes=None, batch_size=None, compact=True, rename=None, output_dir=None, overwrite=False, on_mismatch="strict", max_workers=None) -> ColStoreReader | Path | list` — convert files (one endpoint is `.cstore`); `source` is a path / glob / list; import returns a reader, export returns a `Path`, a glob 1:1 returns a list, a literal `dest` merges. `columns` projects (either direction). `batch_size` (int rows or `"256 MiB"`) streams in bounded memory in **either** direction — import reads row-batches, export writes them (ROOT / Parquet / Feather / HDF5 with a fixed-width numeric schema, else whole-file + warning). `max_workers` (int or `"auto"`) converts files concurrently on a thread pool; peak memory scales with it, so pair with `batch_size`. Also a CLI: `colstore convert SOURCE... [-o OUT] [--columns] [--batch-size] [--max-workers] [--dry-run] ...` (`--dry-run` previews the input → output mapping). `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` are import shortcuts.
+- `saveas(source, dest, *, format=None, batch_size=None)`, `to_root(source, path, ...)` — export by extension (returns `None`; a `.root` dest returns its path); `batch_size` streams a foreign export in bounded memory (else whole-file). A `.cstore` dest uses the native streaming writer (raw-copy / merge like `concat`), foreign formats convert (ROOT is numeric-only). Also `reader.saveas/.to(name)/.arrow()/.to_*`.
 
 **Configuration & diagnostics**
-- `set_max_workers/get_max_workers`, `set_gather_thread_cap/get_gather_thread_cap`, `set_default_backend/get_default_backend`, `set_default_madvise/get_default_madvise`.
+- `set_max_workers/get_max_workers`, `set_convert_auto_workers/get_convert_auto_workers` (the `convert(max_workers="auto")` count), `set_gather_thread_cap/get_gather_thread_cap`, `set_default_backend/get_default_backend`, `set_default_madvise/get_default_madvise`.
 - `calibrate(*, persist=True, rounds=10) -> int`, `ensure_calibrated() -> int`, `max_threads() -> int`, `cpp_available()`, `use_passive_openmp_wait()`.
 
 **Exceptions:** `FormatError` (not a valid `.cstore`), `QueryError` (bad query/expression).
