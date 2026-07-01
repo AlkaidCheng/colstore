@@ -6,13 +6,6 @@ log documents it and everything since.
 
 ## [Unreleased]
 
-### Changed
-
-- [[#266](https://github.com/AlkaidCheng/colstore/pull/266)] Prebuilt Linux wheels now
-  require **glibc >= 2.28** (built on `manylinux_2_28` rather than the EOL
-  `manylinux2014` / glibc 2.17, which crashed the wheel build under CPython 3.12+).
-  Systems on glibc 2.17-2.27 (e.g. CentOS 7) install from the source distribution instead.
-
 ### Fixed
 
 - [[#267](https://github.com/AlkaidCheng/colstore/pull/267)] The ROOT and uproot format
@@ -23,6 +16,15 @@ log documents it and everything since.
   or write, every later backend lookup -- including `backend="auto"` and `backend="uproot"` --
   then failed with `ValueError: ROOT.__spec__ is None`. Availability is now resolved without
   importing the module and treats an already-imported module as present.
+
+## [0.5.1] - 2026-07-01
+
+### Changed
+
+- [[#266](https://github.com/AlkaidCheng/colstore/pull/266)] Prebuilt Linux wheels now
+  require **glibc >= 2.28** (built on `manylinux_2_28` rather than the EOL
+  `manylinux2014` / glibc 2.17, which crashed the wheel build under CPython 3.12+).
+  Systems on glibc 2.17-2.27 (e.g. CentOS 7) install from the source distribution instead.
 
 ## [0.5.0] - 2026-07-01
 
@@ -252,6 +254,7 @@ the full detail.
 Releases before 0.4.0 are summarized on the
 [GitHub Releases](https://github.com/AlkaidCheng/colstore/releases) page.
 
-[Unreleased]: https://github.com/AlkaidCheng/colstore/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/AlkaidCheng/colstore/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/AlkaidCheng/colstore/releases/tag/v0.5.1
 [0.5.0]: https://github.com/AlkaidCheng/colstore/releases/tag/v0.5.0
 [0.4.0]: https://github.com/AlkaidCheng/colstore/releases/tag/v0.4.0
