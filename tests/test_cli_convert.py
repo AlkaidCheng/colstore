@@ -175,16 +175,17 @@ def test_overwrite(tmp_path):
 def test_on_mismatch_drop(tmp_path):
     _store(tmp_path / "a.cstore", id=np.arange(3, dtype=np.int64), x=np.arange(3) * 1.0)
     _store(tmp_path / "b.cstore", id=np.arange(3, dtype=np.int64))  # missing x
-    code = _run(
-        [
-            tmp_path / "a.cstore",
-            tmp_path / "b.cstore",
-            "-o",
-            tmp_path / "m.cstore",
-            "--on-mismatch",
-            "drop",
-        ]
-    )
+    with pytest.warns(RuntimeWarning, match="dropped column"):  # x is not shared by every file
+        code = _run(
+            [
+                tmp_path / "a.cstore",
+                tmp_path / "b.cstore",
+                "-o",
+                tmp_path / "m.cstore",
+                "--on-mismatch",
+                "drop",
+            ]
+        )
     assert code == 0
     assert colstore.open(tmp_path / "m.cstore").columns == ["id"]
 

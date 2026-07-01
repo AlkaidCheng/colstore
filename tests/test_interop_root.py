@@ -352,6 +352,9 @@ def test_root_rejects_string_column(tmp_path, backend):
         colstore.to_root(store, tmp_path / "str.root", backend=backend, show_progress=False)
 
 
+# The RNTuple this writes triggers a uproot-internal filter_branch DeprecationWarning on read
+# (uproot 5.7 raises it even with no column selection); it is uproot's to fix, not ours.
+@pytest.mark.filterwarnings("ignore:the filter_branch kwarg:DeprecationWarning")
 @pytest.mark.parametrize("backend", _BACKENDS)
 def test_reads_cstdint_integer_branches(tmp_path, backend):
     # uproot's f[name]={dict} form writes branches RDataFrame reports as
