@@ -118,6 +118,29 @@ Each file format also has a named shortcut: `ds.to_npz` / `to_parquet` /
 (import, like `from_root`) — each is just the matching `saveas(..., format=...)`
 / `convert(..., format=...)`.
 
+### Command line
+
+`convert` is also a CLI command, so files can be converted without writing Python:
+
+```bash
+colstore convert data.h5                          # -> data.cstore (import, auto-named)
+colstore convert events.cstore -o events.parquet  # export
+colstore convert a.h5 b.h5 c.h5 -o all.cstore     # merge several named files into one
+colstore convert *.h5 -o all.cstore               # same, letting the shell expand the glob
+colstore convert "*.h5" -o "run_{stem}.cstore"    # colstore expands the quoted glob; template names
+colstore convert big.cstore -o big.parquet --columns id,x --batch-size "256 MiB"
+colstore convert "*.parquet" -o merged.cstore --on-mismatch drop --dry-run
+```
+
+The positional arguments are one or more source files — list them explicitly
+(`a.h5 b.h5 c.h5`), let the shell expand a glob (`*.h5`), or quote a glob (`"*.h5"`) for
+colstore to expand. `-o/--output` follows the same rule as the function: omitted auto-names
+each input, a literal path merges every input into it, a `{index}`/`{stem}`/`{name}`/`{parent}`
+template names them one-to-one. The options mirror the function (`--format`, `--columns`,
+`--dtype NAME=DTYPE`, `--rename STEM=NEWSTEM`, `--output-dir`, `--batch-size`, `--no-compact`,
+`--overwrite`, `--on-mismatch`), and `--dry-run` prints the resolved input → output plan
+without writing anything.
+
 ### NumPy `.npz`
 
 One array per column; round-trips every fixed-width dtype (including fixed-width

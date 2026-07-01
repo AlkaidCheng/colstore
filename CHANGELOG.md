@@ -8,6 +8,15 @@ log documents it and everything since.
 
 ### Added
 
+- [[#260](https://github.com/AlkaidCheng/colstore/pull/260)] A `colstore convert` command-line
+  interface wrapping `colstore.convert`: `colstore convert SOURCE... [-o OUTPUT]` with
+  `--format`, `--columns`, `--dtype NAME=DTYPE`, `--rename STEM=NEWSTEM`, `--output-dir`,
+  `--batch-size`, `--no-compact`, `--overwrite`, `--on-mismatch`, and `--dry-run` (which prints
+  the resolved input → output plan without writing). `convert` also gains a `columns=` parameter
+  that converts only the named columns in either direction — projected as a foreign file is read
+  on import, selected from the store on export. `convert` now also raises when two inputs would
+  resolve to the same output path (previously a silent overwrite) instead of writing one over the
+  other, and warns when the same input is listed more than once (honored, but usually a mistake).
 - [[#259](https://github.com/AlkaidCheng/colstore/pull/259)] `batch_size` now streams the
   **export** direction too (`colstore.convert(".cstore -> foreign", batch_size=...)` and
   `ds.saveas(dest, batch_size=...)`), so a `.cstore` larger than memory can be written out

@@ -369,7 +369,17 @@ direction: on import it reads the foreign file in row-batches (ROOT / Parquet / 
 with a fixed-width numeric schema); on export it writes the foreign file in row-batches
 (Parquet row groups, Feather record batches, resizable HDF5 datasets, a ROOT Snapshot, or a
 `.cstore` editing-frame write). A target with no appendable path (JSON / NPZ, the pandas HDF5
-backend, Feather with write options) is written whole with a warning.
+backend, Feather with write options) is written whole with a warning. `columns=[...]` converts
+only the named columns, in either direction.
+
+`convert` is also a CLI command, so the same conversions run from a shell — with `--dry-run`
+to preview the resolved input → output plan first:
+
+```bash
+colstore convert a.h5 b.h5 c.h5 -o all.cstore              # merge named files into one .cstore
+colstore convert "*.h5" -o all.cstore --on-mismatch drop   # or a glob (quoted, or shell-expanded)
+colstore convert big.cstore -o big.parquet --columns id,x --batch-size "256 MiB"
+```
 
 Pass `dtypes={name: dtype}` to coerce named columns as they are read — useful to give a
 column the same dtype across files whose schemas differ (e.g. a flag that is `bool` in some
