@@ -217,9 +217,9 @@ reader = colstore.concat(["jan.cstore", "feb.cstore"], out="q1.cstore")
 
 # grow a dataset by appending shards (each append is a new file, no rewrite):
 colstore.append("shards_dir/", data)                  # one shard
-with colstore.appender("shards_dir/") as ap:          # streaming many shards
+with colstore.appender("shards_dir/", shard_size="256 MiB") as ap:   # roll a new shard when the buffer fills
     for batch in source:
-        ap.write(batch)
+        ap.write(batch)                               # shard_size: rows or bytes; None -> one shard (roll on flush/close)
 ```
 
 A `ColStoreDataset` exposes the same indexing/query/materialize API as a reader, plus
@@ -249,6 +249,9 @@ colstore.convert("in.parquet", "out.cstore", columns=["pt", "eta"])  # project c
 colstore.convert("in.cstore", "out.parquet", batch_size="256 MiB")   # stream the export in bounded memory
 colstore.convert("*.h5", output_dir="out/", max_workers="auto")      # convert files in parallel (threads)
 ```
+
+To ingest an **in-memory** object (Arrow table, dict, DataFrame), materialize it to arrays and use
+`colstore.store(...)` — the built-in data format (`arrow`) only *exports* (`ds.arrow()`).
 
 `convert` is also a **CLI** command (same rules; `--dry-run` previews the input → output plan):
 
@@ -281,7 +284,10 @@ its path); it does *not* hand back a reader — use `convert` / `from_*`, which 
 into a new `.cstore` and return one. ROOT export is numeric-only (ROOT branches have no fixed-width string
 type), and its default multithreaded write does not preserve row order (pass `multithreading=False`
 to keep it). Enumerate what's available at runtime with `colstore.interop.file_formats()` /
-`colstore.interop.data_formats()`.
+`colstore.interop.data_formats()`. **Extend** interop with a custom format: subclass
+`interop.FileFormat` (override `read_columns` / `to_file`, plus optional `stream_import` /
+`stream_export` for bounded memory) or `interop.DataFormat` (`to_object` / `from_object`), then
+`interop.register(MyFormat())` — see `docs/guide/interop.md`.
 
 ## Configuration & performance
 
@@ -298,6 +304,15 @@ colstore.set_default_madvise("normal") # mmap advice for new opens (NUMA/large-f
 ```
 
 Per-open overrides: `colstore.open(path, backend=..., madvise=..., max_workers=..., mlock=...)`.
+
+Calibrate a host from the shell — measures and caches a per-machine thread cap keyed by a hardware
+fingerprint (the shell equivalent of `ensure_calibrated()`):
+
+```bash
+colstore calibrate            # measure + cache (threads / prefetch / mask-density); alias for 'calibration run'
+colstore calibration show     # cached values + whether they match this machine
+colstore calibration clear    # drop this machine's cache
+```
 
 **Best practices**
 - **`compact` once, read zero-copy many.** A single-record store gives `copy=False` views; a
@@ -344,7 +359,7 @@ arguments.
 - `ColStoreDataset(sources)` — many files as one table; reader API plus `.needs_compaction` (and `.append(source)`, which adds more *files* to the in-memory view — to persist a shard use `colstore.append(dir, data)`).
 - `concat(sources, *, out=None, memory_budget=None) -> ColStoreReader | ColStoreDataset` — lazy, or written if `out`.
 - `append(directory, data, *, name=, statistics=) -> Path` — add one shard.
-- `appender(directory) -> Appender` / `Appender.write(data)`, `.flush()`, `.close()` — stream shards.
+- `appender(directory, *, name=, shard_size=None, statistics=) -> Appender` / `Appender.write(data)`, `.flush()`, `.close()` — stream shards; `shard_size` (rows or `"256 MiB"`) rolls a new shard when the buffered rows/bytes reach it (`None` = one shard, rolled on `.flush()`/close).
 
 **Editing**
 - `ColStoreFrame` (via `reader.edit()`) — transform: `.with_columns/.assign/.astype/.drop/.rename/.apply` (or in place: `fr[col] = expr`, `del fr[col]`); row cuts: `.filter/.where/.report` (cutflow); reduce: `.sum/.mean/.std/.var/.min/.max/.count`; materialize: `.array/.dict/.recarray/.frame`; stream: `.iter_batches/.write(path)`. All transforms except `.apply` take `inplace=` (`.apply` builds a column expression, returning an `Expr` to feed into `with_columns`, not a frame).
@@ -353,10 +368,12 @@ arguments.
 **Format interop**
 - `convert(source, dest=None, *, format=None, columns=None, dtypes=None, batch_size=None, compact=True, rename=None, output_dir=None, overwrite=False, on_mismatch="strict", max_workers=None) -> ColStoreReader | Path | list` — convert files (one endpoint is `.cstore`); `source` is a path / glob / list; import returns a reader, export returns a `Path`, a glob 1:1 returns a list, a literal `dest` merges. `columns` projects (either direction). `batch_size` (int rows or `"256 MiB"`) streams in bounded memory in **either** direction — import reads row-batches, export writes them (ROOT / Parquet / Feather / HDF5 with a fixed-width numeric schema, else whole-file + warning). `max_workers` (int or `"auto"`) converts files concurrently on a thread pool; peak memory scales with it, so pair with `batch_size`. Also a CLI: `colstore convert SOURCE... [-o OUT] [--columns] [--batch-size] [--max-workers] [--dry-run] ...` (`--dry-run` previews the input → output mapping). `from_parquet/from_feather/from_json/from_npz/from_hdf/from_root` are import shortcuts.
 - `saveas(source, dest, *, format=None, batch_size=None)`, `to_root(source, path, ...)` — export by extension (returns `None`; a `.root` dest returns its path); `batch_size` streams a foreign export in bounded memory (else whole-file). A `.cstore` dest uses the native streaming writer (raw-copy / merge like `concat`), foreign formats convert (ROOT is numeric-only). Also `reader.saveas/.to(name)/.arrow()/.to_*`.
+- `interop.file_formats()/data_formats()/get(name)/register(fmt)` — list / look up / register formats. Extend by subclassing `interop.FileFormat` (`read_columns`/`to_file`, optional `stream_import`/`stream_export`) or `interop.DataFormat` (`to_object`/`from_object`) and registering (see `docs/guide/interop.md`). The built-in `arrow` data format is export-only; ingest an in-memory object with `store(...)`.
 
 **Configuration & diagnostics**
 - `set_max_workers/get_max_workers`, `set_convert_auto_workers/get_convert_auto_workers` (the `convert(max_workers="auto")` count), `set_gather_thread_cap/get_gather_thread_cap`, `set_default_backend/get_default_backend`, `set_default_madvise/get_default_madvise`.
-- `calibrate(*, persist=True, rounds=10) -> int`, `ensure_calibrated() -> int`, `max_threads() -> int`, `cpp_available()`, `use_passive_openmp_wait()`.
+- `calibrate(*, persist=True, rounds=10) -> int`, `ensure_calibrated() -> int`, `max_threads() -> int`, `cpp_available()`, `use_passive_openmp_wait()`, `__version__`. CLI: `colstore calibrate` / `colstore calibration {run,show,clear}`.
+- `testing` (fixture builders like `testing.make_store`) and `profiling` (benchmark timing) submodules for tests/benchmarks.
 
 **Exceptions:** `FormatError` (not a valid `.cstore`), `QueryError` (bad query/expression).
 
