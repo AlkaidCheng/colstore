@@ -6,6 +6,8 @@ log documents it and everything since.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-01
+
 ### Added
 
 - [[#262](https://github.com/AlkaidCheng/colstore/pull/262)] A `max_workers` option on
@@ -232,5 +234,6 @@ the full detail.
 Releases before 0.4.0 are summarized on the
 [GitHub Releases](https://github.com/AlkaidCheng/colstore/releases) page.
 
-[Unreleased]: https://github.com/AlkaidCheng/colstore/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/AlkaidCheng/colstore/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/AlkaidCheng/colstore/releases/tag/v0.5.0
 [0.4.0]: https://github.com/AlkaidCheng/colstore/releases/tag/v0.4.0
