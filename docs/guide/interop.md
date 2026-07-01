@@ -138,8 +138,9 @@ colstore to expand. `-o/--output` follows the same rule as the function: omitted
 each input, a literal path merges every input into it, a `{index}`/`{stem}`/`{name}`/`{parent}`
 template names them one-to-one. The options mirror the function (`--format`, `--columns`,
 `--dtype NAME=DTYPE`, `--rename STEM=NEWSTEM`, `--output-dir`, `--batch-size`, `--no-compact`,
-`--overwrite`, `--on-mismatch`), and `--dry-run` prints the resolved input → output plan
-without writing anything.
+`--overwrite`, `--on-mismatch`, `--max-workers N|auto`), and `--dry-run` prints the resolved
+input → output plan without writing anything. `--max-workers` converts several files at once on
+a thread pool (peak memory scales with the worker count, so pair it with `--batch-size`).
 
 ### NumPy `.npz`
 

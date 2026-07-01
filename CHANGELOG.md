@@ -8,6 +8,16 @@ log documents it and everything since.
 
 ### Added
 
+- [[#262](https://github.com/AlkaidCheng/colstore/pull/262)] A `max_workers` option on
+  `colstore.convert` (and `colstore convert --max-workers`) to convert multiple files
+  concurrently: `None` (default) is sequential, an `int` is a thread-pool worker count, and
+  `"auto"` uses the per-host throughput plateau (`config.get_convert_auto_workers()`, default 8,
+  tunable via `set_convert_auto_workers`). It parallelizes a glob/list one-to-one convert and a
+  merge's per-file imports; the threads overlap the per-file I/O and decode (the heavy stages
+  release the GIL). On a cold parallel filesystem a batch import runs ~3–5× faster; peak memory
+  scales with the worker count (each worker holds one file's working set), so pair it with
+  `batch_size` to bound the total. A committed benchmark, `benchmark/check_convert_parallel.py`,
+  measures the thread/process speedup per format.
 - [[#260](https://github.com/AlkaidCheng/colstore/pull/260)] A `colstore convert` command-line
   interface wrapping `colstore.convert`: `colstore convert SOURCE... [-o OUTPUT]` with
   `--format`, `--columns`, `--dtype NAME=DTYPE`, `--rename STEM=NEWSTEM`, `--output-dir`,
