@@ -12,11 +12,12 @@ import os
 import shutil
 import tempfile
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, overload
+from typing import Any, Literal, TypeAlias, overload
 
+from . import config
 from . import format as fmt
 from ._coerce import coerce_to_columns
 from ._paths import expand_glob, has_glob_magic
@@ -360,6 +361,7 @@ def _convert_merge(
     compact: bool,
     overwrite: bool,
     on_mismatch: OnMismatch,
+    workers: int = 1,
     **kwargs: Any,
 ) -> ColStoreReader | Path:
     """Merge every input into the single file ``dest`` (a literal output path)."""
@@ -383,36 +385,41 @@ def _convert_merge(
         )
     dest_path = _prepare_output(dest, overwrite)
     scratch = tempfile.mkdtemp(prefix="colstore_convert_")
+
+    def build_part(indexed: tuple[int, str]) -> ColStoreReader:
+        # With columns=, project every input to that schema before merging -- a foreign file as
+        # it is read, a native .cstore into a scratch part -- so an excluded column (unstorable,
+        # or mismatched across files) never reaches the merge, matching the single-file
+        # projection. Without columns=, a native input is merged in place.
+        index, source = indexed
+        if _is_cstore_path(source) and columns is None:
+            return ColStoreReader(source)
+        part = os.path.join(scratch, f"part_{index:05d}.cstore")
+        if _is_cstore_path(source):
+            assert columns is not None  # a native input reaches here only to be projected
+            projected = ColStoreReader(source)
+            try:
+                projected[:, columns].saveas(part)
+            finally:
+                projected.close()
+        else:
+            _import_to_cstore(
+                source,
+                part,
+                format=format,
+                columns=columns,
+                dtypes=dtypes,
+                batch_size=batch_size,
+                compact=compact,
+                **kwargs,
+            )
+        return ColStoreReader(part)
+
     readers: list[ColStoreReader] = []
     try:
-        for index, source in enumerate(inputs):
-            # With columns=, project every input to that schema before merging -- a foreign
-            # file as it is read, a native .cstore into a scratch part -- so an excluded column
-            # (unstorable, or mismatched across files) never reaches the merge, matching the
-            # single-file projection. Without columns=, a native input is merged in place.
-            if _is_cstore_path(source) and columns is None:
-                readers.append(ColStoreReader(source))
-                continue
-            part = os.path.join(scratch, f"part_{index:05d}.cstore")
-            if _is_cstore_path(source):
-                assert columns is not None  # a native input reaches here only to be projected
-                projected = ColStoreReader(source)
-                try:
-                    projected[:, columns].saveas(part)
-                finally:
-                    projected.close()
-            else:
-                _import_to_cstore(
-                    source,
-                    part,
-                    format=format,
-                    columns=columns,
-                    dtypes=dtypes,
-                    batch_size=batch_size,
-                    compact=compact,
-                    **kwargs,
-                )
-            readers.append(ColStoreReader(part))
+        # Append in order as each part is built so a mid-build failure still closes what opened.
+        for reader in _iter_mapped(build_part, list(enumerate(inputs)), workers):
+            readers.append(reader)
         ColStoreDataset(readers, on_mismatch=on_mismatch).saveas(
             dest, format=None if dest_is_cstore else format, batch_size=batch_size
         )
@@ -432,6 +439,54 @@ def _warn_repeated_inputs(repeated: list[str]) -> None:
             RuntimeWarning,
             stacklevel=3,
         )
+
+
+#: How many files a batch ``convert`` processes at once: ``None`` sequential, an ``int``
+#: worker count, or ``"auto"`` (the measured throughput plateau; see :func:`_resolve_workers`).
+MaxWorkers: TypeAlias = int | Literal["auto"] | None
+
+
+def _resolve_workers(max_workers: MaxWorkers, n_jobs: int) -> int:
+    """Concurrent worker count for a batch convert, capped at ``n_jobs``.
+
+    ``None`` (the default) runs sequentially. ``"auto"`` uses
+    ``min(config.get_convert_auto_workers(), n_jobs)`` -- the per-host throughput plateau
+    (default 8; beyond it, files contend on I/O bandwidth rather than scale). An ``int`` is
+    used as given. Parallelism runs one file per worker in threads, so peak memory scales with
+    the worker count -- each worker holds one file's working set -- so bound the total with
+    ``batch_size`` and ``max_workers`` together.
+    """
+    if max_workers is None:
+        return 1
+    if isinstance(max_workers, str):
+        if max_workers != "auto":
+            raise ValueError(f"max_workers must be an int, 'auto', or None; got {max_workers!r}.")
+        return max(1, min(config.get_convert_auto_workers(), n_jobs))
+    # bool is an int subclass, and a float (incl. nan / inf) is not a worker count -- reject both
+    # so a fractional value never reaches ThreadPoolExecutor.
+    if not isinstance(max_workers, int) or isinstance(max_workers, bool):
+        raise ValueError(f"max_workers must be an int, 'auto', or None; got {max_workers!r}.")
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1; got {max_workers}.")
+    return max(1, min(max_workers, n_jobs))
+
+
+def _iter_mapped(func: Callable[[Any], Any], jobs: list[Any], workers: int) -> Iterator[Any]:
+    """Yield ``func(job)`` for each job **in order** -- sequentially, or on a thread pool.
+
+    A thread pool parallelizes the per-file work because the heavy stages release the GIL
+    (pyarrow decode / encode, the HDF5 read, the NumPy conversion and the ``.cstore`` write);
+    the pool shares one process-wide pyarrow pool, so it does not oversubscribe. Results are
+    yielded in input order so a caller can append incrementally (and close on failure).
+    """
+    if workers <= 1 or len(jobs) <= 1:
+        for job in jobs:
+            yield func(job)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        yield from pool.map(func, jobs)
 
 
 def plan_conversions(
@@ -507,6 +562,7 @@ def convert(
     output_dir: str | os.PathLike[str] | None = None,
     overwrite: bool = False,
     on_mismatch: OnMismatch = "strict",
+    max_workers: MaxWorkers = None,
     **kwargs: Any,
 ) -> ColStoreReader | Path | list[ColStoreReader | Path]:
     """Convert files between colstore's format and another, one endpoint being ``.cstore``.
@@ -553,12 +609,26 @@ def convert(
     import only) collapses the streamed multi-record ``.cstore`` into a single record; pass
     ``False`` to keep it multi-record and skip the rewrite.
 
+    ``max_workers`` converts multiple files concurrently (across a glob / list one-to-one, or a
+    merge's per-file imports): ``None`` (default) is sequential, an ``int`` is a thread-pool
+    worker count, and ``"auto"`` is ``min(config.get_convert_auto_workers(), n_files)`` (the
+    per-host throughput plateau, default 8). Threads parallelize the per-file work (the heavy
+    stages release the GIL),
+    and they share one pyarrow pool so they do not oversubscribe. Peak memory scales with the
+    worker count -- each worker holds one file's working set -- so combine ``max_workers`` with
+    ``batch_size`` to bound the total (roughly ``max_workers`` times the per-file peak). A
+    single-file conversion ignores it (nothing to parallelize).
+
     Returns a single result for a single ``source`` path or a merge, and a list (one per
     input) for a glob or list converted one-to-one.
     """
     mode, groups, scalar = plan_conversions(
         source, dest, format=format, rename=rename, output_dir=output_dir
     )
+    # Resolve (and validate) the worker count up front, so a bad max_workers is rejected even
+    # for a single file, which otherwise parallelizes nothing.
+    n_files = len(groups[0][0]) if mode == "merge" else len(groups)
+    workers = _resolve_workers(max_workers, n_files)
     if mode == "merge":
         sources, merged_dest = groups[0]
         return _convert_merge(
@@ -571,10 +641,13 @@ def convert(
             compact=compact,
             overwrite=overwrite,
             on_mismatch=on_mismatch,
+            workers=workers,
             **kwargs,
         )
-    results: list[ColStoreReader | Path] = [
-        _convert_one(
+
+    def convert_group(group: tuple[list[str], str]) -> ColStoreReader | Path:
+        sources, out = group
+        return _convert_one(
             sources[0],
             out,
             format=format,
@@ -585,8 +658,8 @@ def convert(
             overwrite=overwrite,
             **kwargs,
         )
-        for sources, out in groups
-    ]
+
+    results: list[ColStoreReader | Path] = list(_iter_mapped(convert_group, groups, workers))
     return results[0] if scalar else results
 
 

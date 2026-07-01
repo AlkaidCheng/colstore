@@ -82,6 +82,13 @@ _PREFETCH_DISTANCE_CEILING = 1 << 14
 # stays bounded on wide schemas or deep expression graphs.
 _DEFAULT_MEMORY_BUDGET = 32 * 1024 * 1024
 
+# Worker count for ``colstore.convert(max_workers="auto")`` -- how many files it converts at
+# once. 8 is where per-file throughput plateaus in the batch-convert benchmark (beyond it,
+# concurrent files contend on I/O bandwidth rather than scale). Machine-dependent (storage
+# bandwidth), so it is a tunable rather than a literal; a faster parallel filesystem may plateau
+# higher.
+_DEFAULT_CONVERT_AUTO_WORKERS = 8
+
 
 def _default_gather_thread_cap() -> int:
     """Derive a near-optimal default gather thread cap from the hardware.
@@ -109,6 +116,7 @@ _numa_policy: NumaPolicy = "auto"
 _write_method: WriteMethod = "auto"
 _prefetch_distance: int | Literal["auto"] = "auto"
 _default_memory_budget: int = _DEFAULT_MEMORY_BUDGET
+_convert_auto_workers: int = _DEFAULT_CONVERT_AUTO_WORKERS
 
 # Reader-side spread thread-binding. The gate (see ``_numa.maybe_bind_for_gather``)
 # pins the OpenMP pool spread across cores for a gather whose working set exceeds
@@ -147,6 +155,19 @@ def set_max_workers(n: int) -> None:
     if n < 1:
         raise ValueError(f"max_workers must be >= 1, got {n}.")
     _max_workers = int(n)
+
+
+def get_convert_auto_workers() -> int:
+    """Return the worker count ``colstore.convert(max_workers="auto")`` uses (the plateau)."""
+    return _convert_auto_workers
+
+
+def set_convert_auto_workers(n: int) -> None:
+    """Set the ``convert(max_workers="auto")`` worker count (per-host; the throughput plateau)."""
+    global _convert_auto_workers
+    if n < 1:
+        raise ValueError(f"convert_auto_workers must be >= 1, got {n}.")
+    _convert_auto_workers = int(n)
 
 
 def get_gather_thread_cap() -> int:

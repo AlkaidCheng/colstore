@@ -372,6 +372,16 @@ with a fixed-width numeric schema); on export it writes the foreign file in row-
 backend, Feather with write options) is written whole with a warning. `columns=[...]` converts
 only the named columns, in either direction.
 
+Converting many files? `max_workers` runs them concurrently on a thread pool (`"auto"` picks
+the throughput plateau): a batch import from a parallel filesystem goes ~3–5× faster. Peak
+memory scales with the worker count (one file's working set per worker), so pair it with
+`batch_size` to bound the total.
+
+```python
+colstore.convert("*.h5", output_dir="out/", max_workers="auto")   # convert a directory in parallel
+colstore.convert("*.parquet", "all.cstore", max_workers=8, batch_size="256 MiB")  # merge, bounded
+```
+
 `convert` is also a CLI command, so the same conversions run from a shell — with `--dry-run`
 to preview the resolved input → output plan first:
 
@@ -379,6 +389,7 @@ to preview the resolved input → output plan first:
 colstore convert a.h5 b.h5 c.h5 -o all.cstore              # merge named files into one .cstore
 colstore convert "*.h5" -o all.cstore --on-mismatch drop   # or a glob (quoted, or shell-expanded)
 colstore convert big.cstore -o big.parquet --columns id,x --batch-size "256 MiB"
+colstore convert "*.h5" --output-dir out/ --max-workers auto   # convert each file in parallel
 ```
 
 Pass `dtypes={name: dtype}` to coerce named columns as they are read — useful to give a
