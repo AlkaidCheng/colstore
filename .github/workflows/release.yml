@@ -118,6 +118,13 @@ jobs:
           # We support 3.10+; skip older interpreters, PyPy, 32-bit
           # Linux, 32-bit Windows, and musllinux (we don't test it).
           CIBW_SKIP: "cp36-* cp37-* cp38-* cp39-* pp* *-manylinux_i686 *-musllinux* *-win32"
+          # Build and test on manylinux_2_28 (glibc 2.28), not the default
+          # manylinux2014 (CentOS 7, glibc 2.17, EOL). manylinux2014
+          # segfaults building a datetime64/timedelta64 DataFrame under
+          # CPython 3.12+ with the current numpy/pandas (crash inside
+          # pandas' ensure_wrapped_if_datetimelike; reproducible with plain
+          # numpy+pandas). This raises the Linux wheel floor to glibc 2.28.
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           # OpenMP on macOS comes from Homebrew libomp; manylinux
           # images and MSVC on Windows have OpenMP built in, so no
           # before-all step is needed there.
