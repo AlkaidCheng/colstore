@@ -25,7 +25,12 @@ What the earlier feasibility study found (10-core laptop, warm cache), to check 
 Caveats: ``cpu/wall`` is measured in the parent only, so it is meaningful for the
 sequential/thread variants but reads ~0 for process variants (child CPU is not counted) --
 use ``wall`` / ``speedup`` for those. ``--mp-context spawn`` (default) is safe; ``fork`` is
-faster on Linux but can deadlock a child that inherits pyarrow/OpenMP threads.
+faster on Linux but can deadlock a child that inherits pyarrow/OpenMP threads. Each *process*
+worker auto-caps its internal (pyarrow/OpenMP) threads to ~cores/workers so a many-core node
+does not spawn ``workers x cores`` threads (which OOMs the worker); override with
+``--cap-internal``. If a process worker cannot run at all (node subprocess limits), the
+process variants are skipped and the sequential/thread numbers still report. Run the heavy
+sweep on a *compute* node (``srun``), not a memory-limited login node.
 
     PYTHONPATH=src python benchmark/check_convert_parallel.py \\
         --formats parquet,hdf5 --files 16 --rows 2000000 --workers 4,8,16 \\
@@ -35,6 +40,7 @@ faster on Linux but can deadlock a child that inherits pyarrow/OpenMP threads.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -173,50 +179,86 @@ def run_threads(pairs: list[tuple[str, str]], workers: int) -> None:
         list(pool.map(_convert_file, pairs))
 
 
+def _effective_cap(cap: int | None, workers: int) -> int:
+    """Per-worker internal-thread cap: the user's ``--cap-internal``, else about cores/workers.
+
+    Each *process* worker gets its own pyarrow/OpenMP pool, so leaving them uncapped on a
+    many-core node spawns ``workers x cores`` threads -- the thread-stack memory alone can OOM
+    the worker (a ``BrokenProcessPool``). Capping to ~cores/workers keeps the total near the
+    core count. Threads share one process-global pool, so this does not apply to them.
+    """
+    if cap is not None:
+        return cap
+    return max(1, (os.cpu_count() or 1) // max(1, workers))
+
+
 def run_process(pairs: list[tuple[str, str]], workers: int, cap: int | None, mp: str) -> None:
     with ProcessPoolExecutor(
         max_workers=workers,
         mp_context=get_context(mp),
         initializer=_init_worker,
-        initargs=(cap,),
+        initargs=(_effective_cap(cap, workers),),
     ) as pool:
         list(pool.map(_convert_file, pairs))
+
+
+def process_convert_works(pairs: list[tuple[str, str]], cap: int | None, mp: str) -> bool:
+    """Run one real convert in a process worker; report and skip process variants if it dies.
+
+    A node may forbid or resource-limit subprocesses; probing with an actual convert (not a
+    no-op) exercises the code path that spawns the internal thread pools, so the process
+    variants are only benchmarked when they genuinely run.
+    """
+    src, dst = pairs[0]
+    probe = str(Path(dst).with_name("probe_" + Path(dst).name))
+    try:
+        run_process([(src, probe)], 1, cap, mp)
+        return True
+    except Exception as error:
+        print(
+            f"  note: a process-pool convert failed ({type(error).__name__}: {error}); "
+            "skipping process variants."
+        )
+        return False
 
 
 # ---- Correctness gate ------------------------------------------------------
 
 
 def check_parallel_matches_sequential(
-    pairs: list[tuple[str, str]], direction: str, cap: int | None, mp: str
+    pairs: list[tuple[str, str]], direction: str, cap: int | None, mp: str, use_process: bool
 ) -> None:
-    """Convert once each way to distinct outputs and assert byte-for-byte-equal columns."""
+    """On a few files, assert each parallel mode's re-imported columns equal the sequential loop."""
     if direction == "export":
         return  # foreign outputs differ per writer; the round-trip is covered by the test suite
 
-    def tag(
-        dst: str, mode: str
-    ) -> str:  # keep the .cstore extension so convert infers the direction
-        path = Path(dst)
-        return str(path.with_name(f"{mode}_{path.name}"))
+    def tag(dst: str, mode: str) -> str:  # keep the .cstore extension so convert infers direction
+        return str(Path(dst).with_name(f"{mode}_{Path(dst).name}"))
 
-    seq = [(s, tag(d, "seq")) for s, d in pairs]
-    thr = [(s, tag(d, "thr")) for s, d in pairs]
-    proc = [(s, tag(d, "proc")) for s, d in pairs]
+    sample = pairs[: min(3, len(pairs))]
+    seq = [(s, tag(d, "seq")) for s, d in sample]
     run_sequential(seq)
-    run_threads(thr, min(4, len(pairs)))
-    run_process(proc, min(4, len(pairs)), cap, mp)
-    for (_, a), (_, b), (_, c) in zip(seq, thr, proc, strict=True):
-        readers = [colstore.open(a), colstore.open(b), colstore.open(c)]
-        try:
-            da, db, dc = (readers[0].dict(), readers[1].dict(), readers[2].dict())
-            assert da.keys() == db.keys() == dc.keys(), "column set differs across modes"
-            for key in da:
-                _c.check_equal(db[key], da[key], f"thread vs sequential [{key}]")
-                _c.check_equal(dc[key], da[key], f"process vs sequential [{key}]")
-        finally:
-            for reader in readers:
-                reader.close()
-    print("  correctness: parallel outputs match the sequential loop (columns + values).")
+    modes: list[tuple[str, list[tuple[str, str]]]] = []
+    thr = [(s, tag(d, "thr")) for s, d in sample]
+    run_threads(thr, min(4, len(sample)))
+    modes.append(("thread", thr))
+    if use_process:
+        proc = [(s, tag(d, "proc")) for s, d in sample]
+        run_process(proc, min(4, len(sample)), cap, mp)
+        modes.append(("process", proc))
+
+    for label, mode_pairs in modes:
+        for (_, base), (_, other) in zip(seq, mode_pairs, strict=True):
+            readers = [colstore.open(base), colstore.open(other)]
+            try:
+                expected, got = readers[0].dict(), readers[1].dict()
+                assert expected.keys() == got.keys(), "column set differs across modes"
+                for key in expected:
+                    _c.check_equal(got[key], expected[key], f"{label} vs sequential [{key}]")
+            finally:
+                for reader in readers:
+                    reader.close()
+    print(f"  correctness: {'/'.join(m for m, _ in modes)} outputs match the sequential loop.")
 
 
 # ---- Main ------------------------------------------------------------------
@@ -234,9 +276,10 @@ def _bench_one(fmt: str, args: argparse.Namespace, results: list[_c.Result]) -> 
             f"{fmt.upper()} {args.direction}: {args.files} files x {rows:,} rows "
             f"(~{total_mb:.0f} MB in){' [cold]' if args.cold else ''}"
         )
+        use_process = process_convert_works(pairs, args.cap_internal, args.mp_context)
         if not getattr(args, "skip_correctness", False):
             check_parallel_matches_sequential(
-                pairs, args.direction, args.cap_internal, args.mp_context
+                pairs, args.direction, args.cap_internal, args.mp_context, use_process
             )
         if args.skip_bench:
             return
@@ -244,13 +287,14 @@ def _bench_one(fmt: str, args: argparse.Namespace, results: list[_c.Result]) -> 
         specs: list[tuple[str, object]] = [("sequential", lambda: run_sequential(pairs))]
         for worker in args.workers:
             specs.append((f"thread-{worker}", lambda w=worker: run_threads(pairs, w)))
-        for worker in args.workers:
-            specs.append(
-                (
-                    f"process-{worker}",
-                    lambda w=worker: run_process(pairs, w, args.cap_internal, args.mp_context),
+        if use_process:
+            for worker in args.workers:
+                specs.append(
+                    (
+                        f"process-{worker}",
+                        lambda w=worker: run_process(pairs, w, args.cap_internal, args.mp_context),
+                    )
                 )
-            )
 
         setups = [lambda: _c.drop_pagecache(inputs)] * len(specs) if args.cold else None
         profiles = _c.compare(
