@@ -6,6 +6,13 @@ log documents it and everything since.
 
 ## [Unreleased]
 
+### Changed
+
+- [[#266](https://github.com/AlkaidCheng/colstore/pull/266)] Prebuilt Linux wheels now
+  require **glibc >= 2.28** (built on `manylinux_2_28` rather than the EOL
+  `manylinux2014` / glibc 2.17, which crashed the wheel build under CPython 3.12+).
+  Systems on glibc 2.17-2.27 (e.g. CentOS 7) install from the source distribution instead.
+
 ## [0.5.0] - 2026-07-01
 
 ### Added
