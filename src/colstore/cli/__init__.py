@@ -22,11 +22,11 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Sequence
 
-from . import calibration
+from . import calibration, convert
 
 _COMMAND_GROUP_REGISTRARS: tuple[
     Callable[[argparse._SubParsersAction[argparse.ArgumentParser]], None], ...
-] = (calibration.register,)
+] = (calibration.register, convert.register)
 
 
 def build_parser() -> argparse.ArgumentParser:
