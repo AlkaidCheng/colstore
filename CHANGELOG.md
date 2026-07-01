@@ -136,6 +136,12 @@ log documents it and everything since.
 
 ### Fixed
 
+- [[#261](https://github.com/AlkaidCheng/colstore/pull/261)] HDF5 export with the `h5py`
+  backend now preserves column order. HDF5 stores group links alphabetically by default, so a
+  `.cstore` exported to `.h5` and read back came out with its columns re-sorted (the values were
+  intact, only the order changed). The writer now tracks link creation order (`track_order=True`,
+  h5py ≥ 2.9), so the order round-trips; on an older h5py the argument is omitted and the order
+  falls back to alphabetical rather than the write failing.
 - [[#253](https://github.com/AlkaidCheng/colstore/pull/253)] An all-null column imported
   from a foreign file — a pandas object column that is entirely `NaN`, or an all-null /
   null-typed Arrow column — is now stored as an all-`NaN` `float64` column instead of

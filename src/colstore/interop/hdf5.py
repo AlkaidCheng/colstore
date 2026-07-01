@@ -147,11 +147,32 @@ def _h5_stamp_dtype(dataset: Any, array: np.ndarray[Any, Any]) -> None:
         dataset.attrs["np_dtype"] = str(array.dtype)
 
 
+def _order_tracking() -> dict[str, bool]:
+    """``{"track_order": True}`` on h5py that supports it, else ``{}``.
+
+    ``track_order`` makes a group store its links (columns) in creation order so the column
+    order round-trips, instead of HDF5's default alphabetical link storage. It was added in
+    h5py 2.9; on an older h5py the argument is unknown (it would raise), so it is omitted and
+    columns read back alphabetically -- a graceful degradation rather than a failed write.
+    """
+    import h5py
+
+    version = tuple(int(part) for part in h5py.__version__.split(".")[:2] if part.isdigit())
+    return {"track_order": True} if version >= (2, 9) else {}
+
+
+def _write_group(handle: Any, key: str) -> Any:
+    """The group columns are written into: a named group (order-tracked), or the file root."""
+    if key in (None, "", "/"):
+        return handle
+    return handle.create_group(key, **_order_tracking())
+
+
 def _write_h5py(path: str, key: str, data: dict[str, np.ndarray[Any, Any]]) -> None:
     import h5py
 
-    with h5py.File(path, "w") as handle:
-        group = handle.create_group(key) if key not in (None, "", "/") else handle
+    with h5py.File(path, "w", **_order_tracking()) as handle:
+        group = _write_group(handle, key)
         for name, array in data.items():
             dataset = group.create_dataset(
                 name, data=_h5_encode(array), dtype=_h5_dataset_dtype(array)
@@ -163,8 +184,8 @@ def _stream_h5py(path: str, key: str, selection: Selection, batch_size: int | st
     """Stream the selection into one resizable h5py dataset per column, appending each batch."""
     import h5py
 
-    with h5py.File(path, "w") as handle:
-        group = handle.create_group(key) if key not in (None, "", "/") else handle
+    with h5py.File(path, "w", **_order_tracking()) as handle:
+        group = _write_group(handle, key)
         datasets: dict[str, Any] = {}
         offset = 0
         # copy=False is safe here: each dataset assignment copies the batch into the file

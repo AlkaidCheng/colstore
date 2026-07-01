@@ -256,6 +256,20 @@ def test_hdf5_unknown_backend_rejected(tmp_path, store):
         store.saveas(tmp_path / "x.h5", backend="bogus")
 
 
+@pytest.mark.parametrize("write_kwargs", [{}, {"batch_size": 3}, {"key": "grp"}])
+def test_hdf5_h5py_preserves_column_order(tmp_path, store, columns, write_kwargs):
+    # HDF5 stores group links alphabetically by default; the h5py backend tracks creation
+    # order so a column's order round-trips (the fixture order is deliberately not sorted).
+    _need("h5py")
+    expected = list(columns)  # i, f, u, ok, s
+    assert expected != sorted(expected)
+    out = tmp_path / "order.h5"
+    store.saveas(out, backend="h5py", **write_kwargs)
+    back = colstore.convert(out, tmp_path / "order.cstore", key=write_kwargs.get("key"))
+    assert back.columns == expected
+    back.close()
+
+
 # ---- coercion policy: reject nulls / non-strings ---------------------------
 
 
