@@ -13,6 +13,17 @@ log documents it and everything since.
   `manylinux2014` / glibc 2.17, which crashed the wheel build under CPython 3.12+).
   Systems on glibc 2.17-2.27 (e.g. CentOS 7) install from the source distribution instead.
 
+### Fixed
+
+- [[#267](https://github.com/AlkaidCheng/colstore/pull/267)] The ROOT and uproot format
+  backends are detected reliably again once PyROOT has been imported in the same process.
+  Availability was probed with `importlib.util.find_spec`, which *raises* `ValueError`
+  (instead of returning a spec) for an already-imported module whose `__spec__` is `None` --
+  the state PyROOT's lazy facade leaves behind on some ROOT builds. After the first ROOT read
+  or write, every later backend lookup -- including `backend="auto"` and `backend="uproot"` --
+  then failed with `ValueError: ROOT.__spec__ is None`. Availability is now resolved without
+  importing the module and treats an already-imported module as present.
+
 ## [0.5.0] - 2026-07-01
 
 ### Added
