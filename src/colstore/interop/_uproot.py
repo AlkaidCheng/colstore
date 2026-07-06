@@ -8,7 +8,6 @@ colstore`` or by selecting the ROOT backend.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 from collections.abc import Iterator
 from typing import Any, ClassVar
@@ -22,6 +21,7 @@ from .root import (
     _SCALAR_KINDS,
     RootBackend,
     _batch_dict,
+    _module_available,
     _relabel,
     _resolve_chunk_rows,
     _resolve_file_list,
@@ -115,7 +115,7 @@ class UprootBackend(RootBackend):
 
     @staticmethod
     def available() -> bool:
-        return importlib.util.find_spec("uproot") is not None
+        return _module_available("uproot")
 
     def read_batches(
         self,

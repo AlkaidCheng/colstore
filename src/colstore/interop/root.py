@@ -107,6 +107,24 @@ def _import_root() -> ModuleType:
     return cast(ModuleType, ROOT)
 
 
+def _module_available(name: str) -> bool:
+    """Whether ``name`` is importable, without importing it.
+
+    ``importlib.util.find_spec`` returns ``None`` for a genuinely absent module,
+    but *raises* ``ValueError`` when the module is already imported and its
+    ``__spec__`` is ``None`` -- which is exactly what PyROOT's lazy facade leaves
+    behind once ``import ROOT`` has run. A bare ``find_spec`` therefore starts
+    throwing on every availability check the moment ROOT is first used in a
+    process; an already-imported module is available, so treat that as ``True``.
+    """
+    try:
+        return importlib.util.find_spec(name) is not None
+    except ValueError:
+        return True
+    except ImportError:
+        return False
+
+
 def require_existing(requested: list[str], available: list[str]) -> None:
     """Raise ``ValueError`` for any requested column absent from the source tree.
 
@@ -480,7 +498,7 @@ class RootCppBackend(RootBackend):
 
     @staticmethod
     def available() -> bool:
-        return importlib.util.find_spec("ROOT") is not None
+        return _module_available("ROOT")
 
     def read_batches(
         self,
@@ -635,7 +653,7 @@ def _is_rdataframe_source(source: Any) -> bool:
 
 
 def _uproot_available() -> bool:
-    return importlib.util.find_spec("uproot") is not None
+    return _module_available("uproot")
 
 
 def _uproot_backend() -> RootBackend:
